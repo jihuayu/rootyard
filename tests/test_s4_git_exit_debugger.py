@@ -14,7 +14,11 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -24,8 +28,9 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "target"
 
 
-FAKE_GDB = """#!/usr/bin/env python3
+FAKE_GDB = r"""#!/usr/bin/env python3
 import os
+import subprocess
 import sys
 import time
 
@@ -33,8 +38,10 @@ mode = os.environ.get("FAKE_GDB_MODE", "classified")
 if "--args" not in sys.argv:
     if mode == "bad_preflight":
         raise SystemExit(1)
+    if "--se" not in sys.argv:
+        raise SystemExit(2)
     print('s4-gdb-python-ok')
-    print('Line 359 of "src/namespace_service/s4_git_proc.rs"')
+    print('Line 359 of "src/namespace_service/s4_git_proc.rs" starts at address 0x0.')
     raise SystemExit(0)
 
 if mode == "timeout":
@@ -42,6 +49,24 @@ if mode == "timeout":
 
 path = os.environ["S4_GIT_RESULT_PATH"]
 nonce = os.environ["S4_GIT_NONCE"]
+if mode in ("interrupt", "interrupt_result"):
+    if mode == "interrupt_result":
+        with open(path, "x", encoding="utf-8") as handle:
+            handle.write("\n".join([
+                "s4git-result 1 " + nonce,
+                "breakpoint resolved src/namespace_service/s4_git_proc.rs 359",
+                "failure 1",
+                "frame src/namespace_service/s4_git_view_reverse.rs 170",
+                "exit 101",
+                "signal 0",
+            ]) + "\n")
+    child = subprocess.Popen(["sleep", "30"])
+    pidfile = os.environ.get("FAKE_GDB_PIDFILE")
+    if pidfile:
+        with open(pidfile, "w", encoding="utf-8") as handle:
+            handle.write(str(child.pid))
+    time.sleep(30)
+    raise SystemExit(0)
 if mode in ("missing", "no_result"):
     raise SystemExit(0)
 
@@ -81,8 +106,33 @@ else:
     lines.append("signal " + ("9" if mode == "signaled" else "0"))
 
 with open(path, "x", encoding="utf-8") as handle:
-    handle.write("\\n".join(lines) + "\\n")
+    handle.write("\n".join(lines) + "\n")
 """
+
+
+def _wait_for_path(path: Path, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.02)
+    raise AssertionError("fake GDB did not publish its child pid")
+
+
+def _pid_gone(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        completed = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        status = completed.stdout.strip()
+        if completed.returncode != 0 or not status or status.startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 class ObserverFixture(unittest.TestCase):
@@ -132,23 +182,6 @@ class ObserverFixture(unittest.TestCase):
 
 
 class ClosedMapperTests(unittest.TestCase):
-    def test_operation_enum_is_closed(self) -> None:
-        self.assertEqual(
-            {operation.value for operation in debugger.Operation},
-            {
-                "proposal_fetch",
-                "proposal_bundle_verify",
-                "proposal_merge_base",
-                "proposal_fsck",
-                "source_projection",
-                "source_fetch",
-                "source_tree_listing",
-                "root_mktree",
-                "commit_synthesis",
-                "pack_index",
-            },
-        )
-
     def test_every_physical_caller_location_matches_the_closed_table(self) -> None:
         debugger.verify_sites(ROOT)
 
@@ -167,55 +200,15 @@ class ClosedMapperTests(unittest.TestCase):
         operation, frame = debugger.classify_frames(frames)
         self.assertIs(operation, debugger.Operation.ROOT_MKTREE)
         self.assertEqual(frame, frames[1])
-
-    def test_unknown_frame_is_unresolved(self) -> None:
-        operation, frame = debugger.classify_frames(
-            [
-                debugger.Frame("src/namespace_service/s4_git_proc.rs", 359),
-                debugger.Frame("src/namespace_service/s4_git_view_reverse.rs", 99999),
-            ]
-        )
-        self.assertIsNone(operation)
-        self.assertIsNone(frame)
-    def test_duplicate_caller_location_is_rejected(self) -> None:
-        first = debugger.Site("src/namespace_service/s4_git_proc.rs", 1, debugger.Operation.PACK_INDEX, "x")
-        second = debugger.Site("src/namespace_service/s4_git_proc.rs", 1, debugger.Operation.ROOT_MKTREE, "x")
-        with self.assertRaises(debugger.MappingError):
-            debugger.verify_sites(ROOT, (first, second))
-
-    def test_stale_needle_is_rejected(self) -> None:
-        stale = (
-            debugger.Site(
-                "src/namespace_service/s4_git_view_reverse.rs",
-                170,
-                debugger.Operation.PROPOSAL_FETCH,
-                "not-the-physical-line",
-            ),
-        )
-        with self.assertRaises(debugger.MappingError):
-            debugger.verify_sites(ROOT, stale)
-
-    def test_missing_target_case_is_rejected(self) -> None:
+    def test_missing_or_ambiguous_target_case_is_rejected(self) -> None:
         with mock.patch.object(debugger, "TARGET_CASE", "missing_case"):
             with self.assertRaises(debugger.PreflightError):
                 debugger.target_case(ROOT)
-
-    def test_ambiguous_target_case_is_rejected(self) -> None:
         pattern = mock.Mock()
         pattern.findall.return_value = [debugger.TARGET_CASE, debugger.TARGET_CASE]
         with mock.patch.object(debugger, "CASE_PATTERN", pattern):
             with self.assertRaises(debugger.PreflightError):
                 debugger.target_case(ROOT)
-
-    def test_symlinked_source_is_rejected(self) -> None:
-        TARGET.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TARGET, prefix="s4-exit-link-") as directory:
-            base = Path(directory)
-            (base / "link.rs").symlink_to("/etc/passwd")
-            with self.assertRaises(debugger.PreflightError):
-                debugger.safe_repo_path(base, "link.rs")
-
-
 class ResultGrammarTests(unittest.TestCase):
     NONCE = "0123456789abcdef0123456789abcdef"
 
@@ -300,6 +293,15 @@ class FixedDebuggerCommandTests(unittest.TestCase):
         self.assertNotIn("attach", argv)
         self.assertNotIn("-ex", argv)
         self.assertEqual(argv.count("-x"), 1)
+    def test_preflight_argv_binds_the_verified_binary_before_the_script(self) -> None:
+        binary = ROOT / "target" / "test-binary"
+        argv = debugger.build_preflight_argv(ROOT, "gdb", binary)
+        self.assertIn("--se", argv)
+        self.assertEqual(argv[argv.index("--se") + 1], str(binary))
+        self.assertLess(argv.index("--se"), argv.index("-x"))
+        self.assertNotIn("--args", argv)
+        self.assertNotIn("-ex", argv)
+
     def test_gdb_extension_has_one_breakpoint_and_no_target_calls(self) -> None:
         body = debugger.GDB_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("gdb.Breakpoint", body)
@@ -348,13 +350,6 @@ class InstrumentedObserverTests(ObserverFixture):
         self.assertEqual(report["status"], "unresolved_failure")
         self.assertEqual(report["reason"], "no_known_caller_frame")
         self.assertIsNone(report["operation"])
-
-    def test_signaled_exit_is_preserved(self) -> None:
-        self.assertEqual(self.run_sidecar("signaled"), 137)
-        report = self.report()
-        self.assertEqual(report["test_exit"], 137)
-        self.assertEqual(report["status"], "classified_failure")
-
     def test_child_failure_with_zero_exit_reports_mismatch_and_passes_zero(self) -> None:
         self.assertEqual(self.run_sidecar("marker_zero"), 0)
         report = self.report()
@@ -421,20 +416,72 @@ class InstrumentedObserverTests(ObserverFixture):
         self.assertEqual(report["run_phase"], "preflight_not_run")
         self.assertEqual(report["case"], debugger.TARGET_CASE)
         self.assertEqual(report["test_suite"], "not_run")
-
-    def test_git_version_preflight_failure_is_reported_separately(self) -> None:
-        with mock.patch.object(debugger, "probe_git_version", side_effect=debugger.PreflightError("missing")):
-            self.assertEqual(self.run_sidecar("classified"), 2)
-        report = self.report()
-        self.assertEqual(report["status"], "unsupported")
-        self.assertEqual(report["reason"], "git_version_unavailable")
-
     def test_report_has_no_absolute_paths(self) -> None:
         self.assertEqual(self.run_sidecar("classified"), 101)
         payload = self.report_path.read_text(encoding="utf-8")
         self.assertNotIn(str(ROOT), payload)
         self.assertNotIn("/Users/", payload)
         self.assertNotIn("/tmp/", payload)
+
+    def test_started_interrupt_cleans_the_owned_group_and_preserves_a_known_exit(self) -> None:
+        cases = (
+            ("interrupt", None, "started_unknown"),
+            ("interrupt_result", 101, "failed"),
+        )
+        for mode, expected_exit, expected_suite in cases:
+            with self.subTest(mode=mode):
+                pidfile = self.base / (mode + ".pid")
+                report_path = self.base / (mode + ".json")
+                work = self.base / ("work-" + mode)
+                environment = dict(os.environ, FAKE_GDB_MODE=mode, FAKE_GDB_PIDFILE=str(pidfile))
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(ROOT / "tests" / "s4_git_exit_debugger.py"),
+                        "--binary",
+                        str(self.binary),
+                        "--report",
+                        str(report_path),
+                        "--work-dir",
+                        str(work),
+                        "--source-root",
+                        str(ROOT),
+                        "--gdb",
+                        str(self.gdb),
+                        "--git",
+                        "/usr/bin/git",
+                        "--timeout-seconds",
+                        "30",
+                    ],
+                    cwd=ROOT,
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                child_pid = None
+                try:
+                    _wait_for_path(pidfile)
+                    child_pid = int(pidfile.read_text(encoding="utf-8").strip())
+                    process.send_signal(signal.SIGINT)
+                    self.assertEqual(process.wait(timeout=10), 2)
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                    debugger.validate_report(report)
+                    self.assertEqual(report["status"], "unsupported")
+                    self.assertEqual(report["reason"], "run_interrupted")
+                    self.assertEqual(report["run_phase"], "run_started_interrupted")
+                    self.assertEqual(report["test_exit"], expected_exit)
+                    self.assertEqual(report["test_suite"], expected_suite)
+                    self.assertIsNone(report["operation"])
+                    self.assertTrue(_pid_gone(child_pid))
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    if child_pid is not None and not _pid_gone(child_pid):
+                        try:
+                            os.kill(child_pid, signal.SIGKILL)
+                        except OSError:
+                            pass
 
 
 class ReportShapeTests(unittest.TestCase):

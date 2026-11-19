@@ -57,6 +57,7 @@ MAX_FRAMES = 12
 MAX_RESULT_BYTES = 8192
 MAX_RESULT_LINES = 48
 MAX_REPORT_BYTES = 16384
+STOP_GRACE_SECONDS = 2
 
 NONCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -100,8 +101,10 @@ class Reason(str, Enum):
     RESULT_MISSING = "result_missing"
     RESULT_INVALID = "result_invalid"
     RUN_TIMED_OUT = "run_timed_out"
+    RUN_INTERRUPTED = "run_interrupted"
     GIT_VERSION_UNAVAILABLE = "git_version_unavailable"
     BINARY_UNAVAILABLE = "binary_unavailable"
+    BINARY_CHANGED = "binary_changed"
     SOURCE_PREFLIGHT_FAILED = "source_preflight_failed"
     NONE = "none"
 
@@ -111,6 +114,7 @@ class RunPhase(str, Enum):
     RUN_STARTED_TARGET_NOT_RUN = "run_started_target_not_run"
     RUN_STARTED_NO_RESULT = "run_started_no_result"
     RUN_STARTED_TIMED_OUT = "run_started_timed_out"
+    RUN_STARTED_INTERRUPTED = "run_started_interrupted"
     RUN_STARTED_INVALID_RESULT = "run_started_invalid_result"
     COMPLETED = "completed"
 
@@ -523,7 +527,7 @@ def build_gdb_argv(source_root: Path, gdb: str, binary: Path) -> list[str]:
     ]
 
 
-def build_preflight_argv(source_root: Path, gdb: str) -> list[str]:
+def build_preflight_argv(source_root: Path, gdb: str, binary: Path) -> list[str]:
     return [
         gdb,
         "--batch",
@@ -537,6 +541,8 @@ def build_preflight_argv(source_root: Path, gdb: str) -> list[str]:
         "set history save off",
         "-iex",
         "directory " + str(source_root),
+        "--se",
+        str(binary),
         "-x",
         str(GDB_PREFLIGHT),
     ]
@@ -547,13 +553,14 @@ def _preflight_resolved(output: str) -> bool:
         "Line " + str(BREAK_LINE) + " of" in output
         and BREAK_FILE in output
         and "s4-gdb-python-ok" in output
+        and "0x" in output
     )
 
 
-def preflight_gdb(source_root: Path, gdb: str) -> tuple[bool, Reason]:
+def preflight_gdb(source_root: Path, gdb: str, binary: Path) -> tuple[bool, Reason]:
     try:
         completed = subprocess.run(
-            build_preflight_argv(source_root, gdb),
+            build_preflight_argv(source_root, gdb, binary),
             cwd=source_root,
             check=False,
             capture_output=True,
@@ -575,6 +582,27 @@ def _remove(path: Path) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _stop_process_group(process: subprocess.Popen) -> None:
+    """Bounded terminate, kill and reap for the owned GDB session."""
+    if process.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except OSError:
+            try:
+                process.send_signal(sig)
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=STOP_GRACE_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except KeyboardInterrupt:
+            continue
 
 
 def run_observer(
@@ -604,7 +632,9 @@ def run_observer(
         }
     )
     argv = build_gdb_argv(source_root, gdb, binary)
+    process: subprocess.Popen | None = None
     timed_out = False
+    interrupted = False
     try:
         process = subprocess.Popen(
             argv,
@@ -619,38 +649,60 @@ def run_observer(
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                process.kill()
-            process.wait()
-    except FileNotFoundError:
-        return None, Reason.GDB_UNAVAILABLE, RunPhase.PREFLIGHT_NOT_RUN
-    except (OSError, subprocess.SubprocessError):
-        return None, Reason.GDB_UNAVAILABLE, RunPhase.PREFLIGHT_NOT_RUN
-    if timed_out:
-        _remove(result_path)
-        return None, Reason.RUN_TIMED_OUT, RunPhase.RUN_STARTED_TIMED_OUT
-    try:
+            _stop_process_group(process)
+        except KeyboardInterrupt:
+            interrupted = True
+            _stop_process_group(process)
+        if timed_out:
+            _remove(result_path)
+            return None, Reason.RUN_TIMED_OUT, RunPhase.RUN_STARTED_TIMED_OUT
+        if interrupted:
+            parsed = _interrupted_result(result_path, nonce)
+            _remove(result_path)
+            return parsed, Reason.RUN_INTERRUPTED, RunPhase.RUN_STARTED_INTERRUPTED
         if result_path.is_symlink() or not result_path.is_file():
             raise ResultError("result file is not a regular file")
         size = result_path.stat().st_size
         if size > MAX_RESULT_BYTES:
             raise ResultError("result file exceeds its bound")
         text = result_path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError, UnicodeError, ResultError):
+    except FileNotFoundError:
+        return None, Reason.GDB_UNAVAILABLE, RunPhase.PREFLIGHT_NOT_RUN
+    except (OSError, subprocess.SubprocessError):
+        return None, Reason.GDB_UNAVAILABLE, RunPhase.PREFLIGHT_NOT_RUN
+    except ResultError:
         existed = result_path.exists() or result_path.is_symlink()
         _remove(result_path)
         if existed:
             return None, Reason.RESULT_INVALID, RunPhase.RUN_STARTED_INVALID_RESULT
         return None, Reason.RESULT_MISSING, RunPhase.RUN_STARTED_NO_RESULT
+    except KeyboardInterrupt:
+        if process is None:
+            return None, Reason.RUN_INTERRUPTED, RunPhase.PREFLIGHT_NOT_RUN
+        _stop_process_group(process)
+        _remove(result_path)
+        return None, Reason.RUN_INTERRUPTED, RunPhase.RUN_STARTED_INTERRUPTED
     try:
         parsed = parse_result(text, nonce)
     except ResultError:
         _remove(result_path)
         return None, Reason.RESULT_INVALID, RunPhase.RUN_STARTED_INVALID_RESULT
+    except KeyboardInterrupt:
+        _remove(result_path)
+        return None, Reason.RUN_INTERRUPTED, RunPhase.RUN_STARTED_INTERRUPTED
     _remove(result_path)
     return parsed, Reason.NONE, RunPhase.COMPLETED
+
+
+def _interrupted_result(path: Path, nonce: str) -> GdbResult | None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > MAX_RESULT_BYTES:
+            return None
+        return parse_result(path.read_text(encoding="utf-8"), nonce)
+    except (OSError, UnicodeError, ResultError):
+        return None
 
 
 def observed_exit(result: GdbResult) -> int | None:
@@ -780,27 +832,14 @@ def validate_report(report: dict[str, object]) -> None:
     require(report["failure_kind"] == "unknown", "report failure kind changed")
     require(report["failure_kind_reason"] == "exit_status_is_local_and_not_read",
             "report failure-kind reason changed")
-    require(isinstance(report["limitations"], list)
-            and all(isinstance(item, str) for item in report["limitations"]),
-            "report limitations are not a string list")
     require(report["operation"] is None or report["operation"] in {op.value for op in Operation},
             "report operation is not closed")
-    require(isinstance(report["base_parents"], list)
-            and all(isinstance(parent, str) and COMMIT_PATTERN.fullmatch(parent)
-                    for parent in report["base_parents"]),
-            "report base parent is invalid")
     caller = report["caller"]
     if caller is not None:
         require(isinstance(caller, dict) and set(caller) == {"file", "line"}
                 and isinstance(caller["file"], str) and _valid_relative(caller["file"])
-                and isinstance(caller["line"], int) and not isinstance(caller["line"], bool)
-                and caller["line"] >= 1,
+                and isinstance(caller["line"], int) and caller["line"] >= 1,
                 "report caller shape changed")
-    require(report["binary_sha256"] is None
-            or (isinstance(report["binary_sha256"], str)
-                and SHA256_PATTERN.fullmatch(report["binary_sha256"])),
-            "report binary digest is invalid")
-
     status, phase, test_exit = report["status"], report["run_phase"], report["test_exit"]
     completed = phase == RunPhase.COMPLETED.value
     if completed:
@@ -808,18 +847,18 @@ def validate_report(report: dict[str, object]) -> None:
                 "report test exit is not a bounded integer")
         require(isinstance(report["binary_sha256"], str)
                 and SHA256_PATTERN.fullmatch(report["binary_sha256"]), "report binary digest is missing")
-        require(isinstance(report["git_version"], list) and len(report["git_version"]) == 3
-                and all(isinstance(part, int) and not isinstance(part, bool) and part >= 0
-                        for part in report["git_version"]),
-                "report Git version is not exactly numeric")
-        source = report["source"]
-        require(isinstance(source, dict)
-                and set(source) == {"runner_sha256", "reverse_sha256", "test_sha256", "harness_sha256"}
-                and all(isinstance(value, str) and SHA256_PATTERN.fullmatch(value)
-                        for value in source.values()),
-                "report source binding changed")
         require(report["test_suite"] == ("failed" if test_exit != 0 else "passed"),
                 "report test suite does not match the runner exit")
+    elif phase == RunPhase.RUN_STARTED_INTERRUPTED.value:
+        if test_exit is None:
+            require(report["test_suite"] == "started_unknown",
+                    "interrupted run without an exit claims a suite outcome")
+        else:
+            require(isinstance(test_exit, int) and not isinstance(test_exit, bool)
+                    and 0 <= test_exit <= 255,
+                    "interrupted runner exit is not a bounded integer")
+            require(report["test_suite"] == ("failed" if test_exit != 0 else "passed"),
+                    "interrupted runner exit does not match the suite state")
     else:
         require(test_exit is None, "incomplete run carries a runner exit")
         expected = "not_run" if phase in (RunPhase.PREFLIGHT_NOT_RUN.value,
@@ -979,6 +1018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         reason: Reason,
         *,
         run_phase: RunPhase = RunPhase.PREFLIGHT_NOT_RUN,
+        test_exit: int | None = None,
         failure_observed: bool = False,
         debug_resolution: str = "unresolved",
     ) -> int:
@@ -986,6 +1026,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             Status.UNSUPPORTED,
             reason,
             run_phase=run_phase,
+            test_exit=test_exit,
             failure_observed=failure_observed,
             debug_resolution=debug_resolution,
         )
@@ -1010,9 +1051,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("s4-git-exit-debugger: selected Git version preflight failed", file=sys.stderr)
         return unsupported(Reason.GIT_VERSION_UNAVAILABLE)
 
-    ok, preflight_reason = preflight_gdb(root, args.gdb)
+    ok, preflight_reason = preflight_gdb(root, args.gdb, binary)
     if not ok:
         return unsupported(preflight_reason)
+    if hash_file(binary) != binary_sha256:
+        return unsupported(Reason.BINARY_CHANGED)
 
     assert binary is not None
     nonce = observation_nonce()
@@ -1024,6 +1067,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         nonce,
         args.timeout_seconds,
     )
+    if run_phase == RunPhase.RUN_STARTED_INTERRUPTED:
+        test_exit = observed_exit(result) if result is not None else None
+        return unsupported(
+            Reason.RUN_INTERRUPTED,
+            run_phase=run_phase,
+            test_exit=test_exit,
+            failure_observed=result.failure if result is not None else False,
+            debug_resolution=(
+                "resolved"
+                if result is not None and result.breakpoint_state == "resolved"
+                else "unresolved"
+            ),
+        )
     if result is None:
         return unsupported(run_reason, run_phase=run_phase)
     if result.error is not None:

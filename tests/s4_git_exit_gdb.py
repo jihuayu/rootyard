@@ -1,11 +1,8 @@
-"""GDB Python observer loaded by tests/s4_git_exit_debugger.py.
+"""Bounded GDB observer for the reverse-phase child-exit return.
 
-This file runs only inside a batch GDB process. It resolves one breakpoint at the
-unsuccessful-child-exit return in ``run_git_bounded``, walks a bounded DWARF
-frame prefix, keeps only physical repo-relative source locators, and writes the
-bounded result grammar to a private file. It never prints target arguments,
-locals, memory strings, stdout, stderr or a raw stack, and it never attaches to
-an existing process or calls target code.
+Run only inside the sidecar's batch GDB. It keeps repo-relative frame locators
+and writes the bounded result grammar to a private file; it never prints target
+arguments, locals, memory strings, stdout, stderr or a raw stack.
 """
 import gdb
 import os
