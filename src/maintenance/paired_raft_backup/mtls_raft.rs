@@ -130,8 +130,17 @@ impl MtlsLiveRaftBackend {
     pub fn write_freeze_record(&self, rec: &DurableRaftFreezeRecord) -> Result<u64, PairedBackupError> {
         rec.verify()?;
         let raw = serde_json::to_string(rec).map_err(|_| PairedBackupError::IncompleteCut("freeze serialize"))?;
-        let (idx, _) = self.quorum_kv_put(FREEZE_KV_KEY, &raw)?;
-        self.trigger_leader_snapshot()?;
+        let (idx, _) = self.quorum_kv_put(FREEZE_KV_KEY, &raw).map_err(|err| {
+            if rec.frozen {
+                err
+            } else {
+                PairedBackupError::BootThawRefused(format!("Raft quorum refused thaw commit: {err}"))
+            }
+        })?;
+        self.trigger_leader_snapshot().map_err(|err| {
+            let msg = format!("Raft freeze/thaw committed at index {idx}, post-commit snapshot failed: {err}");
+            PairedBackupError::StateMachine(msg)
+        })?;
         Ok(idx)
     }
 
@@ -260,7 +269,10 @@ impl MtlsLiveRaftBackend {
     pub(super) fn trigger_leader_snapshot(&self) -> Result<(), PairedBackupError> {
         let (_, lid) = self.probe_live_voters()?;
         let addr = &self.cfg.voter_endpoints[&lid];
-        let _ = mtls_rpc_call(&self.tls_cfg, addr, lid, &json!("TriggerSnapshot"), self.cfg.rpc_timeout)?;
+        let (resp, _) = mtls_rpc_call(&self.tls_cfg, addr, lid, &json!("TriggerSnapshot"), self.cfg.rpc_timeout)?;
+        if resp != json!("Ok") {
+            return Err(PairedBackupError::StateMachine(format!("leader TriggerSnapshot rejected: {resp}")));
+        }
         Ok(())
     }
 
@@ -344,22 +356,16 @@ impl MtlsLiveRaftBackend {
         if let RefCasCommand::InitializeGate(init) = cmd {
             return init.gate.group_epoch.max(1);
         }
-        // Resolve from the linearizable replay of *this* commit, never from a handle-local cache: a
-        // second backend connected to the same 3-voter cluster may not have observed the peer's
-        // commits yet, and would otherwise seal the wrong group epoch into its command.
         let current = before_sm.snapshot().ok().and_then(|s| s.body.gates.first().map(|g| g.group_epoch));
         current.unwrap_or(1).max(1)
     }
 
-    /// Re-read the full linearizable Raft state into this handle's cache so `durable_state_machine`
-    /// observes every commit made by any other handle connected to the same 3-voter cluster.
     pub fn sync_cached_state_machine(&mut self) -> Result<(), PairedBackupError> {
         let (sm, _) = self.replay_linearizable_sm()?;
         self.cached_sm = sm;
         Ok(())
     }
 
-    /// Refuse restore unless every configured target voter is a brand-new, empty incarnation.
     pub fn verify_pristine_new_incarnation_target(
         &self,
         source_membership_digest: &str,
@@ -466,7 +472,6 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
     fn committed_quorum_index(&self) -> Result<u64, PairedBackupError> {
         self.linearizable_consensus_index()
     }
-
     fn verify_freeze_barrier_active(&self, expected_barrier_id: Uuid) -> Result<(), PairedBackupError> {
         let rec = self.read_freeze_record()?.ok_or(PairedBackupError::FreezeNotHeld(FREEZE_RECORD_MISSING))?;
         if !rec.frozen || rec.barrier_id != expected_barrier_id {
@@ -478,7 +483,6 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
     fn durable_state_machine(&self) -> &RefCasStateMachine {
         &self.cached_sm
     }
-
     fn attest_group_cutpoint(
         &self,
         group_epoch: i64,

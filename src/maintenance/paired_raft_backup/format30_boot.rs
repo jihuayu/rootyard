@@ -244,12 +244,9 @@ async fn restore_and_boot_format30_inner(
         let boot_thaw =
             boot_record(&manifest, &inc, false, boot_freeze.barrier_id, Some(manifest.paired_cut_digest.clone()))?;
         for (&gid, pr) in booted_peer_rafts.iter() {
-            pr.write_freeze_record(&boot_thaw)
-                .map_err(|e| PairedBackupError::BootThawRefused(format!("peer group {gid}: {e}")))?;
+            pr.write_freeze_record(&boot_thaw).map_err(|e| tag_thaw_group(&format!("peer group {gid}"), e))?;
         }
-        booted_active_raft
-            .write_freeze_record(&boot_thaw)
-            .map_err(|e| PairedBackupError::BootThawRefused(format!("active group: {e}")))?;
+        booted_active_raft.write_freeze_record(&boot_thaw).map_err(|e| tag_thaw_group("active group", e))?;
         // Every PostgreSQL fence stays armed here on purpose: the volume is still unpublished and
         // only `publish_staged_dir_noreplace` + `sync_parent_dir` may commit it.
         Ok((dst_client, inc, git_verified_refs))
@@ -297,6 +294,14 @@ async fn restore_and_boot_format30_inner(
         incarnation: inc,
     };
     Ok((outcome, guard))
+}
+
+/// Label only a pre-commit thaw refusal; a post-commit snapshot failure must keep its own class.
+fn tag_thaw_group(label: &str, err: PairedBackupError) -> PairedBackupError {
+    match err {
+        PairedBackupError::BootThawRefused(msg) => PairedBackupError::BootThawRefused(format!("{label}: {msg}")),
+        other => other,
+    }
 }
 
 /// Clear every restored PostgreSQL fence only after the staged volume has been published and its
@@ -435,4 +440,17 @@ async fn install_new_incarnation_on_restored_schema151(
 ) -> Result<NewIncarnationAuthority, PairedBackupError> {
     let install = super::format30_incarnation::install_new_incarnation_on_restored_schema151;
     install(client, manifest, captured_repos).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_commit_snapshot_error_is_never_classified_as_boot_thaw_refused() {
+        let snapshot = PairedBackupError::StateMachine("committed at index 9".into());
+        assert!(matches!(tag_thaw_group("active group", snapshot), PairedBackupError::StateMachine(_)));
+        let refused = PairedBackupError::BootThawRefused("quorum".into());
+        assert!(matches!(tag_thaw_group("active group", refused), PairedBackupError::BootThawRefused(_)));
+    }
 }

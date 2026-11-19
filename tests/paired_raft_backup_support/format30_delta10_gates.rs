@@ -2,6 +2,7 @@
 //! canonical plans, and a thaw that cannot reach quorum must leave the staged volume unpublished (#153).
 use std::collections::BTreeMap;
 use std::fs;
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -199,8 +200,8 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
         let thaw_fail_grp = LiveMtlsRaftGroup::start_three(42)?;
         let mut blocked_raft = thaw_fail_grp.connect_backend(1)?;
         let mut blocked_peers: BTreeMap<i64, MtlsLiveRaftBackend> = BTreeMap::new();
-        let pre_thaw_hook_ran = Arc::new(AtomicBool::new(false));
-        let thaw_flag = pre_thaw_hook_ran.clone();
+        let pre_thaw_outcome: Arc<Mutex<Option<Result<(u64, ExitStatus, ExitStatus)>>>> = Arc::new(Mutex::new(None));
+        let thaw_slot = pre_thaw_outcome.clone();
         let restore_env = s3.apply_env("paired-fmt30-delta10");
         let rejected = restore_and_boot_format30_with_pre_thaw_hook(
             &archive_dir,
@@ -210,24 +211,36 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
             &mut blocked_raft,
             &mut blocked_peers,
             || {
-                thaw_flag.store(true, Ordering::SeqCst);
-                thaw_fail_grp.nodes[&2].kill_hard();
-                thaw_fail_grp.nodes[&3].kill_hard();
+                let outcome = (|| -> Result<_> {
+                    let m = thaw_fail_grp.nodes[&1].rpc(&json!("Metrics"))?;
+                    let pre_applied = m
+                        .pointer("/Metrics/last_applied/index")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| anyhow!("missing pre-thaw voter #1 last_applied.index"))?;
+                    let st2 = thaw_fail_grp.nodes[&2].kill_hard_checked()?;
+                    let st3 = thaw_fail_grp.nodes[&3].kill_hard_checked()?;
+                    Ok((pre_applied, st2, st3))
+                })();
+                *thaw_slot.lock().unwrap() = Some(outcome);
             },
         )
         .await;
         drop(restore_env);
-        ensure!(
-            pre_thaw_hook_ran.load(Ordering::SeqCst),
-            "pre-thaw hook must have run after rebind and cursor verification"
-        );
+        let pre_thaw_hook_ran = pre_thaw_outcome.lock().unwrap().take();
+        let (pre_applied, _st2, _st3) = pre_thaw_hook_ran.ok_or_else(|| anyhow!("pre-thaw hook must have run"))??;
         ensure!(
             matches!(&rejected, Err(PairedBackupError::BootThawRefused(_))),
             "expected BootThawRefused when quorum dies before thaw, got {rejected:?}"
         );
         ensure!(!blocked_vol.exists(), "a failed thaw must never publish the target volume");
         ensure!(blocked_guard.is_file(), "a failed thaw must leave the crash-persistent guard armed");
-        // Voter #1 survived: it must hold the committed frozen `boot_freeze`, never the thawed record.
+        // Voter #1 survived: it must have applied zero log entries after the hook and still hold the
+        // committed frozen `boot_freeze`, never the thawed record.
+        let m = thaw_fail_grp.nodes[&1].rpc(&json!("Metrics"))?;
+        ensure!(
+            m.pointer("/Metrics/last_applied/index").and_then(serde_json::Value::as_u64) == Some(pre_applied),
+            "voter #1 must apply no log entries after the pre-thaw hook, pre_applied={pre_applied}"
+        );
         let kv = thaw_fail_grp.nodes[&1].rpc(&json!({ "InspectReplicaKv": { "key": "refcas/paired_freeze" } }))?;
         let raw = kv
             .pointer("/KvValue/value")

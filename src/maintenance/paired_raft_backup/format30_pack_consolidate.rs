@@ -113,6 +113,11 @@ pub(super) fn needs_consolidation_with_limit(packs: &[RestoredRepoPackFile], max
             || total_pack_bytes(packs) > max_plan_bytes)
 }
 
+/// Typed failure for a single-pair or consolidated closure above A4's frozen verifier byte budget.
+fn exceeds_verifier_budget(bound_bytes: u64) -> PairedBackupError {
+    PairedBackupError::RepositoryClosureExceedsVerifierBudget { repository_id: None, bound_bytes }
+}
+
 /// Choose the pack set for the first rebind plan, consolidating whenever the archived membership
 /// exceeds the pack-count or byte budget; an oversized consolidated closure is a typed refusal.
 pub(super) fn select_packs_for_rebind_with_limit(
@@ -129,9 +134,7 @@ pub(super) fn select_packs_for_rebind_with_limit(
         .ok_or_else(|| PairedBackupError::StateMachine("restore pack consolidation workspace is missing".into()))?;
     let single = consolidate_packs_with_git(git, object_format, packs, root, max_plan_bytes)?;
     if single.pack_len.saturating_add(single.idx_len) > max_plan_bytes {
-        return Err(PairedBackupError::StateMachine(
-            "consolidated pack closure exceeds verifier total byte bound".into(),
-        ));
+        return Err(exceeds_verifier_budget(max_plan_bytes));
     }
     Ok(vec![single])
 }
@@ -300,9 +303,7 @@ fn write_single_pack(
                 let _ = child.wait();
                 drop(pack_out);
                 let _ = std::fs::remove_file(&pack_path);
-                return Err(PairedBackupError::StateMachine(
-                    "consolidated pack closure exceeds verifier total byte bound".into(),
-                ));
+                return Err(exceeds_verifier_budget(max_plan_bytes));
             }
             pack_out.write_all(&buf[..n])?;
         }
@@ -329,9 +330,7 @@ fn write_single_pack(
     if pack_len.saturating_add(idx_len) > max_plan_bytes {
         let _ = std::fs::remove_file(&pack_path);
         let _ = std::fs::remove_file(&idx_path);
-        return Err(PairedBackupError::StateMachine(
-            "consolidated pack closure exceeds verifier total byte bound".into(),
-        ));
+        return Err(exceeds_verifier_budget(max_plan_bytes));
     }
     Ok((pack_path, idx_path))
 }
@@ -378,8 +377,6 @@ mod tests {
         };
         let (pack_path, idx_path) = write_single_pack(git, scratch, &[blob], u64::MAX).expect("single pack");
         std::fs::create_dir_all(target).expect("pack dir");
-        // Every restored pair carries the same archive-local file name, exactly like a real
-        // format 30 archive path `blob/<repo>/<pack_id>/pack.pack` + `idx.idx`.
         let named_pack = target.join("pack.pack");
         let named_idx = target.join("idx.idx");
         std::fs::copy(&pack_path, &named_pack).expect("copy pack");
@@ -454,16 +451,21 @@ mod tests {
             let target = root.0.join(format!("restored-{index}"));
             pairs.push(seed_pack(&git, &scratch, &target, format!("object-{index}\n").as_bytes()));
         }
-        // A `.pack` above the stream bound is killed mid-stream; `.pack + .idx` overflow fails after index-pack.
         let out_a = root.0.join("bounded-pack");
         let packed = select_packs_for_rebind_with_limit(&git, GitObjectFormat::Sha256, &pairs, 16, Some(&out_a));
-        assert!(matches!(packed, Err(PairedBackupError::StateMachine(_))));
+        assert!(matches!(
+            packed,
+            Err(PairedBackupError::RepositoryClosureExceedsVerifierBudget { bound_bytes: 16, .. })
+        ));
         assert!(!out_a.join("pack-consolidated.pack").exists());
         let measure_dir = root.0.join("measure-consolidated");
         let pack = consolidate_packs_with_git(&git, GitObjectFormat::Sha256, &pairs, &measure_dir, u64::MAX).unwrap();
         let (out_b, limit) = (root.0.join("bounded-idx"), pack.pack_len + 1);
         let r = select_packs_for_rebind_with_limit(&git, GitObjectFormat::Sha256, &pairs, limit, Some(&out_b));
-        assert!(matches!(r, Err(PairedBackupError::StateMachine(_))));
+        assert!(matches!(
+            r,
+            Err(PairedBackupError::RepositoryClosureExceedsVerifierBudget { bound_bytes, .. }) if bound_bytes == limit
+        ));
         assert!(!out_b.join("pack-consolidated.pack").exists() && !out_b.join("pack-consolidated.idx").exists());
     }
 

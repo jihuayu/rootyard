@@ -220,7 +220,16 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
             &repo.active_packs,
             VERIFIER_MAX_TOTAL_BYTES,
             repo_root.as_deref(),
-        )?;
+        )
+        .map_err(|err| match err {
+            PairedBackupError::RepositoryClosureExceedsVerifierBudget { bound_bytes, .. } => {
+                PairedBackupError::RepositoryClosureExceedsVerifierBudget {
+                    repository_id: Some(repo.repository_id),
+                    bound_bytes,
+                }
+            }
+            other => other,
+        })?;
         let op_id = Uuid::new_v4();
         let deadline = Instant::now() + Duration::from_secs(30);
         let baseline = PgPackCommit

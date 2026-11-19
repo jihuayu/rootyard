@@ -53,6 +53,10 @@ fn run_openssl(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+const OPENSSL_EC_CA: &str = "req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2";
+const OPENSSL_EC_CSR: &str = "req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes";
+const OPENSSL_X509: &str = "x509 -req -days 2 -CAcreateserial";
+
 pub struct MtlsGroupPki {
     _dir: TempDir,
     pub ca_cert: PathBuf,
@@ -73,26 +77,10 @@ impl MtlsGroupPki {
         let dir = tempfile::tempdir()?;
         let r = dir.path();
         for (ca_name, cn) in [("ca", "paired-raft-ca"), ("rogue", "rogue-ca")] {
-            run_openssl(
-                r,
-                &[
-                    "req",
-                    "-x509",
-                    "-newkey",
-                    "ec",
-                    "-pkeyopt",
-                    "ec_paramgen_curve:prime256v1",
-                    "-nodes",
-                    "-days",
-                    "2",
-                    "-keyout",
-                    &format!("{ca_name}.key"),
-                    "-out",
-                    &format!("{ca_name}.crt"),
-                    "-subj",
-                    &format!("/CN={cn}"),
-                ],
-            )?;
+            let (key, crt, subj) = (format!("{ca_name}.key"), format!("{ca_name}.crt"), format!("/CN={cn}"));
+            let mut args: Vec<&str> = OPENSSL_EC_CA.split_whitespace().collect();
+            args.extend(["-keyout", key.as_str(), "-out", crt.as_str(), "-subj", subj.as_str()]);
+            run_openssl(r, &args)?;
         }
         let sign = |ca: &str, stem: &str, dns: &str| -> Result<(PathBuf, PathBuf)> {
             let ext = r.join(format!("{stem}.ext"));
@@ -104,46 +92,16 @@ impl MtlsGroupPki {
                 ),
             )?;
             let (key, csr, crt) = (format!("{stem}.key"), format!("{stem}.csr"), format!("{stem}.crt"));
-            run_openssl(
-                r,
-                &[
-                    "req",
-                    "-new",
-                    "-newkey",
-                    "ec",
-                    "-pkeyopt",
-                    "ec_paramgen_curve:prime256v1",
-                    "-nodes",
-                    "-keyout",
-                    &key,
-                    "-out",
-                    &csr,
-                    "-subj",
-                    &format!("/CN={dns}"),
-                ],
-            )?;
-            run_openssl(
-                r,
-                &[
-                    "x509",
-                    "-req",
-                    "-in",
-                    &csr,
-                    "-CA",
-                    &format!("{ca}.crt"),
-                    "-CAkey",
-                    &format!("{ca}.key"),
-                    "-CAcreateserial",
-                    "-out",
-                    &crt,
-                    "-days",
-                    "2",
-                    "-extfile",
-                    &ext.to_string_lossy(),
-                    "-extensions",
-                    "v3_req",
-                ],
-            )?;
+            let subj = format!("/CN={dns}");
+            let mut args: Vec<&str> = OPENSSL_EC_CSR.split_whitespace().collect();
+            args.extend(["-keyout", key.as_str(), "-out", csr.as_str(), "-subj", subj.as_str()]);
+            run_openssl(r, &args)?;
+            let (ca_crt, ca_key) = (format!("{ca}.crt"), format!("{ca}.key"));
+            let ext_s = ext.to_string_lossy().into_owned();
+            let mut args: Vec<&str> = OPENSSL_X509.split_whitespace().collect();
+            args.extend(["-in", csr.as_str(), "-CA", ca_crt.as_str(), "-CAkey", ca_key.as_str()]);
+            args.extend(["-out", crt.as_str(), "-extfile", ext_s.as_str(), "-extensions", "v3_req"]);
+            run_openssl(r, &args)?;
             Ok((r.join(crt), r.join(key)))
         };
         let (client_cert, client_key) = sign("ca", "client", "raft-client.refcas.internal")?;
@@ -231,11 +189,19 @@ impl NodeProc {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(val)
     }
-    pub fn kill_hard(&self) {
-        if let Some(mut c) = self.child.lock().unwrap().0.take() {
-            let _ = c.kill();
-            let _ = reap(&mut c, Duration::from_secs(3));
+    pub fn kill_hard_checked(&self) -> Result<ExitStatus> {
+        let mut c = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .take()
+            .context("child process already taken")?;
+        if let Some(status) = c.try_wait().context("probe child status before kill")? {
+            return Ok(status);
         }
+        c.kill().context("kill child process")?;
+        reap(&mut c, Duration::from_secs(5)).context("child process did not exit within 5s after kill")
     }
 }
 
@@ -305,11 +271,19 @@ impl AttestorProc {
         Ok(Self { addr, child: Mutex::new(OwnedChild(Some(spawned))) })
     }
 
-    pub fn kill_hard(&self) {
-        if let Some(mut c) = self.child.lock().unwrap().0.take() {
-            let _ = c.kill();
-            let _ = reap(&mut c, Duration::from_secs(3));
+    pub fn kill_hard_checked(&self) -> Result<ExitStatus> {
+        let mut c = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .take()
+            .context("child process already taken")?;
+        if let Some(status) = c.try_wait().context("probe child status before kill")? {
+            return Ok(status);
         }
+        c.kill().context("kill child process")?;
+        reap(&mut c, Duration::from_secs(5)).context("child process did not exit within 5s after kill")
     }
 }
 
@@ -456,12 +430,12 @@ impl LiveMtlsRaftGroup {
                 == Some(node_id)
         });
         if let Some(old_att) = self.attestors.remove(&node_id) {
-            old_att.kill_hard();
+            old_att.kill_hard_checked()?;
         }
         let dir = {
             let n = self.nodes.remove(&node_id).context("missing node")?;
             let d = n.data_dir.clone();
-            n.kill_hard();
+            n.kill_hard_checked()?;
             d
         };
         if was_leader {

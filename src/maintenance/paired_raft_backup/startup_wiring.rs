@@ -87,7 +87,12 @@ pub fn set_installed_production_runtime_guard(guard: Option<PairedProductionRunt
     *production_guard_slot().write().unwrap_or_else(|poisoned| poisoned.into_inner()) = guard;
 }
 
-type PairedWriteBindings = RwLock<BTreeMap<String, Arc<Mutex<MtlsLiveRaftBackend>>>>;
+struct PairedWriteBinding {
+    serialize: tokio::sync::Mutex<()>,
+    raft: Arc<Mutex<MtlsLiveRaftBackend>>,
+}
+
+type PairedWriteBindings = RwLock<BTreeMap<String, Arc<PairedWriteBinding>>>;
 
 fn paired_write_raft_map() -> &'static PairedWriteBindings {
     static MAP: OnceLock<PairedWriteBindings> = OnceLock::new();
@@ -124,11 +129,12 @@ pub fn install_paired_write_raft_binding(
 ) -> Result<PairedWriteRaftScopeGuard, PairedBackupError> {
     let db_name = database_name_from_url(target_database_url.as_ref())
         .ok_or(PairedBackupError::InvalidArgument("paired write raft binding requires a target database name"))?;
-    paired_write_raft_map().write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(db_name.clone(), raft);
+    let bound = Arc::new(PairedWriteBinding { serialize: tokio::sync::Mutex::new(()), raft });
+    paired_write_raft_map().write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(db_name.clone(), bound);
     Ok(PairedWriteRaftScopeGuard { db_name })
 }
 
-fn bound_paired_write_raft(db_name: &str) -> Option<Arc<Mutex<MtlsLiveRaftBackend>>> {
+fn bound_paired_write_binding(db_name: &str) -> Option<Arc<PairedWriteBinding>> {
     paired_write_raft_map().read().unwrap_or_else(|poisoned| poisoned.into_inner()).get(db_name).cloned()
 }
 
@@ -264,10 +270,11 @@ pub async fn install_production_serving_guard_with_attestor(
             });
         }
         let db_name: String = barrier_client.query_one("SELECT current_database()", &[]).await.map_err(pg_err)?.get(0);
-        paired_write_raft_map()
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(db_name, Arc::new(Mutex::new(backend)));
+        let bound = Arc::new(PairedWriteBinding {
+            serialize: tokio::sync::Mutex::new(()),
+            raft: Arc::new(Mutex::new(backend)),
+        });
+        paired_write_raft_map().write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(db_name, bound);
     }
     let (new_history_incarnation, new_authority_epoch, new_group_epoch) =
         gate.map(|row| (row.get(0), row.get(1), row.get(2))).unwrap_or((cluster_inc, storage_auth_epoch.max(1), 1));
@@ -305,59 +312,154 @@ pub async fn ensure_serving_database_unfrozen(barrier_client: &tokio_postgres::C
     Ok(())
 }
 
-/// Refuse a normal paired write while PostgreSQL *or* the database-bound live Raft cluster is frozen.
-pub async fn check_paired_write_unfrozen(pool: &Pool) -> Result<(), PairedBackupError> {
+/// Serialize one PostgreSQL snapshot read with its blocking Raft CAS-delta apply per database, so a
+/// later read can never overtake an earlier apply.
+async fn run_serialized_pg_to_raft_step<T, ReadFut, ReadFn, ApplyFn>(
+    serialize: &tokio::sync::Mutex<()>,
+    read_pg: ReadFn,
+    apply_raft: ApplyFn,
+) -> Result<(), PairedBackupError>
+where
+    T: Send + 'static,
+    ReadFn: FnOnce() -> ReadFut,
+    ReadFut: std::future::Future<Output = Result<T, PairedBackupError>>,
+    ApplyFn: FnOnce(T) -> Result<(), PairedBackupError> + Send + 'static,
+{
+    let _serial_guard = serialize.lock().await;
+    let pg_snapshot = read_pg().await?;
+    tokio::task::spawn_blocking(move || apply_raft(pg_snapshot))
+        .await
+        .map_err(|e| PairedBackupError::StateMachine(format!("paired Raft serialized task failed: {e}")))?
+}
+
+/// Resolve the caller database without holding a pooled client while waiting for its serialize lock.
+async fn lookup_paired_write_binding(pool: &Pool) -> Result<Option<Arc<PairedWriteBinding>>, PairedBackupError> {
     if paired_write_raft_map().read().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let client = pool.get().await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
     let db_name: String = client.query_one("SELECT current_database()", &[]).await.map_err(pg_err)?.get(0);
-    let Some(raft_arc) = bound_paired_write_raft(&db_name) else {
+    drop(client);
+    Ok(bound_paired_write_binding(&db_name))
+}
+
+/// Refuse a normal paired write while PostgreSQL *or* the database-bound live Raft cluster is frozen.
+pub async fn check_paired_write_unfrozen(pool: &Pool) -> Result<(), PairedBackupError> {
+    let Some(binding) = lookup_paired_write_binding(pool).await? else {
         return Ok(());
     };
-    if read_pg_database_freeze_marker(&**client).await?.is_some() || read_pg_database_read_only(&**client).await? {
-        return Err(PairedBackupError::FreezeNotHeld("paired write refused while PostgreSQL freeze is active"));
-    }
-    drop(client);
-    tokio::task::spawn_blocking(move || -> Result<(), PairedBackupError> {
-        let guard = raft_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(record) = guard.read_freeze_record()?
-            && record.frozen
-        {
-            return Err(PairedBackupError::FreezeNotHeld("paired write refused while Raft freeze is active"));
-        }
-        Ok(())
-    })
+    let raft = binding.raft.clone();
+    run_serialized_pg_to_raft_step(
+        &binding.serialize,
+        || async {
+            let client = pool.get().await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
+            let frozen = read_pg_database_freeze_marker(&**client).await?.is_some()
+                || read_pg_database_read_only(&**client).await?;
+            drop(client);
+            if frozen {
+                return Err(PairedBackupError::FreezeNotHeld("paired write refused while PostgreSQL freeze is active"));
+            }
+            Ok(())
+        },
+        move |()| {
+            let guard = raft.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(record) = guard.read_freeze_record()?
+                && record.frozen
+            {
+                return Err(PairedBackupError::FreezeNotHeld("paired write refused while Raft freeze is active"));
+            }
+            Ok(())
+        },
+    )
     .await
-    .map_err(|e| PairedBackupError::StateMachine(format!("paired write unfrozen check task failed: {e}")))?
 }
 
 /// Mirror a committed gateway push into the database-bound live mTLS Raft cluster as an exact CAS
 /// delta, so the ordinary Smart-HTTP write path — never a test fixture — owns the consensus floor.
 pub async fn mirror_gateway_push_to_paired_raft(pool: &Pool, repository_id: Uuid) -> Result<(), PairedBackupError> {
-    if paired_write_raft_map().read().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty() {
-        return Ok(());
-    }
-    let client = pool.get().await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
-    let db_name: String = client.query_one("SELECT current_database()", &[]).await.map_err(pg_err)?.get(0);
-    let Some(raft_arc) = bound_paired_write_raft(&db_name) else {
+    let Some(binding) = lookup_paired_write_binding(pool).await? else {
         return Ok(());
     };
-    if read_pg_database_freeze_marker(&**client).await?.is_some() || read_pg_database_read_only(&**client).await? {
-        return Err(PairedBackupError::FreezeNotHeld("paired write refused while PostgreSQL freeze is active"));
-    }
-    let floor = super::format30_pg_raft_sync::read_pg_repo_access_floor(&**client, repository_id).await?;
-    let (spec, head_ref, pg_refs) = super::format30_pg_raft_sync::read_pg_repo_state(&**client, repository_id).await?;
-    drop(client);
-    tokio::task::spawn_blocking(move || -> Result<(), PairedBackupError> {
-        let mut guard = raft_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(record) = guard.read_freeze_record()?
-            && record.frozen
-        {
-            return Err(PairedBackupError::FreezeNotHeld("paired write refused while Raft freeze is active"));
-        }
-        super::format30_pg_raft_sync::apply_pg_repo_state_to_raft(&mut guard, &spec, &head_ref, &pg_refs, floor)
-    })
+    let raft = binding.raft.clone();
+    run_serialized_pg_to_raft_step(
+        &binding.serialize,
+        || async {
+            let client = pool.get().await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
+            let frozen = read_pg_database_freeze_marker(&**client).await?.is_some()
+                || read_pg_database_read_only(&**client).await?;
+            if frozen {
+                return Err(PairedBackupError::FreezeNotHeld("paired write refused while PostgreSQL freeze is active"));
+            }
+            let floor = super::format30_pg_raft_sync::read_pg_repo_access_floor(&**client, repository_id).await?;
+            let (spec, head_ref, pg_refs) =
+                super::format30_pg_raft_sync::read_pg_repo_state(&**client, repository_id).await?;
+            drop(client);
+            Ok((spec, head_ref, pg_refs, floor))
+        },
+        move |(spec, head_ref, pg_refs, floor)| {
+            let mut guard = raft.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(record) = guard.read_freeze_record()?
+                && record.frozen
+            {
+                return Err(PairedBackupError::FreezeNotHeld("paired write refused while Raft freeze is active"));
+            }
+            super::format30_pg_raft_sync::apply_pg_repo_state_to_raft(&mut guard, &spec, &head_ref, &pg_refs, floor)
+        },
+    )
     .await
-    .map_err(|e| PairedBackupError::StateMachine(format!("paired push mirror task failed: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serialized_pg_to_raft_step_prevents_out_of_order_read_before_apply() {
+        let serialize = Arc::new(tokio::sync::Mutex::new(()));
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let task1_in_apply = Arc::new(tokio::sync::Notify::new());
+        let task1 = {
+            let (serialize, task1_in_apply) = (serialize.clone(), task1_in_apply.clone());
+            let (read_events, apply_events) = (events.clone(), events.clone());
+            async move {
+                run_serialized_pg_to_raft_step(
+                    &serialize,
+                    || async move {
+                        read_events.lock().unwrap().push("read-1");
+                        Ok(())
+                    },
+                    move |()| {
+                        task1_in_apply.notify_one();
+                        std::thread::sleep(Duration::from_millis(40));
+                        apply_events.lock().unwrap().push("apply-1");
+                        Ok(())
+                    },
+                )
+                .await
+            }
+        };
+        let task2 = {
+            let (serialize, task1_in_apply) = (serialize.clone(), task1_in_apply.clone());
+            let (read_events, apply_events) = (events.clone(), events.clone());
+            async move {
+                task1_in_apply.notified().await;
+                run_serialized_pg_to_raft_step(
+                    &serialize,
+                    || async move {
+                        read_events.lock().unwrap().push("read-2");
+                        Ok(())
+                    },
+                    move |()| {
+                        apply_events.lock().unwrap().push("apply-2");
+                        Ok(())
+                    },
+                )
+                .await
+            }
+        };
+        let (first, second) = tokio::join!(task1, task2);
+        first.expect("task1");
+        second.expect("task2");
+        assert_eq!(*events.lock().unwrap(), vec!["read-1", "apply-1", "read-2", "apply-2"]);
+    }
 }

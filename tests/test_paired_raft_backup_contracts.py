@@ -60,6 +60,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             "CutpointSkew", "TenantOrRepoMismatch", "BlobClosureIncomplete", "CorruptBlobOrDigest",
             "BackendIdentityMismatch", "StaleIncarnation", "StaleGrantRefused", "StaleDecisionRefused",
             "StaleDeleterRefused", "ExpectedPackPairSpec", "max_decision_scope_version",
+            "RepositoryClosureExceedsVerifierBudget",
         ):
             self.assertIn(token, types_src)
 
@@ -82,10 +83,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             self.assertIn(token, bind_src)
 
         freeze_src = (MOD_DIR / "freeze_drain.rs").read_text(encoding="utf-8")
-        for token in (
-            "CloseAuthScope", "CreateSnapshotPin", "AcquireHoldBatch", "RegisterRoot", "unfreeze_after_backup",
-            "SealedArchiveReceipt", "verify_backup_archive",
-        ):
+        for token in ("CloseAuthScope", "CreateSnapshotPin", "AcquireHoldBatch", "RegisterRoot", "unfreeze_after_backup", "SealedArchiveReceipt", "verify_backup_archive"):
             self.assertIn(token, freeze_src)
 
         backup_src = (MOD_DIR / "backup.rs").read_text(encoding="utf-8")
@@ -132,12 +130,8 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
     def test_freeze_reset_attestation_pristine_and_production_guards(self) -> None:
         pg_src = (MOD_DIR / "pg_freeze_settings.rs").read_text(encoding="utf-8")
         for token in (
-            "terminate_and_await_other_pg_sessions",
-            "pg_terminate_backend",
-            "verify_no_active_pg_writers",
-            "enforce_maintenance_pg_write_guard",
-            "pg_stat_activity",
-            "read_pg_database_read_only",
+            "terminate_and_await_other_pg_sessions", "pg_terminate_backend", "verify_no_active_pg_writers",
+            "enforce_maintenance_pg_write_guard", "pg_stat_activity", "read_pg_database_read_only",
         ):
             self.assertIn(token, pg_src, f"missing PG freeze/writer-exit contract: {token}")
 
@@ -157,8 +151,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         )
         for token in (
             "PeerDurableAttestationClaims", "PeerDurableAttestation", "derive_voter_uuid_bound",
-            "load_or_create_ed25519_keypair", "PeerAttestationDaemon", "AttestCommit", "AttestCutpoint",
-            "rootyard-peer-durable-attestation-v1", "voter{slot}.pk8", "0o600",
+            "load_or_create_ed25519_keypair", "PeerAttestationDaemon", "AttestCommit", "AttestCutpoint", "rootyard-peer-durable-attestation-v1", "voter{slot}.pk8", "0o600",
         ):
             self.assertIn(token, attest_src, f"missing Ed25519 attestation contract: {token}")
 
@@ -306,7 +299,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         boot_src = read("format30_boot.rs")
         require(
             boot_src,
-            ("publish_staged_dir_noreplace", "RENAME_NOREPLACE", "boot_thaw"),
+            ("publish_staged_dir_noreplace", "RENAME_NOREPLACE", "boot_thaw", "tag_thaw_group"),
             "atomic no-replace staged publication contract",
         )
         order = ("boot_thaw", "publish_staged_dir_noreplace(&staged_data", "clear_restored_pg_freeze(&dst_client)")
@@ -315,10 +308,12 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertIn("BootThawRefused", read("types.rs"), "boot thaw must be a typed refusal")
         self.assertIn("BootThawRefused", boot_src, "boot thaw refusal must be raised in format30_boot")
         self.assertIn("VERIFIER_MAX_OBJECTS", consolidate_src, "consolidation must bound the verifier object count")
+        self.assertIn("RepositoryClosureExceedsVerifierBudget", read("format30_paired.rs"), "archive pairs must be bounded")
         self.assertNotIn("wait_with_output", consolidate_src, "the consolidated pack must never be buffered in heap RAM")
         mtls_cluster_src = (ROOT / "tests" / "paired_raft_backup_support" / "mtls_cluster.rs").read_text(encoding="utf-8")
         self.assertIn("partition_all_nodes", mtls_cluster_src, "gate 8 must be able to partition every voter")
         self.assertNotIn("let _ = n.rpc", mtls_cluster_src, "partition RPC results must never be discarded")
+        self.assertIn("kill_hard_checked", mtls_cluster_src, "gate 10 must check kill/reap outcomes")
         require(
             read("format30_pg_raft_sync.rs"),
             ("ensure_raft_commit_refs_committed", "TerminalKind::Committed"),
@@ -355,7 +350,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             (
                 "gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish",
                 "restore_and_boot_format30_with_pre_thaw_hook",
-                "kill_hard",
+                "kill_hard_checked",
                 "paired-restore-rebind",
                 "BootThawRefused",
                 "pre_thaw_hook_ran",
@@ -370,7 +365,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         )
         require(
             read("format30_pack_consolidate.rs"),
-            ("chunk_refs_for_plans", "select_packs_for_rebind_with_limit", "MAX_REBIND_REF_ACK_BYTES"),
+            ("chunk_refs_for_plans", "select_packs_for_rebind_with_limit", "MAX_REBIND_REF_ACK_BYTES", "RepositoryClosureExceedsVerifierBudget"),
             "multi-plan rebind ref/ACK and verifier byte chunking contract",
         )
         require(
@@ -380,12 +375,12 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         )
         require(
             read("mtls_raft.rs"),
-            ("sync_cached_state_machine", "resolve_group_epoch(&cmd, &before_sm)"),
+            ("sync_cached_state_machine", "resolve_group_epoch(&cmd, &before_sm)", "post-commit snapshot failed"),
             "multi-handle Raft cache sync and per-commit group-epoch resolution contract",
         )
         require(
             read("startup_wiring.rs"),
-            ("PairedWriteRaftScopeGuard", "install_paired_write_raft_binding", "mirror_gateway_push_to_paired_raft"),
+            ("PairedWriteRaftScopeGuard", "install_paired_write_raft_binding", "mirror_gateway_push_to_paired_raft", "run_serialized_pg_to_raft_step", "tokio::sync::Mutex"),
             "database-keyed paired write binding contract",
         )
         receive_src = (ROOT / "src" / "blob_git_gateway" / "receive.rs").read_text(encoding="utf-8")
@@ -458,6 +453,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             "pg_write_fence.rs",
             "verify_local_group_epoch",
             "rootyard-peer-attestor.rs",
+            "RepositoryClosureExceedsVerifierBudget",
         ):
             self.assertIn(token, doc_text)
         for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", doc_text):

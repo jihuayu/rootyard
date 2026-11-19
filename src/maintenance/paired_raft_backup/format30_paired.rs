@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::blob_store::opendal::BlobStore;
 use crate::config::Config;
 use crate::ref_store::GitObjectFormat;
+use crate::ref_store::core::pack_commit::VERIFIER_MAX_TOTAL_BYTES;
 use crate::ref_store::core::state_machine::{AppliedLogId, RefCasStateMachine};
 
 use super::backup::{reconcile_pg_raft_repositories, stream_sha256_file};
@@ -297,6 +298,19 @@ pub fn verify_format30_paired_archive(
     manifest.freeze.require_frozen()?;
     manifest.pg_cutpoint.verify()?;
     manifest.blob_closure.verify()?;
+    let mut repo_bytes: BTreeMap<Uuid, u64> = BTreeMap::new();
+    for entry in &manifest.blob_closure.entries {
+        let total = repo_bytes.entry(entry.repository_id).or_default();
+        *total = total.saturating_add(entry.length);
+    }
+    for (&repository_id, &bytes) in &repo_bytes {
+        if bytes > VERIFIER_MAX_TOTAL_BYTES {
+            return Err(PairedBackupError::RepositoryClosureExceedsVerifierBudget {
+                repository_id: Some(repository_id),
+                bound_bytes: VERIFIER_MAX_TOTAL_BYTES,
+            });
+        }
+    }
     if let Some(exp) = expected_backend_identity
         && manifest.blob_closure.backend_identity != exp
     {

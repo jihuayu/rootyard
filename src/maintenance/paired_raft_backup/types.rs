@@ -26,6 +26,7 @@ pub enum PairedBackupError {
     IncompleteCut(&'static str),
     FreezeNotHeld(&'static str),
     BootThawRefused(String),
+    RepositoryClosureExceedsVerifierBudget { repository_id: Option<Uuid>, bound_bytes: u64 },
     ScopeNotClosed(String),
     UnknownInFlightOperations(usize),
     DeleterNotFenced(&'static str),
@@ -52,6 +53,9 @@ impl fmt::Display for PairedBackupError {
             Self::IncompleteCut(msg) => write!(f, "incomplete paired backup cut: {msg}"),
             Self::FreezeNotHeld(msg) => write!(f, "tri-party write freeze required: {msg}"),
             Self::BootThawRefused(msg) => write!(f, "paired restore boot thaw refused: {msg}"),
+            Self::RepositoryClosureExceedsVerifierBudget { repository_id, bound_bytes } => {
+                write!(f, "repository {repository_id:?} closure exceeds A4 verifier budget of {bound_bytes} bytes")
+            }
             Self::ScopeNotClosed(msg) => write!(f, "Ref-CAS scope barrier not closed: {msg}"),
             Self::UnknownInFlightOperations(n) => write!(f, "{n} unresolved or unknown in-flight operations remain"),
             Self::DeleterNotFenced(msg) => write!(f, "deleter not fenced: {msg}"),
