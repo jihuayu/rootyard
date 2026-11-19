@@ -661,10 +661,8 @@ int posix_spawn(pid_t *pid, const char *path,
 {
     struct witness_environment built;
 
-    if (real_posix_spawn == NULL) {
-        errno = ENOSYS;
-        return -1;
-    }
+    if (real_posix_spawn == NULL)
+        return ENOSYS;
     if (is_helper_exec(path, arguments)
         && build_helper_environment(environment, &built))
         return real_posix_spawn(pid, path, file_actions, attributes,
@@ -680,10 +678,8 @@ int posix_spawnp(pid_t *pid, const char *file,
 {
     struct witness_environment built;
 
-    if (real_posix_spawnp == NULL) {
-        errno = ENOSYS;
-        return -1;
-    }
+    if (real_posix_spawnp == NULL)
+        return ENOSYS;
     if (is_helper_exec(file, arguments)
         && build_helper_environment(environment, &built))
         return real_posix_spawnp(pid, file, file_actions, attributes,

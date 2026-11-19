@@ -559,6 +559,14 @@ class BusyWitnessSourceContractTest(unittest.TestCase):
         self.assertFalse(complete(b"x" * cap, cap))
         self.assertFalse(complete(exact + b"y", cap))
 
+    def test_posix_spawn_missing_resolver_uses_direct_enosys(self):
+        text = self.SOURCE.read_text(encoding="utf-8")
+        for marker in ("int posix_spawn(", "int posix_spawnp("):
+            block = self._block(text, marker)
+            self.assertIn("return ENOSYS;", block)
+            self.assertNotIn("errno = ENOSYS", block)
+            self.assertNotIn("return -1;", block)
+
     def test_helper_environment_is_prepared_and_pid_guarded(self):
         text = self.SOURCE.read_text(encoding="utf-8")
         self.assertIn("prepare_api_environment", text)
