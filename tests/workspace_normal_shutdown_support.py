@@ -46,6 +46,40 @@ BUSY_WITNESS_ENV = (
     "ROOTYARD_TEST_FUSE_WITNESS_LIBRARY",
     "ROOTYARD_TEST_FUSE_WITNESS_CLOSE_FD",
 )
+RECEIPT_FILENAMES = ("helper.receipt", "writer.receipt")
+RECEIPT_MODE = 0o600
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+def _create_private_receipt(path):
+    """Create one empty fixture-owned 0600 regular receipt file."""
+    if not _O_NOFOLLOW or not _O_CLOEXEC:
+        return False
+    try:
+        path = Path(path)
+        if path.is_symlink() or path.exists():
+            path.unlink()
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC,
+            RECEIPT_MODE,
+        )
+        try:
+            os.fchmod(descriptor, RECEIPT_MODE)
+            info = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        return (
+            stat.S_ISREG(info.st_mode)
+            and (info.st_mode & 0o777) == RECEIPT_MODE
+            and info.st_uid == os.geteuid()
+            and info.st_nlink == 1
+            and info.st_size == 0
+        )
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 class NormalShutdownError(RuntimeError):
@@ -84,10 +118,10 @@ def install_busy_witness(h, witness_dir):
         if not library.is_file():
             return None
         witness_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("helper.receipt", "writer.receipt"):
-            receipt = witness_dir / name
-            if receipt.exists() or receipt.is_symlink():
-                receipt.unlink()
+        os.chmod(witness_dir, 0o700)
+        for name in RECEIPT_FILENAMES:
+            if not _create_private_receipt(witness_dir / name):
+                return None
     except Exception:
         return None
     existing = h.env.get("LD_PRELOAD")
@@ -713,14 +747,59 @@ def _parse_witness_line(line: bytes):
     }
 
 
-def parse_witness_receipt(path) -> list[dict] | None:
-    """Parse one bounded receipt, or return ``None`` for any unsafe shape."""
+def _read_private_receipt(path):
+    """Read one bounded fixture-owned 0600 regular receipt.
+
+    The open is non-blocking and does not follow links, so a replaced FIFO or
+    symlink cannot stall or redirect the diagnostic.  Ownership, type, mode,
+    link count and size are checked on the opened inode, never by pathname.
+    """
+    if not _O_NOFOLLOW or not _O_NONBLOCK or not _O_CLOEXEC:
+        return None
     try:
-        with open(path, "rb") as stream:
-            data = stream.read(MAX_RECEIPT_BYTES + 1)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC,
+        )
     except (OSError, TypeError, ValueError):
         return None
-    if not data or len(data) > MAX_RECEIPT_BYTES or not data.endswith(b"\n"):
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if (info.st_mode & 0o777) != RECEIPT_MODE:
+            return None
+        if info.st_uid != os.geteuid():
+            return None
+        if info.st_nlink != 1:
+            return None
+        if info.st_size < 0 or info.st_size > MAX_RECEIPT_BYTES:
+            return None
+        data = bytearray()
+        while len(data) <= MAX_RECEIPT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(8192, MAX_RECEIPT_BYTES + 1 - len(data)),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def parse_witness_receipt(path) -> list[dict] | None:
+    """Parse one bounded receipt, or return ``None`` for any unsafe shape."""
+    data = _read_private_receipt(path)
+    if data is None or not data or len(data) > MAX_RECEIPT_BYTES:
+        return None
+    if not data.endswith(b"\n"):
         return None
     records = []
     for line in data.splitlines():

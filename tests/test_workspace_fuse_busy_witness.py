@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 from pathlib import Path
+import stat
 import tempfile
 import types
 import unittest
@@ -103,6 +105,12 @@ def _line(record):
         "mount_id={mount_id} path_hash={path_hash:016x} proc_tag={proc_tag:016x} "
         "rc={rc} errno={errno} flags={flags} owned={owned}\n"
     ).format(**record).encode("ascii")
+
+
+def _write_private(path, data):
+    path.write_bytes(data)
+    path.chmod(0o600)
+    return path
 
 
 class BusyWitnessProjectionTest(unittest.TestCase):
@@ -269,7 +277,7 @@ class BusyWitnessReceiptParserTest(unittest.TestCase):
     def test_round_trip_and_bounds(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "helper.receipt"
-            path.write_bytes(_line(_umount()) + _line(_umount(mount_id=12, path=GIT_PATH)))
+            _write_private(path, _line(_umount()) + _line(_umount(mount_id=12, path=GIT_PATH)))
             records = parse_witness_receipt(path)
             self.assertEqual(len(records), 2)
             self.assertEqual(records[0]["kind"], "umount")
@@ -291,13 +299,14 @@ class BusyWitnessReceiptParserTest(unittest.TestCase):
                 expected_mounts=EXPECTED,
                 owned_mounts=OWNED,
             ), (UNKNOWN, UNKNOWN))
-            (directory / "helper.receipt").write_bytes(b"")
-            (directory / "writer.receipt").write_bytes(b"")
+            _write_private(directory / "helper.receipt", b"")
+            _write_private(directory / "writer.receipt", b"")
             self.assertIsNone(parse_witness_receipt(directory / "helper.receipt"))
-            (directory / "helper.receipt").write_bytes(
+            _write_private(
+                directory / "helper.receipt",
                 b"W1 kind=umount\n" + b"x" * (MAX_RECEIPT_BYTES + 1))
             self.assertIsNone(parse_witness_receipt(directory / "helper.receipt"))
-            (directory / "helper.receipt").write_bytes(_line(_umount())[:-1])
+            _write_private(directory / "helper.receipt", _line(_umount())[:-1])
             self.assertIsNone(parse_witness_receipt(directory / "helper.receipt"))
 
     def test_malformed_duplicate_missing_and_extra_fields_are_rejected(self):
@@ -320,13 +329,13 @@ class BusyWitnessReceiptParserTest(unittest.TestCase):
             path = Path(root) / "helper.receipt"
             for variant in variants:
                 with self.subTest(variant=variant[:80]):
-                    path.write_bytes(variant)
+                    _write_private(path, variant)
                     self.assertIsNone(parse_witness_receipt(path))
 
     def test_too_many_records_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "helper.receipt"
-            path.write_bytes(_line(_umount()) * (MAX_RECEIPTS + 1))
+            _write_private(path, _line(_umount()) * (MAX_RECEIPTS + 1))
             self.assertIsNone(parse_witness_receipt(path))
 
     def test_close_receipt_cannot_claim_a_mount_identity(self):
@@ -334,13 +343,13 @@ class BusyWitnessReceiptParserTest(unittest.TestCase):
         record["mount_id"] = 11
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "writer.receipt"
-            path.write_bytes(_line(record))
+            _write_private(path, _line(record))
             self.assertIsNone(parse_witness_receipt(path))
 
     def test_project_receipts_returns_only_closed_values(self):
         with tempfile.TemporaryDirectory() as root:
-            Path(root, "helper.receipt").write_bytes(_line(_umount()))
-            Path(root, "writer.receipt").write_bytes(_line(_close()))
+            _write_private(Path(root) / "helper.receipt", _line(_umount()))
+            _write_private(Path(root) / "writer.receipt", _line(_close()))
             target, state = project_busy_witness_receipts(
                 root,
                 helper_tag=HELPER_TAG,
@@ -351,6 +360,39 @@ class BusyWitnessReceiptParserTest(unittest.TestCase):
         self.assertIn(target, BUSY_TARGETS)
         self.assertIn(state, WRITER_CLOSE_STATES)
         self.assertEqual((target, state), ("writer", "completed_before_unmount_entry"))
+
+    def test_receipt_requires_private_regular_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "helper.receipt"
+            _write_private(path, _line(_umount()))
+            self.assertIsNotNone(parse_witness_receipt(path))
+            path.chmod(0o644)
+            self.assertIsNone(parse_witness_receipt(path))
+            path.chmod(0o600)
+            with mock.patch.object(normal_shutdown.os, "geteuid",
+                                   return_value=os.geteuid() + 1):
+                self.assertIsNone(parse_witness_receipt(path))
+            hard = Path(root) / "hard.receipt"
+            os.link(path, hard)
+            self.assertIsNone(parse_witness_receipt(hard))
+            link = Path(root) / "linked.receipt"
+            link.symlink_to(path)
+            self.assertIsNone(parse_witness_receipt(link))
+            fifo = Path(root) / "fifo.receipt"
+            os.mkfifo(fifo)
+            self.assertIsNone(parse_witness_receipt(fifo))
+
+    def test_private_receipt_creation_is_empty_0600_regular(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "helper.receipt"
+            self.assertTrue(normal_shutdown._create_private_receipt(path))
+            info = path.stat()
+            self.assertTrue(stat.S_ISREG(info.st_mode))
+            self.assertEqual(info.st_mode & 0o777, 0o600)
+            self.assertEqual(path.read_bytes(), b"")
+            path.write_bytes(b"stale")
+            self.assertTrue(normal_shutdown._create_private_receipt(path))
+            self.assertEqual(path.read_bytes(), b"")
 
 
 class BusyWitnessInstallGuardTest(unittest.TestCase):
