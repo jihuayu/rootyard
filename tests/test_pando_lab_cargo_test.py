@@ -108,6 +108,10 @@ class PandoLabCargoTest(unittest.TestCase):
                 expected["failure_checkpoint"] = {"stage": checkpoint[0], "class": checkpoint[1]}
         self.assertEqual(json.loads(self.receipt.read_text()), expected)
 
+    def run_output(self, output, status, phase, **kwargs):
+        code = f"import sys\nsys.stdout.write({output!r})\nsys.exit({status})"
+        return self.run_gate(code, status, phase, **kwargs)
+
     def test_success_preserves_argv_environment_and_working_directory(self):
         self.run_gate(f"""
             import os, sys
@@ -145,58 +149,198 @@ class PandoLabCargoTest(unittest.TestCase):
             sys.exit(101)
         """, 101, "test", names=KNOWN_TESTS[:8], truncated=True)
 
-    def test_named_merkle_case_projects_only_allowlisted_checkpoint(self):
-        self.run_gate(f"""
-            import sys
-            print("running 2 tests")
-            print("test workspace_merkle_sync::{MERKLE_TEST} ... FAILED")
-            print("---- workspace_merkle_sync::{MERKLE_TEST} stdout ----")
-            print("rootyard-merkle-checkpoint stage=base_capture class=not_quiescent")
-            print("credential=private /private/path")
-            print("failures:")
-            print("    {MERKLE_TEST}")
-            print("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
-                  "0 measured; 0 filtered out; finished in 0.01s")
-            sys.exit(101)
-        """, 101, "test", names=(MERKLE_TEST,), checkpoint=("base_capture", "not_quiescent"))
+    def test_named_merkle_case_projects_exact_captured_block(self):
+        for suffix in ("-0123456789abcdef", ""):
+            with self.subTest(executable=suffix or "no-hash"):
+                output = f"""     Running unittests src/lib.rs (/workspace/rootyard/target/debug/deps/rootyard-c512e8eeea7428b7)
 
-    def test_named_merkle_case_ignores_unbounded_or_ambiguous_checkpoints(self):
+running 1 test
+test {MERKLE_TEST} ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/workspace_merkle_sync.rs (/workspace/rootyard/target/debug/deps/workspace_merkle_sync{suffix})
+
+running 2 tests
+test {MERKLE_TEST} ... FAILED
+test {KNOWN_TESTS[1]} ... ok
+
+failures:
+
+---- {MERKLE_TEST} stdout ----
+rootyard-merkle-checkpoint stage=base_capture class=not_quiescent
+Error: private diagnostic /private/path
+
+failures:
+    {MERKLE_TEST}
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test workspace_merkle_sync`
+"""
+                self.run_output(
+                    output, 101, "test", names=(MERKLE_TEST,),
+                    checkpoint=("base_capture", "not_quiescent"),
+                )
+
+    def test_named_merkle_case_rejects_filtered_second_failure(self):
+        output = f"""     Running tests/workspace_merkle_sync.rs (/workspace/rootyard/target/debug/deps/workspace_merkle_sync-0123456789abcdef)
+
+running 2 tests
+test {MERKLE_TEST} ... FAILED
+test valid_but_unknown_name ... FAILED
+
+failures:
+
+---- {MERKLE_TEST} stdout ----
+rootyard-merkle-checkpoint stage=base_capture class=not_quiescent
+
+---- valid_but_unknown_name stdout ----
+Error: private diagnostic
+
+failures:
+    {MERKLE_TEST}
+    valid_but_unknown_name
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test workspace_merkle_sync`
+"""
+        self.run_output(output, 101, "test", names=(MERKLE_TEST,))
+
+    def test_named_merkle_case_rejects_second_failed_harness(self):
+        output = f"""     Running tests/other_harness.rs (/workspace/rootyard/target/debug/deps/other_harness-0123456789abcdef)
+
+running 1 test
+test {KNOWN_TESTS[0]} ... FAILED
+
+failures:
+
+---- {KNOWN_TESTS[0]} stdout ----
+Error: private diagnostic
+
+failures:
+    {KNOWN_TESTS[0]}
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test other_harness`
+
+     Running tests/workspace_merkle_sync.rs (/workspace/rootyard/target/debug/deps/workspace_merkle_sync-0123456789abcdef)
+
+running 1 test
+test {MERKLE_TEST} ... FAILED
+
+failures:
+
+---- {MERKLE_TEST} stdout ----
+rootyard-merkle-checkpoint stage=base_capture class=not_quiescent
+
+failures:
+    {MERKLE_TEST}
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test workspace_merkle_sync`
+"""
+        self.run_output(output, 101, "test", names=(KNOWN_TESTS[0], MERKLE_TEST))
+
+    def test_named_merkle_case_separates_earlier_harness_with_same_leaf(self):
+        output = f"""     Running tests/other_harness.rs (/workspace/rootyard/target/debug/deps/other_harness-0123456789abcdef)
+
+running 1 test
+test {MERKLE_TEST} ... FAILED
+
+failures:
+
+---- {MERKLE_TEST} stdout ----
+rootyard-merkle-checkpoint stage=setup class=io
+
+failures:
+    {MERKLE_TEST}
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test other_harness`
+
+     Running tests/workspace_merkle_sync.rs (/workspace/rootyard/target/debug/deps/workspace_merkle_sync-0123456789abcdef)
+
+running 1 test
+test {MERKLE_TEST} ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+"""
+        self.run_output(output, 101, "test", names=(MERKLE_TEST,))
+
+    def merkle_harness_output(
+        self, body, *, summary_failed=1, include_summary=True,
+        extra="", executable="workspace_merkle_sync-0123456789abcdef",
+    ):
+        summary = (
+            f"test result: FAILED. 1 passed; {summary_failed} failed; "
+            "0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n"
+            "error: test failed, to rerun pass `--test workspace_merkle_sync`\n"
+            if include_summary else ""
+        )
+        return (
+            f"     Running tests/workspace_merkle_sync.rs "
+            f"(/workspace/rootyard/target/debug/deps/{executable})\n\n"
+            f"running 2 tests\n"
+            f"test {MERKLE_TEST} ... FAILED\n"
+            f"test {KNOWN_TESTS[0]} ... ok\n\n"
+            f"failures:\n\n"
+            f"---- {MERKLE_TEST} stdout ----\n"
+            f"{body}\n\n"
+            f"failures:\n"
+            f"    {MERKLE_TEST}\n\n"
+            f"{extra}{summary}"
+        )
+
+    def test_named_merkle_case_rejects_unbound_or_malformed_checkpoints(self):
         marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
         cases = {
-            "unknown stage": "rootyard-merkle-checkpoint stage=private_stage class=unknown",
-            "unknown class": "rootyard-merkle-checkpoint stage=base_capture class=private_class",
-            "trailing text": marker + " /private/path",
-            "oversized line": "x" * 4097 + marker,
-            "conflicting checkpoints": marker + "\n" + "rootyard-merkle-checkpoint stage=remove class=io",
+            "unknown stage": self.merkle_harness_output(
+                "rootyard-merkle-checkpoint stage=private_stage class=unknown"),
+            "unknown class": self.merkle_harness_output(
+                "rootyard-merkle-checkpoint stage=base_capture class=private_class"),
+            "trailing text": self.merkle_harness_output(marker + " /private/path"),
+            "duplicate markers": self.merkle_harness_output(marker + "\n" + marker),
+            "oversized marker line": self.merkle_harness_output("x" * 4097 + marker),
+            "missing summary": self.merkle_harness_output(
+                marker, include_summary=False,
+                extra="error: test failed, to rerun pass `--test workspace_merkle_sync`\n",
+            ),
+            "contradictory count": self.merkle_harness_output(marker, summary_failed=2),
+            "unbound marker": self.merkle_harness_output(marker, extra=marker + "\n"),
         }
         for context, output in cases.items():
             with self.subTest(context=context):
-                self.run_gate(f"""
-                    import sys
-                    print("running 2 tests")
-                    print("test workspace_merkle_sync::{MERKLE_TEST} ... FAILED")
-                    print({output!r})
-                    print("failures:")
-                    print("    {MERKLE_TEST}")
-                    print("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
-                          "0 measured; 0 filtered out; finished in 0.01s")
-                    sys.exit(101)
-                """, 101, "test", names=(MERKLE_TEST,))
+                self.run_output(output, 101, "test", names=(MERKLE_TEST,))
 
-    def test_named_merkle_case_requires_a_sole_failure(self):
-        self.run_gate(f"""
-            import sys
-            print("running 3 tests")
-            print("test workspace_merkle_sync::{MERKLE_TEST} ... FAILED")
-            print("test valid_source::{KNOWN_TESTS[0]} ... FAILED")
-            print("rootyard-merkle-checkpoint stage=base_capture class=not_quiescent")
-            print("failures:")
-            print("    {MERKLE_TEST}")
-            print("    {KNOWN_TESTS[0]}")
-            print("test result: FAILED. 0 passed; 2 failed; 0 ignored; "
-                  "0 measured; 0 filtered out; finished in 0.01s")
-            sys.exit(101)
-        """, 101, "test", names=(KNOWN_TESTS[0], MERKLE_TEST))
+    def test_named_merkle_case_rejects_marker_outside_target_block(self):
+        output = f"""     Running tests/workspace_merkle_sync.rs (/workspace/rootyard/target/debug/deps/workspace_merkle_sync-0123456789abcdef)
+
+running 2 tests
+test {MERKLE_TEST} ... FAILED
+test {KNOWN_TESTS[0]} ... FAILED
+
+failures:
+
+---- {MERKLE_TEST} stdout ----
+Error: private diagnostic
+
+---- {KNOWN_TESTS[0]} stdout ----
+rootyard-merkle-checkpoint stage=base_capture class=not_quiescent
+
+failures:
+    {MERKLE_TEST}
+    {KNOWN_TESTS[0]}
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test workspace_merkle_sync`
+"""
+        self.run_output(output, 101, "test", names=(MERKLE_TEST, KNOWN_TESTS[0]))
 
     def test_compile_marker_is_projected_without_diagnostic_text(self):
         self.run_gate("""
