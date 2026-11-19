@@ -229,7 +229,7 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         )
         self.assertIn("a.slot = w.current_slot", binding)
         self.assertIn("current_private != private_id", binding)
-        self.assertIn("wrapper_backend != backend_hex", binding)
+        self.assertIn("wrapper_backend.as_str() != backend_hex", binding)
         self.assertIn("rootyard_ref_store_attempt_current_scope(w)", binding)
         self.assertIn("rootyard_ref_store_verify_public_operation($1,$2)", binding)
         self.assertIn("private_event != wrapper_event", binding)
