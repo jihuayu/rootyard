@@ -3,6 +3,20 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(unix)]
+const REVERSE_STAGES: [ReverseGitStage; 10] = [
+    ReverseGitStage::SourceProjection,
+    ReverseGitStage::ProposalVerifyFetch,
+    ReverseGitStage::AncestryIntegrity,
+    ReverseGitStage::SubtreeExportRefUpdate,
+    ReverseGitStage::SubtreeSourceFetch,
+    ReverseGitStage::SubtreeSourceTreeResolve,
+    ReverseGitStage::SubtreeRootListing,
+    ReverseGitStage::SubtreeRootRebuild,
+    ReverseGitStage::CommitSynthesize,
+    ReverseGitStage::PackWriteIndex,
+];
+
 const SCRIPT: &str = concat!(
     r#"sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$1"; "#,
     r#"trap "" TERM; while :; do sleep 1; done"#,
@@ -271,7 +285,11 @@ fn reverse_git_diagnostic_labels_are_closed_and_bounded() {
         (ReverseGitStage::SourceProjection, "source_projection"),
         (ReverseGitStage::ProposalVerifyFetch, "proposal_verify_fetch"),
         (ReverseGitStage::AncestryIntegrity, "ancestry_integrity"),
-        (ReverseGitStage::SubtreeGraft, "subtree_graft"),
+        (ReverseGitStage::SubtreeExportRefUpdate, "subtree_export_ref_update"),
+        (ReverseGitStage::SubtreeSourceFetch, "subtree_source_fetch"),
+        (ReverseGitStage::SubtreeSourceTreeResolve, "subtree_source_tree_resolve"),
+        (ReverseGitStage::SubtreeRootListing, "subtree_root_listing"),
+        (ReverseGitStage::SubtreeRootRebuild, "subtree_root_rebuild"),
         (ReverseGitStage::CommitSynthesize, "commit_synthesize"),
         (ReverseGitStage::PackWriteIndex, "pack_write_index"),
     ];
@@ -330,24 +348,26 @@ fn reverse_git_child_outcome_distinguishes_nonzero_signal_and_unknown() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
-async fn failing_reverse_child_emits_closed_diagnostic_and_keeps_public_conflict() {
-    let _ = reverse_diag::take_for_test();
-    let mut cmd = base_command(FsPath::new("/bin/sh"));
-    cmd.args(["-c", "exit 7"]);
-    let error = run_git_bounded(
-        cmd,
-        GitStdin::Null,
-        1024,
-        Instant::now() + Duration::from_secs(10),
-        Error(StatusCode::CONFLICT, "Git View reverse mapping conflict"),
-        Some(ReverseGitStage::CommitSynthesize),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.0, StatusCode::CONFLICT);
-    assert_eq!(error.1, "Git View reverse mapping conflict");
-    assert_eq!(
-        reverse_diag::take_for_test(),
-        vec![(ReverseGitStage::CommitSynthesize, reverse_diag::ReverseGitChildOutcome::NonzeroExit)]
-    );
+async fn every_reverse_stage_reaches_closed_runner_diagnostic_and_keeps_public_conflict() {
+    for stage in REVERSE_STAGES {
+        let _ = reverse_diag::take_for_test();
+        let mut cmd = base_command(FsPath::new("/bin/sh"));
+        cmd.args(["-c", "exit 7"]);
+        let error = run_git_bounded(
+            cmd,
+            GitStdin::Null,
+            1024,
+            Instant::now() + Duration::from_secs(10),
+            Error(StatusCode::CONFLICT, "Git View reverse mapping conflict"),
+            Some(stage),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1, "Git View reverse mapping conflict");
+        assert_eq!(
+            reverse_diag::take_for_test(),
+            vec![(stage, reverse_diag::ReverseGitChildOutcome::NonzeroExit)]
+        );
+    }
 }

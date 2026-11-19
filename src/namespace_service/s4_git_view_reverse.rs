@@ -198,7 +198,7 @@ pub(super) async fn create(
                 &work,
                 &["update-ref", "refs/heads/reverse-import", candidate.as_str()],
                 deadline,
-                ReverseGitStage::SubtreeGraft,
+                ReverseGitStage::SubtreeExportRefUpdate,
             )
             .await?;
             run_git(
@@ -206,7 +206,7 @@ pub(super) async fn create(
                 source,
                 &["fetch", "--no-tags", "--no-write-fetch-head", work_text, "refs/heads/reverse-import"],
                 deadline,
-                ReverseGitStage::SubtreeGraft,
+                ReverseGitStage::SubtreeSourceFetch,
             )
             .await?;
             let source_tree_arg = format!("{}^{{tree}}", binding.source_oid);
@@ -215,7 +215,7 @@ pub(super) async fn create(
                 source,
                 &["rev-parse", &source_tree_arg],
                 deadline,
-                Some(ReverseGitStage::SubtreeGraft),
+                Some(ReverseGitStage::SubtreeSourceTreeResolve),
             )
             .await?;
             let new_tree = if binding.subdir.is_empty() {

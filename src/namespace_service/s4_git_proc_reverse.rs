@@ -204,7 +204,7 @@ async fn mktree(
             input: &input,
             actor: None,
             max_out: META_OUTPUT_CAP,
-            stage: ReverseGitStage::SubtreeGraft,
+            stage: ReverseGitStage::SubtreeRootRebuild,
         },
         deadline,
     )
@@ -229,7 +229,7 @@ pub(crate) async fn replace_tree(
             &["ls-tree", "-z", &current],
             deadline,
             "Git View reverse mapping conflict",
-            Some(ReverseGitStage::SubtreeGraft),
+            Some(ReverseGitStage::SubtreeRootListing),
         )
         .await?,
     )?;
@@ -255,7 +255,7 @@ pub(crate) async fn replace_tree(
                 &["ls-tree", "-z", &current],
                 deadline,
                 "Git View reverse mapping conflict",
-                Some(ReverseGitStage::SubtreeGraft),
+                Some(ReverseGitStage::SubtreeRootListing),
             )
             .await?,
         )?;

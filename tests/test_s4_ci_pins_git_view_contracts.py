@@ -315,7 +315,11 @@ class SourceContracts(unittest.TestCase):
             "source_projection",
             "proposal_verify_fetch",
             "ancestry_integrity",
-            "subtree_graft",
+            "subtree_export_ref_update",
+            "subtree_source_fetch",
+            "subtree_source_tree_resolve",
+            "subtree_root_listing",
+            "subtree_root_rebuild",
             "commit_synthesize",
             "pack_write_index",
         ):
@@ -351,16 +355,25 @@ class SourceContracts(unittest.TestCase):
             "ReverseGitStage::SourceProjection",
             "ReverseGitStage::ProposalVerifyFetch",
             "ReverseGitStage::AncestryIntegrity",
-            "ReverseGitStage::SubtreeGraft",
+            "ReverseGitStage::SubtreeExportRefUpdate",
+            "ReverseGitStage::SubtreeSourceFetch",
+            "ReverseGitStage::SubtreeSourceTreeResolve",
             "ReverseGitStage::CommitSynthesize",
         ):
             self.assertIn(variant, view_reverse)
-        self.assertIn("ReverseGitStage::PackWriteIndex", reverse)
+        for variant in (
+            "ReverseGitStage::SubtreeRootListing",
+            "ReverseGitStage::SubtreeRootRebuild",
+            "ReverseGitStage::PackWriteIndex",
+        ):
+            self.assertIn(variant, reverse)
+        self.assertNotIn("ReverseGitStage::SubtreeGraft", view_reverse + reverse)
+        self.assertNotIn('"subtree_graft"', diag)
         self.assertIn("Git View reverse mapping conflict", reverse)
         self.assertIn("Git View reverse mapping conflict", view_reverse)
 
         self.assertIn("reverse_diag::take_for_test", tests)
-        self.assertIn("failing_reverse_child_emits_closed_diagnostic_and_keeps_public_conflict", tests)
+        self.assertIn("every_reverse_stage_reaches_closed_runner_diagnostic_and_keeps_public_conflict", tests)
         self.assertIn("reverse_git_child_outcome_distinguishes_nonzero_signal_and_unknown", tests)
         self.assertIn("reverse_git_diagnostic_labels_are_closed_and_bounded", tests)
         self.assertIn("reverse_git_diagnostic_write_failure_is_best_effort", tests)
