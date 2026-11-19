@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     io::{self, Write},
     panic::AssertUnwindSafe,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
@@ -25,27 +25,36 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::Value;
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::Instant};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpListener,
+    sync::oneshot,
+    task::JoinHandle,
+    time::{Instant, timeout_at},
+};
 use uuid::Uuid;
 
 use super::super::session_http_acceptance::fixtures::{
-    actor,
+    actor::{self, Actor},
     db::{Db, deadline, prepare},
-    git::Git,
+    git::{self, Git},
 };
 use super::{
-    Captures, INDEPENDENT_A, INDEPENDENT_B, SEED_CONTENT, SEED_FILE, SEED_REF, WitnessResources, clone_one, clone_url,
-    core_event, create_repository, durable_ref, gate_revision, open_store, operation_row, pinned_operation,
-    provision_decision_realm, report_status, require_owned_disposable_blob_fixture, require_per_run_blob_prefix,
+    Captures, INDEPENDENT_A, INDEPENDENT_B, SEED_CONTENT, SEED_FILE, SEED_REF, WitnessResources, clone_url,
+    create_repository, durable_ref, gate_revision, open_store, pinned_operation, provision_decision_realm,
+    report_status, require_owned_disposable_blob_fixture, require_per_run_blob_prefix,
 };
 use crate::{
     blob_git_gateway::{
-        BlobGitConfig, BlobGitState, NATIVE_ACCEPTANCE_SERIAL,
+        BlobGitConfig, BlobGitState, NATIVE_ACCEPTANCE_SERIAL, operation,
         protocol::{self, MAX_COMMAND_BYTES},
         router,
     },
     ref_store::{
-        GitObjectFormat, RefCommitResult, TerminalKind, core::pack_commit::PackCommitTerminal, serving::lookup,
+        CommitMode, GitObjectFormat, OperationState, PgRefStore, RefCommitResult, RequestDigest, TerminalKind,
+        core::pack_commit::PackCommitTerminal,
+        pg::public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
+        serving::{ServingRepository, lookup},
     },
 };
 
@@ -83,6 +92,7 @@ struct BodyTrace {
     prefix: Vec<u8>,
     samples: Vec<BodySample>,
     samples_truncated: bool,
+    content_encoded: bool,
     completed: Option<Instant>,
 }
 
@@ -92,6 +102,7 @@ struct BodyTrace {
 struct BodyWitness {
     first: Uuid,
     second: Uuid,
+    receipt_root: PathBuf,
     state: Mutex<BodyWitnessState>,
 }
 
@@ -102,17 +113,24 @@ struct BodyWitnessState {
 }
 
 impl BodyWitness {
-    fn new(first: Uuid, second: Uuid) -> Arc<Self> {
-        Arc::new(Self { first, second, state: Mutex::new(BodyWitnessState::default()) })
+    fn new(first: Uuid, second: Uuid, receipt_root: PathBuf) -> Arc<Self> {
+        Arc::new(Self { first, second, receipt_root, state: Mutex::new(BodyWitnessState::default()) })
+    }
+
+    fn body_path(&self, operation: Uuid) -> PathBuf {
+        self.receipt_root.join(format!("{operation}.receive-pack-request"))
     }
 
     fn accepts(&self, operation: Uuid) -> bool {
         operation == self.first || operation == self.second
     }
 
-    fn begin_request(&self, operation: Uuid) {
+    fn begin_request(&self, operation: Uuid, content_encoded: bool) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         *state.requests.entry(operation).or_insert(0) += 1;
+        if content_encoded {
+            state.traces.entry(operation).or_default().content_encoded = true;
+        }
     }
 
     fn observe(&self, operation: Uuid, bytes: &[u8]) {
@@ -172,9 +190,16 @@ async fn observe_receive_body(State(witness): State<Arc<BodyWitness>>, request: 
     if !witness.accepts(operation) {
         return next.run(request).await;
     }
-    witness.begin_request(operation);
+    let content_encoded = request
+        .headers()
+        .get_all("content-encoding")
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"));
+    witness.begin_request(operation, content_encoded);
     let (parts, body) = request.into_parts();
     let body_witness = witness.clone();
+    let receipt_path = witness.body_path(operation);
+    let mut receipt = tokio::fs::File::create(&receipt_path).await.ok();
     let observed = async_stream::stream! {
         let mut body = body.into_data_stream();
         while let Some(frame) = body.next().await {
@@ -184,8 +209,11 @@ async fn observe_receive_body(State(witness): State<Arc<BodyWitness>>, request: 
                     let mut offset = 0usize;
                     while offset < bytes.len() {
                         let end = (offset + MAX_OBSERVED_CHUNK_BYTES).min(bytes.len());
-                        tokio::time::sleep(SLOW_FRAME_PACE).await;
                         let chunk = bytes.slice(offset..end);
+                        if let Some(file) = receipt.as_mut() {
+                            let _ = file.write_all(&chunk).await;
+                        }
+                        tokio::time::sleep(SLOW_FRAME_PACE).await;
                         // Timestamp immediately before the unchanged bytes are
                         // yielded, after pacing. Only actual received body data
                         // creates a progress sample.
@@ -196,6 +224,9 @@ async fn observe_receive_body(State(witness): State<Arc<BodyWitness>>, request: 
                 }
                 Err(error) => yield Err(error),
             }
+        }
+        if let Some(mut file) = receipt {
+            let _ = file.flush().await;
         }
     };
     let request = Request::from_parts(parts, Body::from_stream(observed));
@@ -271,17 +302,29 @@ fn body_overlap_witness(first: &BodyTrace, second: &BodyTrace) -> Result<BodyOve
     ensure!(!first_windows.is_empty(), "the first receive body produced no bounded pack-progress interval");
     ensure!(!second_windows.is_empty(), "the second receive body produced no bounded pack-progress interval");
 
-    for first_window in &first_windows {
-        for second_window in &second_windows {
-            let start = if first_window.start > second_window.start { first_window.start } else { second_window.start };
-            let end = if first_window.end < second_window.end { first_window.end } else { second_window.end };
-            if start < end && end < first_done && end < second_done {
-                return Ok(BodyOverlap {
-                    start,
-                    end,
-                    first_pack_bytes: first_window.pack_bytes,
-                    second_pack_bytes: second_window.pack_bytes,
-                });
+    // Consecutive progress windows in each trace are chronologically sorted by
+    // both start and end. One two-pointer scan finds any strict overlap without
+    // changing the predicate or its completion bound.
+    let (mut first_index, mut second_index) = (0usize, 0usize);
+    while first_index < first_windows.len() && second_index < second_windows.len() {
+        let first_window = &first_windows[first_index];
+        let second_window = &second_windows[second_index];
+        let start = if first_window.start > second_window.start { first_window.start } else { second_window.start };
+        let end = if first_window.end < second_window.end { first_window.end } else { second_window.end };
+        if start < end && end < first_done && end < second_done {
+            return Ok(BodyOverlap {
+                start,
+                end,
+                first_pack_bytes: first_window.pack_bytes,
+                second_pack_bytes: second_window.pack_bytes,
+            });
+        }
+        match first_window.end.cmp(&second_window.end) {
+            std::cmp::Ordering::Less => first_index += 1,
+            std::cmp::Ordering::Greater => second_index += 1,
+            std::cmp::Ordering::Equal => {
+                first_index += 1;
+                second_index += 1;
             }
         }
     }
@@ -327,9 +370,9 @@ fn body_overlap_requires_advancing_pack_bytes_before_both_completions() {
 /// command for the expected fixture ref and OID. This proves the observed bytes
 /// are that operation's standard receive-pack body, not a response or a
 /// synthetic client stream.
-fn ensure_body_command(trace: &BodyTrace, expected_ref: &str, expected_oid: &str) -> Result<()> {
+fn ensure_body_command(trace: &BodyTrace, expected_ref: &str, expected_oid: &str) -> Result<protocol::PushRequest> {
     let request = protocol::parse_push(&trace.prefix, GitObjectFormat::Sha1)
-        .map_err(|error| anyhow!("the pinned receive-pack command prefix was refused: {error}"))?;
+        .map_err(|_| anyhow!("the pinned receive-pack command prefix was refused"))?;
     ensure!(request.commands.len() == 1, "the pinned receive-pack body did not carry exactly one command");
     let command = &request.commands[0];
     ensure!(command.name.as_str() == expected_ref, "the pinned receive-pack body named another ref");
@@ -342,10 +385,10 @@ fn ensure_body_command(trace: &BodyTrace, expected_ref: &str, expected_oid: &str
         trace.total_bytes > command_end as u64,
         "the pinned receive-pack body carried no pack bytes after its flush"
     );
-    Ok(())
+    Ok(request)
 }
 
-fn ensure_committed_terminal(terminal: Value, expected_ref: &str, expected_new: &str) -> Result<()> {
+fn ensure_committed_terminal(terminal: Value, expected_ref: &str, expected_new: &str) -> Result<PackCommitTerminal> {
     let terminal: PackCommitTerminal = serde_json::from_value(terminal)
         .map_err(|_| anyhow!("the committed terminal does not match the pack terminal schema"))?;
     ensure!(terminal.kind == TerminalKind::Committed, "the terminal is not committed");
@@ -360,7 +403,185 @@ fn ensure_committed_terminal(terminal: Value, expected_ref: &str, expected_new: 
             return Err(anyhow!("the committed terminal contains a not-applied ref"));
         }
     }
-    Ok(())
+    Ok(terminal)
+}
+
+/// Strict intended-product oracle: one public Git operation UUID is resolved
+/// through migration 152's restore-scoped wrapper, then to the selected private
+/// operation and its exact terminal/event. A legacy operation row is never a
+/// success branch here, even if it happens to carry the same public UUID.
+async fn verify_private_committed_ack(
+    db: &Db,
+    serving: &ServingRepository,
+    owner: &Actor,
+    public_id: Uuid,
+    request: &protocol::PushRequest,
+    wire_digest: RequestDigest,
+    mode: CommitMode,
+    backend_identity: &str,
+    expected_ref: &str,
+    expected_oid: &str,
+) -> Result<i64> {
+    let repository_id = serving.gate.repository_id();
+    ensure!(serving.repository.id == repository_id, "authoritative serving view names another repository");
+    let public_request = PublicAttemptRequest {
+        repository_id,
+        admission_owner_id: serving.gate.tenant_id(),
+        issuer_id: owner.identity.id,
+        public_id,
+        wire_digest,
+        request_mode: mode,
+        backend_identity: backend_identity.to_owned(),
+        object_format: serving.gate.object_format(),
+        history_incarnation: serving.gate.history_incarnation(),
+        authority_epoch: serving.gate.authority_epoch(),
+        group_epoch: serving.gate.group_epoch(),
+        restore_incarnation: serving.cluster_incarnation,
+    };
+    let bound = deadline();
+    let mut client = timeout_at(bound, db.pool.get())
+        .await
+        .map_err(|_| anyhow!("private wrapper pool checkout timed out"))?
+        .map_err(|_| anyhow!("private wrapper pool checkout failed"))?;
+    let tx = timeout_at(bound, client.transaction())
+        .await
+        .map_err(|_| anyhow!("private wrapper transaction timed out"))?
+        .map_err(|_| anyhow!("private wrapper transaction failed"))?;
+    let result = verify_private_committed_ack_in_tx(
+        &tx,
+        &public_request,
+        request,
+        wire_digest,
+        expected_ref,
+        expected_oid,
+        bound,
+    )
+    .await;
+    let rollback = tx.rollback().await;
+    match (result, rollback) {
+        (Ok(revision), Ok(())) => Ok(revision),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(_)) => Err(anyhow!("private wrapper transaction rollback failed")),
+    }
+}
+
+async fn verify_private_committed_ack_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    public_request: &PublicAttemptRequest,
+    request: &protocol::PushRequest,
+    wire_digest: RequestDigest,
+    expected_ref: &str,
+    expected_oid: &str,
+    bound: Instant,
+) -> Result<i64> {
+    let proposed = Uuid::new_v4();
+    ensure!(!proposed.is_nil() && proposed != public_request.public_id, "private wrapper lock proposal was invalid");
+    PgRefStore
+        .lock_public_attempt(tx, public_request, proposed, bound)
+        .await
+        .map_err(|_| anyhow!("private wrapper lock was refused"))?;
+    let evidence = match PgRefStore
+        .lookup_public_attempt(tx, public_request, bound)
+        .await
+        .map_err(|_| anyhow!("private wrapper lookup was refused"))?
+    {
+        PublicAttemptLookup::Committed(evidence) => evidence,
+        PublicAttemptLookup::Unknown => {
+            return Err(anyhow!("private wrapper is missing for the claimed committed operation"));
+        }
+        PublicAttemptLookup::PrivateIdentifier => {
+            return Err(anyhow!("public operation UUID was already a private identifier"));
+        }
+        PublicAttemptLookup::LegacyPath => {
+            return Err(anyhow!("a legacy operation row cannot satisfy private product qualification"));
+        }
+        PublicAttemptLookup::Pending(_) => {
+            return Err(anyhow!("private wrapper is pending, not a committed two-ACK result"));
+        }
+        PublicAttemptLookup::Rejected(_) => {
+            return Err(anyhow!("private wrapper rejected the expected ACK"));
+        }
+        PublicAttemptLookup::Cancelled(_) => {
+            return Err(anyhow!("private wrapper cancelled the expected ACK"));
+        }
+    };
+    ensure!(evidence.public_id == public_request.public_id, "private wrapper names another public operation");
+    ensure!(evidence.current.state == OperationState::Committed, "private wrapper current attempt is not committed");
+    ensure!(
+        !evidence.current.private_id.is_nil() && evidence.current.private_id != public_request.public_id,
+        "private wrapper selected an invalid private operation"
+    );
+    let phase_slot_ok = match (evidence.current.slot, evidence.retired.as_ref()) {
+        (0, None) => true,
+        (1, Some(retired)) => retired.slot == 0 && retired.state == OperationState::Rejected,
+        _ => false,
+    };
+    ensure!(phase_slot_ok, "private wrapper phase/slot does not match the selected committed attempt");
+    ensure!(
+        evidence.current.event_id.is_some() && evidence.current.event_revision.is_some(),
+        "private wrapper committed attempt has no exact core event"
+    );
+
+    let claimed = operation::lookup_public_private_in_tx(tx, public_request, &evidence, request, wire_digest, bound)
+        .await
+        .map_err(|_| anyhow!("verified private operation binding was refused"))?;
+    let claimed_terminal = match claimed {
+        operation::Claim::Replay(terminal) => terminal,
+        operation::Claim::Fresh | operation::Claim::Pending | operation::Claim::Cancelled(_) => {
+            return Err(anyhow!("verified private operation is not a committed ACK replay"));
+        }
+    };
+    ensure!(
+        claimed_terminal.kind == TerminalKind::Committed
+            && claimed_terminal.repository_id == public_request.repository_id,
+        "verified private ACK terminal is not committed in this repository"
+    );
+
+    // Read the exact selected private operation and core event in the same
+    // wrapper transaction snapshot. The public operation UUID is never used as
+    // the private row key.
+    let private_id = evidence.current.private_id;
+    let row = tx
+        .query_opt(
+            "SELECT state, terminal_result FROM ref_store_operations
+              WHERE repository_id=$1 AND operation_id=$2",
+            &[&public_request.repository_id, &private_id],
+        )
+        .await
+        .map_err(|_| anyhow!("selected private operation read failed"))?
+        .ok_or_else(|| anyhow!("private wrapper selected a missing private operation"))?;
+    let state: String = row.get(0);
+    let terminal_value: Option<Value> = row.get(1);
+    ensure!(state == "committed", "selected private operation is not committed");
+    let terminal = ensure_committed_terminal(
+        terminal_value.ok_or_else(|| anyhow!("selected private operation has no terminal"))?,
+        expected_ref,
+        expected_oid,
+    )?;
+    ensure!(
+        terminal.repository_id == public_request.repository_id,
+        "selected private terminal names another repository"
+    );
+    ensure!(terminal == claimed_terminal, "selected private terminal differs from the verified replay terminal");
+
+    let event = tx
+        .query_opt(
+            "SELECT revision, outcome FROM ref_store_core_events
+              WHERE repository_id=$1 AND operation_id=$2",
+            &[&public_request.repository_id, &private_id],
+        )
+        .await
+        .map_err(|_| anyhow!("selected private core event read failed"))?
+        .ok_or_else(|| anyhow!("selected private operation has no core event"))?;
+    let event_revision: i64 = event.get(0);
+    let event_outcome: String = event.get(1);
+    ensure!(event_outcome == "committed", "selected private core event is not committed");
+    ensure!(
+        Some(event_revision) == evidence.current.event_revision,
+        "selected private core event revision differs from wrapper evidence"
+    );
+    ensure!(terminal.revision == event_revision, "selected private terminal revision differs from its core event");
+    Ok(event_revision)
 }
 
 fn deterministic_pack_bytes(mut state: u64) -> Vec<u8> {
@@ -393,6 +614,14 @@ fn spawn_fixture_push_ref(
     })
 }
 
+/// Fixed-diagnostic clone for the two fixture worktrees. Failure never echoes
+/// the credentialed URL or stock output.
+async fn clone_fixture(git: &Git, root: &Path, url: &str, destination: &str) -> Result<PathBuf> {
+    let output = git.clone(root, url, destination).await?;
+    ensure!(output.success, "stock fixture clone failed");
+    Ok(root.join(destination))
+}
+
 async fn commit_bytes(git: &Git, directory: &Path, file: &str, bytes: &[u8], message: &str) -> Result<String> {
     std::fs::write(directory.join(file), bytes).with_context(|| format!("write fixture file {file}"))?;
     git.ok(directory, &["add", file]).await?;
@@ -403,6 +632,11 @@ async fn commit_bytes(git: &Git, directory: &Path, file: &str, bytes: &[u8], mes
 /// Strict original distinct-ref slow-body criterion. The two stock Git children
 /// run concurrently against one tenant-created repository and standard Smart
 /// HTTP route; each pushes one unrelated new branch from a nontrivial pack.
+///
+/// Durable qualification is private-wrapper-only: the public Git operation UUID
+/// must resolve through migration 152 to a committed private operation with its
+/// exact terminal and core event. A legacy-only row is a red refusal, never an
+/// alternate success path.
 ///
 /// This test intentionally makes no local-pass claim. The current branch's
 /// legacy admission path may refuse the second independent ref as `stale info`;
@@ -424,7 +658,8 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         let first_operation = Uuid::new_v4();
         let second_operation = Uuid::new_v4();
         ensure!(first_operation != second_operation, "the slow-body race pins shared an operation id");
-        let witness = BodyWitness::new(first_operation, second_operation);
+        let receipt = tempfile::tempdir().context("temporary receive-body receipt root")?;
+        let witness = BodyWitness::new(first_operation, second_operation, receipt.path().to_path_buf());
         let captures = Captures::default();
         let scratch = resources.scratch.insert(tempfile::tempdir().context("temporary gateway scratch root")?);
         let state = Arc::new(
@@ -460,7 +695,9 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         let name = format!("slow-body-{}", &Uuid::new_v4().simple().to_string()[..12]);
         let created = create_repository(address, &owner, &name).await?;
         let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
-        provision_decision_realm(db, &owner, &name, &store).await?;
+        provision_decision_realm(db, &owner, &name, &store)
+            .await
+            .map_err(|_| anyhow!("decision realm provisioning was refused"))?;
 
         let work = resources.work.insert(tempfile::tempdir().context("temporary Git work root")?);
         let direct_url = clone_url(address, &owner, &name);
@@ -472,8 +709,8 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         let pushed = git.run(&seed_dir, &["push", "origin", seed_target.as_str()]).await?;
         ensure!(pushed.success, "seed push was refused");
 
-        let first_dir = clone_one(git, work.path(), &direct_url, "slow-a").await?;
-        let second_dir = clone_one(git, work.path(), &direct_url, "slow-b").await?;
+        let first_dir = clone_fixture(git, work.path(), &direct_url, "slow-a").await?;
+        let second_dir = clone_fixture(git, work.path(), &direct_url, "slow-b").await?;
         let first_old = git.text(&first_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
         let second_old = git.text(&second_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
         ensure!(first_old == seed && second_old == seed, "the two slow-body clones did not share the seed tip");
@@ -533,8 +770,38 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             witness.trace(second_operation).ok_or_else(|| anyhow!("the second receive body was not observed"))?;
         ensure!(!first_trace.samples_truncated, "the first receive body exceeded its sample receipt bound");
         ensure!(!second_trace.samples_truncated, "the second receive body exceeded its sample receipt bound");
-        ensure_body_command(&first_trace, INDEPENDENT_A, &first_new)?;
-        ensure_body_command(&second_trace, INDEPENDENT_B, &second_new)?;
+        ensure!(
+            !first_trace.content_encoded,
+            "the first receive body was encoded, not the exact decoded request bytes"
+        );
+        ensure!(
+            !second_trace.content_encoded,
+            "the second receive body was encoded, not the exact decoded request bytes"
+        );
+        let first_request = ensure_body_command(&first_trace, INDEPENDENT_A, &first_new)?;
+        let second_request = ensure_body_command(&second_trace, INDEPENDENT_B, &second_new)?;
+        let first_digest = operation::request_digest(
+            repository_id,
+            first_operation,
+            GitObjectFormat::Sha1,
+            &first_request,
+            CommitMode::AcceptedSubset,
+            &witness.body_path(first_operation),
+            deadline(),
+        )
+        .await
+        .map_err(|_| anyhow!("the first pinned request digest could not be recomputed"))?;
+        let second_digest = operation::request_digest(
+            repository_id,
+            second_operation,
+            GitObjectFormat::Sha1,
+            &second_request,
+            CommitMode::AcceptedSubset,
+            &witness.body_path(second_operation),
+            deadline(),
+        )
+        .await
+        .map_err(|_| anyhow!("the second pinned request digest could not be recomputed"))?;
         let overlap = body_overlap_witness(&first_trace, &second_trace)?;
         ensure!(
             overlap.start < overlap.end
@@ -563,90 +830,94 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         );
         ensure!(!first_capture.truncated, "the first slow-body raw reply is truncated");
         ensure!(!second_capture.truncated, "the second slow-body raw reply is truncated");
-        let (first_unpack, first_verdicts) = report_status(&first_capture.body)?;
-        let (second_unpack, second_verdicts) = report_status(&second_capture.body)?;
-        ensure!(first_unpack == "ok", "the first slow-body report-status did not unpack: {first_unpack}");
-        ensure!(second_unpack == "ok", "the second slow-body report-status did not unpack: {second_unpack}");
+        let (first_unpack, first_verdicts) = report_status(&first_capture.body)
+            .map_err(|_| anyhow!("raw report-status parser refused the first pinned reply"))?;
+        let (second_unpack, second_verdicts) = report_status(&second_capture.body)
+            .map_err(|_| anyhow!("raw report-status parser refused the second pinned reply"))?;
+        ensure!(first_unpack == "ok", "the first slow-body report-status did not unpack");
+        ensure!(second_unpack == "ok", "the second slow-body report-status did not unpack");
         ensure!(
             first_verdicts == vec![(INDEPENDENT_A.to_owned(), None)],
-            "the first slow-body report-status is not exactly one ok on {INDEPENDENT_A}: {first_verdicts:?}"
+            "the first slow-body report-status is not exactly one ok on the expected ref"
         );
         ensure!(
             second_verdicts == vec![(INDEPENDENT_B.to_owned(), None)],
-            "the second slow-body report-status is not exactly one ok on {INDEPENDENT_B}: {second_verdicts:?}"
+            "the second slow-body report-status is not exactly one ok on the expected ref"
         );
         ensure!(first_output.success, "the first slow-body stock push was refused");
         ensure!(second_output.success, "the second slow-body stock push was refused");
 
-        // Durable refs/OIDs, both exact committed terminals, exactly two gate
-        // revisions and one committed core event per pinned operation.
+        // Durable refs/OIDs, then the intended product route: a real
+        // restore-scoped public wrapper lookup selects the exact committed
+        // private operation, terminal and core event. The public Git operation
+        // UUID is not used as the private row key, and a legacy-only row is a
+        // fixed refusal rather than a qualification success.
         let first_oid = durable_ref(db, repository_id, INDEPENDENT_A)
             .await?
-            .ok_or_else(|| anyhow!("durable {INDEPENDENT_A} is missing"))?;
+            .ok_or_else(|| anyhow!("durable indep-a is missing"))?;
         let second_oid = durable_ref(db, repository_id, INDEPENDENT_B)
             .await?
-            .ok_or_else(|| anyhow!("durable {INDEPENDENT_B} is missing"))?;
-        ensure!(first_oid == first_new, "durable {INDEPENDENT_A} is {first_oid}, not {first_new}");
-        ensure!(second_oid == second_new, "durable {INDEPENDENT_B} is {second_oid}, not {second_new}");
-        let (first_state, first_terminal) = operation_row(db, repository_id, first_operation)
-            .await?
-            .ok_or_else(|| anyhow!("the first slow-body operation has no durable row"))?;
-        let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
-            .await?
-            .ok_or_else(|| anyhow!("the second slow-body operation has no durable row"))?;
-        ensure!(first_state == "committed", "the first slow-body operation is {first_state}, not committed");
-        ensure!(second_state == "committed", "the second slow-body operation is {second_state}, not committed");
-        ensure_committed_terminal(
-            first_terminal.ok_or_else(|| anyhow!("the first slow-body operation has no terminal"))?,
+            .ok_or_else(|| anyhow!("durable indep-b is missing"))?;
+        ensure!(first_oid == first_new, "durable indep-a OID differs from the pushed commit");
+        ensure!(second_oid == second_new, "durable indep-b OID differs from the pushed commit");
+
+        let served =
+            lookup(&db.pool, &owner.identity, &owner.username, &name, false, store.backend_identity(), deadline())
+                .await
+                .map_err(|_| anyhow!("authoritative serving lookup was refused"))?;
+        ensure!(served.gate.repository_id() == repository_id, "the authoritative lookup named another repository");
+        ensure!(
+            served.gate.revision() == revision_before + 2,
+            "the authoritative lookup gate revision is not exactly two independent revisions"
+        );
+        let backend_identity = store.backend_identity().as_hex();
+        let first_event_revision = verify_private_committed_ack(
+            db,
+            &served,
+            &owner,
+            first_operation,
+            &first_request,
+            first_digest,
+            CommitMode::AcceptedSubset,
+            &backend_identity,
             INDEPENDENT_A,
             &first_new,
-        )?;
-        ensure_committed_terminal(
-            second_terminal.ok_or_else(|| anyhow!("the second slow-body operation has no terminal"))?,
+        )
+        .await?;
+        let second_event_revision = verify_private_committed_ack(
+            db,
+            &served,
+            &owner,
+            second_operation,
+            &second_request,
+            second_digest,
+            CommitMode::AcceptedSubset,
+            &backend_identity,
             INDEPENDENT_B,
             &second_new,
-        )?;
+        )
+        .await?;
         let revision_after = gate_revision(db, repository_id).await?;
-        ensure!(
-            revision_after == revision_before + 2,
-            "the gate moved {revision_before}->{revision_after}, not exactly two independent revisions"
-        );
-        let (first_event_revision, first_event_outcome) = core_event(db, repository_id, first_operation)
-            .await?
-            .ok_or_else(|| anyhow!("the first slow-body operation has no core event"))?;
-        let (second_event_revision, second_event_outcome) = core_event(db, repository_id, second_operation)
-            .await?
-            .ok_or_else(|| anyhow!("the second slow-body operation has no core event"))?;
-        ensure!(first_event_outcome == "committed", "the first slow-body core event is not committed");
-        ensure!(second_event_outcome == "committed", "the second slow-body core event is not committed");
+        ensure!(revision_after == revision_before + 2, "the gate did not advance by exactly two independent revisions");
         let mut event_revisions = vec![first_event_revision, second_event_revision];
         event_revisions.sort_unstable();
         ensure!(
             event_revisions == vec![revision_before + 1, revision_before + 2],
-            "the two slow-body core events do not carry exact consecutive revisions: {event_revisions:?}"
+            "the two private core events do not carry exact consecutive revisions"
         );
 
-        // Fresh authoritative serving lookup, then a fresh stock client readback
-        // including `fsck --strict`, proves both durable refs and their pack bytes
-        // are readable without any compute-view reuse.
-        let served =
-            lookup(&db.pool, &owner.identity, &owner.username, &name, false, store.backend_identity(), deadline())
-                .await?;
-        ensure!(served.gate.repository_id() == repository_id, "the authoritative lookup named another repository");
-        ensure!(
-            served.gate.revision() == revision_before + 2,
-            "the authoritative lookup gate revision is {}, not {}",
-            served.gate.revision(),
-            revision_before + 2
-        );
+        // A fresh stock client readback including `fsck --strict` proves both
+        // durable refs and their pack bytes are readable without compute-view
+        // reuse. It does not substitute for the private wrapper oracle above.
         let readback = git.clone(work.path(), &direct_url, "slow-readback").await?;
         ensure!(readback.success, "the fresh stock readback clone failed");
         let readback_dir = work.path().join("slow-readback");
-        git.ok(&readback_dir, &["fsck", "--strict"]).await?;
+        let fsck = git.run(&readback_dir, &["fsck", "--strict"]).await?;
+        ensure!(fsck.success, "stock readback fsck failed");
         let first_read = git.text(&readback_dir, &["rev-parse", "refs/remotes/origin/indep-a"]).await?;
         let second_read = git.text(&readback_dir, &["rev-parse", "refs/remotes/origin/indep-b"]).await?;
-        ensure!(first_read == first_oid, "stock readback of {INDEPENDENT_A} is {first_read}, not {first_oid}");
-        ensure!(second_read == second_oid, "stock readback of {INDEPENDENT_B} is {second_read}, not {second_oid}");
+        ensure!(first_read == first_oid, "stock readback of indep-a differs from the durable OID");
+        ensure!(second_read == second_oid, "stock readback of indep-b differs from the durable OID");
 
         Ok::<(), anyhow::Error>(())
     })
@@ -658,13 +929,13 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         .catch_unwind()
         .await
         .unwrap_or_else(|_| Err(anyhow!("slow-body witness cleanup panicked")));
-    if let Err(error) = &cleanup {
+    if cleanup.is_err() {
         let sealed = AssertUnwindSafe(resources.seal_failed_cleanup(&db)).catch_unwind().await;
         if sealed.is_err() {
             let _ = writeln!(io::stderr().lock(), "slow-body witness cleanup fallback panicked");
         }
         if !matches!(&outcome, Ok(Ok(()))) {
-            let _ = writeln!(io::stderr().lock(), "slow-body witness cleanup failed ({error})");
+            let _ = writeln!(io::stderr().lock(), "slow-body witness cleanup failed");
         }
     }
     drop(fence);

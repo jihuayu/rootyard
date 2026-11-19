@@ -34,7 +34,8 @@
 //! not prove slow HTTP body overlap and does not cover AC3 GC, backup, PR
 //! merge, crash or Raft.
 //!
-//! A third case, [`slow_body::slow_body_distinct_refs_overlap_and_both_commit`], is the
+//! A third case,
+//! [`slow_body::slow_body_distinct_refs_overlap_and_both_commit`], is the
 //! separate slow-body extension for the original distinct-ref criterion. It
 //! wraps only that fixture's two exact receive-pack operation ids with a
 //! test-only body observer, records bounded per-data-frame pack progress as the
@@ -42,10 +43,13 @@
 //! pair of progress intervals before either response completes. The observer is
 //! attached by the test router, never by the production router or state, and it
 //! neither synthesizes client bytes nor infers progress from response delivery,
-//! request scheduling or native-child wall clocks. This case does not replace or
-//! relax the two rendezvous cases above, and it does not claim the other ACs
-//! (same-old-OID conflict, multi-ref atomic/accepted-subset, GC, backup, PR
-//! merge, crash or Raft).
+//! request scheduling or native-child wall clocks. Its durable result oracle is
+//! the restore-scoped public wrapper to exact private operation path, not a
+//! lookup keyed by the public Git operation UUID, and a legacy-only row cannot
+//! satisfy that product qualification. This case does not replace or relax the
+//! two rendezvous cases above, and it does not claim the other ACs (same-old-OID
+//! conflict, multi-ref atomic/accepted-subset, GC, backup, PR merge, crash or
+//! Raft).
 //!
 //! The external `tests/blob_git_gateway.rs` race case and its exact one-ok /
 //! one-ng assertions remain untouched; it stays the unsynchronized stress case.
