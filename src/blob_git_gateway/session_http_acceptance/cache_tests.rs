@@ -198,10 +198,10 @@ impl CaseFixture {
 
 impl Drop for CaseFixture {
     fn drop(&mut self) {
-        if self.retain_on_drop {
-            if let Some(gateway) = self.gateway.take() {
-                std::mem::forget(gateway);
-            }
+        if self.retain_on_drop
+            && let Some(gateway) = self.gateway.take()
+        {
+            std::mem::forget(gateway);
         }
     }
 }
