@@ -185,12 +185,12 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
         ensure!(plan.packs().len() == 1, "fresh slot-one plan must have one pack");
         let planned = &plan.packs()[0];
         ensure!(
-            planned.artifact(PackArtifactRole::Pack).content().as_str() == pack_sha
+            planned.artifact(PackArtifactRole::Pack).content().as_str() == pack_sha.as_str()
                 && planned.artifact(PackArtifactRole::Pack).length() == pack_len,
             "fresh plan did not preserve the exact staged pack bytes"
         );
         ensure!(
-            planned.artifact(PackArtifactRole::Idx).content().as_str() == idx_sha
+            planned.artifact(PackArtifactRole::Idx).content().as_str() == idx_sha.as_str()
                 && planned.artifact(PackArtifactRole::Idx).length() == idx_len,
             "fresh plan did not preserve the exact staged idx bytes"
         );
