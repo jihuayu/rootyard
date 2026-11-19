@@ -23,7 +23,7 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde_json::Value;
 use tokio::{
     io::AsyncWriteExt,
@@ -617,7 +617,8 @@ fn spawn_fixture_push_ref(
 /// Fixed-diagnostic clone for the two fixture worktrees. Failure never echoes
 /// the credentialed URL or stock output.
 async fn clone_fixture(git: &Git, root: &Path, url: &str, destination: &str) -> Result<PathBuf> {
-    let output = git.clone(root, url, destination).await?;
+    let output =
+        git.clone(root, url, destination).await.map_err(|_| anyhow!("stock fixture clone invocation failed"))?;
     ensure!(output.success, "stock fixture clone failed");
     Ok(root.join(destination))
 }
@@ -644,24 +645,28 @@ async fn commit_bytes(git: &Git, directory: &Path, file: &str, bytes: &[u8], mes
 #[tokio::test]
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
 async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
-    require_owned_disposable_blob_fixture()?;
+    require_owned_disposable_blob_fixture()
+        .map_err(|_| anyhow!("owned disposable Blob fixture opt-in was not proven"))?;
     let _serial = NATIVE_ACCEPTANCE_SERIAL.lock().await;
-    prepare()?;
-    require_per_run_blob_prefix()?;
-    let db = Db::setup().await?;
+    prepare().map_err(|_| anyhow!("shared fixture environment preparation failed"))?;
+    require_per_run_blob_prefix().map_err(|_| anyhow!("per-run Blob fixture prefix was not proven"))?;
+    let db = Db::setup().await.map_err(|_| anyhow!("fixture PostgreSQL schema setup failed"))?;
     let mut resources = WitnessResources::default();
     let outcome = AssertUnwindSafe(async {
         let db = &db;
-        let store = open_store()?;
-        let git: &'static Git = Box::leak(Box::new(Git::new()?));
+        let store = open_store().map_err(|_| anyhow!("fixture Blob store setup failed"))?;
+        let git: &'static Git =
+            Box::leak(Box::new(Git::new().map_err(|_| anyhow!("fixture Git binary setup failed"))?));
 
         let first_operation = Uuid::new_v4();
         let second_operation = Uuid::new_v4();
         ensure!(first_operation != second_operation, "the slow-body race pins shared an operation id");
-        let receipt = tempfile::tempdir().context("temporary receive-body receipt root")?;
+        let receipt = tempfile::tempdir().map_err(|_| anyhow!("temporary receive-body receipt root was refused"))?;
         let witness = BodyWitness::new(first_operation, second_operation, receipt.path().to_path_buf());
         let captures = Captures::default();
-        let scratch = resources.scratch.insert(tempfile::tempdir().context("temporary gateway scratch root")?);
+        let scratch = resources
+            .scratch
+            .insert(tempfile::tempdir().map_err(|_| anyhow!("temporary gateway scratch root was refused"))?);
         let state = Arc::new(
             BlobGitState::new(BlobGitConfig {
                 pool: db.pool.clone(),
@@ -675,10 +680,11 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
                 operation_deadline: Duration::from_secs(120),
                 native_limits: Default::default(),
             })
-            .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?,
+            .map_err(|_| anyhow!("gateway configuration was refused"))?,
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.map_err(|_| anyhow!("gateway listener bind was refused"))?;
+        let address = listener.local_addr().map_err(|_| anyhow!("gateway listener address was refused"))?;
         let app =
             observe_receive_bodies(capture_receive_responses(router(state.clone()), captures.clone()), witness.clone());
         let (shutdown, signal) = oneshot::channel();
@@ -691,36 +697,62 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
                 .await
         }));
 
-        let owner = actor::owner(&db.pool).await?;
+        let owner = actor::owner(&db.pool).await.map_err(|_| anyhow!("fixture actor creation was refused"))?;
         let name = format!("slow-body-{}", &Uuid::new_v4().simple().to_string()[..12]);
-        let created = create_repository(address, &owner, &name).await?;
-        let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
+        let created = create_repository(address, &owner, &name)
+            .await
+            .map_err(|_| anyhow!("fixture repository creation was refused"))?;
+        let repository_id = Uuid::parse_str(
+            created["id"].as_str().ok_or_else(|| anyhow!("fixture repository creation returned no id"))?,
+        )
+        .map_err(|_| anyhow!("fixture repository creation returned an invalid id"))?;
         provision_decision_realm(db, &owner, &name, &store)
             .await
             .map_err(|_| anyhow!("decision realm provisioning was refused"))?;
 
-        let work = resources.work.insert(tempfile::tempdir().context("temporary Git work root")?);
+        let work =
+            resources.work.insert(tempfile::tempdir().map_err(|_| anyhow!("temporary Git work root was refused"))?);
         let direct_url = clone_url(address, &owner, &name);
-        let seeded = git.clone(work.path(), &direct_url, "seed").await?;
+        let seeded = git
+            .clone(work.path(), &direct_url, "seed")
+            .await
+            .map_err(|_| anyhow!("seed stock clone invocation was refused"))?;
         ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
         let seed_dir = work.path().join("seed");
-        let seed = git.commit(&seed_dir, SEED_FILE, SEED_CONTENT, "seed commit").await?;
+        let seed = git
+            .commit(&seed_dir, SEED_FILE, SEED_CONTENT, "seed commit")
+            .await
+            .map_err(|_| anyhow!("seed commit was refused"))?;
         let seed_target = format!("HEAD:{SEED_REF}");
-        let pushed = git.run(&seed_dir, &["push", "origin", seed_target.as_str()]).await?;
+        let pushed = git
+            .run(&seed_dir, &["push", "origin", seed_target.as_str()])
+            .await
+            .map_err(|_| anyhow!("seed push invocation was refused"))?;
         ensure!(pushed.success, "seed push was refused");
 
         let first_dir = clone_fixture(git, work.path(), &direct_url, "slow-a").await?;
         let second_dir = clone_fixture(git, work.path(), &direct_url, "slow-b").await?;
-        let first_old = git.text(&first_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
-        let second_old = git.text(&second_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
+        let first_old = git
+            .text(&first_dir, &["rev-parse", "refs/remotes/origin/main"])
+            .await
+            .map_err(|_| anyhow!("first fixture old-OID readback failed"))?;
+        let second_old = git
+            .text(&second_dir, &["rev-parse", "refs/remotes/origin/main"])
+            .await
+            .map_err(|_| anyhow!("second fixture old-OID readback failed"))?;
         ensure!(first_old == seed && second_old == seed, "the two slow-body clones did not share the seed tip");
 
         let first_new =
-            commit_bytes(git, &first_dir, "slow-a.bin", &deterministic_pack_bytes(0x51a7_0001), "slow body a").await?;
+            commit_bytes(git, &first_dir, "slow-a.bin", &deterministic_pack_bytes(0x51a7_0001), "slow body a")
+                .await
+                .map_err(|_| anyhow!("first fixture commit was refused"))?;
         let second_new =
-            commit_bytes(git, &second_dir, "slow-b.bin", &deterministic_pack_bytes(0x51a7_0002), "slow body b").await?;
+            commit_bytes(git, &second_dir, "slow-b.bin", &deterministic_pack_bytes(0x51a7_0002), "slow body b")
+                .await
+                .map_err(|_| anyhow!("second fixture commit was refused"))?;
         ensure!(first_new != second_new, "the two slow-body commits are identical");
-        let revision_before = gate_revision(db, repository_id).await?;
+        let revision_before =
+            gate_revision(db, repository_id).await.map_err(|_| anyhow!("fixture gate revision read failed"))?;
 
         ensure!(
             FIXTURE_HTTP_POST_BUFFER_BYTES > SLOW_PACK_BYTES && FIXTURE_HTTP_POST_BUFFER_BYTES < 16 * 1024 * 1024,
@@ -743,7 +775,9 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             first_handle.await
         };
         *resources.first_push = None;
-        let first_output = first_join.context("the first slow-body stock push task failed")??;
+        let first_output = first_join
+            .map_err(|_| anyhow!("the first slow-body stock push task failed"))?
+            .map_err(|_| anyhow!("the first slow-body stock push failed"))?;
         let second_join = {
             let second_handle = resources
                 .second_push
@@ -752,7 +786,9 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             second_handle.await
         };
         *resources.second_push = None;
-        let second_output = second_join.context("the second slow-body stock push task failed")??;
+        let second_output = second_join
+            .map_err(|_| anyhow!("the second slow-body stock push task failed"))?
+            .map_err(|_| anyhow!("the second slow-body stock push failed"))?;
 
         // The body criterion is independent of the ACK outcome and is checked
         // first: exactly one request body per pinned operation, exact command
@@ -853,10 +889,12 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         // UUID is not used as the private row key, and a legacy-only row is a
         // fixed refusal rather than a qualification success.
         let first_oid = durable_ref(db, repository_id, INDEPENDENT_A)
-            .await?
+            .await
+            .map_err(|_| anyhow!("durable indep-a read failed"))?
             .ok_or_else(|| anyhow!("durable indep-a is missing"))?;
         let second_oid = durable_ref(db, repository_id, INDEPENDENT_B)
-            .await?
+            .await
+            .map_err(|_| anyhow!("durable indep-b read failed"))?
             .ok_or_else(|| anyhow!("durable indep-b is missing"))?;
         ensure!(first_oid == first_new, "durable indep-a OID differs from the pushed commit");
         ensure!(second_oid == second_new, "durable indep-b OID differs from the pushed commit");
@@ -897,7 +935,8 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             &second_new,
         )
         .await?;
-        let revision_after = gate_revision(db, repository_id).await?;
+        let revision_after =
+            gate_revision(db, repository_id).await.map_err(|_| anyhow!("post-ACK gate revision read failed"))?;
         ensure!(revision_after == revision_before + 2, "the gate did not advance by exactly two independent revisions");
         let mut event_revisions = vec![first_event_revision, second_event_revision];
         event_revisions.sort_unstable();
@@ -909,13 +948,25 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         // A fresh stock client readback including `fsck --strict` proves both
         // durable refs and their pack bytes are readable without compute-view
         // reuse. It does not substitute for the private wrapper oracle above.
-        let readback = git.clone(work.path(), &direct_url, "slow-readback").await?;
+        let readback = git
+            .clone(work.path(), &direct_url, "slow-readback")
+            .await
+            .map_err(|_| anyhow!("fresh stock readback clone invocation failed"))?;
         ensure!(readback.success, "the fresh stock readback clone failed");
         let readback_dir = work.path().join("slow-readback");
-        let fsck = git.run(&readback_dir, &["fsck", "--strict"]).await?;
+        let fsck = git
+            .run(&readback_dir, &["fsck", "--strict"])
+            .await
+            .map_err(|_| anyhow!("stock readback fsck invocation failed"))?;
         ensure!(fsck.success, "stock readback fsck failed");
-        let first_read = git.text(&readback_dir, &["rev-parse", "refs/remotes/origin/indep-a"]).await?;
-        let second_read = git.text(&readback_dir, &["rev-parse", "refs/remotes/origin/indep-b"]).await?;
+        let first_read = git
+            .text(&readback_dir, &["rev-parse", "refs/remotes/origin/indep-a"])
+            .await
+            .map_err(|_| anyhow!("stock readback of indep-a failed"))?;
+        let second_read = git
+            .text(&readback_dir, &["rev-parse", "refs/remotes/origin/indep-b"])
+            .await
+            .map_err(|_| anyhow!("stock readback of indep-b failed"))?;
         ensure!(first_read == first_oid, "stock readback of indep-a differs from the durable OID");
         ensure!(second_read == second_oid, "stock readback of indep-b differs from the durable OID");
 
