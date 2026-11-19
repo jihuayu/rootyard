@@ -1,9 +1,15 @@
 use super::{
-    PublicAttemptLookup, PublicAttemptRequest, RawAttempt, RawSnapshot, RawWrapper, SELECT_SNAPSHOT, evaluate,
+    PublicAttemptLookup, PublicAttemptRequest, PublicOperationReadAuthorization, PublicOperationStatusLookup,
+    PublicOperationStatusRequest, RawAttempt, RawSnapshot, RawWrapper, SELECT_SNAPSHOT, evaluate, evaluate_status,
+    status_terminal::project_terminal,
 };
 use crate::ref_store::{
-    CommitMode, GitObjectFormat, OperationState, RefStoreError, RequestDigest,
-    core::pack_commit::{PackCommitError, PackCommitRejectCode},
+    CommitMode, CommitRejectCode, GitObjectFormat, OperationState, RefCommitResult, RefStoreError, RequestDigest,
+    TerminalKind,
+    core::pack_commit::{
+        PackCommitError, PackCommitRejectCode, PackCommitTerminal, PackTerminalRegistration,
+        receipt::PackTerminalRejection,
+    },
 };
 use uuid::Uuid;
 
@@ -96,6 +102,22 @@ fn request() -> PublicAttemptRequest {
     }
 }
 
+fn status_request() -> PublicOperationStatusRequest {
+    PublicOperationStatusRequest {
+        repository_id: repo(),
+        public_id: public(),
+        authorization: PublicOperationReadAuthorization::LiveIssuer { issuer_id: issuer() },
+    }
+}
+
+fn admin_status_request() -> PublicOperationStatusRequest {
+    PublicOperationStatusRequest {
+        repository_id: repo(),
+        public_id: public(),
+        authorization: PublicOperationReadAuthorization::RepositoryAdmin,
+    }
+}
+
 fn wrapper(current_slot: i16, state: &str) -> RawWrapper {
     RawWrapper {
         repository_id: repo(),
@@ -185,6 +207,12 @@ fn committed_attempt() -> RawAttempt {
     attempt
 }
 
+fn rejected_attempt() -> RawAttempt {
+    let mut attempt = committed_attempt();
+    attempt.operation_state = Some("rejected".into());
+    attempt
+}
+
 fn cancelled_attempt() -> RawAttempt {
     let mut attempt = base_attempt(0, private0(), plan0(), proof0(), 1);
     attempt.operation_state = Some("cancelled".into());
@@ -205,6 +233,8 @@ fn snapshot(wrapper: RawWrapper, attempts: Vec<RawAttempt>) -> RawSnapshot {
         legacy_operation: false,
         legacy_cancellation: false,
         realm_matches: true,
+        status_terminal: None,
+        status_terminal_over_bound: false,
     }
 }
 
@@ -216,7 +246,55 @@ fn empty_snapshot() -> RawSnapshot {
         legacy_operation: false,
         legacy_cancellation: false,
         realm_matches: true,
+        status_terminal: None,
+        status_terminal_over_bound: false,
     }
+}
+
+fn pack_committed_terminal() -> PackCommitTerminal {
+    PackCommitTerminal {
+        kind: TerminalKind::Committed,
+        repository_id: repo(),
+        revision: 2,
+        head_ref: Some("refs/heads/main".into()),
+        mode: "pack_verified".into(),
+        refs: vec![RefCommitResult::Applied {
+            name: "refs/heads/main".into(),
+            old_oid: Some("1".repeat(40)),
+            new_oid: Some("2".repeat(40)),
+        }],
+        registrations: vec![PackTerminalRegistration {
+            pack_id: id(11),
+            registration_id: id(12),
+            artifact_set_digest: "b".repeat(64),
+        }],
+        rejection: None,
+    }
+}
+
+fn pack_rejected_terminal(code: PackCommitRejectCode, detail: &str) -> PackCommitTerminal {
+    PackCommitTerminal {
+        kind: TerminalKind::Rejected,
+        repository_id: repo(),
+        revision: 2,
+        head_ref: Some("refs/heads/main".into()),
+        mode: "pack_verified".into(),
+        refs: vec![RefCommitResult::NotApplied {
+            name: "refs/heads/main".into(),
+            reason: CommitRejectCode::PolicyDenied,
+        }],
+        registrations: Vec::new(),
+        rejection: Some(PackTerminalRejection { code: code.as_str().to_owned(), detail: detail.to_owned() }),
+    }
+}
+
+fn terminal_value(terminal: &PackCommitTerminal) -> serde_json::Value {
+    serde_json::to_value(terminal).expect("terminal serializes")
+}
+
+fn with_terminal(mut snapshot: RawSnapshot, terminal: serde_json::Value) -> RawSnapshot {
+    snapshot.status_terminal = Some(terminal);
+    snapshot
 }
 
 fn assert_ledger(result: Result<PublicAttemptLookup, PackCommitError>) {
@@ -234,6 +312,24 @@ fn assert_identity_conflict(result: Result<PublicAttemptLookup, PackCommitError>
 
 fn assert_digest_conflict(result: Result<PublicAttemptLookup, PackCommitError>) {
     assert!(matches!(result, Err(PackCommitError::RefStore(RefStoreError::DigestConflict))));
+}
+
+fn assert_status_ledger(result: Result<PublicOperationStatusLookup, PackCommitError>) {
+    match result {
+        Err(PackCommitError::Rejected(rejection)) => {
+            assert_eq!(rejection.code, PackCommitRejectCode::LedgerIntegrity);
+        }
+        other => panic!("expected status ledger integrity, got {other:?}"),
+    }
+}
+
+fn assert_projection_ledger(result: Result<Option<serde_json::Value>, PackCommitError>) {
+    match result {
+        Err(PackCommitError::Rejected(rejection)) => {
+            assert_eq!(rejection.code, PackCommitRejectCode::LedgerIntegrity);
+        }
+        other => panic!("expected terminal projection ledger integrity, got {other:?}"),
+    }
 }
 
 #[test]
@@ -584,6 +680,466 @@ fn stored_wrapper_and_attempt_evidence_is_fail_closed() {
     let mut bad_operation_state = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
     bad_operation_state.operation_state = Some("unknown".into());
     assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![bad_operation_state]), &request()));
+}
+
+#[test]
+fn status_returns_only_the_current_public_state() {
+    let pending = evaluate_status(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &status_request(),
+    )
+    .expect("valid pending status");
+    match pending {
+        PublicOperationStatusLookup::Found(status) => {
+            assert_eq!(status.public_id, public());
+            assert_eq!(status.state, OperationState::Pending);
+            assert!(status.terminal().is_none());
+        }
+        other => panic!("expected pending status, got {other:?}"),
+    }
+
+    let committed_terminal = pack_committed_terminal();
+    let expected_committed = terminal_value(&committed_terminal);
+    let committed = evaluate_status(
+        with_terminal(snapshot(wrapper(0, "committed"), vec![committed_attempt()]), expected_committed.clone()),
+        &status_request(),
+    )
+    .expect("valid committed status");
+    match committed {
+        PublicOperationStatusLookup::Found(status) => {
+            assert_eq!(status.public_id, public());
+            assert_eq!(status.state, OperationState::Committed);
+            assert_eq!(status.terminal(), Some(&expected_committed));
+        }
+        other => panic!("expected committed status, got {other:?}"),
+    }
+
+    let rejected_terminal =
+        pack_rejected_terminal(PackCommitRejectCode::RevisionMismatch, "admitted base was superseded");
+    let expected_rejected = terminal_value(&rejected_terminal);
+    let rejected = evaluate_status(
+        with_terminal(snapshot(wrapper(0, "rejected"), vec![rejected_attempt()]), expected_rejected.clone()),
+        &status_request(),
+    )
+    .expect("valid rejected status");
+    match rejected {
+        PublicOperationStatusLookup::Found(status) => {
+            assert_eq!(status.state, OperationState::Rejected);
+            assert_eq!(status.terminal(), Some(&expected_rejected));
+        }
+        other => panic!("expected rejected status, got {other:?}"),
+    }
+
+    let expected_cancelled = serde_json::json!({"state": "cancelled", "reason": "cancel_requested"});
+    let cancelled = evaluate_status(
+        with_terminal(snapshot(wrapper(0, "cancelled"), vec![cancelled_attempt()]), expected_cancelled.clone()),
+        &status_request(),
+    )
+    .expect("valid cancelled status");
+    match cancelled {
+        PublicOperationStatusLookup::Found(status) => {
+            assert_eq!(status.state, OperationState::Cancelled);
+            assert_eq!(status.terminal(), Some(&expected_cancelled));
+        }
+        other => panic!("expected cancelled status, got {other:?}"),
+    }
+}
+
+#[test]
+fn status_requires_the_exact_live_issuer_or_a_caller_resolved_admin_policy() {
+    let mut other_issuer = status_request();
+    other_issuer.authorization = PublicOperationReadAuthorization::LiveIssuer { issuer_id: private1() };
+    assert!(matches!(
+        evaluate_status(
+            snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+            &other_issuer,
+        )
+        .expect("data-free forbidden marker"),
+        PublicOperationStatusLookup::Forbidden
+    ));
+
+    let admin = evaluate_status(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &admin_status_request(),
+    )
+    .expect("caller-resolved admin policy");
+    assert!(matches!(
+        admin,
+        PublicOperationStatusLookup::Found(status)
+            if status.public_id == public() && status.state == OperationState::Pending
+    ));
+}
+
+#[test]
+fn status_markers_preserve_unknown_legacy_and_private_routes() {
+    let mut private = empty_snapshot();
+    private.private_occupied = true;
+    private.legacy_operation = true;
+    private.legacy_cancellation = true;
+    assert!(matches!(
+        evaluate_status(private, &status_request()).expect("private marker"),
+        PublicOperationStatusLookup::PrivateIdentifier
+    ));
+
+    let mut legacy = empty_snapshot();
+    legacy.legacy_operation = true;
+    assert!(matches!(
+        evaluate_status(legacy, &status_request()).expect("legacy marker"),
+        PublicOperationStatusLookup::LegacyPath
+    ));
+
+    assert!(matches!(
+        evaluate_status(empty_snapshot(), &status_request()).expect("unknown marker"),
+        PublicOperationStatusLookup::Unknown
+    ));
+
+    let mut private_alias =
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    private_alias.private_occupied = true;
+    assert_status_ledger(evaluate_status(private_alias, &status_request()));
+}
+
+#[test]
+fn status_reuses_terminal_event_attempt_and_realm_integrity() {
+    let valid_terminal = terminal_value(&pack_committed_terminal());
+    let mut wrong_body = committed_attempt();
+    wrong_body.event_body_matches = false;
+    assert_status_ledger(evaluate_status(
+        with_terminal(snapshot(wrapper(0, "committed"), vec![wrong_body]), valid_terminal.clone()),
+        &status_request(),
+    ));
+
+    let mut pending_with_terminal = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    pending_with_terminal.operation_state = Some("committed".into());
+    pending_with_terminal.terminal_present = true;
+    pending_with_terminal.event_id = Some(event1());
+    pending_with_terminal.event_revision = Some(2);
+    pending_with_terminal.event_outcome_matches = true;
+    pending_with_terminal.event_body_matches = true;
+    assert_status_ledger(evaluate_status(
+        with_terminal(snapshot(wrapper(0, "pending"), vec![pending_with_terminal]), valid_terminal),
+        &status_request(),
+    ));
+
+    let mut stale = snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    stale.realm_matches = false;
+    assert_status_ledger(evaluate_status(stale, &status_request()));
+
+    let mut unbound = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    unbound.serving_bound = false;
+    assert_status_ledger(evaluate_status(snapshot(wrapper(0, "pending"), vec![unbound]), &status_request()));
+}
+
+#[test]
+fn status_terminal_over_the_sql_transport_bound_fails_closed() {
+    let mut over_bound = with_terminal(
+        snapshot(wrapper(0, "committed"), vec![committed_attempt()]),
+        terminal_value(&pack_committed_terminal()),
+    );
+    over_bound.status_terminal_over_bound = true;
+    assert_status_ledger(evaluate_status(over_bound, &status_request()));
+}
+
+#[test]
+fn status_checks_stored_immutable_digest_and_mode_without_a_push_request() {
+    let attempt = || vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)];
+
+    let mut bad_wire = wrapper(0, "pending");
+    bad_wire.wire_digest = "not-a-wire-digest".into();
+    assert_status_ledger(evaluate_status(snapshot(bad_wire, attempt()), &status_request()));
+
+    let mut bad_mode = wrapper(0, "pending");
+    bad_mode.request_mode = "unknown".into();
+    assert_status_ledger(evaluate_status(snapshot(bad_mode, attempt()), &status_request()));
+
+    let mut bad_backend = wrapper(0, "pending");
+    bad_backend.backend_identity = "not-a-backend".into();
+    assert_status_ledger(evaluate_status(snapshot(bad_backend, attempt()), &status_request()));
+
+    let mut bad_state = wrapper(0, "pending");
+    bad_state.state = "unknown".into();
+    assert_status_ledger(evaluate_status(snapshot(bad_state, attempt()), &status_request()));
+}
+
+#[test]
+fn status_request_shape_and_debug_are_bounded_and_redacted() {
+    let mut nil_repo = status_request();
+    nil_repo.repository_id = Uuid::nil();
+    assert!(matches!(nil_repo.validate(), Err(PackCommitError::Invalid(_))));
+
+    let mut nil_public = status_request();
+    nil_public.public_id = Uuid::nil();
+    assert!(matches!(nil_public.validate(), Err(PackCommitError::Invalid(_))));
+
+    let mut nil_issuer = status_request();
+    nil_issuer.authorization = PublicOperationReadAuthorization::LiveIssuer { issuer_id: Uuid::nil() };
+    assert!(matches!(nil_issuer.validate(), Err(PackCommitError::Invalid(_))));
+    assert!(admin_status_request().validate().is_ok());
+
+    let found = evaluate_status(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &status_request(),
+    )
+    .expect("valid pending status");
+    let debug = format!("{found:?}");
+    for secret in [
+        public().to_string(),
+        private0().to_string(),
+        plan0().as_hex(),
+        proof0().as_hex(),
+        wire().as_hex(),
+        event0().to_string(),
+    ] {
+        assert!(!debug.contains(secret.as_str()), "status Debug leaked {secret}");
+    }
+    assert!(debug.contains("Found"));
+    assert!(debug.contains("Pending"));
+
+    let request_debug = format!("{:?}", status_request());
+    for secret in [repo().to_string(), public().to_string(), issuer().to_string()] {
+        assert!(!request_debug.contains(secret.as_str()), "status request Debug leaked {secret}");
+    }
+    assert!(request_debug.contains("LiveIssuer"));
+    assert_eq!(format!("{:?}", PublicOperationReadAuthorization::RepositoryAdmin), "RepositoryAdmin");
+}
+
+#[test]
+fn status_terminal_projection_keeps_the_exact_typed_public_payload() {
+    let terminal = pack_committed_terminal();
+    let expected = terminal_value(&terminal);
+    let projected =
+        project_terminal(OperationState::Committed, repo(), GitObjectFormat::Sha1, Some(2), Some(&expected))
+            .expect("valid committed projection")
+            .expect("committed terminal is present");
+    assert_eq!(projected, expected);
+    let object = projected.as_object().expect("terminal object");
+    assert_eq!(object.len(), 8);
+    for field in ["kind", "repository_id", "revision", "head_ref", "mode", "refs", "registrations", "rejection"] {
+        assert!(object.contains_key(field), "terminal is missing {field}");
+    }
+    let registration =
+        object["registrations"].as_array().expect("registrations array")[0].as_object().expect("registration object");
+    for field in ["pack_id", "registration_id", "artifact_set_digest"] {
+        assert!(registration.contains_key(field), "registration is missing {field}");
+    }
+    assert_eq!(registration.len(), 3);
+
+    let rejected = pack_rejected_terminal(PackCommitRejectCode::RevisionMismatch, "admitted base was superseded");
+    let expected = terminal_value(&rejected);
+    let projected = project_terminal(OperationState::Rejected, repo(), GitObjectFormat::Sha1, Some(2), Some(&expected))
+        .expect("valid rejected projection")
+        .expect("rejected terminal is present");
+    assert_eq!(projected, expected);
+}
+
+#[test]
+fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
+    let expected = terminal_value(&pack_committed_terminal());
+    assert_projection_ledger(project_terminal(
+        OperationState::Pending,
+        repo(),
+        GitObjectFormat::Sha1,
+        None,
+        Some(&expected),
+    ));
+    assert_projection_ledger(project_terminal(
+        OperationState::Cancelled,
+        repo(),
+        GitObjectFormat::Sha1,
+        None,
+        Some(&serde_json::json!({"state": "cancelled", "reason": "cancel_before_register"})),
+    ));
+
+    let mut extra = expected.clone();
+    extra.as_object_mut().expect("terminal object").insert("wire_digest".into(), serde_json::json!("leaked"));
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&extra),
+    ));
+
+    let mut missing = expected.clone();
+    missing.as_object_mut().expect("terminal object").remove("mode");
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&missing),
+    ));
+
+    let mut wrong_repo = expected.clone();
+    wrong_repo["repository_id"] = serde_json::json!(id(99));
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&wrong_repo),
+    ));
+
+    let mut wrong_revision = expected.clone();
+    wrong_revision["revision"] = serde_json::json!(3);
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&wrong_revision),
+    ));
+
+    let mut wrong_kind = expected.clone();
+    wrong_kind["kind"] = serde_json::json!("rejected");
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&wrong_kind),
+    ));
+
+    let mut non_applied = expected.clone();
+    non_applied["refs"] = serde_json::json!([{
+        "outcome": "not_applied",
+        "name": "refs/heads/main",
+        "reason": "policy_denied"
+    }]);
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&non_applied),
+    ));
+
+    let mut bad_head = expected.clone();
+    bad_head["head_ref"] = serde_json::json!("not-a-ref");
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&bad_head),
+    ));
+
+    let mut bad_oid = expected.clone();
+    bad_oid["refs"][0]["new_oid"] = serde_json::json!("0".repeat(40));
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&bad_oid),
+    ));
+
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&serde_json::json!([1, 2])),
+    ));
+}
+
+#[test]
+fn status_terminal_projection_validates_rejection_paths_and_registrations() {
+    for terminal in [
+        pack_rejected_terminal(PackCommitRejectCode::RevisionMismatch, "admitted base was superseded"),
+        pack_rejected_terminal(PackCommitRejectCode::NoRefApplied, "no ref accepted"),
+        pack_rejected_terminal(PackCommitRejectCode::DecisionRejected, "policy_changed"),
+    ] {
+        let expected = terminal_value(&terminal);
+        let projected =
+            project_terminal(OperationState::Rejected, repo(), GitObjectFormat::Sha1, Some(2), Some(&expected))
+                .expect("accepted rejection producer path")
+                .expect("rejected terminal is present");
+        assert_eq!(projected, expected);
+    }
+
+    let unknown_detail = pack_rejected_terminal(PackCommitRejectCode::DecisionRejected, "caller supplied text");
+    let unknown_detail = terminal_value(&unknown_detail);
+    assert_projection_ledger(project_terminal(
+        OperationState::Rejected,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&unknown_detail),
+    ));
+
+    let mut with_registration = pack_rejected_terminal(PackCommitRejectCode::NoRefApplied, "no ref accepted");
+    with_registration.registrations = pack_committed_terminal().registrations;
+    let with_registration = terminal_value(&with_registration);
+    assert_projection_ledger(project_terminal(
+        OperationState::Rejected,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&with_registration),
+    ));
+
+    let mut bad_registration = pack_committed_terminal();
+    bad_registration.registrations[0].artifact_set_digest = "not-a-digest".into();
+    let bad_registration = terminal_value(&bad_registration);
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&bad_registration),
+    ));
+}
+
+#[test]
+fn status_terminal_projection_uses_the_compact_64k_bound() {
+    let mut dense = pack_committed_terminal();
+    dense.refs = (0..80)
+        .map(|index| RefCommitResult::Applied {
+            name: format!("refs/heads/{index:02}-{}", "n".repeat(300)),
+            old_oid: Some("1".repeat(40)),
+            new_oid: Some("2".repeat(40)),
+        })
+        .collect();
+    dense.registrations.clear();
+    let dense = terminal_value(&dense);
+    assert!(serde_json::to_vec(&dense).expect("compact terminal").len() < 64 * 1024);
+    assert!(project_terminal(OperationState::Committed, repo(), GitObjectFormat::Sha1, Some(2), Some(&dense)).is_ok());
+
+    let oversized = serde_json::json!({"body": "x".repeat(65 * 1024)});
+    assert_projection_ledger(project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        Some(2),
+        Some(&oversized),
+    ));
+}
+
+#[test]
+fn status_terminal_debug_redacts_the_private_view() {
+    let terminal = pack_committed_terminal();
+    let expected = terminal_value(&terminal);
+    let found = evaluate_status(
+        with_terminal(snapshot(wrapper(0, "committed"), vec![committed_attempt()]), expected),
+        &status_request(),
+    )
+    .expect("valid committed status");
+    let debug = format!("{found:?}");
+    for secret in [
+        "refs/heads/main".to_owned(),
+        terminal.registrations[0].pack_id.to_string(),
+        terminal.registrations[0].registration_id.to_string(),
+        terminal.registrations[0].artifact_set_digest.clone(),
+        public().to_string(),
+        private0().to_string(),
+        wire().as_hex(),
+    ] {
+        assert!(!debug.contains(secret.as_str()), "status Debug leaked {secret}");
+    }
+    assert!(debug.contains("Found"));
+    assert!(debug.contains("Committed"));
+    assert!(debug.contains("<redacted>"));
 }
 
 #[test]

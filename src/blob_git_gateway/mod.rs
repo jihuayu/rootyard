@@ -36,6 +36,7 @@ mod history;
 mod metadata;
 mod native;
 mod operation;
+mod operation_read;
 mod process_guard;
 mod protocol;
 mod publish;

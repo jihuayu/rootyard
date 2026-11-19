@@ -181,6 +181,9 @@ pub struct Db {
     admin: Pool,
     pub pool: Pool,
     pub(super) schema: String,
+    /// Present only for a fixture that owns a whole random database (needed by
+    /// migration 152's explicit `public.cluster_authority` references).
+    owned_database: Option<String>,
 }
 
 impl Db {
@@ -212,10 +215,72 @@ impl Db {
             .get(0);
         ensure!(installed, "db::migrate did not install migration 144 and the core gate/pack tables");
         drop(client);
-        Ok(Self { admin, pool, schema })
+        Ok(Self { admin, pool, schema, owned_database: None })
+    }
+
+    /// Create a complete random, disposable database whose public schema is
+    /// migrated. Migration 152 names `public.cluster_authority`, so the
+    /// schema-isolated fixture above cannot host its wrapper functions. The
+    /// caller must have CREATEDB; [`Db::finish`] drops this owned database.
+    pub async fn setup_public_owned() -> Result<Self> {
+        // Pin the per-process Blob prefix through the existing fixture. The
+        // random schema selector it also writes is discarded by `options`
+        // below; only the independently owned database is used here.
+        let _ = prepare()?;
+        let url = std::env::var("ROOTYARD_TEST_DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("ROOTYARD_TEST_DATABASE_URL must be set for the blob_git_gateway suite"))?;
+        let admin = db::pool(&url)?;
+        let database = format!("rootyard_public_{}", Uuid::new_v4().simple());
+        let create = admin.get().await?;
+        create
+            .batch_execute(&format!("CREATE DATABASE {database}"))
+            .await
+            .map_err(|error| anyhow::anyhow!("could not create the owned public-schema database: {error}"))?;
+        drop(create);
+
+        let setup: Result<Pool> = async {
+            let mut config: tokio_postgres::Config = url.parse()?;
+            config.dbname(&database);
+            config.options("-c search_path=public -c timezone=UTC -c statement_timeout=30000 -c lock_timeout=15000");
+            let pool = Pool::builder(Manager::new(config, tokio_postgres::NoTls))
+                .runtime(deadpool_postgres::Runtime::Tokio1)
+                .max_size(16)
+                .build()?;
+            db::migrate(&pool).await?;
+            let client = pool.get().await?;
+            let installed: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152)
+                        AND to_regclass('ref_store_public_operations') IS NOT NULL
+                        AND to_regclass('ref_store_private_attempts') IS NOT NULL",
+                    &[],
+                )
+                .await?
+                .get(0);
+            ensure!(installed, "db::migrate did not install migration 152 in the owned public schema");
+            drop(client);
+            Ok(pool)
+        }
+        .await;
+
+        match setup {
+            Ok(pool) => Ok(Self { admin, pool, schema: "public".to_owned(), owned_database: Some(database) }),
+            Err(error) => {
+                let cleanup = drop_owned_database(&admin, &database).await;
+                match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(anyhow::anyhow!(
+                        "{error:#}; owned public-schema database cleanup also failed: {cleanup_error:#}"
+                    )),
+                }
+            }
+        }
     }
 
     pub async fn teardown(&self) -> Result<()> {
+        if let Some(database) = &self.owned_database {
+            return drop_owned_database(&self.admin, database).await;
+        }
         self.admin.get().await?.batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema)).await?;
         Ok(())
     }
@@ -229,6 +294,20 @@ impl Db {
             }
         }
     }
+}
+
+/// Drop one database whose ownership is already proven by a successful
+/// `CREATE DATABASE`. Active fixture pools are terminated first.
+async fn drop_owned_database(admin: &Pool, database: &str) -> Result<()> {
+    let client = admin.get().await?;
+    client
+        .query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()",
+            &[&database],
+        )
+        .await?;
+    client.batch_execute(&format!("DROP DATABASE {database}")).await?;
+    Ok(())
 }
 
 #[cfg(test)]
