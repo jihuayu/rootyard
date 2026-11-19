@@ -60,7 +60,9 @@ use crate::{
             },
         },
         pg::{
-            public_attempt::{PublicAttemptEvidence, PublicAttemptLookup, PublicAttemptRequest},
+            public_attempt::{
+                PublicAttemptEvidence, PublicAttemptFinishLookup, PublicAttemptLookup, PublicAttemptRequest,
+            },
             public_terminal::{PublicAttemptRetirement, PublicAttemptTerminalOutcome},
             slot_zero::SlotZeroAdmissionRequest,
         },
@@ -403,7 +405,16 @@ pub(super) async fn push_private(
                     verified.mode(),
                     state.store().backend_identity().as_hex().to_owned(),
                 )?;
-                match mirror_public_terminal_with_request(state, &public_request, &record, deadline).await? {
+                match mirror_public_terminal_with_request(
+                    state,
+                    serving,
+                    verified.actor(),
+                    &public_request,
+                    &record,
+                    deadline,
+                )
+                .await?
+                {
                     PublicAttemptTerminalOutcome::Mirrored(_) => {
                         return Ok(PrivatePushOutcome::Terminal { terminal, private_id: Some(private_id) });
                     }
@@ -473,7 +484,16 @@ async fn complete_private_probe(
                 verified.mode(),
                 state.store().backend_identity().as_hex().to_owned(),
             )?;
-            match mirror_public_terminal_with_request(state, &public_request, &record, deadline).await? {
+            match mirror_public_terminal_with_request(
+                state,
+                serving,
+                verified.actor(),
+                &public_request,
+                &record,
+                deadline,
+            )
+            .await?
+            {
                 PublicAttemptTerminalOutcome::Mirrored(_) => {
                     Ok(PrivatePushOutcome::Terminal { terminal, private_id: Some(private_id) })
                 }
@@ -703,14 +723,25 @@ pub(super) async fn finish_public_terminal(
         request_mode,
         state.store().backend_identity().as_hex().to_owned(),
     )?;
-    mirror_public_terminal_with_request(state, &public_request, record, deadline).await
+    mirror_public_terminal_with_request(state, serving, actor, &public_request, record, deadline).await
 }
 
 /// Shared dedicated-transaction terminal mirror. The typed public request is
 /// already the exact authenticated wrapper identity; no private UUID is read
 /// from it or formatted into an error.
+///
+/// The transaction takes the migration-152 public/attempt keys first. If the
+/// wrapper is still pending (the only mutating case), it then re-authenticates
+/// the current actor and writable serving realm through the existing authorized
+/// lookup before the mirror update. The token row stays locked through the
+/// wrapper update and the one outer COMMIT, so a revocation between the prior
+/// probe and this attempt either refuses before the update or blocks until
+/// commit. An already-terminal wrapper remains a read-only replay and does not
+/// take a fresh write-authorization step.
 async fn mirror_public_terminal_with_request(
     state: &BlobGitState,
+    serving: &ServingRepository,
+    actor: &Identity,
     public_request: &PublicAttemptRequest,
     record: &OperationRecord,
     deadline: Instant,
@@ -721,6 +752,52 @@ async fn mirror_public_terminal_with_request(
         Ok(Err(_)) => return Err(GatewayError::Internal("private terminal mirror transaction failed")),
         Err(_) => return Err(GatewayError::Timeout),
     };
+    if let Err(error) =
+        PgRefStore.lock_public_attempt(&**tx, public_request, record.identity().operation_id(), deadline).await
+    {
+        let _ = rollback_deadpool_bounded(tx, deadline).await;
+        return Err(GatewayError::from(error));
+    }
+    let may_mutate = match PgRefStore.lookup_public_attempt_finish(&**tx, public_request, deadline).await {
+        Ok(PublicAttemptFinishLookup::Evidence(found)) => found.wrapper_state == OperationState::Pending,
+        Ok(_) => false,
+        Err(error) => {
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
+            return Err(GatewayError::from(error));
+        }
+    };
+    if may_mutate {
+        let fresh = match crate::ref_store::serving::lookup_in_tx(
+            &tx,
+            actor,
+            &serving.repository.owner,
+            &serving.repository.name,
+            true,
+            state.store().backend_identity(),
+            deadline,
+        )
+        .await
+        {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                let _ = rollback_deadpool_bounded(tx, deadline).await;
+                return Err(GatewayError::from(error));
+            }
+        };
+        if fresh.gate.repository_id() != public_request.repository_id
+            || fresh.gate.tenant_id() != public_request.admission_owner_id
+            || fresh.gate.object_format() != public_request.object_format
+            || fresh.gate.history_incarnation() != public_request.history_incarnation
+            || fresh.gate.authority_epoch() != public_request.authority_epoch
+            || fresh.gate.group_epoch() != public_request.group_epoch
+            || fresh.cluster_incarnation != public_request.restore_incarnation
+            || crate::ref_store::core::RealmExpectation::from_gate(&fresh.gate)
+                != crate::ref_store::core::RealmExpectation::from_gate(&serving.gate)
+        {
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
+            return Err(GatewayError::Conflict("repository authority changed; retry"));
+        }
+    }
     let mirrored = timeout_at(
         deadline,
         PgRefStore.mirror_public_attempt_terminal_in_tx(&**tx, public_request, record, deadline),
@@ -804,7 +881,16 @@ pub(super) async fn retire_slot_one(
             let private_id = plan.identity().operation_id();
             let record =
                 load_terminal_record(state, serving.gate.repository_id(), private_id, deadline).await?;
-            match mirror_public_terminal_with_request(state, &public_request, &record, deadline).await? {
+            match mirror_public_terminal_with_request(
+                state,
+                serving,
+                verified.actor(),
+                &public_request,
+                &record,
+                deadline,
+            )
+            .await?
+            {
                 PublicAttemptTerminalOutcome::Mirrored(_) => {
                     Ok(RetiredSlotOneOutcome { terminal, private_id })
                 }

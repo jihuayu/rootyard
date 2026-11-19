@@ -89,6 +89,32 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
             "the raw child report must be gated by the authoritative public probe",
         )
 
+    def test_mirror_rechecks_current_write_authority_before_its_owner_commit(self):
+        mirror = slice_between(
+            self.publish,
+            "async fn mirror_public_terminal_with_request(",
+            "/// The one terminal produced",
+        )
+        self.assertIn("lock_public_attempt(&**tx, public_request, record.identity().operation_id()", mirror)
+        self.assertIn("lookup_public_attempt_finish(&**tx, public_request, deadline)", mirror)
+        self.assertIn("found.wrapper_state == OperationState::Pending", mirror)
+        self.assertIn("crate::ref_store::serving::lookup_in_tx(", mirror)
+        self.assertIn("fresh.gate.repository_id() != public_request.repository_id", mirror)
+        self.assertIn("fresh.gate.tenant_id() != public_request.admission_owner_id", mirror)
+        self.assertIn("fresh.cluster_incarnation != public_request.restore_incarnation", mirror)
+        self.assertIn("RealmExpectation::from_gate(&fresh.gate)", mirror)
+        self.assertIn("mirror_public_attempt_terminal_in_tx(", mirror)
+        self.assertIn("commit_deadpool_bounded(tx, deadline).await?", mirror)
+        self.assertIn("rollback_deadpool_bounded(tx, deadline).await", mirror)
+        self.assertLess(
+            mirror.index("lookup_in_tx("),
+            mirror.index("mirror_public_attempt_terminal_in_tx("),
+            "owner auth must precede the mirror mutation",
+        )
+        self.assertNotIn("loop {", mirror)
+        self.assertNotIn("private_id", mirror)
+        self.assertNotIn("format!(", mirror)
+
     def test_private_fresh_entry_selects_begin_slot_zero_and_never_the_legacy_writer(self):
         private = slice_between(
             self.publish,
@@ -100,7 +126,8 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("Start::Fresh { plan, _token: token }", private)
         self.assertIn("publish_pair(state, &plan, planned.pack_id(), pair, deadline)", private)
         self.assertIn("decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline)", private)
-        self.assertIn("mirror_public_terminal_with_request(state, &public_request, &record, deadline)", private)
+        self.assertIn("mirror_public_terminal_with_request(", private)
+        self.assertIn("verified.actor(),", private)
         self.assertIn("PrivatePushOutcome::Terminal", private)
         self.assertIn("Start::Terminal(_)", private)
         self.assertNotIn("begin_fresh(", private)
@@ -168,7 +195,8 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("slot_one::rotate_slot_one(state, serving, &handoff, &baseline, deadline)", retire)
         self.assertIn("publish_pair(state, &plan, planned.pack_id(), pair, deadline)", retire)
         self.assertIn("decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline)", retire)
-        self.assertIn("mirror_public_terminal_with_request(state, &public_request, &record, deadline)", retire)
+        self.assertIn("mirror_public_terminal_with_request(", retire)
+        self.assertIn("verified.actor(),", retire)
         self.assertIn("slot_one::SlotOneAdmission::Replayed(_) => Err(GatewayError::OutcomeUnknown)", retire)
         self.assertNotIn("loop {", retire)
         self.assertNotIn("rebases", retire)
