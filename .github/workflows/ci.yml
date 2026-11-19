@@ -20,12 +20,25 @@ jobs:
     # reaps orphaned Git grandchildren. Do not introduce a global child
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
-    # 95 minutes baseline, 12 for the #304 cold tenant LFS gate on owned Garage,
-    # 28 for the full Redis qualification (13 build, 5 restore/flush, 3
-    # partition, 4 failover, 3 cleanup and manifest binding), 40 for the Pando
-    # package gates, and 22 for the #29 bounded owned-Garage named witness:
-    # 95 + 12 + 28 + 40 + 22 = 197 minutes.
-    timeout-minutes: 197
+    # Main's verify/lifecycle budget is 175 minutes: the 95-minute baseline plus
+    # 12 for the #304 cold tenant LFS gate on owned Garage and 28 for the full
+    # Redis qualification (13 build, 5 restore/flush, 3 partition, 4 failover,
+    # 3 cleanup and manifest binding), plus 40 for the Pando package gates.
+    # This branch's independent workspace FUSE lane adds three phases on top of
+    # that budget, each independent of every main step: the 12-minute start of
+    # the job-owned workspace FUSE/remote S3 fixture, the 30-minute
+    # helper/lifecycle and remote-delete acceptance step, and the 10-minute
+    # legacy four-case service-shutdown step. The C5 API-SIGKILL case runs
+    # inside that same helper step and shares its 30-minute cap, so it reserves
+    # no separate job minutes. The bind, stop and upload steps keep no
+    # independent cap of their own, and no existing step cap is inflated: the
+    # helper step cap stays 30.
+    # 175 + 12 + 30 + 10 = 227 for main's live workspace/FUSE budget.
+    # PR #321 adds the independent #29 bounded owned-Garage named witness at
+    # 22 minutes, with its own 540s start and 90s stop lifecycle deadlines:
+    # 227 + 22 = 249. Keep this bounded; raising it further must not be used to
+    # hide a regression inside one individual step.
+    timeout-minutes: 249
     services:
       postgres:
         image: postgres:17
@@ -121,7 +134,8 @@ jobs:
           java -version
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --features pando-lab -- -D warnings
-      - run: cargo test --locked --all-targets --features pando-lab
+      - id: cargo_all_targets
+        run: cargo test --locked --all-targets --features pando-lab
       - name: Verify durable PostgreSQL workers
         run: cargo test --locked --features pando-lab --test outbox --test resolution_fences -- --ignored
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
@@ -160,6 +174,8 @@ jobs:
             --harness scripts/native_build_receipt.py \
             --harness .github/workflows/ci.yml
       - name: Build native bins and RefStore fixtures in one batch
+        id: native_batch
+        if: ${{ !cancelled() && (steps.cargo_all_targets.outcome == 'success' || steps.cargo_all_targets.outcome == 'failure') }}
         timeout-minutes: 10
         run: |
           python3 scripts/build_native_batch.py \
@@ -173,6 +189,8 @@ jobs:
             --manifest-out test-results/native-build-batch.json \
             --artifact-store "$HOME/.cache/rootyard/native-artifacts"
       - name: Export immutable native artifact paths
+        id: native_export
+        if: ${{ !cancelled() && steps.native_batch.outcome == 'success' }}
         run: |
           python3 scripts/export_native_artifacts.py \
             --manifest test-results/native-build-batch.json \
@@ -338,7 +356,8 @@ jobs:
         # periodic stderr thread stacks without changing exit semantics.
         env:
           ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 283 && 'test-results/python-ci-result.json' || '' }}
-          ROOTYARD_PYTHON_SUITE_REPORT: ${{ (github.event.pull_request.number == 277 || github.event.pull_request.number == 283) && 'test-results/python-ci-result.json' || '' }}
+          ROOTYARD_PYTHON_CI_REPORT_258: ${{ github.event.pull_request.number == 258 && 'test-results/python-ci-result.json' || '' }}
+          ROOTYARD_PYTHON_SUITE_REPORT: ${{ (github.event.pull_request.number == 258 || github.event.pull_request.number == 277 || github.event.pull_request.number == 283) && 'test-results/python-ci-result.json' || '' }}
         run: |
           report_args=()
           if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then
@@ -651,6 +670,130 @@ jobs:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
           ROOTYARD_WORKSPACE_MOUNT_MODE: direct
         run: python3 tests/workspace_capture_acceptance.py --binary "$ROOTYARD_BIN" --report test-results/workspace-capture.json
+      - name: Start the job-owned workspace FUSE/remote S3 fixture
+        id: workspace_garage
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' }}
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          garage_dir="$RUNNER_TEMP/rootyard-workspace-fuse-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          env_file="$RUNNER_TEMP/rootyard-workspace-fuse-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.env"
+          scripts/owned_garage_fixture.sh start             --directory "$garage_dir"             --output-env "$env_file"             --bucket-prefix "rootyard-workspace-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"             --region garage
+          echo "directory=$garage_dir" >> "$GITHUB_OUTPUT"
+          echo "env_file=$env_file" >> "$GITHUB_OUTPUT"
+      - name: Exercise original FUSE helper and remote-delete acceptance
+        id: workspace_fuse_remote
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' && steps.workspace_garage.outcome == 'success' && steps.workspace_garage.outputs.env_file != '' }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          test -n "${ROOTYARD_BIN:-}"
+          test -x "$ROOTYARD_BIN"
+          test -n "${ROOTYARD_BUILD_RECEIPT:-}"
+          test -f "$ROOTYARD_BUILD_RECEIPT"
+          set -a
+          . "${{ steps.workspace_garage.outputs.env_file }}"
+          set +a
+          set +e
+          ROOTYARD_TEST_FUSE_BACKEND=fuse-helper             python3 tests/workspace_fuse_service_acceptance.py               --report test-results/workspace-fuse-service.json
+          fuse_rc=$?
+          python3 tests/workspace_remote_delete_policy.py             --binary "$ROOTYARD_BIN"             --report test-results/workspace-remote-delete-policy.json
+          remote_rc=$?
+          if [ "$fuse_rc" -ne 0 ] || [ "$remote_rc" -ne 0 ]; then
+            exit 1
+          fi
+      - name: Bind workspace FUSE and remote-delete evidence to the built binary
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' && steps.workspace_fuse_remote.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/native_report_manifest.py --mode job             --manifest-out test-results/native-workspace-fuse-gate.json             --expect-commit "$GITHUB_SHA"             --build-receipt "$ROOTYARD_BUILD_RECEIPT"             --binary "$ROOTYARD_BIN"             --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST"             --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256"             --report workspace_fuse_service=test-results/workspace-fuse-service.json             --report workspace_remote_delete=test-results/workspace-remote-delete-policy.json             --require-case workspace_fuse_service=tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_live_editor_capture_checkpoint_and_remount             --require-case workspace_fuse_service=tests.test_workspace_handoff.WorkspaceHandoffTest.test_expired_host_reattach_from_remote_checkpoint             --require-case workspace_fuse_service=tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_normal_sigterm_helper_unmount_precedes_parked_git_join             --require-case workspace_fuse_service=tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_api_sigkill_with_pending_kernel_writer             --require-case workspace_remote_delete=invalid_optin_rejected_at_startup             --require-case workspace_remote_delete=default_retains_failed_remote_cleanup             --require-case workspace_remote_delete=exit77_with_pending_fuse_request             --harness tests/test_workspace_fuse_service.py             --harness tests/test_workspace_handoff.py             --harness tests/workspace_fuse_service_acceptance.py             --harness tests/workspace_remote_delete_policy.py             --harness tests/runtime_binary.py             --harness tests/source_bound_binary.py             --harness tests/ops_provenance.py             --harness tests/native_evidence.py             --harness tests/e2e.py             --harness tests/owned_fuse_cleanup.py             --harness tests/fuse_helper_native_support.py             --harness tests/workspace_normal_shutdown_support.py             --harness tests/workspace_capture_acceptance.py             --harness tests/lfs_hydration_concurrency.py             --harness tests/lfs.py             --harness tests/lfs_remote_contract.py             --harness tests/schema_baseline.py             --harness tests/fixtures/capture_read_gate.c             --harness scripts/native_report_manifest.py             --harness scripts/native_build_receipt.py             --harness .github/workflows/ci.yml             --fixture-rust-from-receipt             --fixture workspace_mount_mode=fuse-helper             --fixture postgres=postgres:17             --fixture garage=garage:2.1.0             --fixture fuse_device="$(stat -Lc '%F mode=%a' /dev/fuse)"
+      - name: Exercise four legacy in-process FUSE service-shutdown cases
+        id: workspace_legacy_service
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ROOTYARD_BIN:-}"
+          test -x "$ROOTYARD_BIN"
+          test -n "${ROOTYARD_BUILD_RECEIPT:-}"
+          test -f "$ROOTYARD_BUILD_RECEIPT"
+          test -n "${ROOTYARD_TEST_DATABASE_URL:-}"
+          test -c /dev/fuse
+          command -v unshare >/dev/null
+          command -v nsenter >/dev/null
+          python3 tests/workspace_legacy_fuse_shutdown_report.py \
+            --report test-results/workspace-legacy-service.json
+      - name: Bind legacy FUSE evidence independently to the built binary
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' && steps.workspace_legacy_service.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/native-workspace-legacy-gate.json \
+            --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+            --binary "$ROOTYARD_BIN" \
+            --expect-commit "$GITHUB_SHA" \
+            --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
+            --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
+            --report workspace_legacy_service=test-results/workspace-legacy-service.json \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_normal_legacy_sigterm_join_evidence_and_exact_unmount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_partial_reconcile_failure_cleans_earlier_owned_mount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_post_reconcile_api_bind_failure_cleans_owned_mount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_sigterm_during_blocked_startup_joins_mounted_owner \
+            --harness tests/workspace_legacy_fuse_shutdown_report.py \
+            --harness tests/workspace_legacy_fuse_shutdown_acceptance.py \
+            --harness tests/workspace_legacy_fuse_shutdown_support.py \
+            --harness tests/workspace_legacy_fuse_shutdown_fixtures.py \
+            --harness tests/workspace_legacy_fuse_shutdown_ownership.py \
+            --harness tests/workspace_legacy_fuse_shutdown_fifo.py \
+            --harness tests/fuse_helper_native_support.py \
+            --harness tests/e2e.py \
+            --harness tests/runtime_binary.py \
+            --harness tests/source_bound_binary.py \
+            --harness tests/native_evidence.py \
+            --harness tests/ops_provenance.py \
+            --harness tests/owned_fuse_cleanup.py \
+            --harness tests/test_workspace_legacy_fuse_shutdown_primary.py \
+            --harness tests/test_workspace_legacy_fuse_shutdown_fifo.py \
+            --harness tests/test_workspace_legacy_fuse_containment_owner.py \
+            --harness tests/test_workspace_legacy_fuse_bind_gate.py \
+            --harness tests/test_workspace_legacy_fuse_stat_gate.py \
+            --harness tests/fixtures/api_bind_gate.c \
+            --harness tests/fixtures/legacy_stat_gate.c \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/native_build_receipt.py \
+            --harness .github/workflows/ci.yml \
+            --fixture-rust-from-receipt \
+            --fixture postgres=postgres:17
+      - name: Stop only the job-owned workspace FUSE/remote Garage fixture
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          garage_dir="$RUNNER_TEMP/rootyard-workspace-fuse-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if [ -f "$garage_dir/.rootyard-owned-fixture" ]; then
+            scripts/owned_garage_fixture.sh stop --directory "$garage_dir"
+          fi
+      - name: Upload workspace FUSE/remote acceptance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-fuse-service-acceptance
+          path: |
+            test-results/workspace-fuse-service.json
+            test-results/workspace-remote-delete-policy.json
+            test-results/workspace-legacy-service.json
+            test-results/native-workspace-fuse-gate.json
+            test-results/native-workspace-legacy-gate.json
+            ${{ env.ROOTYARD_BUILD_RECEIPT }}
+            ${{ env.ROOTYARD_BATCH_MANIFEST }}
+            test-results/ci-native-tools/provenance.json
+          if-no-files-found: ignore
       - name: Exercise Namespace, Git View and cross-repository ChangeSet semantics
         run: python3 tests/git_views.py --binary "$ROOTYARD_VIEW_LAB_BIN" --report test-results/git-views.json
       - name: Exercise Pando object store delta resolution, graph traversal, and differential export
@@ -844,6 +987,7 @@ jobs:
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
             --report workspace_capture=test-results/workspace-capture.json \
             --report workspace_remote_auth=test-results/workspace-remote-auth.json \
+            --report workspace_legacy_service=test-results/workspace-legacy-service.json \
             --report repository_pagination=test-results/repository-pagination.json \
             --report organization_pagination=test-results/organization-pagination.json \
             --report organizations=test-results/organizations.json \
@@ -929,7 +1073,21 @@ jobs:
             --harness tests/workspace_capture_acceptance.py \
             --harness scripts/run_named_unittest.py \
             --harness tests/test_workspace_remote.py \
+            --harness tests/workspace_legacy_fuse_shutdown_acceptance.py \
+            --harness tests/workspace_legacy_fuse_shutdown_support.py \
+            --harness tests/workspace_legacy_fuse_shutdown_fixtures.py \
+            --harness tests/workspace_legacy_fuse_shutdown_ownership.py \
+            --harness tests/workspace_legacy_fuse_shutdown_fifo.py \
+            --harness tests/workspace_legacy_fuse_shutdown_report.py \
+            --harness tests/fuse_helper_native_support.py \
             --harness tests/runtime_binary.py \
+            --harness tests/test_workspace_legacy_fuse_shutdown_primary.py \
+            --harness tests/test_workspace_legacy_fuse_shutdown_fifo.py \
+            --harness tests/test_workspace_legacy_fuse_containment_owner.py \
+            --harness tests/test_workspace_legacy_fuse_bind_gate.py \
+            --harness tests/test_workspace_legacy_fuse_stat_gate.py \
+            --harness tests/fixtures/api_bind_gate.c \
+            --harness tests/fixtures/legacy_stat_gate.c \
             --harness tests/fixtures/capture_read_gate.c \
             --harness tests/repository_pagination.py \
             --harness tests/organization_pagination.py \
@@ -988,6 +1146,10 @@ jobs:
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing \
             --require-case workspace_remote_auth=tests.test_workspace_remote.WorkspaceRemoteTest.test_commit_retry_and_restore_without_source_volume \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_normal_legacy_sigterm_join_evidence_and_exact_unmount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_partial_reconcile_failure_cleans_earlier_owned_mount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_post_reconcile_api_bind_failure_cleans_owned_mount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_sigterm_during_blocked_startup_joins_mounted_owner \
             --require-case lfs_read_amplification=read_amplification_and_offline_remote \
             --require-case lfs_split_tx_races=split_tx_races_reauth_and_repair_dedup \
             --require-case lfs_lock_policy=setup_repo \

@@ -89,16 +89,50 @@ impl Pool {
 }
 
 static INFLIGHT: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+static ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
 
 fn inflight() -> &'static Mutex<HashSet<Uuid>> {
     INFLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn scan_idle() -> &'static tokio::sync::Notify {
+    static IDLE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    IDLE.get_or_init(tokio::sync::Notify::new)
+}
+
+fn active_scans() -> usize {
+    ACTIVE_SCANS.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(super) fn scan_is_active(id: Uuid) -> bool {
+    lock(inflight()).contains(&id)
+}
+
+/// Wait until every accepted scan has left its pool closure, or the absolute
+/// `deadline` expires. The marker is released only after `with_frozen` returns,
+/// so a timed-out caller cannot make its still-running scan look drained.
+pub(super) async fn wait_idle_until(deadline: tokio::time::Instant) -> bool {
+    loop {
+        let notified = scan_idle().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if active_scans() == 0 {
+            return true;
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return active_scans() == 0;
+        }
+    }
 }
 
 struct InflightGuard(Uuid);
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        lock(inflight()).remove(&self.0);
+        if lock(inflight()).remove(&self.0) && ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            scan_idle().notify_waiters();
+        }
     }
 }
 
@@ -134,6 +168,7 @@ where
         if !set.insert(id) {
             return Err(ScanFailure::Busy);
         }
+        ACTIVE_SCANS.fetch_add(1, Ordering::AcqRel);
     }
     let guard = InflightGuard(id);
     let operation = worker::blocking_scope();
