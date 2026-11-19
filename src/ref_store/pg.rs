@@ -457,9 +457,34 @@ impl PgRefStore {
         before_deadline(deadline, self.get_inner(tx, repository_id, operation_id, deadline)).await
     }
 
-    /// Resolve a legacy operation for an authorized HTTP caller. The caller
-    /// must already hold the migration-138 operation lock in this transaction.
+    /// Resolve a legacy operation for an authorized HTTP caller that must
+    /// serialize with operation mutations. The caller must already hold the
+    /// migration-138 operation lock in this transaction.
     pub(crate) async fn get_legacy_locked(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        operation_id: Uuid,
+        deadline: Instant,
+    ) -> Result<OperationLookup, RefStoreError> {
+        before_deadline(deadline, async {
+            bound(tx, deadline).await?;
+            refuse_legacy_collision(tx, repository_id, operation_id).await?;
+            self.get_inner(tx, repository_id, operation_id, deadline).await
+        })
+        .await
+    }
+
+    /// Resolve a legacy operation for the authenticated read-only status route.
+    ///
+    /// This keeps the pre-152-safe migration-152 collision refusal but
+    /// deliberately does not acquire the migration-138 operation lock, so a
+    /// writer or barrier holding that key cannot stall a status read. Migration
+    /// 152 refuses a UUID that already has a committed legacy operation under
+    /// that same key, so a committed wrapper/attempt claim and a committed
+    /// legacy row cannot coexist; a claimed UUID still yields
+    /// [`RefStoreError::IdentityConflict`].
+    pub(crate) async fn get_legacy_read(
         &self,
         tx: &Transaction<'_>,
         repository_id: Uuid,

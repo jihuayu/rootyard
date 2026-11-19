@@ -328,10 +328,9 @@ async fn get_operation_authorized(
         .map_err(|_| GatewayError::Timeout)?
         .map_err(|_| GatewayError::Internal("authorization transaction failed"))?;
     let loaded: Result<(OperationLookup, Option<Role>), GatewayError> = async {
-        // Take the operation key before the authorization checks take row locks.
-        crate::ref_store::pg::lock_operation(&tx, repository_id, operation_id, deadline)
-            .await
-            .map_err(GatewayError::from)?;
+        // The status route is read-only: keep the migration-152 collision guard
+        // but do not take the migration-138 operation key, so a writer or test
+        // barrier that holds it cannot stall this view.
         let fresh = crate::ref_store::serving::lookup_in_tx(
             &tx,
             &identity,
@@ -345,7 +344,7 @@ async fn get_operation_authorized(
         .map_err(authority_error)?;
         authorization.ensure_same_realm(&fresh)?;
         let lookup = PgRefStore
-            .get_legacy_locked(&tx, repository_id, operation_id, deadline)
+            .get_legacy_read(&tx, repository_id, operation_id, deadline)
             .await
             .map_err(GatewayError::from)?;
         // Distinguish a write intent from its reader: the durable issuer or a

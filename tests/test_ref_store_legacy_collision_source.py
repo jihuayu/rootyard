@@ -3,9 +3,10 @@
 This pins the five bff76bee paths against the current later source: reserve,
 begin and cancel take the migration-138 key before probing migration 152;
 external legacy get/replay probes use the guarded lookup; the raw core get
-remains internal; pre-152 catalogs stay independent; and HTTP authorization
-checks happen after the operation key is held. No database, Cargo or service
-is touched.
+remains internal; pre-152 catalogs stay independent; the HTTP status read
+keeps the collision guard without taking the operation key; and the receive
+probe still takes that key before its HTTP authorization checks. No database,
+Cargo or service is touched.
 """
 from pathlib import Path
 import unittest
@@ -56,14 +57,23 @@ class LegacyCollisionSourceTest(unittest.TestCase):
         raw = slice_between(self.pg, 'pub async fn get(', 'pub(crate) async fn get_legacy_locked(')
         self.assertIn('self.get_inner(', raw)
         self.assertNotIn('refuse_legacy_collision', raw)
-        guarded = slice_between(self.pg, 'pub(crate) async fn get_legacy_locked(', 'async fn get_inner(')
+        guarded = slice_between(
+            self.pg,
+            'pub(crate) async fn get_legacy_locked(',
+            'pub(crate) async fn get_legacy_read(',
+        )
         self.assertLess(guarded.index('bound(tx, deadline)'), guarded.index('refuse_legacy_collision'))
         self.assertLess(guarded.index('refuse_legacy_collision'), guarded.index('self.get_inner('))
+        read = slice_between(self.pg, 'pub(crate) async fn get_legacy_read(', 'async fn get_inner(')
+        self.assertLess(read.index('bound(tx, deadline)'), read.index('refuse_legacy_collision'))
+        self.assertLess(read.index('refuse_legacy_collision'), read.index('self.get_inner('))
+        self.assertNotIn('lock_operation', read)
 
-    def test_http_get_and_receive_probe_take_the_operation_key_first(self):
+    def test_http_status_read_is_unlocked_and_receive_probe_takes_the_operation_key(self):
         api = slice_between(self.api, 'let loaded: Result<(OperationLookup, Option<Role>)', 'let _ = tokio::time::timeout_at')
-        self.assertLess(api.index('lock_operation('), api.index('lookup_in_tx('))
-        self.assertLess(api.index('lock_operation('), api.index('get_legacy_locked('))
+        self.assertNotIn('lock_operation(', api)
+        self.assertNotIn('get_legacy_locked(', api)
+        self.assertLess(api.index('lookup_in_tx('), api.index('get_legacy_read('))
         self.assertNotIn('PgRefStore.get(&tx', api)
 
         lookup = slice_between(self.operation, 'pub(super) async fn lookup(', 'pub(super) async fn lookup_in_tx(')
