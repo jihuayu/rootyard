@@ -47,6 +47,7 @@ pub(super) async fn retire_p0_with_producer(db: &db::Db, store: &BlobStore, git:
 }
 
 async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_request: bool) -> Result<Retired> {
+    super::mark_stage("retire_serving");
     let (verified, actor, repository) = serving::verify_new_serving(db, store, git, "slot-one-native").await?;
     let gate0 = db::gate_version(&db.pool, repository.id, actor.id).await?;
     ensure!(gate0.revision() == verified.gate.revision(), "initial gate revision differs from the serving receipt");
@@ -96,6 +97,7 @@ async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_re
 
     // Real A3 protected upload + real A4 registration. These artifacts remain
     // durable but are never promoted: P0 does not commit.
+    super::mark_stage("retire_stage");
     stage(db, store, &plan, &p0_files).await?;
     ensure!(plan.packs().len() == 1, "P0 fixture plan must have one pack");
     let p0_publication = publication_for(db, repository.id, private0).await?;
@@ -111,6 +113,7 @@ async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_re
         gate_before_p1.revision() == gate0.revision(),
         "P0 admission advanced the gate before the unrelated P1 advance"
     );
+    super::mark_stage("retire_p1");
     let draft1 = pack::draft(
         db,
         repository.id,
@@ -139,6 +142,7 @@ async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_re
     ensure!(stored_ref(db, repository.id, REF_RETRY).await?.is_none(), "P0 became visible before any commit");
 
     let token = PackPendingToken::established(repository.id, actor.id, private0, *plan.parent_digest())?;
+    super::mark_stage("retire_reject");
     let authorized = PgAuthorizedCommit::new(store.clone(), git.to_path_buf())
         .map_err(|error| anyhow!("authorized adapter rejected the slot-zero fixture: {error:?}"))?;
     let terminal = authorized
@@ -168,6 +172,7 @@ async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_re
     ensure!(durable.registrations.is_empty(), "P0 durable rejection names active registrations");
 
     let wrapper_before = wrapper_json(db, repository.id, public.public_id).await?;
+    super::mark_stage("retire_mirror");
     let retirement = retirement_required(db, &public, private0).await?;
     let wrapper_after = wrapper_json(db, repository.id, public.public_id).await?;
     ensure!(wrapper_before == wrapper_after, "the retirement selection mutated the pending wrapper");
@@ -179,6 +184,7 @@ async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_re
         operation_record(db, repository.id, private0).await?.state() == OperationState::Rejected,
         "the mirror selection changed the durable P0 terminal"
     );
+    super::mark_stage("retire_evidence");
     let private_evidence = private_retirement_evidence(db, &public, &admission, &retirement).await?;
 
     Ok(Retired {
@@ -226,6 +232,7 @@ async fn admit_slot_zero(
     let mut client = db.pool.get().await?;
     let tx = tokio_postgres::Client::transaction(&mut client).await?;
     let mut built = None;
+    super::mark_stage("retire_admit");
     let admission = PgRefStore
         .admit_slot_zero_in_tx(
             tx,

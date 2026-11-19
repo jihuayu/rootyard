@@ -38,7 +38,7 @@ REPORTS = (
     "slot-one-handoff-replay.json",
 )
 CASE_SCHEMA = "rootyard/refstore-issue42-slot-one-handoff-case/v1"
-MANIFEST_SCHEMA = "rootyard/refstore-issue42-slot-one-handoff-qualification/v1"
+MANIFEST_SCHEMA = "rootyard/refstore-issue42-slot-one-handoff-qualification/v2"
 LIB_LABEL = "preflighted-#174-libtest"
 ISSUE = 42
 PROBE_COUNT = 2
@@ -51,6 +51,7 @@ if len(CASES) != PROBE_COUNT or len(REPORTS) != PROBE_COUNT:
 CASE_FIELDS = (
     "case", "report_label", "result", "probe_count", "ran", "passed",
     "failed", "ignored", "complete", "error_class", "selection",
+    "failure_stage",
 )
 MANIFEST_FIELDS = (
     "schema", "issue", "expected_commit", "head", "tree",
@@ -64,6 +65,8 @@ REPORT_ATTESTATION_FIELDS = tuple(
 CASE_ERROR_CLASSES = frozenset(
     set(checkpoint.ERROR_CLASSES)
     | {"setup", "report_invalid", "attestation_mismatch", "returned_mismatch"})
+FAILURE_STAGE_VALUES = frozenset(
+    set(checkpoint.FAILURE_STAGES) | set(checkpoint.FAILURE_STAGE_SENTINELS))
 MANIFEST_ERROR_CLASSES = frozenset(
     set(CASE_ERROR_CLASSES) | {"probe_count", "manifest"})
 SAFE_LABEL = re.compile(r"^[A-Za-z0-9._#-]{1,64}$")
@@ -71,7 +74,7 @@ SAFE_LABEL = re.compile(r"^[A-Za-z0-9._#-]{1,64}$")
 checkpoint_failed = checkpoint.CheckpointError
 
 
-def _closed_failure(case, label, error_class):
+def _closed_failure(case, label, error_class, failure_stage="stage_unavailable"):
     return {
         "case": case,
         "report_label": label,
@@ -84,10 +87,11 @@ def _closed_failure(case, label, error_class):
         "complete": False,
         "error_class": error_class,
         "selection": "unavailable",
+        "failure_stage": failure_stage,
     }
 
 
-def _case_record(report, label):
+def _case_record(report, label, failure_stage):
     return {
         "case": report["case"],
         "report_label": label,
@@ -100,6 +104,7 @@ def _case_record(report, label):
         "complete": report["complete"],
         "error_class": report["error_class"],
         "selection": report["selection"],
+        "failure_stage": None if report["complete"] else failure_stage,
     }
 
 
@@ -223,7 +228,7 @@ def _case_args(args, case, report):
 
 def run_qualification(args, run_checkpoint=None):
     """Run both cases serially and return the validated closed manifest."""
-    runner = checkpoint.run_checkpoint if run_checkpoint is None else run_checkpoint
+    runner = checkpoint.run_checkpoint_observed if run_checkpoint is None else run_checkpoint
     attestation = checkpoint.build_attestation(
         args.lib, args.receipt, args.preflight, args.workspace,
         args.expected_commit, schema=CASE_SCHEMA, case=CASES[0])
@@ -266,14 +271,23 @@ def run_qualification(args, run_checkpoint=None):
                 _discard(final_path)
                 records.append(_closed_failure(case, label, "runner"))
                 continue
+            if isinstance(returned, tuple):
+                if len(returned) != 2:
+                    candidate, failure_stage = None, "stage_unavailable"
+                else:
+                    candidate, failure_stage = returned
+            else:
+                candidate, failure_stage = returned, None
             final, failure = _admit_case(
-                attestation, case, staged_path, final_path, returned)
+                attestation, case, staged_path, final_path, candidate)
             if failure is not None:
                 _discard(staged_path)
                 _discard(final_path)
                 records.append(_closed_failure(case, label, failure))
                 continue
-            records.append(_case_record(final, label))
+            if not isinstance(failure_stage, str) or failure_stage not in FAILURE_STAGE_VALUES:
+                failure_stage = "stage_unavailable"
+            records.append(_case_record(final, label, failure_stage))
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
@@ -345,16 +359,22 @@ def validate_manifest(manifest):
             raise checkpoint_failed("manifest_case_complete")
         if item.get("selection") not in ("unique", "unavailable"):
             raise checkpoint_failed("manifest_case_selection")
+        failure_stage = item.get("failure_stage")
+        if failure_stage is not None and (
+                not isinstance(failure_stage, str)
+                or failure_stage not in FAILURE_STAGE_VALUES):
+            raise checkpoint_failed("manifest_case_failure_stage")
         error = item.get("error_class")
         if error is not None and (not isinstance(error, str) or error not in CASE_ERROR_CLASSES):
             raise checkpoint_failed("manifest_case_error")
         if item["complete"]:
             if (item["result"] != "passed" or item["ran"] != 1 or item["passed"] != 1
                     or item["failed"] != 0 or item["ignored"] != 0
-                    or item["selection"] != "unique" or error is not None):
+                    or item["selection"] != "unique" or error is not None
+                    or failure_stage is not None):
                 raise checkpoint_failed("manifest_case_complete_inconsistent")
         elif (item["result"] != "failed" or item["passed"] != 0
-              or item["failed"] != 1 or not error):
+              or item["failed"] != 1 or not error or failure_stage is None):
             raise checkpoint_failed("manifest_case_failure_inconsistent")
     result = manifest.get("result")
     error = manifest.get("error_class")

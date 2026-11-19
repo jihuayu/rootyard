@@ -33,6 +33,58 @@ CASE = (
 )
 REPORT_SCHEMA = "rootyard/refstore-issue42-slot-one-checkpoint/v1"
 
+# Fixed failure-stage observations for the two reviewed Slot-One handoff
+# cases. The native fixture emits these only on failure; the runner keeps the
+# last strictly increasing value and never persists any other console text.
+FAILURE_STAGE_PREFIX = "ROOTYARD_SLOT_ONE_STAGE="
+FAILURE_STAGES = (
+    "fixture_guard",
+    "db_setup",
+    "postgres17",
+    "blob_git",
+    "retire_p0",
+    "retire_serving",
+    "retire_admit",
+    "retire_stage",
+    "retire_p1",
+    "retire_reject",
+    "retire_mirror",
+    "retire_evidence",
+    "gateway_state",
+    "live_serving",
+    "baseline",
+    "rotation",
+    "fresh_assertions",
+    "a3_a4_stage",
+    "authorized_commit",
+    "a5_snapshot",
+    "terminal",
+    "wrapper",
+    "public_status",
+    "revoke",
+    "restore",
+    "fresh_positive",
+    "later_gate",
+    "replay",
+    "revoked_replay",
+    "restored_replay",
+    "cleanup",
+)
+FAILURE_STAGE_INDEX = {name: index for index, name in enumerate(FAILURE_STAGES)}
+FAILURE_STAGE_MISSING = "stage_missing"
+FAILURE_STAGE_UNAVAILABLE = "stage_unavailable"
+FAILURE_STAGE_UNKNOWN = "stage_unknown"
+FAILURE_STAGE_ORDER = "stage_order"
+FAILURE_STAGE_UNBOUND = "stage_unbound"
+FAILURE_STAGE_SENTINELS = (
+    FAILURE_STAGE_MISSING,
+    FAILURE_STAGE_UNAVAILABLE,
+    FAILURE_STAGE_UNKNOWN,
+    FAILURE_STAGE_ORDER,
+    FAILURE_STAGE_UNBOUND,
+)
+FAILURE_STAGE_LINE = re.compile(r"^ROOTYARD_SLOT_ONE_STAGE=([a-z0-9_]+)$")
+
 DEFAULT_TIMEOUT_SECONDS = 600.0
 DEFAULT_STDOUT_LIMIT = 16 * 1024
 LISTING_STDOUT_LIMIT = 1 << 20
@@ -187,6 +239,40 @@ def classify_result(raw, exit_code, *, outcome="exited", error_class=None,
         "ignored": 0,
         "error_class": None,
     }
+
+
+def classify_failure_stage(raw, *, expected=CASE):
+    """Return only a fixed, ordered failure-stage value from bounded output.
+
+    The fixture emits fixed ``ROOTYARD_SLOT_ONE_STAGE=<name>`` lines as it
+    advances. On failure the last strictly increasing allowlisted value is the
+    stage attribution. Missing, unknown, out-of-order/duplicate and unbound
+    output are closed sentinels; no raw line is ever returned or persisted.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return FAILURE_STAGE_UNAVAILABLE
+    if expected not in text:
+        return FAILURE_STAGE_UNBOUND
+    stages = []
+    for line in text.splitlines():
+        match = FAILURE_STAGE_LINE.fullmatch(line.strip())
+        if match is None:
+            continue
+        name = match.group(1)
+        if name not in FAILURE_STAGE_INDEX:
+            return FAILURE_STAGE_UNKNOWN
+        stages.append(name)
+    if not stages:
+        return FAILURE_STAGE_MISSING
+    previous = -1
+    for name in stages:
+        index = FAILURE_STAGE_INDEX[name]
+        if index <= previous:
+            return FAILURE_STAGE_ORDER
+        previous = index
+    return stages[-1]
 
 
 def make_report(attestation, projection, exit_code, process_outcome,
@@ -502,7 +588,7 @@ def run_bounded(command, *, timeout, stdout_limit, environment=None):
             "stdout": b"".join(raw), "error_class": error_class}
 
 
-def run_checkpoint(args):
+def run_checkpoint_observed(args):
     attestation = build_attestation(
         args.lib, args.receipt, args.preflight, args.workspace,
         args.expected_commit, schema=args.report_schema, case=args.case)
@@ -520,11 +606,22 @@ def run_checkpoint(args):
     projection = classify_result(
         run["stdout"], run["exit_code"], outcome=run["outcome"],
         error_class=run["error_class"], expected=args.case)
+    failure_stage = None
+    if not projection["complete"]:
+        if run["outcome"] != "exited":
+            failure_stage = FAILURE_STAGE_UNAVAILABLE
+        else:
+            failure_stage = classify_failure_stage(run["stdout"], expected=args.case)
     report = make_report(
         attestation, projection, run["exit_code"], run["outcome"],
         schema=args.report_schema, case=args.case)
     write_report(args.report, report)
     recheck_report(args.report, schema=args.report_schema, case=args.case)
+    return report, failure_stage
+
+
+def run_checkpoint(args):
+    report, _failure_stage = run_checkpoint_observed(args)
     return report
 
 

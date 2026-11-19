@@ -146,26 +146,35 @@ struct AttemptRow {
 #[tokio::test]
 #[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
 async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Result<()> {
+    super::mark_stage("fixture_guard");
     require_owned_disposable_fixture()?;
+    super::mark_stage("db_setup");
     let db = super::db::Db::setup().await?;
     let outcome: Result<()> = async {
+        super::mark_stage("postgres17");
         require_postgres_17(&db).await?;
+        super::mark_stage("blob_git");
         let store = super::common::open_store()?;
         let git = super::git::git_binary()?;
+        super::mark_stage("retire_p0");
         let retired = retire_p0_with_producer(&db, &store, &git).await?;
+        super::mark_stage("gateway_state");
         let (state, _scratch) = gateway_state(&db, &store, &git)?;
+        super::mark_stage("live_serving");
         let serving = live_serving(&db, &store, &retired).await?;
         ensure!(
             serving.cluster_incarnation == retired.public.restore_incarnation,
             "live serving restore incarnation differs from P0"
         );
         let evidence = &retired.private_evidence;
+        super::mark_stage("baseline");
         let baseline = capture_baseline(&db, retired.repository.id, retired.verified.tenant).await?;
         ensure!(baseline.gate().revision() == retired.gate.revision(), "rotation baseline is not the advanced P1 gate");
         let body_dir = tempfile::tempdir()?;
         let body = write_p0_body(&body_dir, &retired)?;
         let p0_publication = publication_for(&db, retired.repository.id, retired.admission.private_id).await?;
 
+        super::mark_stage("rotation");
         let admission = acceptance::rotate_direct(
             &state,
             &serving,
@@ -185,6 +194,7 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
             acceptance::Admission::Fresh { plan, receipt } => (plan, receipt),
             acceptance::Admission::Replayed(_) => bail!("fresh direct handoff replayed"),
         };
+        super::mark_stage("fresh_assertions");
         assert_fresh_receipt(&retired, &plan, &receipt)?;
 
         let (pack_sha, pack_len) = super::git::digest_file(&retired.p0_files.pack)?;
@@ -207,7 +217,9 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
             "fresh slot-one plan reused the retired pack identity"
         );
 
+        super::mark_stage("a3_a4_stage");
         stage(&db, &store, &plan, &retired.p0_files).await?;
+        super::mark_stage("authorized_commit");
         let committed = authorized_commit(&db, &store, &git, &retired.actor, plan.clone()).await?;
         ensure!(
             committed.terminal.revision == retired.gate.revision() + 1,
@@ -235,8 +247,10 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
             "P2 publication projection differs from the fresh plan"
         );
 
+        super::mark_stage("a5_snapshot");
         assert_a5_after_rotation(&db, &store, &retired, &plan).await?;
 
+        super::mark_stage("terminal");
         let p2_record = operation_record(&db, retired.repository.id, receipt.private_id).await?;
         ensure!(p2_record.state() == OperationState::Committed, "P2 operation is not durably committed");
         let mirror = mirror_committed_terminal(&db, &retired.public, &p2_record).await?;
@@ -246,6 +260,7 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
         );
         ensure!(mirror.event_id == p2_event, "P2 terminal mirror used another core event");
 
+        super::mark_stage("wrapper");
         let wrapper = wrapper_row(&db, retired.repository.id, retired.public.public_id).await?;
         ensure!(wrapper.current_slot == 1, "public wrapper is not slot one");
         ensure!(wrapper.state == "committed", "public wrapper is not committed");
@@ -303,6 +318,7 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
             "durable gate did not advance exactly once after P2"
         );
 
+        super::mark_stage("public_status");
         match public_lookup(&db, &retired.public).await? {
             PublicAttemptLookup::Committed(evidence) => {
                 ensure!(evidence.current.slot == 1, "mirrored current attempt is not slot one");
@@ -343,26 +359,39 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
         Ok(())
     }
     .await;
-    db.finish(outcome).await
+    let failed = outcome.is_err();
+    let finished = db.finish(outcome).await;
+    if !failed && finished.is_err() {
+        super::mark_stage("cleanup");
+    }
+    finished
 }
 
 #[tokio::test]
 #[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
 async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate() -> Result<()> {
+    super::mark_stage("fixture_guard");
     require_owned_disposable_fixture()?;
+    super::mark_stage("db_setup");
     let db = super::db::Db::setup().await?;
     let outcome: Result<()> = async {
+        super::mark_stage("postgres17");
         require_postgres_17(&db).await?;
+        super::mark_stage("blob_git");
         let store = super::common::open_store()?;
         let git = super::git::git_binary()?;
+        super::mark_stage("retire_p0");
         let retired = retire_p0_with_producer(&db, &store, &git).await?;
+        super::mark_stage("gateway_state");
         let (state, _scratch) = gateway_state(&db, &store, &git)?;
+        super::mark_stage("live_serving");
         let serving = live_serving(&db, &store, &retired).await?;
         ensure!(
             serving.cluster_incarnation == retired.public.restore_incarnation,
             "live serving restore incarnation differs from P0"
         );
         let evidence = &retired.private_evidence;
+        super::mark_stage("baseline");
         let baseline = capture_baseline(&db, retired.repository.id, retired.verified.tenant).await?;
         let body_dir = tempfile::tempdir()?;
         let body = write_p0_body(&body_dir, &retired)?;
@@ -372,6 +401,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
         // fail at its same-outer live authorization check, after the primitive
         // has written and released its savepoint. The outer rollback must leave
         // no slot-one candidate, sequence, operation, binding, event or ref.
+        super::mark_stage("revoke");
         revoke_identity(&db.pool, &retired.actor).await?;
         let refused = acceptance::rotate_direct(
             &state,
@@ -404,8 +434,10 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
 
         // Restore exactly the same user identity through the production token
         // path. The new token is a different live credential, not a mock.
+        super::mark_stage("restore");
         let restored = issue_identity(&db.pool, &retired.actor.username).await?;
         ensure!(restored.id == retired.actor.id, "restored token belongs to another user");
+        super::mark_stage("fresh_positive");
         let admission = acceptance::rotate_direct(
             &state,
             &serving,
@@ -432,6 +464,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
         // A later real authorized commit on an unrelated ref advances the gate
         // while the exact slot-one rotation is still pending. It is not a new
         // slot-one candidate and does not mirror or rewrite the pending wrapper.
+        super::mark_stage("later_gate");
         let later_gate = advance_gate(&db, &store, &git, &retired, &restored).await?;
         ensure!(
             later_gate.revision() == retired.gate.revision() + 1,
@@ -448,6 +481,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
 
         // Pass the pre-advance historical baseline: replay must use the stored
         // rotation rather than silently requiring the current gate baseline.
+        super::mark_stage("replay");
         let replay = acceptance::rotate_direct(
             &state,
             &serving,
@@ -491,6 +525,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
 
         // Revoked replay: the primitive proves the stored rotation, then the
         // same-outer live lookup refuses and rolls the whole transaction back.
+        super::mark_stage("revoked_replay");
         revoke_identity(&db.pool, &restored).await?;
         let refused_replay = acceptance::rotate_direct(
             &state,
@@ -516,6 +551,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
 
         // Restore a second time and prove the same live identity/realm still
         // replays the original pending rotation without any effect count change.
+        super::mark_stage("restored_replay");
         let restored_again = issue_identity(&db.pool, &retired.actor.username).await?;
         ensure!(restored_again.id == retired.actor.id, "second restored token belongs to another user");
         let replay_again = acceptance::rotate_direct(
@@ -548,7 +584,12 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
         Ok(())
     }
     .await;
-    db.finish(outcome).await
+    let failed = outcome.is_err();
+    let finished = db.finish(outcome).await;
+    if !failed && finished.is_err() {
+        super::mark_stage("cleanup");
+    }
+    finished
 }
 
 fn gateway_state(db: &db::Db, store: &BlobStore, git: &Path) -> Result<(Arc<BlobGitState>, tempfile::TempDir)> {

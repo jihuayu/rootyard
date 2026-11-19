@@ -168,6 +168,9 @@ class SlotOneHandoffPostgresSourceTest(unittest.TestCase):
     def test_no_sleep_or_token_output_and_route_is_unselected(self):
         self.assertNotIn("sleep(", self.gateway)
         self.assertNotIn("println!", self.gateway)
+        self.assertIn("super::mark_stage(", self.gateway)
+        self.assertIn('const FAILURE_STAGE_PREFIX: &str = "ROOTYARD_SLOT_ONE_STAGE=";', self.native)
+        self.assertIn('eprintln!("{FAILURE_STAGE_PREFIX}{stage}")', self.native)
         self.assertNotIn("ryt_", self.gateway)
         self.assertNotIn("DATABASE_URL", self.gateway)
         self.assertIn('if producer_request {', self.retirement)

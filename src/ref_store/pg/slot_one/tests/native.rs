@@ -87,6 +87,14 @@ const REF_SIDE: &str = "refs/heads/side";
 const SLOT_ZERO_LANE: &str = "slot-zero-rotation";
 const WIRE_DOMAIN: &str = "rootyard-test-wire-ref-command-v1";
 const WIRE_BODY: &[u8] = b"identical logical receive-pack ref update";
+const FAILURE_STAGE_PREFIX: &str = "ROOTYARD_SLOT_ONE_STAGE=";
+
+/// Emit one fixed, allowlisted failure-stage marker. The test harness captures
+/// this with the failing case and the bounded runner projects only the closed
+/// stage value; no assertion text, SQL, path or credential is printed.
+fn mark_stage(stage: &'static str) {
+    eprintln!("{FAILURE_STAGE_PREFIX}{stage}");
+}
 
 /// The durable state through P0 admission, P0 artifact staging, the real P1
 /// authorized advance, the production superseded refusal and the read-only

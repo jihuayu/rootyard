@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -139,6 +140,77 @@ class InventoryTests(unittest.TestCase):
         self.assertRegex(qualification.LIB_LABEL, r"^[A-Za-z0-9._#-]{1,64}$")
 
 
+class FailureStageTests(unittest.TestCase):
+    def raw(self, *stages):
+        case = qualification.CASES[0]
+        body = "".join("ROOTYARD_SLOT_ONE_STAGE=" + stage + "\n" for stage in stages)
+        return (f"test {case} ... FAILED\n---- {case} stderr ----\n" + body).encode()
+
+    def test_ordered_markers_return_the_last_known_stage(self):
+        raw = self.raw("fixture_guard", "retire_p0", "retire_admit", "retire_stage")
+        self.assertEqual(
+            checkpoint.classify_failure_stage(
+                raw, expected=qualification.CASES[0]),
+            "retire_stage")
+
+    def test_missing_unknown_order_duplicate_and_unbound_are_closed(self):
+        expected = qualification.CASES[0]
+        self.assertEqual(
+            checkpoint.classify_failure_stage(
+                f"test {expected} ... FAILED\n".encode(), expected=expected),
+            "stage_missing")
+        self.assertEqual(
+            checkpoint.classify_failure_stage(
+                self.raw("fixture_guard", "not_a_stage"), expected=expected),
+            "stage_unknown")
+        self.assertEqual(
+            checkpoint.classify_failure_stage(
+                self.raw("retire_stage", "fixture_guard"), expected=expected),
+            "stage_order")
+        self.assertEqual(
+            checkpoint.classify_failure_stage(
+                self.raw("fixture_guard", "fixture_guard"), expected=expected),
+            "stage_order")
+        self.assertEqual(
+            checkpoint.classify_failure_stage(
+                b"ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n", expected=expected),
+            "stage_unbound")
+        self.assertEqual(
+            checkpoint.classify_failure_stage(b"\xff", expected=expected),
+            "stage_unavailable")
+
+    def test_arbitrary_injected_stage_cannot_move_backwards(self):
+        expected = qualification.CASES[0]
+        raw = (f"test {expected} ... FAILED\n"
+               "ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n"
+               "ROOTYARD_SLOT_ONE_STAGE=authorized_commit\n"
+               "ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n").encode()
+        self.assertEqual(
+            checkpoint.classify_failure_stage(raw, expected=expected),
+            "stage_order")
+
+    def test_fixture_marker_source_is_fixed_and_allowlisted(self):
+        gateway = (ROOT / "src/ref_store/pg/slot_one/tests/native/gateway.rs").read_text()
+        retirement = (ROOT / "src/ref_store/pg/slot_one/tests/native/retirement.rs").read_text()
+        native = (ROOT / "src/ref_store/pg/slot_one/tests/native.rs").read_text()
+        self.assertIn(
+            'const FAILURE_STAGE_PREFIX: &str = "ROOTYARD_SLOT_ONE_STAGE=";',
+            native)
+        self.assertIn('eprintln!("{FAILURE_STAGE_PREFIX}{stage}")', native)
+        self.assertNotIn("println!", gateway)
+        self.assertIn("super::mark_stage(", gateway)
+        calls = set(re.findall(
+            r'mark_stage\("([a-z0-9_]+)"\)', gateway + retirement))
+        self.assertTrue(calls)
+        self.assertLessEqual(calls, set(checkpoint.FAILURE_STAGES))
+        for selector in qualification.CASES:
+            name = selector.rsplit("::", 1)[-1]
+            start = gateway.index(f"async fn {name}()")
+            end = gateway.find("#[tokio::test]", start)
+            body = gateway[start:end if end != -1 else len(gateway)]
+            self.assertIn("super::mark_stage(", body)
+
+
 class QualificationRunTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -160,6 +232,44 @@ class QualificationRunTests(unittest.TestCase):
                 lambda *args, **kwargs: attestation(qualification.CASES[0])):
             return qualification.run_qualification(
                 self.args, run_checkpoint=runner)
+
+    def test_failure_stage_is_carried_and_closed(self):
+        def runner(namespace):
+            if namespace.case == qualification.CASES[0]:
+                payload = report(namespace.case, FAILED)
+                checkpoint.write_report(namespace.report, payload)
+                return payload, "retire_admit"
+            payload = report(namespace.case)
+            checkpoint.write_report(namespace.report, payload)
+            return payload
+
+        manifest = self.run_qualification(runner)
+        self.assertEqual(manifest["result"], "failed")
+        self.assertEqual(manifest["cases"][0]["failure_stage"], "retire_admit")
+        self.assertEqual(manifest["cases"][1]["failure_stage"], None)
+        qualification.validate_manifest(manifest)
+
+    def test_passed_case_ignores_observed_stage_and_invalid_stage_is_closed(self):
+        def runner(namespace):
+            payload = report(namespace.case)
+            checkpoint.write_report(namespace.report, payload)
+            return payload, "fixture_guard"
+
+        manifest = self.run_qualification(runner)
+        self.assertEqual(manifest["result"], "passed")
+        self.assertEqual(
+            [item["failure_stage"] for item in manifest["cases"]], [None, None])
+
+        def invalid_runner(namespace):
+            payload = report(namespace.case, FAILED)
+            checkpoint.write_report(namespace.report, payload)
+            return payload, "arbitrary_stage"
+
+        invalid = self.run_qualification(invalid_runner)
+        self.assertEqual(invalid["result"], "failed")
+        self.assertEqual(
+            [item["failure_stage"] for item in invalid["cases"]],
+            ["stage_unavailable", "stage_unavailable"])
 
     def test_two_passed_probes_are_serial_and_closed(self):
         runner, calls = runner_factory()
@@ -398,6 +508,42 @@ class ManifestValidationTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 bad = dict(manifest)
                 bad.update(changes)
+                with self.assertRaises(checkpoint.CheckpointError) as raised:
+                    qualification.validate_manifest(bad)
+                self.assertEqual(str(raised.exception), expected)
+
+    def test_manifest_rejects_stage_on_pass_and_unknown_failed_stage(self):
+        manifest = self.valid_manifest()
+        stage_on_pass = dict(manifest)
+        stage_on_pass["cases"] = [dict(item) for item in manifest["cases"]]
+        stage_on_pass["cases"][0]["failure_stage"] = "fixture_guard"
+        with self.assertRaises(checkpoint.CheckpointError) as raised:
+            qualification.validate_manifest(stage_on_pass)
+        self.assertEqual(str(raised.exception), "manifest_case_complete_inconsistent")
+
+        def failing_runner(namespace):
+            payload = report(namespace.case, FAILED)
+            checkpoint.write_report(namespace.report, payload)
+            return payload, "retire_admit"
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                lib="/tmp/lib", receipt="/tmp/receipt", preflight="/tmp/preflight",
+                workspace="/tmp/workspace", expected_commit=HEAD,
+                report_dir=directory, timeout=600, stdout_limit=16384)
+            with patch.object(
+                    checkpoint, "build_attestation",
+                    lambda *a, **k: attestation(qualification.CASES[0])):
+                failed = qualification.run_qualification(
+                    args, run_checkpoint=failing_runner)
+        for changes, expected in (
+                ({"failure_stage": "arbitrary"}, "manifest_case_failure_stage"),
+                ({"failure_stage": None}, "manifest_case_failure_inconsistent"),
+        ):
+            with self.subTest(expected=expected):
+                bad = dict(failed)
+                bad["cases"] = [dict(item) for item in failed["cases"]]
+                bad["cases"][0].update(changes)
                 with self.assertRaises(checkpoint.CheckpointError) as raised:
                     qualification.validate_manifest(bad)
                 self.assertEqual(str(raised.exception), expected)
