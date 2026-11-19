@@ -174,7 +174,7 @@ fn distinct_pack_bytes(marker: u8, extra_pad: usize) -> (Vec<u8>, String, String
 
 #[tokio::test]
 async fn stream_paused_live_auth_hits_absolute_deadline_without_yielding_and_releases_guards() {
-    let (auth, mut entered, _release) = PausedAuthorizer::new(2);
+    let (auth, mut entered, _release) = PausedAuthorizer::new(3);
     let fx = build_stream_fixture(Arc::new(auth), 100, 1);
     let permits_before = fx.state.inflight_limiter.available_permits();
     let body = serve_signed_packfile_stream(Arc::clone(&fx.state), &fx.request()).await.unwrap();
@@ -182,6 +182,8 @@ async fn stream_paused_live_auth_hits_absolute_deadline_without_yielding_and_rel
     assert_eq!(fx.state.inflight_bytes.used_bytes(), fx.raw_len as u64);
 
     let mut stream = body.into_data_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(first.len(), 32 * 1024);
     let mut next = Box::pin(stream.next());
     tokio::select! {
         entered = tokio::time::timeout(Duration::from_secs(1), entered.recv()) => {
@@ -206,11 +208,12 @@ async fn stream_paused_live_auth_hits_absolute_deadline_without_yielding_and_rel
 #[tokio::test]
 async fn stream_paused_live_auth_success_after_revocation_is_rechecked_before_next_chunk() {
     for disable_policy in [false, true] {
-        let (auth, mut entered, release) = PausedAuthorizer::new(2);
+        let (auth, mut entered, release) = PausedAuthorizer::new(3);
         let fx = build_stream_fixture(Arc::new(auth), 30_000, 1);
         let permits_before = fx.state.inflight_limiter.available_permits();
         let body = serve_signed_packfile_stream(Arc::clone(&fx.state), &fx.request()).await.unwrap();
         let mut stream = body.into_data_stream();
+        assert!(stream.next().await.unwrap().is_ok());
         let mut next = Box::pin(stream.next());
         tokio::select! {
             entered = tokio::time::timeout(Duration::from_secs(1), entered.recv()) => {
