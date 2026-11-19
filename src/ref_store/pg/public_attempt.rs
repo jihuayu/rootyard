@@ -317,6 +317,46 @@ impl fmt::Debug for PublicAttempt {
 }
 
 impl PgRefStore {
+    /// Take migration 152's normalized public/attempt advisory lock set before
+    /// an authorized private-mode preflight reads a wrapper.
+    ///
+    /// The public UUID and the freshly proposed private UUID are both locked;
+    /// for an existing wrapper the SQL function also locks every durable private
+    /// attempt UUID. This is a lock-only step: it writes no row, allocates no
+    /// sequence and never enters the legacy migration-138 guard. It must run in
+    /// the same read-committed transaction as the subsequent authenticated
+    /// public lookup.
+    #[allow(dead_code)] // No route selects private mode until the read paths are ready.
+    pub(crate) async fn lock_public_attempt(
+        &self,
+        tx: &Transaction<'_>,
+        request: &PublicAttemptRequest,
+        proposed_private_id: Uuid,
+        deadline: Instant,
+    ) -> Result<(), PackCommitError> {
+        request.validate()?;
+        if proposed_private_id.is_nil() || proposed_private_id == request.public_id {
+            return Err(PackCommitError::Invalid("proposed private attempt id must be non-nil and distinct"));
+        }
+        match timeout_at(deadline, async {
+            bound(tx, deadline).await.map_err(PackCommitError::from)?;
+            ensure_schema(tx).await?;
+            tx.query_one(
+                "SELECT rootyard_ref_store_lock_public_operation($1,$2,$3)",
+                &[&request.repository_id, &request.public_id, &proposed_private_id],
+            )
+            .await
+            .map_err(lookup_db_error)
+            .map_err(PackCommitError::from)?;
+            Ok(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(PackCommitError::from(RefStoreError::Timeout)),
+        }
+    }
+
     /// Resolve one exact public attempt inside the caller-owned read transaction.
     ///
     /// The absolute deadline bounds the whole lookup; [`bound`] additionally
@@ -353,16 +393,7 @@ impl PgRefStore {
             })
         })?;
 
-        let schema = tx.query_one(SCHEMA_PROBE, &[]).await.map_err(lookup_db_error).map_err(PackCommitError::from)?;
-        if !schema.get::<_, bool>(0)
-            || !schema.get::<_, bool>(1)
-            || !schema.get::<_, bool>(2)
-            || !schema.get::<_, bool>(3)
-        {
-            return Err(PackCommitError::from(RefStoreError::Unsupported(
-                "public attempt lookup requires migration 152",
-            )));
-        }
+        ensure_schema(tx).await?;
 
         // PostgreSQL applies statement_timeout per statement. The schema probe
         // may have consumed its own budget, so refresh the same absolute
@@ -384,6 +415,18 @@ impl PgRefStore {
             .map_err(|_| ledger("public attempt lookup snapshot shape is not recognized"))?;
         evaluate(snapshot, request)
     }
+}
+
+/// Shared catalog probe for the lock and read adapters. A missing or partial
+/// migration 152 is an explicit unsupported outcome before any relation or SQL
+/// function is referenced.
+async fn ensure_schema(tx: &Transaction<'_>) -> Result<(), PackCommitError> {
+    let schema = tx.query_one(SCHEMA_PROBE, &[]).await.map_err(lookup_db_error).map_err(PackCommitError::from)?;
+    if !schema.get::<_, bool>(0) || !schema.get::<_, bool>(1) || !schema.get::<_, bool>(2) || !schema.get::<_, bool>(3)
+    {
+        return Err(PackCommitError::from(RefStoreError::Unsupported("public attempt lookup requires migration 152")));
+    }
+    Ok(())
 }
 
 fn validate_request(request: &PublicAttemptRequest) -> Result<(), PackCommitError> {

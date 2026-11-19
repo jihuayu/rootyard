@@ -32,6 +32,7 @@ use crate::ref_store::{
     CommitMode, GitObjectFormat, OperationLookup, OperationRecord, OperationState, PgRefStore, RefCommitResult,
     RequestDigest, TerminalKind,
     core::pack_commit::{PackCommitTerminal, read_serving_operation},
+    pg::public_attempt::PublicAttemptEvidence,
 };
 
 use super::{error::GatewayError, native, protocol::PushRequest, state::BlobGitState};
@@ -294,6 +295,80 @@ pub(super) fn classify(
             }
         }
     }
+}
+
+/// Resolve the private record named by one already-verified migration-152
+/// public attempt, without entering the legacy UUID guard.
+///
+/// This is deliberately separate from [`lookup_in_tx`]: the public wrapper path
+/// first holds migration 152's public/attempt advisory lock, authenticates the
+/// live repository in the same transaction, and obtains `evidence` from
+/// [`PgRefStore::lookup_public_attempt`]. Only then may this helper read the
+/// exact private operation and its migration-147 producer binding.
+///
+/// The stored private UUID, lane, sequence, plan digest, state, realm and
+/// producer digest must all agree with that evidence. The migration-152 attempt
+/// lock is re-proved before the raw core read, so a caller cannot use this
+/// helper to bypass the external legacy collision guard or reach a private
+/// record from a legacy route. Every refusal is fixed and carries no UUID.
+pub(super) async fn lookup_public_private_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    repository_id: Uuid,
+    public_id: Uuid,
+    evidence: &PublicAttemptEvidence,
+    issuer_id: Uuid,
+    request: &PushRequest,
+    digest: RequestDigest,
+    deadline: Instant,
+) -> Result<Claim, GatewayError> {
+    if evidence.public_id != public_id {
+        return Err(GatewayError::Internal("verified public attempt names another public operation"));
+    }
+    let private_id = evidence.current.private_id;
+    if private_id.is_nil() || private_id == public_id {
+        return Err(GatewayError::Internal("verified public attempt has an invalid private identity"));
+    }
+    // The public preflight lock includes every existing private attempt of this
+    // wrapper. Re-prove that exact operation lock before the raw core read.
+    tx.query_one("SELECT rootyard_ref_store_require_attempt_lock($1,$2)", &[&repository_id, &private_id])
+        .await
+        .map_err(|_| GatewayError::Internal("verified public attempt lock is not held"))?;
+
+    let Some(binding) =
+        read_serving_operation(tx, repository_id, private_id, deadline).await.map_err(GatewayError::from)?
+    else {
+        return Err(GatewayError::Internal("verified public attempt has no producer binding"));
+    };
+    let record = match PgRefStore.get(tx, repository_id, private_id, deadline).await.map_err(GatewayError::from)? {
+        OperationLookup::Unknown => {
+            return Err(GatewayError::Internal("verified public attempt has no private operation record"));
+        }
+        OperationLookup::Known(record) => record,
+    };
+    let identity = record.identity();
+    let current = &evidence.current;
+    if identity.repository_id() != repository_id
+        || identity.operation_id() != private_id
+        || identity.lane() != &current.lane
+        || identity.sequence() != current.sequence
+        || identity.digest() != &current.plan_digest
+        || record.state() != current.state
+    {
+        return Err(GatewayError::Internal("verified public attempt does not match its private operation identity"));
+    }
+    if binding.parent_digest() != identity.digest() {
+        return Err(GatewayError::Internal(
+            "verified public attempt producer binding differs from its private operation",
+        ));
+    }
+    classify(
+        ResolvedOperation { record, producer_digest: *binding.producer_digest() },
+        repository_id,
+        issuer_id,
+        private_id,
+        request,
+        digest,
+    )
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

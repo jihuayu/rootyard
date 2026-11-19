@@ -59,7 +59,10 @@ use crate::{
                 PlannedArtifact, PlannedPack, PrepareOutcome, ensure_pack_terminal_budget,
             },
         },
-        pg::slot_zero::{SlotZeroAdmissionRequest, SlotZeroReceipt},
+        pg::{
+            public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
+            slot_zero::SlotZeroAdmissionRequest,
+        },
         tx::{begin_bounded, commit_bounded},
     },
 };
@@ -330,16 +333,18 @@ async fn begin(
 /// Crate-private entry for the migration-152 private-slot admission mode.
 ///
 /// The public UUID and producer digest remain the caller-visible operation
-/// identity. The pre-admission lookup still resolves an already durable legacy
-/// terminal for that public UUID; only an unknown public identity reaches the
-/// migration-152 path, where one independent private UUID is minted. A private
-/// admission refusal, an unsupported Foundation or an unknown private `COMMIT`
-/// is returned as-is: this entry never calls [`begin_fresh`] afterwards.
+/// identity. The public preflight and the coordinator's lock, receipts and
+/// captured authorized baseline are all migration-152 objects; this entry never
+/// enters the legacy operation lookup for an unknown or privately claimed
+/// public identifier. Only an explicit `LegacyPath` marker may use the older
+/// legacy lookup, in the same authenticated transaction and under its operation
+/// key. A private admission refusal, an unsupported Foundation or an unknown
+/// private `COMMIT` is returned as-is: this entry never calls [`begin_fresh`].
 ///
 /// The caller must already have captured `baseline` after native ingestion and
 /// hold the staged raw pack pairs. This function performs only the short
-/// PostgreSQL admission; it holds no transaction while reading or uploading a
-/// pair.
+/// PostgreSQL preflight/admission; it holds no transaction while reading or
+/// uploading a pair.
 #[allow(dead_code)] // No route selects private mode until the GET/replay/cancel paths are ready.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn begin_slot_zero(
@@ -354,46 +359,159 @@ pub(super) async fn begin_slot_zero(
     baseline: &PackCommitBaseline,
     deadline: Instant,
 ) -> Result<Start, GatewayError> {
-    let repository_id = baseline.gate().repository_id();
-    match operation::lookup(state, serving, actor, public_id, deadline).await? {
-        operation::Lookup::Known(resolved) => start_from_claim(operation::classify(
-            resolved,
-            repository_id,
-            actor.id,
-            public_id,
+    let private_id = Uuid::new_v4();
+    let backend_identity = state.store().backend_identity().as_hex().to_owned();
+    let public_request =
+        public_attempt_request(serving, actor, public_id, request_digest, mode, baseline, backend_identity)?;
+
+    let mut client = state.pooled(deadline).await?;
+    let tx = begin_bounded(&mut client, deadline).await.map_err(ref_error)?;
+    let preflight = timeout_at(
+        deadline,
+        slot_zero_public_preflight(
+            &tx,
+            serving,
+            actor,
+            &public_request,
+            state.store().backend_identity(),
+            private_id,
             request,
-            request_digest,
-        )?),
-        // No legacy operation exists under the public UUID. The private wrapper
-        // preflight resolves an exact public replay without a sequence/build;
-        // otherwise it creates the private slot-zero admission atomically.
-        operation::Lookup::Unknown => {
-            begin_slot_zero_fresh(
-                state,
-                serving,
-                actor,
-                public_id,
-                request_digest,
+            baseline,
+            deadline,
+        ),
+    )
+    .await;
+    match preflight {
+        Ok(Ok(SlotZeroPreflight::Fresh(public_request))) => {
+            // Keep the same owning transaction: current user/role/token,
+            // namespace, restore and realm were just validated under its locks,
+            // and the migration-152 admission must publish or roll back with
+            // those exact locks. No Git/Blob IO occurs in this transaction.
+            begin_slot_zero_fresh(tx, request, pairs, mode, baseline, public_request, private_id, deadline).await
+        }
+        Ok(Ok(SlotZeroPreflight::Claim(claim))) => {
+            rollback_bounded(tx, deadline).await?;
+            start_from_claim(claim)
+        }
+        Ok(Err(error)) => {
+            // Every branch above returned a typed refusal, not a legacy
+            // fallback. The transaction has no publishable admission; keep the
+            // typed error if best-effort cleanup is unconfirmed.
+            let _ = rollback_bounded(tx, deadline).await;
+            Err(error)
+        }
+        Err(_) => {
+            let _ = rollback_bounded(tx, deadline).await;
+            Err(GatewayError::Timeout)
+        }
+    }
+}
+
+/// What the authenticated public preflight found for this public UUID.
+enum SlotZeroPreflight {
+    /// No wrapper, private claim or legacy operation exists. The typed request
+    /// is carried forward for the fresh migration-152 admission.
+    Fresh(PublicAttemptRequest),
+    /// An exact wrapper attempt or an explicit legacy-path record was resolved.
+    Claim(Claim),
+}
+
+/// One authenticated, lock-ordered public preflight in the caller's transaction.
+///
+/// Order is fixed: migration-152 public/attempt locks, the migration-138
+/// operation key, live serving authority, then the read-only public lookup. The
+/// fresh restore/realm must equal the already authorized baseline; a moved
+/// authority is a conflict, never a silently adopted realm. Explicit
+/// `LegacyPath` is the only branch that calls the older legacy operation
+/// lookup, and it does so only after that operation key is already held.
+#[allow(clippy::too_many_arguments)]
+async fn slot_zero_public_preflight(
+    tx: &tokio_postgres::Transaction<'_>,
+    serving: &ServingRepository,
+    actor: &Identity,
+    public_request: &PublicAttemptRequest,
+    backend_identity: &crate::blob_store::BlobBackendIdentity,
+    private_id: Uuid,
+    request: &PushRequest,
+    baseline: &PackCommitBaseline,
+    deadline: Instant,
+) -> Result<SlotZeroPreflight, GatewayError> {
+    let repository_id = serving.gate.repository_id();
+    PgRefStore.lock_public_attempt(tx, public_request, private_id, deadline).await.map_err(GatewayError::from)?;
+    crate::ref_store::pg::lock_operation(tx, repository_id, public_request.public_id, deadline)
+        .await
+        .map_err(GatewayError::from)?;
+    let fresh = crate::ref_store::serving::lookup_in_tx(
+        tx,
+        actor,
+        &serving.repository.owner,
+        &serving.repository.name,
+        true,
+        backend_identity,
+        deadline,
+    )
+    .await
+    .map_err(GatewayError::from)?;
+    if fresh.gate.repository_id() != repository_id
+        || crate::ref_store::core::RealmExpectation::from_gate(&fresh.gate)
+            != crate::ref_store::core::RealmExpectation::from_gate(&serving.gate)
+        || !admission_realm_matches_serving(baseline, &fresh)
+        || fresh.cluster_incarnation != public_request.restore_incarnation
+    {
+        return Err(GatewayError::Conflict("repository authority changed; retry"));
+    }
+
+    match PgRefStore.lookup_public_attempt(tx, public_request, deadline).await.map_err(GatewayError::from)? {
+        PublicAttemptLookup::Unknown => Ok(SlotZeroPreflight::Fresh(public_request.clone())),
+        PublicAttemptLookup::PrivateIdentifier => {
+            Err(GatewayError::Conflict("operation identifier is already a private attempt"))
+        }
+        PublicAttemptLookup::LegacyPath => {
+            // Explicitly authorized compatibility branch. The migration-152
+            // lookup proved there is no wrapper or private claim for this UUID;
+            // the migration-138 key is already held, so the guarded legacy
+            // lookup can resolve only its own durable record.
+            match operation::lookup_in_tx(tx, repository_id, public_request.public_id, deadline).await? {
+                operation::Lookup::Known(resolved) => Ok(SlotZeroPreflight::Claim(operation::classify(
+                    resolved,
+                    repository_id,
+                    actor.id,
+                    public_request.public_id,
+                    request,
+                    public_request.wire_digest,
+                )?)),
+                operation::Lookup::Unknown => {
+                    Err(GatewayError::Internal("legacy public marker has no durable operation record"))
+                }
+            }
+        }
+        PublicAttemptLookup::Pending(evidence)
+        | PublicAttemptLookup::Committed(evidence)
+        | PublicAttemptLookup::Rejected(evidence)
+        | PublicAttemptLookup::Cancelled(evidence) => Ok(SlotZeroPreflight::Claim(
+            operation::lookup_public_private_in_tx(
+                tx,
+                repository_id,
+                public_request.public_id,
+                &evidence,
+                actor.id,
                 request,
-                pairs,
-                mode,
-                baseline,
+                public_request.wire_digest,
                 deadline,
             )
-            .await
-        }
+            .await?,
+        )),
     }
 }
 
 /// One fresh slot-zero admission transaction against the reviewed migration-152
 /// coordinator.
 ///
-/// The candidate private UUID is unrelated to the public UUID. The request
-/// binds the exact issuer/lane, full captured base realm, live restore
-/// incarnation and opened Blob backend. The plan builder receives the locked
-/// preview and reuses the same canonical [`build_plan_core`] as the legacy
-/// transaction, so HEAD/ref and same-ref atomic/subset rules are not
-/// reimplemented here.
+/// The request was constructed before the public preflight and carries the exact
+/// issuer/lane realm, authorized restore incarnation and opened Blob backend.
+/// The plan builder receives the locked preview and reuses the same canonical
+/// [`build_plan_core`] as the legacy transaction, so HEAD/ref and same-ref
+/// atomic/subset rules are not reimplemented here.
 ///
 /// A preview whose revision differs from the captured baseline is a typed
 /// revision refusal. `admit_slot_zero_in_tx` rolls the savepoint back and
@@ -403,34 +521,18 @@ pub(super) async fn begin_slot_zero(
 /// existing generic gateway outcome.
 #[allow(clippy::too_many_arguments)]
 async fn begin_slot_zero_fresh(
-    state: &BlobGitState,
-    serving: &ServingRepository,
-    actor: &Identity,
-    public_id: Uuid,
-    request_digest: RequestDigest,
+    tx: tokio_postgres::Transaction<'_>,
     request: &PushRequest,
     pairs: &[Pair],
     mode: CommitMode,
     baseline: &PackCommitBaseline,
+    public_request: PublicAttemptRequest,
+    private_id: Uuid,
     deadline: Instant,
 ) -> Result<Start, GatewayError> {
-    let repository_id = baseline.gate().repository_id();
-    // The private UUID is minted independently and is never derived from the
-    // public operation id or from any staged pack byte.
-    let private_id = Uuid::new_v4();
-    let admission = slot_zero_admission_request(
-        serving,
-        actor,
-        public_id,
-        private_id,
-        request_digest,
-        mode,
-        baseline,
-        state.store().backend_identity().as_hex(),
-    )?;
+    let repository_id = public_request.repository_id;
+    let admission = slot_zero_admission_request(&public_request, private_id)?;
 
-    let mut client = state.pooled(deadline).await?;
-    let tx = begin_bounded(&mut client, deadline).await.map_err(ref_error)?;
     let mut built = None;
     let outcome = timeout_at(
         deadline,
@@ -443,10 +545,10 @@ async fn begin_slot_zero_fresh(
                     pairs,
                     mode,
                     admission.admission_owner_id,
-                    actor.id,
+                    admission.issuer_id,
                     baseline,
                     private_id,
-                    request_digest,
+                    public_request.wire_digest,
                     preview.sequence(),
                     preview.base_revision(),
                 )?;
@@ -458,19 +560,21 @@ async fn begin_slot_zero_fresh(
     )
     .await;
     let (tx, admission_result) = match outcome {
-        Ok(admission) => admission.into_parts(),
-        // `admit_slot_zero_in_tx` owns and drops the outer transaction on every
-        // fatal/uncertain path, so this future cannot leave a commit-able handle.
+        Ok(Ok(admission)) => admission.into_parts(),
+        // The coordinator owns and drops the outer transaction on an inner
+        // fatal/uncertain error; there is no handle here to commit.
+        Ok(Err(error)) => return Err(GatewayError::from(error)),
         Err(_) => return Err(GatewayError::Timeout),
     };
 
     match admission_result {
         Ok(receipt) if receipt.replayed => {
             // Exact public replay: no plan was built and no sequence, wrapper or
-            // operation write occurred. Resolve the stored private operation in
-            // the same transaction, then roll the read/lock transaction back.
+            // operation write occurred. Resolve the stored private operation
+            // through the same verified public evidence, never the legacy
+            // private-id lookup, then roll the read/lock transaction back.
             let claim =
-                replay_slot_zero_claim(&tx, repository_id, actor, &receipt, request, request_digest, deadline).await;
+                replay_slot_zero_claim(&tx, &public_request, request, public_request.wire_digest, deadline).await;
             let cleanup = rollback_bounded(tx, deadline).await;
             let claim = claim?;
             cleanup?;
@@ -482,7 +586,7 @@ async fn begin_slot_zero_fresh(
                 return Err(GatewayError::Internal("slot zero admission did not build its plan"));
             };
             if receipt.state != OperationState::Pending
-                || receipt.public_id != public_id
+                || receipt.public_id != public_request.public_id
                 || receipt.private_id != private_id
                 || receipt.private_id != plan.identity().operation_id()
                 || receipt.sequence != plan.identity().sequence()
@@ -503,7 +607,7 @@ async fn begin_slot_zero_fresh(
             // bounded commit keeps the private UUID out of any COMMIT-unknown
             // error identity; `From<RefStoreError>` renders the generic unknown
             // outcome, never the private id.
-            commit_bounded(tx, deadline, repository_id, Some(public_id)).await.map_err(ref_error)?;
+            commit_bounded(tx, deadline, repository_id, Some(public_request.public_id)).await.map_err(ref_error)?;
             Ok(Start::Fresh { _token: token, plan: Box::new(plan) })
         }
         Err(error) if is_rolled_back_revision_mismatch(&error) => {
@@ -523,38 +627,32 @@ async fn begin_slot_zero_fresh(
     }
 }
 
-/// Construct the exact private admission request from the authorized serving
-/// realm and the captured base baseline.
+/// Construct the exact typed public request from the authorized serving realm
+/// and the captured base baseline.
 ///
 /// `admission_owner_id` is the owner/tenant UUID proven by the authorized
-/// serving lookup, never the actor or a caller-supplied tenant. `owner` in the
-/// plan is deliberately the same value: migration 152 validates both plan
-/// fields against this one request field. The restore incarnation comes from
-/// the same authorized lookup; the coordinator re-locks the live singleton
-/// before any fresh write.
+/// serving lookup, never the actor or a caller-supplied tenant. The restore
+/// incarnation comes from the same authorized lookup; the coordinator re-locks
+/// the live singleton before any fresh write.
 #[allow(clippy::too_many_arguments)]
-fn slot_zero_admission_request(
+fn public_attempt_request(
     serving: &ServingRepository,
     actor: &Identity,
     public_id: Uuid,
-    private_id: Uuid,
     wire_digest: RequestDigest,
     request_mode: CommitMode,
     baseline: &PackCommitBaseline,
     backend_identity: String,
-) -> Result<SlotZeroAdmissionRequest, GatewayError> {
+) -> Result<PublicAttemptRequest, GatewayError> {
     if !admission_realm_matches_serving(baseline, serving) {
         return Err(GatewayError::Conflict("repository authority changed; retry"));
     }
     let gate = baseline.gate();
-    let lane = IssuerLane::new(ISSUER_LANE).map_err(ref_error)?;
-    Ok(SlotZeroAdmissionRequest {
+    Ok(PublicAttemptRequest {
         repository_id: gate.repository_id(),
         admission_owner_id: gate.tenant_id(),
         issuer_id: actor.id,
-        lane,
         public_id,
-        private_id,
         wire_digest,
         request_mode,
         backend_identity,
@@ -563,6 +661,32 @@ fn slot_zero_admission_request(
         authority_epoch: gate.authority_epoch(),
         group_epoch: gate.group_epoch(),
         restore_incarnation: serving.cluster_incarnation,
+    })
+}
+
+/// Add the private slot identity to an already validated public request. Both
+/// migration-152 records are populated from this one typed source, so the
+/// wrapper and private attempt cannot diverge on realm or wiring fields.
+fn slot_zero_admission_request(
+    public: &PublicAttemptRequest,
+    private_id: Uuid,
+) -> Result<SlotZeroAdmissionRequest, GatewayError> {
+    let lane = IssuerLane::new(ISSUER_LANE).map_err(ref_error)?;
+    Ok(SlotZeroAdmissionRequest {
+        repository_id: public.repository_id,
+        admission_owner_id: public.admission_owner_id,
+        issuer_id: public.issuer_id,
+        lane,
+        public_id: public.public_id,
+        private_id,
+        wire_digest: public.wire_digest,
+        request_mode: public.request_mode,
+        backend_identity: public.backend_identity.clone(),
+        object_format: public.object_format,
+        history_incarnation: public.history_incarnation,
+        authority_epoch: public.authority_epoch,
+        group_epoch: public.group_epoch,
+        restore_incarnation: public.restore_incarnation,
     })
 }
 
@@ -605,27 +729,39 @@ fn build_slot_zero_plan(
     build_plan_core(request, pairs, mode, owner, baseline, identity)
 }
 
-/// Resolve one exact slot-zero replay through the shared operation classifier.
-/// The private UUID is used only inside this read-only transaction; the caller
-/// exposes the resulting terminal or unknown claim, not the UUID.
+/// Resolve one exact slot-zero replay through the verified public evidence.
+/// No legacy operation lookup is used: the public attempt lookup re-proves the
+/// wrapper/attempt, then the separately scoped internal helper reads the exact
+/// private record under the already-held migration-152 lock.
 async fn replay_slot_zero_claim(
     tx: &tokio_postgres::Transaction<'_>,
-    repository_id: Uuid,
-    actor: &Identity,
-    receipt: &SlotZeroReceipt,
+    public_request: &PublicAttemptRequest,
     request: &PushRequest,
     request_digest: RequestDigest,
     deadline: Instant,
 ) -> Result<Claim, GatewayError> {
-    let private = receipt.private_id;
-    match operation::lookup_in_tx(tx, repository_id, private, deadline).await? {
-        operation::Lookup::Known(resolved) => {
-            operation::classify(resolved, repository_id, actor.id, private, request, request_digest)
-        }
-        operation::Lookup::Unknown => {
-            Err(GatewayError::Internal("slot zero replay has no durable private operation record"))
-        }
-    }
+    let repository_id = public_request.repository_id;
+    let evidence =
+        match PgRefStore.lookup_public_attempt(tx, public_request, deadline).await.map_err(GatewayError::from)? {
+            PublicAttemptLookup::Pending(evidence)
+            | PublicAttemptLookup::Committed(evidence)
+            | PublicAttemptLookup::Rejected(evidence)
+            | PublicAttemptLookup::Cancelled(evidence) => evidence,
+            PublicAttemptLookup::Unknown | PublicAttemptLookup::PrivateIdentifier | PublicAttemptLookup::LegacyPath => {
+                return Err(GatewayError::Internal("slot zero replay evidence is not a verified public attempt"));
+            }
+        };
+    operation::lookup_public_private_in_tx(
+        tx,
+        repository_id,
+        public_request.public_id,
+        &evidence,
+        public_request.issuer_id,
+        request,
+        request_digest,
+        deadline,
+    )
+    .await
 }
 
 /// What one fresh-write transaction decided about this operation identity.
@@ -1256,18 +1392,24 @@ mod tests {
         let digest = RequestDigest::of("test-slot-zero-request", &[b"wire"]);
         let backend = "b".repeat(64);
 
-        let request = slot_zero_admission_request(
+        let public = public_attempt_request(
             &serving,
             &actor,
             public_id,
-            private_id,
             digest,
             CommitMode::AcceptedSubset,
             &baseline,
             backend.clone(),
         )
         .unwrap();
+        let request = slot_zero_admission_request(&public, private_id).unwrap();
 
+        assert_eq!(public.repository_id, serving.gate.repository_id());
+        assert_eq!(public.admission_owner_id, serving.gate.tenant_id());
+        assert_eq!(public.issuer_id, actor.id);
+        assert_eq!(public.public_id, public_id);
+        assert_eq!(public.wire_digest, digest);
+        assert_eq!(public.restore_incarnation, serving.cluster_incarnation);
         assert_eq!(request.repository_id, serving.gate.repository_id());
         assert_eq!(request.admission_owner_id, serving.gate.tenant_id());
         assert_eq!(request.issuer_id, actor.id);
@@ -1309,10 +1451,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = slot_zero_admission_request(
+        let error = public_attempt_request(
             &serving,
             &test_actor(),
-            Uuid::new_v4(),
             Uuid::new_v4(),
             RequestDigest::of("test-slot-zero-moved-realm", &[b"wire"]),
             CommitMode::Atomic,
