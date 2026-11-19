@@ -60,6 +60,8 @@ mod challenge_tests;
 mod session_browser_acceptance;
 #[cfg(test)]
 mod session_http_acceptance;
+#[cfg(test)]
+pub(crate) mod slot_one_acceptance_support;
 
 /// Serializes the two top-level cfg(test) native cases that each pin their own
 /// fixture schema and Blob prefix. The wider session harness (including its

@@ -1018,3 +1018,53 @@ mod tests {
         }
     }
 }
+
+/// Test-only digest derivation for the same exact producer body a fixture will
+/// later hand to [`verified_receive_from_test_wire`]. The operation id is
+/// supplied by the caller because the durable public identity is chosen before
+/// admission; nothing here invents a request or a mode.
+#[cfg(test)]
+pub(super) async fn producer_request_digest(
+    repository_id: Uuid,
+    operation: Uuid,
+    format: GitObjectFormat,
+    body: &Path,
+    deadline: tokio::time::Instant,
+) -> Result<RequestDigest, GatewayError> {
+    let prefix = native::read_prefix(body, protocol::MAX_COMMAND_BYTES).await?;
+    let request = protocol::parse_push(&prefix, format)?;
+    let mode = if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
+    operation::request_digest(repository_id, operation, format, &request, mode, body, deadline).await
+}
+
+/// Test-only completion of one [`VerifiedReceive`] from the exact producer body
+/// and already-staged pairs. It uses the production parser and digest assembly,
+/// and only [`ReceiveInput::complete`] constructs the value, so it cannot accept
+/// independent commands, mode, digest or pair metadata as the handoff input.
+#[cfg(test)]
+pub(super) async fn verified_receive_from_test_wire<'a>(
+    actor: &'a Identity,
+    operation: Uuid,
+    serving: &ServingRepository,
+    body: &Path,
+    pairs: Vec<Pair>,
+    deadline: tokio::time::Instant,
+) -> Result<VerifiedReceive<'a>, GatewayError> {
+    let format = serving.gate.object_format();
+    let prefix = native::read_prefix(body, protocol::MAX_COMMAND_BYTES).await?;
+    let request = protocol::parse_push(&prefix, format)?;
+    let mode = if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
+    let digest =
+        operation::request_digest(serving.gate.repository_id(), operation, format, &request, mode, body, deadline)
+            .await?;
+    Ok(ReceiveInput {
+        actor,
+        operation,
+        repository_id: serving.gate.repository_id(),
+        object_format: format,
+        request,
+        mode,
+        digest,
+    }
+    .complete(pairs))
+}

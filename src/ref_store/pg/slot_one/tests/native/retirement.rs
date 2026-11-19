@@ -11,6 +11,7 @@ use super::{
     serving,
 };
 use anyhow::{Result, anyhow, bail, ensure};
+use rootyard::blob_git_gateway::slot_one_acceptance_support as acceptance;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::{
     CommitMode, CommitRejectCode, GitObjectFormat, IssuerLane, OperationLookup, OperationState, RefCommitResult,
@@ -33,6 +34,19 @@ use uuid::Uuid;
 /// through the production superseded writer, and select the retirement through
 /// the production mirror without mutating the pending wrapper.
 pub(super) async fn retire_p0(db: &db::Db, store: &BlobStore, git: &Path) -> Result<Retired> {
+    retire_p0_inner(db, store, git, false).await
+}
+
+/// Same real retirement prefix, but P0's public wire digest is derived by the
+/// gateway's production parser/digest from the exact command-plus-pack body.
+/// The private direct-handoff acceptance reconstructs that same body, so the
+/// handoff consumes a genuine producer value rather than a logical fixture
+/// digest.
+pub(super) async fn retire_p0_with_producer(db: &db::Db, store: &BlobStore, git: &Path) -> Result<Retired> {
+    retire_p0_inner(db, store, git, true).await
+}
+
+async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_request: bool) -> Result<Retired> {
     let (verified, actor, repository) = serving::verify_new_serving(db, store, git, "slot-one-native").await?;
     let gate0 = db::gate_version(&db.pool, repository.id, actor.id).await?;
     ensure!(gate0.revision() == verified.gate.revision(), "initial gate revision differs from the serving receipt");
@@ -50,12 +64,22 @@ pub(super) async fn retire_p0(db: &db::Db, store: &BlobStore, git: &Path) -> Res
 
     let lane = IssuerLane::new(SLOT_ZERO_LANE)?;
     let refs0 = vec![ref_update(format, REF_RETRY, None, &retry_oid)?];
-    let wire0 = wire_digest(format, REF_RETRY, None, &retry_oid, CommitMode::Atomic);
+    let public_id = Uuid::new_v4();
+    let wire0 = if producer_request {
+        let body_dir = tempfile::tempdir()?;
+        let body = body_dir.path().join("slot-zero-p0.request");
+        acceptance::write_producer_body(&body, &p0_files.pack, format, REF_RETRY, None, &retry_oid, true)?;
+        acceptance::producer_request_digest(repository.id, public_id, format, &body, deadline())
+            .await
+            .map_err(|error| anyhow!("producer request digest refused: {error:?}"))?
+    } else {
+        wire_digest(format, REF_RETRY, None, &retry_oid, CommitMode::Atomic)
+    };
     let public = PublicAttemptRequest {
         repository_id: repository.id,
         admission_owner_id: actor.id,
         issuer_id: actor.id,
-        public_id: Uuid::new_v4(),
+        public_id,
         wire_digest: wire0,
         request_mode: CommitMode::Atomic,
         backend_identity: store.backend_identity().as_hex().to_owned(),

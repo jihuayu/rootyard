@@ -162,3 +162,4 @@ async fn slot_one_rotation_replays_identical_wire_command_on_real_a3_a4_a5() -> 
     .await;
     db.finish(outcome).await
 }
+mod gateway;
