@@ -27,6 +27,8 @@ jobs:
     name: S4 failure-only Git child-exit diagnostic (PG17)
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    # PG17 is pinned. The exact S4 fixture owns its in-process S3 backend, so
+    # this diagnostic does not inject an external Garage service.
     services:
       postgres:
         image: postgres:17
@@ -100,10 +102,9 @@ jobs:
           cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
           rustc -V | grep -Eq '^rustc 1\.99\.1 '
 
-      - name: Verify selected Git and GDB
+      - name: Build exact unstripped S4 test executable
         run: |
           set -euo pipefail
-          mkdir -p test-results/s4-git-exit-diagnostic
           test -x /usr/bin/git
           /usr/bin/git --version
           if ! command -v gdb >/dev/null 2>&1; then
@@ -111,10 +112,6 @@ jobs:
             sudo apt-get install -y --no-install-recommends gdb
           fi
           gdb --version | sed -n '1p'
-
-      - name: Build exact unstripped S4 test executable
-        run: |
-          set -euo pipefail
           mkdir -p test-results/s4-git-exit-diagnostic
           # build_native_test.py is the normal exact-target Rust subprocess
           # selector and runs cargo rustc --locked --profile test --test
@@ -133,9 +130,11 @@ jobs:
       - name: Run failure-only Git child-exit observer
         run: |
           set -euo pipefail
-          # The observer passes exactly --ignored --test-threads=1 to the test
-          # executable and does not filter individual test names. Its exit
-          # status is the test binary's exit status.
+          # The observer passes exactly --ignored --exact <target>
+          # --test-threads=1. Normal six-case S4 acceptance remains the
+          # authoritative gate and is unchanged; a single-case pass here does
+          # not refute that six-case failure. The exit status is the test
+          # binary's exit status.
           python3 tests/s4_git_exit_debugger.py \
             --binary test-results/s4-git-exit-diagnostic/s4_ci_pins_git_view \
             --report test-results/s4-git-exit-diagnostic/report.json \

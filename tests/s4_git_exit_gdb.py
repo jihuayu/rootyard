@@ -42,6 +42,10 @@ except ValueError:
 _FRAMES = []
 _FAILURE = False
 _WRITTEN = False
+_REVERSE_PHASE_FILES = (
+    "src/namespace_service/s4_git_view_reverse.rs",
+    "src/namespace_service/s4_git_proc_reverse.rs",
+)
 
 
 def _write(lines):
@@ -91,8 +95,7 @@ class _FailureObserver(gdb.Breakpoint):
 
     def stop(self):
         global _FAILURE
-        _FAILURE = True
-        _FRAMES.clear()
+        frames = []
         frame = gdb.newest_frame()
         seen = 0
         while frame is not None and seen < _MAX_FRAMES:
@@ -100,9 +103,14 @@ class _FailureObserver(gdb.Breakpoint):
             if sal is not None and sal.symtab is not None and sal.line and sal.line > 0:
                 relative = _repo_relative(sal.symtab.fullname())
                 if relative:
-                    _FRAMES.append((relative, int(sal.line)))
+                    frames.append((relative, int(sal.line)))
             frame = frame.older()
             seen += 1
+        if not any(relative in _REVERSE_PHASE_FILES for relative, _line in frames):
+            return False
+        _FAILURE = True
+        _FRAMES.clear()
+        _FRAMES.extend(frames)
         self.enabled = False
         return False
 

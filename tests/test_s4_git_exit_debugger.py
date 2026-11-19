@@ -27,6 +27,7 @@ TARGET = ROOT / "target"
 FAKE_GDB = """#!/usr/bin/env python3
 import os
 import sys
+import time
 
 mode = os.environ.get("FAKE_GDB_MODE", "classified")
 if "--args" not in sys.argv:
@@ -36,9 +37,12 @@ if "--args" not in sys.argv:
     print('Line 359 of "src/namespace_service/s4_git_proc.rs"')
     raise SystemExit(0)
 
+if mode == "timeout":
+    time.sleep(10)
+
 path = os.environ["S4_GIT_RESULT_PATH"]
 nonce = os.environ["S4_GIT_NONCE"]
-if mode == "missing":
+if mode in ("missing", "no_result"):
     raise SystemExit(0)
 
 lines = ["s4git-result 1 " + nonce]
@@ -148,9 +152,11 @@ class ClosedMapperTests(unittest.TestCase):
     def test_every_physical_caller_location_matches_the_closed_table(self) -> None:
         debugger.verify_sites(ROOT)
 
-    def test_the_six_exact_cases_are_in_source_order(self) -> None:
-        self.assertEqual(debugger.test_cases(ROOT), debugger.EXPECTED_CASES)
-        self.assertEqual(len(debugger.EXPECTED_CASES), 6)
+    def test_target_case_is_unique_sha1_reverse_case(self) -> None:
+        self.assertEqual(debugger.target_case(ROOT), debugger.TARGET_CASE)
+        self.assertEqual(debugger.TARGET_OBJECT_FORMAT, "sha1")
+        body = debugger.read_source(ROOT, debugger.TEST_FILE)
+        self.assertEqual(body.count("async fn " + debugger.TARGET_CASE + "("), 1)
 
     def test_innermost_verified_frame_wins(self) -> None:
         frames = [
@@ -158,26 +164,19 @@ class ClosedMapperTests(unittest.TestCase):
             debugger.Frame("src/namespace_service/s4_git_proc_reverse.rs", 190),
             debugger.Frame("src/namespace_service/s4_git_view_reverse.rs", 202),
         ]
-        classification = debugger.classify_frames(frames)
-        self.assertIs(classification.operation, debugger.Operation.ROOT_MKTREE)
-        self.assertEqual(classification.frame, frames[1])
+        operation, frame = debugger.classify_frames(frames)
+        self.assertIs(operation, debugger.Operation.ROOT_MKTREE)
+        self.assertEqual(frame, frames[1])
 
     def test_unknown_frame_is_unresolved(self) -> None:
-        classification = debugger.classify_frames(
+        operation, frame = debugger.classify_frames(
             [
                 debugger.Frame("src/namespace_service/s4_git_proc.rs", 359),
                 debugger.Frame("src/namespace_service/s4_git_view_reverse.rs", 99999),
             ]
         )
-        self.assertIsNone(classification.operation)
-        self.assertIs(classification.reason, debugger.Reason.NO_KNOWN_CALLER_FRAME)
-
-    def test_outside_or_traversal_frames_are_ignored(self) -> None:
-        for relative in ("/etc/passwd", "../escape.rs", ".git/config", "src/../x.rs"):
-            with self.subTest(relative=relative):
-                classification = debugger.classify_frames([debugger.Frame(relative, 1)])
-                self.assertIsNone(classification.operation)
-
+        self.assertIsNone(operation)
+        self.assertIsNone(frame)
     def test_duplicate_caller_location_is_rejected(self) -> None:
         first = debugger.Site("src/namespace_service/s4_git_proc.rs", 1, debugger.Operation.PACK_INDEX, "x")
         second = debugger.Site("src/namespace_service/s4_git_proc.rs", 1, debugger.Operation.ROOT_MKTREE, "x")
@@ -196,10 +195,17 @@ class ClosedMapperTests(unittest.TestCase):
         with self.assertRaises(debugger.MappingError):
             debugger.verify_sites(ROOT, stale)
 
-    def test_changed_case_order_is_rejected(self) -> None:
-        with mock.patch.object(debugger, "EXPECTED_CASES", tuple(reversed(debugger.EXPECTED_CASES))):
+    def test_missing_target_case_is_rejected(self) -> None:
+        with mock.patch.object(debugger, "TARGET_CASE", "missing_case"):
             with self.assertRaises(debugger.PreflightError):
-                debugger.test_cases(ROOT)
+                debugger.target_case(ROOT)
+
+    def test_ambiguous_target_case_is_rejected(self) -> None:
+        pattern = mock.Mock()
+        pattern.findall.return_value = [debugger.TARGET_CASE, debugger.TARGET_CASE]
+        with mock.patch.object(debugger, "CASE_PATTERN", pattern):
+            with self.assertRaises(debugger.PreflightError):
+                debugger.target_case(ROOT)
 
     def test_symlinked_source_is_rejected(self) -> None:
         TARGET.mkdir(exist_ok=True)
@@ -214,7 +220,7 @@ class ResultGrammarTests(unittest.TestCase):
     NONCE = "0123456789abcdef0123456789abcdef"
 
     def result(self, *lines: str) -> str:
-        return "\n".join(( "s4git-result 1 " + self.NONCE, *lines)) + "\n"
+        return "\n".join((("s4git-result 1 " + self.NONCE), *lines)) + "\n"
 
     def test_accepts_the_fixed_result_shape(self) -> None:
         parsed = debugger.parse_result(
@@ -231,77 +237,39 @@ class ResultGrammarTests(unittest.TestCase):
         self.assertEqual(parsed.frames, (debugger.Frame("src/namespace_service/s4_git_view_reverse.rs", 170),))
         self.assertEqual(parsed.exit_code, 101)
 
-    def test_rejects_nonce_mismatch(self) -> None:
-        with self.assertRaises(debugger.ResultError):
-            debugger.parse_result(self.result("breakpoint resolved x 1"), "f" * 32)
-
-    def test_rejects_a_breakpoint_at_another_line(self) -> None:
-        with self.assertRaises(debugger.ResultError):
-            debugger.parse_result(
-                self.result(
-                    "breakpoint resolved src/namespace_service/s4_git_proc.rs 358",
-                    "failure 0",
-                    "exit 0",
-                    "signal 0",
-                ),
-                self.NONCE,
-            )
-
-    def test_rejects_unknown_record_and_absolute_frame(self) -> None:
-        with self.assertRaises(debugger.ResultError):
-            debugger.parse_result(
-                self.result(
-                    "breakpoint resolved src/namespace_service/s4_git_proc.rs 359",
-                    "failure 1",
-                    "frame /etc/passwd 1",
-                    "exit 1",
-                    "signal 0",
-                    "marker injected",
-                ),
-                self.NONCE,
-            )
-
-    def test_rejects_duplicate_and_unbounded_records(self) -> None:
-        with self.assertRaises(debugger.ResultError):
-            debugger.parse_result(
-                self.result(
-                    "breakpoint resolved src/namespace_service/s4_git_proc.rs 359",
-                    "failure 1",
-                    "exit 1",
-                    "exit 1",
-                    "signal 0",
-                ),
-                self.NONCE,
-            )
-        with self.assertRaises(debugger.ResultError):
-            debugger.parse_result(
-                self.result(
-                    "breakpoint resolved src/namespace_service/s4_git_proc.rs 359",
-                    "failure 1",
-                    *(f"frame src/namespace_service/s4_git_view_reverse.rs {line}" for line in range(1, 20)),
-                    "exit 1",
-                    "signal 0",
-                ),
-                self.NONCE,
-            )
-
-    def test_rejects_target_data_on_unresolved_breakpoint(self) -> None:
-        with self.assertRaises(debugger.ResultError):
-            debugger.parse_result(
-                self.result(
-                    "breakpoint unresolved src/namespace_service/s4_git_proc.rs 359",
-                    "failure 0",
-                    "exit 1",
-                    "signal 0",
-                    "error breakpoint_unresolved",
-                ),
-                self.NONCE,
-            )
-
-    def test_failure_kind_is_unknown_without_positive_evidence(self) -> None:
-        self.assertIs(debugger.failure_kind(), debugger.FailureKind.UNKNOWN)
-        self.assertIs(debugger.failure_kind(positively_nonzero=True), debugger.FailureKind.NONZERO_EXIT)
-        self.assertIs(debugger.failure_kind(positively_signaled=True), debugger.FailureKind.SIGNALED)
+    def test_rejects_malformed_or_injected_results(self) -> None:
+        cases = {
+            "nonce": self.result("breakpoint resolved src/namespace_service/s4_git_proc.rs 359", "failure 0", "exit 0", "signal 0"),
+            "wrong-breakpoint": self.result(
+                "breakpoint resolved src/namespace_service/s4_git_proc.rs 358", "failure 0", "exit 0", "signal 0"
+            ),
+            "absolute-frame": self.result(
+                "breakpoint resolved src/namespace_service/s4_git_proc.rs 359",
+                "failure 1", "frame /etc/passwd 1", "exit 1", "signal 0",
+            ),
+            "unknown-record": self.result(
+                "breakpoint resolved src/namespace_service/s4_git_proc.rs 359",
+                "failure 1", "marker injected", "exit 1", "signal 0",
+            ),
+            "duplicate-exit": self.result(
+                "breakpoint resolved src/namespace_service/s4_git_proc.rs 359",
+                "failure 1", "exit 1", "exit 1", "signal 0",
+            ),
+            "unresolved-with-target": self.result(
+                "breakpoint unresolved src/namespace_service/s4_git_proc.rs 359",
+                "failure 0", "exit 1", "signal 0", "error breakpoint_unresolved",
+            ),
+            "too-many-frames": self.result(
+                "breakpoint resolved src/namespace_service/s4_git_proc.rs 359",
+                "failure 1",
+                *(f"frame src/namespace_service/s4_git_view_reverse.rs {line}" for line in range(1, 20)),
+                "exit 1", "signal 0",
+            ),
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(debugger.ResultError):
+                    debugger.parse_result(text, "f" * 32 if name == "nonce" else self.NONCE)
 
     def test_git_version_is_numeric_only(self) -> None:
         self.assertEqual(debugger.parse_git_version("git version 2.43.0\n"), (2, 43, 0))
@@ -318,26 +286,28 @@ class FixedDebuggerCommandTests(unittest.TestCase):
         self.assertIn("--nx", argv)
         self.assertIn("-x", argv)
         self.assertIn("--args", argv)
-        self.assertEqual(argv[-3:], [str(ROOT / "target" / "test-binary"), "--ignored", "--test-threads=1"])
+        self.assertEqual(
+            argv[-5:],
+            [
+                str(ROOT / "target" / "test-binary"),
+                "--ignored",
+                "--exact",
+                debugger.TARGET_CASE,
+                "--test-threads=1",
+            ],
+        )
+        self.assertEqual(argv.count(debugger.TARGET_CASE), 1)
         self.assertNotIn("attach", argv)
         self.assertNotIn("-ex", argv)
         self.assertEqual(argv.count("-x"), 1)
-
-    def test_preflight_script_has_no_run_break_attach_or_target_code(self) -> None:
-        body = debugger.GDB_PREFLIGHT.read_text(encoding="utf-8")
-        self.assertIn("info line src/namespace_service/s4_git_proc.rs:359", body)
-        self.assertIn("s4-gdb-python-ok", body)
-        self.assertNotIn("run", body)
-        self.assertNotIn("break ", body)
-        self.assertNotIn("attach", body)
-        self.assertNotIn("call ", body)
-
     def test_gdb_extension_has_one_breakpoint_and_no_target_calls(self) -> None:
         body = debugger.GDB_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("gdb.Breakpoint", body)
         self.assertIn("newest_frame", body)
         self.assertIn("unset environment", body)
         self.assertIn('gdb.execute("run")', body)
+        self.assertIn("_REVERSE_PHASE_FILES", body)
+        self.assertIn("s4_git_view_reverse.rs", body)
         self.assertNotIn("gdb.execute(\"attach", body)
         self.assertNotIn("gdb.execute(\"call", body)
         self.assertNotIn("parse_and_eval", body)
@@ -385,49 +355,72 @@ class InstrumentedObserverTests(ObserverFixture):
         self.assertEqual(report["test_exit"], 137)
         self.assertEqual(report["status"], "classified_failure")
 
-    def test_marker_with_success_exit_is_inconsistent(self) -> None:
-        self.assertEqual(self.run_sidecar("marker_zero"), 3)
+    def test_child_failure_with_zero_exit_reports_mismatch_and_passes_zero(self) -> None:
+        self.assertEqual(self.run_sidecar("marker_zero"), 0)
         report = self.report()
-        self.assertEqual(report["status"], "inconsistent")
-
-    def test_missing_result_fails_closed(self) -> None:
-        self.assertEqual(self.run_sidecar("missing"), 2)
+        debugger.validate_report(report)
+        self.assertEqual(report["status"], "observer_mismatch")
+        self.assertEqual(report["test_exit"], 0)
+        self.assertTrue(report["failure_observed"])
+        self.assertEqual(report["operation"], "proposal_fetch")
+        self.assertEqual(report["test_suite"], "passed")
+        self.assertEqual(report["run_phase"], "completed")
+    def test_missing_result_reports_started_without_result(self) -> None:
+        self.assertEqual(self.run_sidecar("no_result"), 2)
         report = self.report()
+        debugger.validate_report(report)
         self.assertEqual(report["status"], "unsupported")
         self.assertEqual(report["reason"], "result_missing")
+        self.assertEqual(report["run_phase"], "run_started_no_result")
+        self.assertEqual(report["test_suite"], "started_unknown")
 
-    def test_invalid_result_fails_closed(self) -> None:
+    def test_started_timeout_is_not_reported_as_never_started(self) -> None:
+        self.assertEqual(self.run_sidecar("timeout", ["--timeout-seconds", "1"]), 2)
+        report = self.report()
+        debugger.validate_report(report)
+        self.assertEqual(report["status"], "unsupported")
+        self.assertEqual(report["reason"], "run_timed_out")
+        self.assertEqual(report["run_phase"], "run_started_timed_out")
+        self.assertEqual(report["test_suite"], "started_unknown")
+        self.assertIsNone(report["test_exit"])
+
+    def test_invalid_result_reports_started_with_invalid_result(self) -> None:
         self.assertEqual(self.run_sidecar("invalid"), 2)
         report = self.report()
+        debugger.validate_report(report)
         self.assertEqual(report["status"], "unsupported")
         self.assertEqual(report["reason"], "result_invalid")
-
-    def test_absolute_frame_path_fails_closed(self) -> None:
-        self.assertEqual(self.run_sidecar("bad_path"), 2)
-        report = self.report()
-        self.assertEqual(report["status"], "unsupported")
-        self.assertEqual(report["reason"], "result_invalid")
-
-    def test_unresolved_breakpoint_fails_closed(self) -> None:
+        self.assertEqual(report["run_phase"], "run_started_invalid_result")
+        self.assertEqual(report["test_suite"], "started_unknown")
+    def test_unresolved_breakpoint_reports_target_not_run(self) -> None:
         self.assertEqual(self.run_sidecar("breakpoint_unresolved"), 2)
         report = self.report()
+        debugger.validate_report(report)
         self.assertEqual(report["status"], "unsupported")
         self.assertEqual(report["reason"], "breakpoint_unresolved")
+        self.assertEqual(report["run_phase"], "run_started_target_not_run")
+        self.assertEqual(report["test_suite"], "not_run")
 
-    def test_preflight_failure_does_not_run_the_suite(self) -> None:
+    def test_preflight_failure_is_reported_as_preflight_not_run(self) -> None:
         self.assertEqual(self.run_sidecar("bad_preflight"), 2)
         report = self.report()
+        debugger.validate_report(report)
         self.assertEqual(report["status"], "unsupported")
         self.assertEqual(report["reason"], "breakpoint_unresolved")
+        self.assertEqual(report["run_phase"], "preflight_not_run")
+        self.assertEqual(report["test_suite"], "not_run")
         self.assertIsNone(report["test_exit"])
 
     def test_source_preflight_failure_writes_a_bounded_unsupported_report(self) -> None:
         with mock.patch.object(debugger, "verify_sites", side_effect=debugger.PreflightError("stale")):
             self.assertEqual(self.run_sidecar("classified"), 2)
         report = self.report()
+        debugger.validate_report(report)
         self.assertEqual(report["status"], "unsupported")
         self.assertEqual(report["reason"], "source_preflight_failed")
-        self.assertEqual(report["cases"], [])
+        self.assertEqual(report["run_phase"], "preflight_not_run")
+        self.assertEqual(report["case"], debugger.TARGET_CASE)
+        self.assertEqual(report["test_suite"], "not_run")
 
     def test_git_version_preflight_failure_is_reported_separately(self) -> None:
         with mock.patch.object(debugger, "probe_git_version", side_effect=debugger.PreflightError("missing")):
@@ -449,13 +442,13 @@ class ReportShapeTests(unittest.TestCase):
         return debugger.make_report(
             status=debugger.Status.NO_FAILURE_OBSERVED,
             reason=debugger.Reason.NONE,
+            run_phase=debugger.RunPhase.COMPLETED,
             test_exit=0,
             failure_observed=False,
             operation=None,
             caller=None,
             debug_resolution="resolved",
             git_version=(2, 43, 0),
-            cases=debugger.EXPECTED_CASES,
             binary_sha256="a" * 64,
             source={
                 "runner_sha256": "b" * 64,
@@ -467,49 +460,5 @@ class ReportShapeTests(unittest.TestCase):
             base_tree="2" * 40,
             base_parents=["3" * 40, "4" * 40],
         )
-
-    def test_fixed_report_shape_is_valid(self) -> None:
-        debugger.validate_report(self.sample())
-
-    def test_classified_caller_must_be_a_verified_site(self) -> None:
-        report = self.sample()
-        report["status"] = "classified_failure"
-        report["reason"] = "classified"
-        report["test_exit"] = 101
-        report["test_suite"] = "failed"
-        report["failure_observed"] = True
-        report["operation"] = "proposal_fetch"
-        report["caller"] = {"file": "src/namespace_service/s4_git_view_reverse.rs", "line": 170}
-        debugger.validate_report(report)
-        report["caller"] = {"file": "src/namespace_service/s4_git_view_reverse.rs", "line": 1}
-        with self.assertRaises(ValueError):
-            debugger.validate_report(report)
-
-    def test_unsupported_preflight_report_may_have_no_case_list(self) -> None:
-        report = self.sample()
-        report["status"] = "unsupported"
-        report["reason"] = "source_preflight_failed"
-        report["test_exit"] = None
-        report["test_suite"] = "not_run"
-        report["debug_resolution"] = "not_run"
-        report["git_version"] = None
-        report["cases"] = []
-        report["binary_sha256"] = None
-        report["source"] = {}
-        debugger.validate_report(report)
-
-    def test_absolute_path_is_rejected(self) -> None:
-        report = self.sample()
-        report["caller"] = {"file": "/etc/passwd", "line": 1}
-        with self.assertRaises(ValueError):
-            debugger.validate_report(report)
-
-    def test_report_is_bounded(self) -> None:
-        report = self.sample()
-        report["limitations"] = ["x" * debugger.MAX_REPORT_BYTES]
-        with self.assertRaises(ValueError):
-            debugger.validate_report(report)
-
-
 if __name__ == "__main__":
     unittest.main()

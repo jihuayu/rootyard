@@ -43,6 +43,14 @@ HARNESS_FILE = "tests/s4_ci_pins_git_view_support/harness.rs"
 RUNNER_FILE = "src/namespace_service/s4_git_proc.rs"
 REVERSE_FILE = "src/namespace_service/s4_git_view_reverse.rs"
 
+TARGET_CASE = "s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree"
+TARGET_OBJECT_FORMAT = "sha1"
+TARGET_CASE_MARKER = 'create_repository("view-repo", "sha1")'
+REVERSE_PHASE_FILES = (
+    "src/namespace_service/s4_git_view_reverse.rs",
+    "src/namespace_service/s4_git_proc_reverse.rs",
+)
+
 RESULT_SCHEMA = "s4-git-exit-diagnostic-v1"
 RESULT_HEADER = "s4git-result 1"
 MAX_FRAMES = 12
@@ -59,16 +67,6 @@ CASE_PATTERN = re.compile(
     re.MULTILINE,
 )
 
-EXPECTED_CASES = (
-    "s4_pin_retained_clone_survives_force_push_and_revocation",
-    "s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree",
-    "s4_sha256_pin_clone_and_reverse_round_trip",
-    "s4_terminal_job_rechecks_under_final_lock",
-    "s4_git_children_are_bounded_and_reaped",
-    "s4_cluster_authority_fixture_restores_on_failure",
-)
-
-
 class Operation(str, Enum):
     """Closed enum for the observed reverse-import Git caller."""
 
@@ -84,20 +82,12 @@ class Operation(str, Enum):
     PACK_INDEX = "pack_index"
 
 
-class FailureKind(str, Enum):
-    """Only positively ascertainable child-exit kinds are ever emitted."""
-
-    NONZERO_EXIT = "nonzero_exit"
-    SIGNALED = "signaled"
-    UNKNOWN = "unknown"
-
-
 class Status(str, Enum):
     CLASSIFIED_FAILURE = "classified_failure"
+    OBSERVER_MISMATCH = "observer_mismatch"
     UNRESOLVED_FAILURE = "unresolved_failure"
     NO_FAILURE_OBSERVED = "no_failure_observed"
     UNSUPPORTED = "unsupported"
-    INCONSISTENT = "inconsistent"
 
 
 class Reason(str, Enum):
@@ -106,12 +96,23 @@ class Reason(str, Enum):
     NO_FAILURE_MARKER = "no_failure_marker"
     BREAKPOINT_UNRESOLVED = "breakpoint_unresolved"
     GDB_UNAVAILABLE = "gdb_unavailable"
+    WORKDIR_UNAVAILABLE = "workdir_unavailable"
     RESULT_MISSING = "result_missing"
     RESULT_INVALID = "result_invalid"
+    RUN_TIMED_OUT = "run_timed_out"
     GIT_VERSION_UNAVAILABLE = "git_version_unavailable"
     BINARY_UNAVAILABLE = "binary_unavailable"
     SOURCE_PREFLIGHT_FAILED = "source_preflight_failed"
     NONE = "none"
+
+
+class RunPhase(str, Enum):
+    PREFLIGHT_NOT_RUN = "preflight_not_run"
+    RUN_STARTED_TARGET_NOT_RUN = "run_started_target_not_run"
+    RUN_STARTED_NO_RESULT = "run_started_no_result"
+    RUN_STARTED_TIMED_OUT = "run_started_timed_out"
+    RUN_STARTED_INVALID_RESULT = "run_started_invalid_result"
+    COMPLETED = "completed"
 
 
 class PreflightError(RuntimeError):
@@ -141,13 +142,6 @@ class Frame:
 
 
 @dataclass(frozen=True)
-class Classification:
-    operation: Operation | None
-    frame: Frame | None
-    reason: Reason
-
-
-@dataclass(frozen=True)
 class GdbResult:
     nonce: str
     breakpoint_state: str
@@ -166,7 +160,6 @@ class GdbResult:
 # outer replace_tree frame is also present.
 SITES: tuple[Site, ...] = (
     Site("src/namespace_service/s4_git_view_reverse.rs", 153, Operation.SOURCE_PROJECTION, "git_clone("),
-    Site("src/namespace_service/s4_git_view_reverse.rs", 160, Operation.SOURCE_PROJECTION, ".await?;"),
     Site("src/namespace_service/s4_git_view_reverse.rs", 162, Operation.SOURCE_PROJECTION, "s4_git_view::project"),
     Site("src/namespace_service/s4_git_view_reverse.rs", 169, Operation.PROPOSAL_BUNDLE_VERIFY, '"bundle", "verify"'),
     Site("src/namespace_service/s4_git_view_reverse.rs", 170, Operation.PROPOSAL_FETCH, '"fetch", "--no-tags"'),
@@ -175,11 +168,9 @@ SITES: tuple[Site, ...] = (
     Site("src/namespace_service/s4_git_view_reverse.rs", 175, Operation.PROPOSAL_FSCK, '"fsck", "--strict"'),
     Site("src/namespace_service/s4_git_view_reverse.rs", 189, Operation.SOURCE_FETCH, "run_git("),
     Site("src/namespace_service/s4_git_view_reverse.rs", 192, Operation.SOURCE_FETCH, '"fetch", "--no-tags"'),
-    Site("src/namespace_service/s4_git_view_reverse.rs", 195, Operation.SOURCE_FETCH, ".await?;"),
     Site("src/namespace_service/s4_git_view_reverse.rs", 197, Operation.SOURCE_TREE_LISTING, "source_tree_arg"),
     Site("src/namespace_service/s4_git_view_reverse.rs", 202, Operation.SOURCE_TREE_LISTING, "replace_tree("),
     Site("src/namespace_service/s4_git_view_reverse.rs", 206, Operation.COMMIT_SYNTHESIS, "git_input("),
-    Site("src/namespace_service/s4_git_view_reverse.rs", 217, Operation.COMMIT_SYNTHESIS, ".await?;"),
     Site("src/namespace_service/s4_git_view_reverse.rs", 220, Operation.PACK_INDEX, "new_pack("),
     Site("src/namespace_service/s4_git_view.rs", 152, Operation.SOURCE_PROJECTION, '"checkout", "-B"'),
     Site("src/namespace_service/s4_git_view.rs", 153, Operation.SOURCE_PROJECTION, '"for-each-ref"'),
@@ -196,51 +187,35 @@ SITES: tuple[Site, ...] = (
     Site("src/namespace_service/s4_git_proc_reverse.rs", 132, Operation.PACK_INDEX, "git_input("),
     Site("src/namespace_service/s4_git_proc_reverse.rs", 190, Operation.ROOT_MKTREE, "git_input("),
     Site("src/namespace_service/s4_git_proc_reverse.rs", 210, Operation.SOURCE_TREE_LISTING, '"ls-tree"'),
-    Site("src/namespace_service/s4_git_proc_reverse.rs", 217, Operation.ROOT_MKTREE, "mktree("),
-    Site("src/namespace_service/s4_git_proc_reverse.rs", 222, Operation.ROOT_MKTREE, "mktree("),
     Site("src/namespace_service/s4_git_proc_reverse.rs", 227, Operation.SOURCE_TREE_LISTING, '"ls-tree"'),
-    Site("src/namespace_service/s4_git_proc_reverse.rs", 232, Operation.ROOT_MKTREE, "mktree("),
-    Site("src/namespace_service/reverse.rs", 49, Operation.SOURCE_TREE_LISTING, '"ls-tree"'),
-    Site("src/namespace_service/reverse.rs", 71, Operation.ROOT_MKTREE, '"mktree"'),
-    Site("src/namespace_service/reverse.rs", 81, Operation.ROOT_MKTREE, '"mktree"'),
-    Site("src/namespace_service/reverse.rs", 116, Operation.SOURCE_PROJECTION, "git("),
-    Site("src/namespace_service/reverse.rs", 119, Operation.SOURCE_PROJECTION, '"clone"'),
-    Site("src/namespace_service/reverse.rs", 126, Operation.PROPOSAL_BUNDLE_VERIFY, '"bundle", "verify"'),
-    Site("src/namespace_service/reverse.rs", 127, Operation.PROPOSAL_FETCH, '"fetch", "--no-tags"'),
-    Site("src/namespace_service/reverse.rs", 128, Operation.PROPOSAL_FETCH, "FETCH_HEAD^{commit}"),
-    Site("src/namespace_service/reverse.rs", 129, Operation.PROPOSAL_MERGE_BASE, '"merge-base"'),
-    Site("src/namespace_service/reverse.rs", 136, Operation.PROPOSAL_FSCK, '"fsck", "--strict"'),
-    Site("src/namespace_service/reverse.rs", 137, Operation.SOURCE_TREE_LISTING, "projected_tree"),
-    Site("src/namespace_service/reverse.rs", 138, Operation.SOURCE_TREE_LISTING, "old_projected_tree"),
-    Site("src/namespace_service/reverse.rs", 142, Operation.SOURCE_TREE_LISTING, '"rev-parse"'),
-    Site("src/namespace_service/reverse.rs", 151, Operation.SOURCE_FETCH, "git("),
-    Site("src/namespace_service/reverse.rs", 154, Operation.SOURCE_FETCH, '"fetch"'),
-    Site("src/namespace_service/reverse.rs", 160, Operation.SOURCE_FETCH, ")?;"),
-    Site("src/namespace_service/reverse.rs", 164, Operation.SOURCE_TREE_LISTING, "old_tree"),
-    Site("src/namespace_service/reverse.rs", 169, Operation.SOURCE_TREE_LISTING, "replace_tree("),
-    Site("src/namespace_service/reverse.rs", 172, Operation.COMMIT_SYNTHESIS, '"commit-tree"'),
 )
+
+
+def _inside_worktree(root: Path, raw: str | Path, label: str) -> Path:
+    root = root.resolve()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = root / path
+    if path.is_symlink():
+        raise PreflightError(label + " must not be a symlink")
+    path = path.resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise PreflightError(label + " must live inside the worktree") from error
+    if ".git" in relative.parts:
+        raise PreflightError(label + " must not live in .git")
+    return path
 
 
 def safe_repo_path(root: Path, relative: str) -> Path:
     """Resolve one physical repo-relative file and reject escapes/symlinks."""
-    if not isinstance(relative, str) or not relative or relative.startswith("/") or "\\" in relative:
+    if not _valid_relative(relative):
         raise PreflightError("repo-relative source path required")
-    parts = relative.split("/")
-    if any(part in ("", ".", "..") for part in parts) or ".git" in parts:
-        raise PreflightError("repo-relative source path required")
-    root = root.resolve()
-    raw = root / relative
-    if raw.is_symlink():
-        raise PreflightError("source path must not be a symlink")
-    resolved = raw.resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as error:
-        raise PreflightError("source path escapes the repository") from error
-    if not resolved.is_file():
+    path = _inside_worktree(root, relative, "source path")
+    if not path.is_file():
         raise PreflightError("source path is not a regular file")
-    return resolved
+    return path
 
 
 def read_source(root: Path, relative: str) -> str:
@@ -254,12 +229,26 @@ def read_source(root: Path, relative: str) -> str:
     return body
 
 
-def test_cases(root: Path) -> tuple[str, ...]:
+def target_case(root: Path) -> str:
+    """Resolve exactly one stable SHA-1 reverse case; reject ambiguity."""
     body = read_source(root, TEST_FILE)
-    names = tuple(CASE_PATTERN.findall(body))
-    if names != EXPECTED_CASES:
-        raise PreflightError("the six exact ignored S4 cases changed or moved")
-    return names
+    names = CASE_PATTERN.findall(body)
+    if names.count(TARGET_CASE) != 1:
+        raise PreflightError("target case is missing or ambiguous")
+    signature = "async fn " + TARGET_CASE + "("
+    if body.count(signature) != 1:
+        raise PreflightError("target case is missing or ambiguous")
+    lines = body.splitlines()
+    start = next(index for index, line in enumerate(lines) if signature in line)
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if "#[tokio::test]" in lines[index]:
+            end = index
+            break
+    block = "\n".join(lines[start:end])
+    if TARGET_CASE_MARKER not in block or "cluster.reverse" not in block:
+        raise PreflightError("target case is not the SHA-1 reverse case")
+    return TARGET_CASE
 
 
 def verify_sites(root: Path, sites: Sequence[Site] = SITES) -> None:
@@ -292,7 +281,7 @@ def _valid_relative(relative: str) -> bool:
     return ".git" not in parts
 
 
-def classify_frames(frames: Iterable[Frame], sites: Sequence[Site] = SITES) -> Classification:
+def classify_frames(frames: Iterable[Frame], sites: Sequence[Site] = SITES) -> tuple[Operation | None, Frame | None]:
     """Map the innermost verified caller locator to the closed enum."""
     table: dict[tuple[str, int], Operation] = {}
     for site in sites:
@@ -305,8 +294,8 @@ def classify_frames(frames: Iterable[Frame], sites: Sequence[Site] = SITES) -> C
             continue
         operation = table.get((frame.file, frame.line))
         if operation is not None:
-            return Classification(operation, frame, Reason.CLASSIFIED)
-    return Classification(None, None, Reason.NO_KNOWN_CALLER_FRAME)
+            return operation, frame
+    return None, None
 
 
 def observation_nonce() -> str:
@@ -453,15 +442,6 @@ def parse_result(text: str, nonce: str) -> GdbResult:
     )
 
 
-def failure_kind(*, positively_nonzero: bool = False, positively_signaled: bool = False) -> FailureKind:
-    """The observer never reads the target's ExitStatus local."""
-    if positively_signaled:
-        return FailureKind.SIGNALED
-    if positively_nonzero:
-        return FailureKind.NONZERO_EXIT
-    return FailureKind.UNKNOWN
-
-
 def parse_git_version(text: str) -> tuple[int, int, int]:
     match = GIT_VERSION_PATTERN.search(text)
     if match is None:
@@ -494,39 +474,25 @@ def hash_file(path: Path) -> str:
 
 
 def verify_binary(root: Path, raw: str) -> Path:
-    root = root.resolve()
-    path = Path(raw)
-    if not path.is_absolute():
-        path = root / path
-    if path.is_symlink():
-        raise PreflightError("test executable must not be a symlink")
-    path = path.resolve()
-    try:
-        path.relative_to(root)
-    except ValueError as error:
-        raise PreflightError("test executable must live inside the worktree") from error
-    if ".git" in path.relative_to(root).parts:
-        raise PreflightError("test executable must not live in .git")
+    path = _inside_worktree(root, raw, "test executable")
     if not path.is_file() or not os.access(path, os.X_OK):
         raise PreflightError("test executable is missing or not executable")
     return path
 
 
 def safe_work_path(root: Path, raw: str | Path, label: str) -> Path:
-    root = root.resolve()
-    path = Path(raw)
-    if not path.is_absolute():
-        path = root / path
-    if path.is_symlink():
-        raise PreflightError(label + " must not be a symlink")
-    path = path.resolve()
-    try:
-        relative = path.relative_to(root)
-    except ValueError as error:
-        raise PreflightError(label + " must live inside the worktree") from error
-    if ".git" in relative.parts:
-        raise PreflightError(label + " must not live in .git")
-    return path
+    return _inside_worktree(root, raw, label)
+
+
+def target_argv(binary: Path) -> list[str]:
+    """The one named SHA-1 case, with the normal serial ignored selection."""
+    return [
+        str(binary),
+        "--ignored",
+        "--exact",
+        TARGET_CASE,
+        "--test-threads=1",
+    ]
 
 
 def build_gdb_argv(source_root: Path, gdb: str, binary: Path) -> list[str]:
@@ -553,9 +519,7 @@ def build_gdb_argv(source_root: Path, gdb: str, binary: Path) -> list[str]:
         "-x",
         str(GDB_SCRIPT),
         "--args",
-        str(binary),
-        "--ignored",
-        "--test-threads=1",
+        *target_argv(binary),
     ]
 
 
@@ -620,12 +584,12 @@ def run_observer(
     work_dir: Path,
     nonce: str,
     timeout_seconds: int,
-) -> tuple[GdbResult | None, Reason]:
+) -> tuple[GdbResult | None, Reason, RunPhase]:
     try:
         work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         work_dir.chmod(0o700)
     except OSError:
-        return None, Reason.RESULT_MISSING
+        return None, Reason.WORKDIR_UNAVAILABLE, RunPhase.PREFLIGHT_NOT_RUN
     result_path = work_dir / "result.txt"
     _remove(result_path)
     environment = dict(os.environ)
@@ -661,12 +625,12 @@ def run_observer(
                 process.kill()
             process.wait()
     except FileNotFoundError:
-        return None, Reason.GDB_UNAVAILABLE
+        return None, Reason.GDB_UNAVAILABLE, RunPhase.PREFLIGHT_NOT_RUN
     except (OSError, subprocess.SubprocessError):
-        return None, Reason.GDB_UNAVAILABLE
+        return None, Reason.GDB_UNAVAILABLE, RunPhase.PREFLIGHT_NOT_RUN
     if timed_out:
         _remove(result_path)
-        return None, Reason.RESULT_MISSING
+        return None, Reason.RUN_TIMED_OUT, RunPhase.RUN_STARTED_TIMED_OUT
     try:
         if result_path.is_symlink() or not result_path.is_file():
             raise ResultError("result file is not a regular file")
@@ -677,14 +641,16 @@ def run_observer(
     except (FileNotFoundError, OSError, UnicodeError, ResultError):
         existed = result_path.exists() or result_path.is_symlink()
         _remove(result_path)
-        return None, Reason.RESULT_INVALID if existed else Reason.RESULT_MISSING
+        if existed:
+            return None, Reason.RESULT_INVALID, RunPhase.RUN_STARTED_INVALID_RESULT
+        return None, Reason.RESULT_MISSING, RunPhase.RUN_STARTED_NO_RESULT
     try:
         parsed = parse_result(text, nonce)
     except ResultError:
         _remove(result_path)
-        return None, Reason.RESULT_INVALID
+        return None, Reason.RESULT_INVALID, RunPhase.RUN_STARTED_INVALID_RESULT
     _remove(result_path)
-    return parsed, Reason.NONE
+    return parsed, Reason.NONE, RunPhase.COMPLETED
 
 
 def observed_exit(result: GdbResult) -> int | None:
@@ -716,32 +682,37 @@ def make_report(
     *,
     status: Status,
     reason: Reason,
+    run_phase: RunPhase,
     test_exit: int | None,
     failure_observed: bool,
     operation: Operation | None,
     caller: Frame | None,
     debug_resolution: str,
     git_version: tuple[int, int, int] | None,
-    cases: tuple[str, ...],
     binary_sha256: str | None,
     source: dict[str, str | None | list[str]],
     base_commit: str | None,
     base_tree: str | None,
     base_parents: list[str],
 ) -> dict[str, object]:
+    if test_exit is None:
+        test_suite = (
+            "not_run"
+            if run_phase in (RunPhase.PREFLIGHT_NOT_RUN, RunPhase.RUN_STARTED_TARGET_NOT_RUN)
+            else "started_unknown"
+        )
+    else:
+        test_suite = "failed" if test_exit != 0 else "passed"
     return {
         "schema": RESULT_SCHEMA,
         "status": status.value,
         "reason": reason.value,
-        "test_suite": (
-            "not_run"
-            if test_exit is None
-            else ("failed" if test_exit != 0 else "passed")
-        ),
+        "run_phase": run_phase.value,
+        "test_suite": test_suite,
         "test_exit": test_exit,
         "failure_observed": failure_observed,
         "operation": operation.value if operation is not None else None,
-        "failure_kind": failure_kind().value,
+        "failure_kind": "unknown",
         "failure_kind_reason": "exit_status_is_local_and_not_read",
         "caller": (
             {"file": caller.file, "line": caller.line} if caller is not None else None
@@ -749,8 +720,12 @@ def make_report(
         "debug_resolution": debug_resolution,
         "breakpoint": {"file": BREAK_FILE, "line": BREAK_LINE},
         "git_version": list(git_version) if git_version is not None else None,
-        "cases": list(cases),
-        "selection": {"ignored": True, "test_threads": 1, "filtered_by_name": False},
+        "case": TARGET_CASE,
+        "case_object_format": TARGET_OBJECT_FORMAT,
+        "scope": "single_case",
+        "authoritative_suite": "six_case_s4_acceptance",
+        "single_case_result_does_not_refute_six_case_failure": True,
+        "selection": {"ignored": True, "exact": True, "test_threads": 1, "filtered_by_name": True},
         "binary_sha256": binary_sha256,
         "source": source,
         "base_commit": base_commit,
@@ -759,8 +734,9 @@ def make_report(
         "rebuilt_executable_may_differ_by_build_path": True,
         "limitations": [
             "child_exit_status_is_not_read_from_target_memory",
-            "first_unsuccessful_child_exit_wins",
+            "first_reverse_phase_child_exit_wins",
             "classification_requires_the_exact_unstripped_source_line",
+            "single_case_probe_does_not_refute_the_six_case_failure",
             "rebuilt_executable_can_differ_from_a_prior_hosted_binary",
         ],
     }
@@ -769,141 +745,124 @@ def make_report(
 def validate_report(report: dict[str, object]) -> None:
     """Strict shape check used by tests and by the workflow-side reader."""
     required = {
-        "schema",
-        "status",
-        "reason",
-        "test_suite",
-        "test_exit",
-        "failure_observed",
-        "operation",
-        "failure_kind",
-        "failure_kind_reason",
-        "caller",
-        "debug_resolution",
-        "breakpoint",
-        "git_version",
-        "cases",
-        "selection",
-        "binary_sha256",
-        "source",
-        "base_commit",
-        "base_tree",
-        "base_parents",
-        "rebuilt_executable_may_differ_by_build_path",
-        "limitations",
+        "schema", "status", "reason", "run_phase", "test_suite", "test_exit",
+        "failure_observed", "operation", "failure_kind", "failure_kind_reason",
+        "caller", "debug_resolution", "breakpoint", "git_version", "case",
+        "case_object_format", "scope", "authoritative_suite",
+        "single_case_result_does_not_refute_six_case_failure", "selection",
+        "binary_sha256", "source", "base_commit", "base_tree", "base_parents",
+        "rebuilt_executable_may_differ_by_build_path", "limitations",
     }
-    if set(report) != required:
-        raise ValueError("report keys changed")
-    if report["schema"] != RESULT_SCHEMA:
-        raise ValueError("report schema changed")
-    statuses = {status.value for status in Status}
-    if report["status"] not in statuses:
-        raise ValueError("report status is not closed")
-    if report["test_suite"] not in ("passed", "failed", "not_run"):
-        raise ValueError("report test suite is not closed")
-    if report["debug_resolution"] not in ("resolved", "unresolved", "not_run"):
-        raise ValueError("report debug resolution is not closed")
-    if report["breakpoint"] != {"file": BREAK_FILE, "line": BREAK_LINE}:
-        raise ValueError("report breakpoint changed")
-    if report["selection"] != {"ignored": True, "test_threads": 1, "filtered_by_name": False}:
-        raise ValueError("report selection changed")
-    if report["rebuilt_executable_may_differ_by_build_path"] is not True:
-        raise ValueError("report rebuild caveat changed")
-    if not isinstance(report["limitations"], list) or not all(
-        isinstance(item, str) for item in report["limitations"]
-    ):
-        raise ValueError("report limitations are not a string list")
-    if report["operation"] is not None and report["operation"] not in {op.value for op in Operation}:
-        raise ValueError("report operation is not closed")
-    reasons = {reason.value for reason in Reason}
-    if report["reason"] not in reasons:
-        raise ValueError("report reason is not closed")
-    if report["failure_kind"] not in {kind.value for kind in FailureKind}:
-        raise ValueError("report failure kind is not closed")
-    if report["failure_kind_reason"] != "exit_status_is_local_and_not_read":
-        raise ValueError("report failure-kind reason changed")
-    for value, label, pattern in (
-        (report["base_commit"], "base commit", COMMIT_PATTERN),
-        (report["base_tree"], "base tree", COMMIT_PATTERN),
-    ):
-        if value is not None and (not isinstance(value, str) or not pattern.fullmatch(value)):
-            raise ValueError("report " + label + " is invalid")
-    if not isinstance(report["base_parents"], list):
-        raise ValueError("report base parents are not a list")
-    for parent in report["base_parents"]:
-        if not isinstance(parent, str) or not COMMIT_PATTERN.fullmatch(parent):
-            raise ValueError("report base parent is invalid")
+
+    def require(condition: object, message: str) -> None:
+        if not condition:
+            raise ValueError(message)
+
+    require(set(report) == required, "report keys changed")
+    require(report["schema"] == RESULT_SCHEMA, "report schema changed")
+    require(report["status"] in {status.value for status in Status}, "report status is not closed")
+    require(report["reason"] in {reason.value for reason in Reason}, "report reason is not closed")
+    require(report["run_phase"] in {phase.value for phase in RunPhase}, "report run phase is not closed")
+    require(report["test_suite"] in ("passed", "failed", "not_run", "started_unknown"),
+            "report test suite is not closed")
+    require(report["debug_resolution"] in ("resolved", "unresolved", "not_run"),
+            "report debug resolution is not closed")
+    require(report["case"] == TARGET_CASE and report["case_object_format"] == TARGET_OBJECT_FORMAT,
+            "report case identity changed")
+    require(report["scope"] == "single_case", "report scope changed")
+    require(report["authoritative_suite"] == "six_case_s4_acceptance", "report authoritative suite changed")
+    require(report["single_case_result_does_not_refute_six_case_failure"] is True,
+            "report single-case caveat changed")
+    require(report["breakpoint"] == {"file": BREAK_FILE, "line": BREAK_LINE}, "report breakpoint changed")
+    require(report["selection"] == {"ignored": True, "exact": True, "test_threads": 1, "filtered_by_name": True},
+            "report selection changed")
+    require(report["rebuilt_executable_may_differ_by_build_path"] is True, "report rebuild caveat changed")
+    require(report["failure_kind"] == "unknown", "report failure kind changed")
+    require(report["failure_kind_reason"] == "exit_status_is_local_and_not_read",
+            "report failure-kind reason changed")
+    require(isinstance(report["limitations"], list)
+            and all(isinstance(item, str) for item in report["limitations"]),
+            "report limitations are not a string list")
+    require(report["operation"] is None or report["operation"] in {op.value for op in Operation},
+            "report operation is not closed")
+    require(isinstance(report["base_parents"], list)
+            and all(isinstance(parent, str) and COMMIT_PATTERN.fullmatch(parent)
+                    for parent in report["base_parents"]),
+            "report base parent is invalid")
     caller = report["caller"]
     if caller is not None:
-        if not isinstance(caller, dict) or set(caller) != {"file", "line"}:
-            raise ValueError("report caller shape changed")
-        if not isinstance(caller["file"], str) or not _valid_relative(caller["file"]):
-            raise ValueError("report caller file is not repo-relative")
-        if not isinstance(caller["line"], int) or caller["line"] < 1:
-            raise ValueError("report caller line is invalid")
-    if report["binary_sha256"] is not None and (
-        not isinstance(report["binary_sha256"], str)
-        or not SHA256_PATTERN.fullmatch(report["binary_sha256"])
-    ):
-        raise ValueError("report binary digest is invalid")
-    status = report["status"]
-    if status != Status.UNSUPPORTED.value:
-        if not isinstance(report["test_exit"], int) or not 0 <= report["test_exit"] <= 255:
-            raise ValueError("report test exit is not a bounded integer")
-        if not isinstance(report["binary_sha256"], str) or not SHA256_PATTERN.fullmatch(report["binary_sha256"]):
-            raise ValueError("report binary digest is missing")
-        if not isinstance(report["git_version"], list) or len(report["git_version"]) != 3:
-            raise ValueError("report Git version is not exactly numeric")
-        if not all(isinstance(part, int) and part >= 0 for part in report["git_version"]):
-            raise ValueError("report Git version is not exactly numeric")
+        require(isinstance(caller, dict) and set(caller) == {"file", "line"}
+                and isinstance(caller["file"], str) and _valid_relative(caller["file"])
+                and isinstance(caller["line"], int) and not isinstance(caller["line"], bool)
+                and caller["line"] >= 1,
+                "report caller shape changed")
+    require(report["binary_sha256"] is None
+            or (isinstance(report["binary_sha256"], str)
+                and SHA256_PATTERN.fullmatch(report["binary_sha256"])),
+            "report binary digest is invalid")
+
+    status, phase, test_exit = report["status"], report["run_phase"], report["test_exit"]
+    completed = phase == RunPhase.COMPLETED.value
+    if completed:
+        require(isinstance(test_exit, int) and not isinstance(test_exit, bool) and 0 <= test_exit <= 255,
+                "report test exit is not a bounded integer")
+        require(isinstance(report["binary_sha256"], str)
+                and SHA256_PATTERN.fullmatch(report["binary_sha256"]), "report binary digest is missing")
+        require(isinstance(report["git_version"], list) and len(report["git_version"]) == 3
+                and all(isinstance(part, int) and not isinstance(part, bool) and part >= 0
+                        for part in report["git_version"]),
+                "report Git version is not exactly numeric")
         source = report["source"]
-        if not isinstance(source, dict) or set(source) != {
-            "runner_sha256",
-            "reverse_sha256",
-            "test_sha256",
-            "harness_sha256",
-        }:
-            raise ValueError("report source binding changed")
-        if not all(isinstance(value, str) and SHA256_PATTERN.fullmatch(value) for value in source.values()):
-            raise ValueError("report source digest is not a SHA-256")
-        if status == Status.CLASSIFIED_FAILURE.value:
-            if report["operation"] is None or not isinstance(report["caller"], dict):
-                raise ValueError("classified failure has no caller")
-            if report["failure_observed"] is not True:
-                raise ValueError("classified failure has no failure marker")
-            site = next(
-                (
-                    site
-                    for site in SITES
-                    if site.file == caller["file"] and site.line == caller["line"]
-                ),
-                None,
-            )
-            if site is None or site.operation.value != report["operation"]:
-                raise ValueError("classified caller is not a verified site")
-        if status in (Status.NO_FAILURE_OBSERVED.value, Status.UNRESOLVED_FAILURE.value):
-            if report["operation"] is not None or report["caller"] is not None:
-                raise ValueError("unclassified status carries a caller")
-    cases = report["cases"]
-    if not isinstance(cases, list):
-        raise ValueError("report cases changed")
-    if status == Status.UNSUPPORTED.value:
-        if cases not in ([], list(EXPECTED_CASES)):
-            raise ValueError("report cases changed")
-    elif tuple(cases) != EXPECTED_CASES:
-        raise ValueError("report cases changed")
+        require(isinstance(source, dict)
+                and set(source) == {"runner_sha256", "reverse_sha256", "test_sha256", "harness_sha256"}
+                and all(isinstance(value, str) and SHA256_PATTERN.fullmatch(value)
+                        for value in source.values()),
+                "report source binding changed")
+        require(report["test_suite"] == ("failed" if test_exit != 0 else "passed"),
+                "report test suite does not match the runner exit")
+    else:
+        require(test_exit is None, "incomplete run carries a runner exit")
+        expected = "not_run" if phase in (RunPhase.PREFLIGHT_NOT_RUN.value,
+                                          RunPhase.RUN_STARTED_TARGET_NOT_RUN.value) else "started_unknown"
+        require(report["test_suite"] == expected, "report suite state does not match the run phase")
+
+    if status == Status.CLASSIFIED_FAILURE.value:
+        require(completed and test_exit != 0 and report["failure_observed"] is True,
+                "classified failure needs a completed nonzero runner")
+        require(report["operation"] is not None and isinstance(caller, dict),
+                "classified failure has no caller")
+        site = next((site for site in SITES if site.file == caller["file"] and site.line == caller["line"]), None)
+        require(site is not None and site.operation.value == report["operation"],
+                "classified caller is not a verified site")
+    elif status == Status.OBSERVER_MISMATCH.value:
+        require(completed and test_exit == 0 and report["failure_observed"] is True,
+                "observer mismatch needs a completed zero runner")
+        if report["operation"] is None:
+            require(caller is None, "observer mismatch caller has no operation")
+        else:
+            require(isinstance(caller, dict), "observer mismatch operation has no caller")
+            site = next((site for site in SITES if site.file == caller["file"] and site.line == caller["line"]), None)
+            require(site is not None and site.operation.value == report["operation"],
+                    "observer mismatch caller is not a verified site")
+    elif status == Status.UNRESOLVED_FAILURE.value:
+        require(completed and test_exit != 0 and report["operation"] is None and caller is None,
+                "unresolved failure carries an inconsistent caller")
+    elif status == Status.NO_FAILURE_OBSERVED.value:
+        require(completed and test_exit == 0 and report["failure_observed"] is False
+                and report["operation"] is None and caller is None,
+                "no-failure status is inconsistent")
+    else:
+        require(report["operation"] is None and caller is None and not completed,
+                "unsupported status is inconsistent")
+
     payload = json.dumps(report, sort_keys=True)
-    if len(payload.encode("utf-8")) > MAX_REPORT_BYTES:
-        raise ValueError("report exceeds its bound")
+    require(len(payload.encode("utf-8")) <= MAX_REPORT_BYTES, "report exceeds its bound")
 
     def reject_absolute(value: object) -> None:
         if isinstance(value, str):
-            if value.startswith("/") or str(ROOT) in value:
-                raise ValueError("report leaked an absolute path")
-            if value.startswith(("/Users/", "/tmp/", "/home/", "/private/")):
-                raise ValueError("report leaked an absolute path")
-            if ".." in value.split("/"):
-                raise ValueError("report carries path traversal")
+            require(not value.startswith("/") and str(ROOT) not in value
+                    and not value.startswith(("/Users/", "/tmp/", "/home/", "/private/"))
+                    and ".." not in value.split("/"), "report leaked an absolute path")
         elif isinstance(value, dict):
             for item in value.values():
                 reject_absolute(item)
@@ -932,21 +891,9 @@ def write_report(path: Path, report: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
-def _summary(report: dict[str, object]) -> str:
-    fields = [
-        "status=" + str(report["status"]),
-        "reason=" + str(report["reason"]),
-        "test_exit=" + str(report["test_exit"]),
-        "failure_observed=" + str(report["failure_observed"]).lower(),
-        "operation=" + str(report["operation"]),
-        "debug_resolution=" + str(report["debug_resolution"]),
-    ]
-    return "s4-git-exit-debugger: " + " ".join(fields)
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Failure-only GDB observer for the exact S4 reverse-import Git caller."
+        description="Failure-only GDB observer for one exact S4 reverse-import test case."
     )
     parser.add_argument("--binary", required=True, help="unstripped integration-test executable")
     parser.add_argument("--report", required=True, help="fixed bounded JSON report path")
@@ -990,7 +937,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("s4-git-exit-debugger: " + str(error), file=sys.stderr)
         return 2
 
-    cases: tuple[str, ...] = ()
     source: dict[str, str | None | list[str]] = {}
     binary_sha256: str | None = None
     binary: Path | None = None
@@ -1000,6 +946,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         status: Status,
         reason: Reason,
         *,
+        run_phase: RunPhase = RunPhase.PREFLIGHT_NOT_RUN,
         test_exit: int | None = None,
         failure_observed: bool = False,
         operation: Operation | None = None,
@@ -1009,13 +956,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = make_report(
             status=status,
             reason=reason,
+            run_phase=run_phase,
             test_exit=test_exit,
             failure_observed=failure_observed,
             operation=operation,
             caller=caller,
             debug_resolution=debug_resolution,
             git_version=git_version,
-            cases=cases,
             binary_sha256=binary_sha256,
             source=source,
             base_commit=base_commit,
@@ -1026,39 +973,50 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_report(report_path, report)
         except (OSError, PreflightError, ValueError):
             return None
-        print(_summary(report))
         return report
+
+    def unsupported(
+        reason: Reason,
+        *,
+        run_phase: RunPhase = RunPhase.PREFLIGHT_NOT_RUN,
+        failure_observed: bool = False,
+        debug_resolution: str = "unresolved",
+    ) -> int:
+        emit(
+            Status.UNSUPPORTED,
+            reason,
+            run_phase=run_phase,
+            failure_observed=failure_observed,
+            debug_resolution=debug_resolution,
+        )
+        return 2
 
     try:
         verify_sites(root)
-        cases = test_cases(root)
+        target_case(root)
         source = source_hashes(root)
     except (PreflightError, MappingError):
         print("s4-git-exit-debugger: source preflight failed", file=sys.stderr)
-        emit(Status.UNSUPPORTED, Reason.SOURCE_PREFLIGHT_FAILED)
-        return 2
+        return unsupported(Reason.SOURCE_PREFLIGHT_FAILED)
     try:
         binary = verify_binary(root, args.binary)
         binary_sha256 = hash_file(binary)
     except PreflightError:
         print("s4-git-exit-debugger: test executable preflight failed", file=sys.stderr)
-        emit(Status.UNSUPPORTED, Reason.BINARY_UNAVAILABLE)
-        return 2
+        return unsupported(Reason.BINARY_UNAVAILABLE)
     try:
         git_version = probe_git_version(args.git)
     except PreflightError:
         print("s4-git-exit-debugger: selected Git version preflight failed", file=sys.stderr)
-        emit(Status.UNSUPPORTED, Reason.GIT_VERSION_UNAVAILABLE)
-        return 2
+        return unsupported(Reason.GIT_VERSION_UNAVAILABLE)
 
     ok, preflight_reason = preflight_gdb(root, args.gdb)
     if not ok:
-        emit(Status.UNSUPPORTED, preflight_reason, debug_resolution="unresolved")
-        return 2
+        return unsupported(preflight_reason)
 
     assert binary is not None
     nonce = observation_nonce()
-    result, run_reason = run_observer(
+    result, run_reason, run_phase = run_observer(
         root,
         args.gdb,
         binary,
@@ -1067,46 +1025,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.timeout_seconds,
     )
     if result is None:
-        emit(Status.UNSUPPORTED, run_reason, debug_resolution="unresolved")
-        return 2
+        return unsupported(run_reason, run_phase=run_phase)
     if result.error is not None:
         reason = Reason.GDB_UNAVAILABLE if result.error == "setup_error" else Reason.BREAKPOINT_UNRESOLVED
-        emit(Status.UNSUPPORTED, reason, debug_resolution="unresolved")
-        return 2
+        return unsupported(reason, run_phase=RunPhase.RUN_STARTED_TARGET_NOT_RUN)
     if result.breakpoint_state != "resolved":
-        emit(Status.UNSUPPORTED, Reason.BREAKPOINT_UNRESOLVED, debug_resolution="unresolved")
-        return 2
+        return unsupported(Reason.BREAKPOINT_UNRESOLVED, run_phase=RunPhase.RUN_STARTED_TARGET_NOT_RUN)
 
     test_exit = observed_exit(result)
     if test_exit is None:
-        emit(
-            Status.UNSUPPORTED,
+        return unsupported(
             Reason.RESULT_INVALID,
+            run_phase=RunPhase.RUN_STARTED_INVALID_RESULT,
             failure_observed=result.failure,
             debug_resolution="resolved",
         )
-        return 2
-    if test_exit == 0 and result.failure:
-        emit(
-            Status.INCONSISTENT,
-            Reason.RESULT_INVALID,
-            test_exit=test_exit,
-            failure_observed=True,
-            debug_resolution="resolved",
-        )
-        return 3
     if result.failure:
-        classification = classify_frames(result.frames)
-        if classification.operation is None:
+        operation, caller = classify_frames(result.frames)
+        if test_exit == 0:
+            status = Status.OBSERVER_MISMATCH
+            reason = Reason.CLASSIFIED if operation is not None else Reason.NO_KNOWN_CALLER_FRAME
+        elif operation is None:
             status = Status.UNRESOLVED_FAILURE
             reason = Reason.NO_KNOWN_CALLER_FRAME
-            operation = None
-            caller = None
         else:
             status = Status.CLASSIFIED_FAILURE
             reason = Reason.CLASSIFIED
-            operation = classification.operation
-            caller = classification.frame
     elif test_exit != 0:
         status = Status.UNRESOLVED_FAILURE
         reason = Reason.NO_FAILURE_MARKER
@@ -1121,6 +1065,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = emit(
         status,
         reason,
+        run_phase=RunPhase.COMPLETED,
         test_exit=test_exit,
         failure_observed=result.failure,
         operation=operation,
@@ -1130,9 +1075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if report is None:
         print("s4-git-exit-debugger: report could not be written", file=sys.stderr)
         return 2
-    if test_exit != 0:
-        return test_exit
-    return 0
+    return test_exit
 
 
 if __name__ == "__main__":
