@@ -40,6 +40,19 @@ impl Error {
         crate::observability::observe_internal(error);
         Self(StatusCode::SERVICE_UNAVAILABLE, "service temporarily unavailable")
     }
+
+    /// Private normal-shutdown diagnostic. The existing internal-error
+    /// observation and fixed 503 status are preserved, but one bounded fixed
+    /// clause replaces the default redacted message. This is only for the
+    /// private shutdown result and is never returned by an HTTP handler.
+    pub(crate) fn internal_shutdown_diagnostic(
+        error: impl std::fmt::Display + std::any::Any,
+        message: &'static str,
+    ) -> Self {
+        let error: &dyn std::any::Any = &error;
+        crate::observability::observe_internal(error);
+        Self(StatusCode::SERVICE_UNAVAILABLE, message)
+    }
     pub fn unauthorized() -> Self {
         Self(StatusCode::UNAUTHORIZED, "valid credentials required")
     }
