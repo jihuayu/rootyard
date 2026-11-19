@@ -728,7 +728,13 @@ PostgreSQL 17 state:
   and `409` stale attempt fencing (Scenario B), and all-mirrors-down
   simultaneous origin-fallback bursts covering all 5 `X-Rootyard-CI-State`
   outcomes and leak checks (Scenario C) on single-host loopback PG 17 (not a
-  multi-host WAN/power-loss test). Enforced statically by
+  multi-host WAN/power-loss test). Scenario D adds a fresh unlisted live
+  mirror that is alive but not ready for a new target: a first claim returns a
+  genuine `202` `waiting` with no lease or checkout grant, an explicit
+  named-mirror auto-fetch on the same controller/PostgreSQL/storage commits the
+  exact target-OID readiness, and the same durable queued run then claims `200`
+  from that mirror with the persisted `(attempt, lease_generation, grant)`
+  bound to repository/target/storage generation. Enforced statically by
   `tests/test_ci_mirror_ha_contracts.py` and in CI by
   `.github/workflows/ci-mirror-ha.yml`.
 
