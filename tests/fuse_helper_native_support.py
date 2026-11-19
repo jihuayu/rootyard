@@ -773,7 +773,17 @@ while True:
     try:
         os.write(parked, b"x")
     except OSError as error:
-        publish("error", error.errno)
+        write_errno = error.errno
+        try:
+            # Drop the owned parked descriptor before the status publish so it
+            # cannot keep the failed mount busy across fsync/rename/exit.
+            os.close(parked)
+        except OSError:
+            # close(2) can report the same fenced error after releasing the
+            # descriptor.  Never turn that into success: the failed write stays
+            # terminal and every path exits non-zero.
+            pass
+        publish("error", write_errno)
         os._exit(23)
     writes += 1
     success_ns = time.time_ns()
