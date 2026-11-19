@@ -645,17 +645,28 @@ class ProtocolSuiteCountTest(unittest.TestCase):
         asserted = ast.literal_eval(assertion_node.test.comparators[0])
         self.assertEqual(asserted, [8, 12, 23, 24])
 
-        stores = [
+        receipt_lines = [
+            index + 1 for index, line in enumerate(lines)
+            if line.strip() == "'suite_counts': suite_counts,"
+        ]
+        self.assertEqual(len(receipt_lines), 1, "expected one exact A4 receipt reference")
+        names = [
             node for node in ast.walk(tree)
             if isinstance(node, ast.Name) and node.id == "suite_counts"
-            and isinstance(node.ctx, ast.Store)
         ]
-        self.assertEqual(len(stores), 1, "expected exactly one suite_counts write")
+        self.assertEqual(len(names), 3, "expected exactly three suite_counts references")
+        self.assertEqual(
+            {(node.lineno, type(node.ctx)) for node in names},
+            {
+                (binding_lines[0] + 1, ast.Store),
+                (assertion_lines[0] + 1, ast.Load),
+                (receipt_lines[0], ast.Load),
+            },
+            "suite_counts is only bound, verified, and read by the A4 receipt",
+        )
 
         self.assertEqual(step.count("issue107-a4-native.json"), 1)
-        self.assertEqual(step.count("'suite_counts': suite_counts,"), 1,
-                         "A4 receipt must use the checked suite_counts binding")
-        self.assertLess(step.index(assertion), step.index("issue107-a4-native.json"))
+        self.assertLess(assertion_lines[0] + 1, receipt_lines[0])
         self.assertLess(step.index("issue107-a4-native.json"),
                         step.index("'suite_counts': suite_counts,"))
         return asserted
@@ -689,6 +700,16 @@ class ProtocolSuiteCountTest(unittest.TestCase):
             step.replace(
                 "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
                 "          suite_counts = [0, 0, 0, 0]\n"
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                1),
+            step.replace(
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                "          suite_counts[:] = [0, 0, 0, 0]\n"
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                1),
+            step.replace(
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                "          suite_counts.clear()\n"
                 "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
                 1),
         )
