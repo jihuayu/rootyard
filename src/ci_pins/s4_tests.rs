@@ -7,10 +7,8 @@ use super::s4_models::{
     GrantExpectation, NewGrant, S4ClosureGrant, fixed_oid, is_digest_hex, is_lower_hex, oid_width,
 };
 use super::s4_authority::{StreamSlot, wide_credential};
-use super::s4_transport::{guarded_chunks, refused_want};
+use super::s4_transport::refused_want;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use bytes::Bytes;
-use futures_util::StreamExt;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -179,29 +177,6 @@ fn stream_slot_returns_its_permit_when_dropped() {
         let _slot = StreamSlot::from_permit(permit);
         assert!(semaphore.clone().try_acquire_owned().is_err());
     }
-    assert!(semaphore.clone().try_acquire_owned().is_ok());
-}
-
-#[tokio::test]
-async fn revoked_stream_aborts_on_next_chunk_and_releases_slot() {
-    let live = Arc::new(AtomicBool::new(true));
-    let semaphore = Arc::new(Semaphore::new(1));
-    let permit = semaphore.clone().try_acquire_owned().expect("one slot");
-    let source = futures_util::stream::iter([
-        Ok::<_, std::io::Error>(Bytes::from_static(b"first-chunk")),
-        Ok(Bytes::from_static(b"second-chunk")),
-    ]);
-    let gate = live.clone();
-    let check = move || {
-        let value = gate.load(Ordering::SeqCst);
-        Box::pin(std::future::ready(value)) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
-    };
-    let mut stream = Box::pin(guarded_chunks(source, check, StreamSlot::from_permit(permit)));
-    assert_eq!(stream.next().await.expect("first").expect("chunk"), Bytes::from_static(b"first-chunk"));
-    live.store(false, Ordering::SeqCst);
-    assert!(stream.next().await.expect("second").is_err(), "revocation must abort the next chunk");
-    // The generator dropped its owned permit at the exact point it returned the
-    // error, so the shared Git capacity is immediately reusable.
     assert!(semaphore.clone().try_acquire_owned().is_ok());
 }
 

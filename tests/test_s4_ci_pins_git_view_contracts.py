@@ -31,6 +31,8 @@ TOUCHED = [
     CI_PINS / "s4_git_reaper_tests.rs",
     CI_PINS / "s4_checkout.rs",
     CI_PINS / "s4_transport.rs",
+    CI_PINS / "s4_transport_stream.rs",
+    CI_PINS / "s4_transport_stream_tests.rs",
     CI_PINS / "s4_tests.rs",
     SRC / "ci_checkouts" / "authority.rs",
     SRC / "ci_checkouts" / "handlers.rs",
@@ -157,17 +159,20 @@ class SourceContracts(unittest.TestCase):
 
     def test_transport_is_read_only_and_narrow(self) -> None:
         transport = text(CI_PINS / "s4_transport.rs")
+        stream = text(CI_PINS / "s4_transport_stream.rs")
         authority = text(CI_PINS / "s4_authority.rs")
         self.assertIn("CI transport is read-only", transport)
         self.assertIn("wide user credentials cannot access CI transport", transport)
-        self.assertIn("checkout authorization revoked during transfer", transport)
+        self.assertIn("checkout authorization revoked during transfer", stream)
         self.assertIn("allowAnySHA1InWant", transport)
-        self.assertIn("16 * 1024", transport)
-        self.assertIn("100", transport)
-        self.assertIn("guarded_chunks", transport)
+        self.assertIn("16 * 1024", stream)
+        self.assertIn("100", stream)
+        self.assertIn("live_check", stream)
+        self.assertIn("try_reserve", stream)
+        self.assertIn("kill_and_reap", stream)
         self.assertIn("revoked", authority)
-        self.assertNotIn("tempfile", transport)
-        self.assertNotIn("unreachable!", transport)
+        self.assertNotIn("tempfile", transport + stream)
+        self.assertNotIn("unreachable!", transport + stream)
         self.assertNotIn("unreachable!", text(CI_PINS / "s4_checkout.rs"))
 
     def test_view_creation_is_one_transaction(self) -> None:
@@ -229,6 +234,7 @@ class SourceContracts(unittest.TestCase):
             text(SRC / "namespace_service" / "s4_git_view_http.rs"),
             text(SRC / "namespace_service" / "s4_git_view_reverse.rs"),
             text(CI_PINS / "s4_transport.rs"),
+            text(CI_PINS / "s4_transport_stream.rs"),
         ):
             self.assertNotIn("std::process::Command", body)
             self.assertNotIn("Command::new", body)
@@ -264,7 +270,7 @@ class SourceContracts(unittest.TestCase):
         ):
             self.assertIn("ClusterAuthorityRestoreGuard", text(rel), rel)
         proc = text(SRC / "namespace_service" / "s4_git_proc.rs")
-        transport = text(CI_PINS / "s4_transport.rs")
+        stream = text(CI_PINS / "s4_transport_stream.rs")
         self.assertNotIn('"closure_grant"', text(CI_PINS / "s4_checkout.rs"))
         for body in (runner, proc):
             self.assertNotIn("Ok(true) | Err(_)", body, "cleanup must not treat a wait error as confirmed")
@@ -293,7 +299,7 @@ class SourceContracts(unittest.TestCase):
         ):
             self.assertNotIn("libc::kill", test_body)
             self.assertNotIn("waitpid", test_body)
-        for body in (runner, transport):
+        for body in (runner, stream):
             self.assertIn("finish(deadline)", body)
         hold = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
         self.assertIn("SET incarnation=$1, rotated_at=$2", hold)
