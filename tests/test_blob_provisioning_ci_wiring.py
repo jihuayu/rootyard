@@ -36,6 +36,8 @@ EXPECTED_CASES = (
     "deferred_commit_barrier_kill_rolls_back_and_retry_converges",
     "backend_identity_conflict_is_explicit_and_preserves_authority",
     "unsupported_legacy_repository_format_is_explicitly_refused",
+    "missing_database_url_is_explicit_refusal_without_listener",
+    "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
 )
 DEPENDENCIES = (
     "blob_only_service.py",
@@ -229,6 +231,8 @@ class _StartHarness(provisioning.ProvisioningHarness):
 
     def _popen(self, argv, **kwargs):
         self.popen_calls += 1
+        self.popen_argv = argv
+        self.popen_env = kwargs.get("env")
         if self.popen_error is not None:
             raise self.popen_error
         self.popen_proc = self.proc_factory()
@@ -324,8 +328,10 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertEqual(cases, EXPECTED_CASES)
         self.assertIn("FIRST_CHECKPOINT = CASES[:4]", self.harness)
         self.assertIn("SECOND_CHECKPOINT = CASES[4:5]", self.harness)
-        self.assertIn("REFUSAL_CHECKPOINT = CASES[5:]", self.harness)
+        self.assertIn("REFUSAL_CHECKPOINT = CASES[5:7]", self.harness)
+        self.assertIn("STARTUP_CHECKPOINT = CASES[7:]", self.harness)
         self.assertIn('"refusal": list(REFUSAL_CHECKPOINT)', self.harness)
+        self.assertIn('"startup": list(STARTUP_CHECKPOINT)', self.harness)
         self.assertIn('assert client_result in ("RemoteDisconnected", "ConnectionReset")', self.harness)
 
     def test_harness_binds_its_own_and_transitive_sources(self) -> None:
@@ -594,6 +600,110 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertIn('if state != "ready"', auth_source)
         self.assertIn('"repository is not ready"', auth_source)
 
+    def test_missing_dependency_cases_bind_real_cli_and_closed_reasons(self) -> None:
+        tree = ast.parse(self.harness)
+        functions = {
+            node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+        database = ast.get_source_segment(
+            self.harness, functions["missing_database_url_is_explicit_refusal_without_listener"])
+        self.assertIn('"missing-database-url", ("serve",), ("DATABASE_URL",)', database)
+        self.assertIn('"DATABASE_URL is required"', database)
+        blob = ast.get_source_segment(
+            self.harness, functions["missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback"])
+        self.assertIn('"missing-blob-endpoint", ("serve-blob",), ("ROOTYARD_BLOB_ENDPOINT",)', blob)
+        self.assertIn('"invalid Blob profile"', blob)
+        helper = ast.get_source_segment(self.harness, functions["_startup_refusal"])
+        self.assertIn("serving.StartupProjection()", helper)
+        self.assertIn("closed_startup_reason(raw)", helper)
+        self.assertIn("self._listener_absent(bind)", helper)
+        self.assertIn("self.stop(hard=True)", helper)
+        self.assertNotIn("raw.decode", helper)
+        self.assertNotIn("print(", helper)
+        listener = ast.get_source_segment(self.harness, functions["_listener_absent"])
+        self.assertIn("probe.connect((host, int(port)))", listener)
+        self.assertEqual(provisioning.STARTUP_REFUSAL_REASONS,
+                         ("DATABASE_URL is required", "invalid Blob profile"))
+
+        # The child must be the actual public CLI, not a fake handler. `serve`
+        # reaches Config::from_env before the listener; `serve-blob` reaches the
+        # standalone Blob profile after PostgreSQL is already valid.
+        serving_source = (ROOT / "tests" / "blob_only_service.py").read_text(encoding="utf-8")
+        self.assertIn('command=("serve-blob",), unset=()', serving_source)
+        self.assertIn("for key in unset:", serving_source)
+        self.assertIn("subprocess.Popen([str(self.profile.binary), *command]", serving_source)
+        self.assertIn("self.log_path = self.root /", serving_source)
+        main_source = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn('if args.len() == 1 && args[0] == "serve-blob"', main_source)
+        self.assertIn("let config = Config::from_env()?;", main_source)
+        self.assertIn('args.first().map(String::as_str).unwrap_or("serve")', main_source)
+        config_source = (ROOT / "src" / "config.rs").read_text(encoding="utf-8")
+        self.assertIn(
+            'env::var("DATABASE_URL").context("DATABASE_URL is required")?', config_source)
+        standalone_source = (ROOT / "src" / "standalone.rs").read_text(encoding="utf-8")
+        self.assertIn(
+            'BlobProfile::from_env().map_err(|_| anyhow!("invalid Blob profile"))',
+            standalone_source)
+        blob_config_source = (ROOT / "src" / "blob_store" / "config.rs").read_text(
+            encoding="utf-8")
+        self.assertIn('env_required("ROOTYARD_BLOB_SERVICE")?', blob_config_source)
+        self.assertIn(
+            '"standalone blob profile needs an explicit remote ROOTYARD_BLOB_ENDPOINT"',
+            blob_config_source)
+        # The standalone profile's production constructor never reads the
+        # legacy object-store selector; a missing explicit endpoint is not
+        # eligible for its local fallback.
+        from_env = blob_config_source.split("pub fn from_env", 1)[1].split(
+            "pub fn with_root", 1)[0]
+        self.assertNotIn("ROOTYARD_OBJECT_STORE_ENDPOINT", from_env)
+
+    def test_closed_startup_reason_projection_only_returns_fixed_literals(self) -> None:
+        cases = (
+            (b"Error: DATABASE_URL is required\n\nCaused by:\n    environment variable not found\n",
+             "DATABASE_URL is required"),
+            (b"Error: invalid Blob profile\n", "invalid Blob profile"),
+        )
+        for raw, expected in cases:
+            with self.subTest(reason=expected):
+                self.assertEqual(provisioning.closed_startup_reason(raw), expected)
+        for raw in (b"", b"Error: something else\n",
+                    b"Error: DATABASE_URL is required\nError: invalid Blob profile\n"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(AssertionError) as caught:
+                    provisioning.closed_startup_reason(raw)
+                self.assertEqual(
+                    str(caught.exception),
+                    "startup refusal did not emit exactly one known fixed reason")
+        secret = "POISONOUS-STARTUP-OUTPUT-143"
+        with self.assertRaises(AssertionError) as caught:
+            provisioning.closed_startup_reason(b"Error: " + secret.encode() + b"\n")
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn(secret, repr(caught.exception.args))
+        with self.assertRaises(AssertionError):
+            provisioning.closed_startup_reason("not bytes")
+        with self.assertRaises(AssertionError):
+            provisioning.closed_startup_reason(
+                b"x" * (provisioning.MAX_STARTUP_LOG_BYTES + 1))
+
+    def test_start_uses_the_fixed_public_command_and_removes_only_requested_env(self) -> None:
+        harness = _StartHarness(proc=lambda: _FakeProc(returncode=1))
+        harness.env = {"DATABASE_URL": "postgresql://owned", "ROOTYARD_GIT": "/owned/git",
+                       "ROOTYARD_BIND": "127.0.0.1:1234"}
+        with _patched_serving(harness):
+            with self.assertRaises(RuntimeError) as caught:
+                harness.start(label="missing-database-url", command=("serve",),
+                              unset=("DATABASE_URL",),
+                              overrides={"ROOTYARD_DATA_DIR": "/owned/data"})
+        self.assertEqual(str(caught.exception), "serve exited during startup with status 1")
+        self.assertEqual(harness.popen_argv, ["fake-binary", "serve"])
+        self.assertNotIn("DATABASE_URL", harness.popen_env)
+        self.assertEqual(harness.popen_env["ROOTYARD_GIT"], "/owned/git")
+        self.assertEqual(harness.popen_env["ROOTYARD_DATA_DIR"], "/owned/data")
+        for command, unset in ((["serve"], ()), ((), ()), (("serve",), ["DATABASE_URL"])):
+            with self.subTest(command=command, unset=unset):
+                with self.assertRaises(TypeError):
+                    harness.start(command=command, unset=unset)
+
     def test_first_checkpoint_stays_first(self) -> None:
         # A reordering that silently turns the independent kill checkpoint into
         # the first thing to run would invalidate the reviewable split.
@@ -606,6 +716,10 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertEqual(EXPECTED_CASES[4], "deferred_commit_barrier_kill_rolls_back_and_retry_converges")
         self.assertEqual(EXPECTED_CASES[5], "backend_identity_conflict_is_explicit_and_preserves_authority")
         self.assertEqual(EXPECTED_CASES[6], "unsupported_legacy_repository_format_is_explicitly_refused")
+        self.assertEqual(EXPECTED_CASES[7:], (
+            "missing_database_url_is_explicit_refusal_without_listener",
+            "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
+        ))
 
     def _run_failing_backend_case(self, harness):
         with self.assertRaises(provisioning.BackendIdentityConflictPhaseError) as caught:
@@ -976,7 +1090,8 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertEqual(provisioning.CASES, EXPECTED_CASES)
         self.assertEqual(provisioning.FIRST_CHECKPOINT, EXPECTED_CASES[:4])
         self.assertEqual(provisioning.SECOND_CHECKPOINT, EXPECTED_CASES[4:5])
-        self.assertEqual(provisioning.REFUSAL_CHECKPOINT, EXPECTED_CASES[5:])
+        self.assertEqual(provisioning.REFUSAL_CHECKPOINT, EXPECTED_CASES[5:7])
+        self.assertEqual(provisioning.STARTUP_CHECKPOINT, EXPECTED_CASES[7:])
         harness = _BackendIdentityCaseDouble(fail_phase=Phase.initial_create)
         error = self._run_failing_backend_case(harness)
         self.assertEqual(len(harness.results), 1)

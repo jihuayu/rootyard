@@ -272,19 +272,29 @@ esac
 
     def prepare(self):
         if not self.schema_created: self.setup()
-    def start(self, overrides=None, label="server", startup_projection=None):
+    def start(self, overrides=None, label="server", startup_projection=None,
+              command=("serve-blob",), unset=()):
         if self.proc is not None:
             raise AssertionError("serve-blob is already running")
+        if not isinstance(command, tuple) or not command or not all(
+                type(part) is str and part for part in command):
+            raise TypeError("command must be a non-empty tuple of fixed argv tokens")
+        if not isinstance(unset, tuple) or not all(type(key) is str and key for key in unset):
+            raise TypeError("unset must be a tuple of fixed environment names")
+        command_line = " ".join(command)
         observation = startup_projection if type(startup_projection) is StartupProjection else None
         if observation is not None:
             observation.enter("spawn")
         completed = False
         try:
             env = self.env.copy()
+            for key in unset:
+                env.pop(key, None)
             env.update(overrides or {})
             self.server_count += 1
-            self.log = open(self.root / (label + "-" + str(self.server_count) + ".log"), "ab")
-            self.proc = subprocess.Popen([str(self.profile.binary), "serve-blob"], env=env,
+            self.log_path = self.root / (label + "-" + str(self.server_count) + ".log")
+            self.log = open(self.log_path, "ab")
+            self.proc = subprocess.Popen([str(self.profile.binary), *command], env=env,
                                          stdout=self.log, stderr=self.log, start_new_session=True)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -298,7 +308,7 @@ esac
                     self.stop()
                     if observation is not None:
                         observation.leave_stop()
-                    raise RuntimeError("serve-blob exited during startup with status " + str(status))
+                    raise RuntimeError(command_line + " exited during startup with status " + str(status))
                 try:
                     if self.http("/health/ready")[0] == 200:
                         if observation is not None:
@@ -316,7 +326,7 @@ esac
             self.stop(hard=True)
             if observation is not None:
                 observation.leave_stop()
-            raise RuntimeError("serve-blob readiness timeout")
+            raise RuntimeError(command_line + " readiness timeout")
         finally:
             if observation is not None and not completed:
                 observation.failed = True
