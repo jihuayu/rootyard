@@ -320,3 +320,41 @@ async fn upload_pack_advertise_and_spawn_pass_positional_directory() {
     let status = group.finish(deadline).await.expect("finish upload-pack");
     assert!(status.success(), "upload-pack failed: {status}");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_reaper_failure_bounds_caller_and_retains_scratch() {
+    use super::s4_authority::DisposableCiView;
+    use std::{os::unix::fs::PermissionsExt, process::Stdio};
+    let view = DisposableCiView::create().expect("disposable view");
+    let root = view.path().to_path_buf();
+    let wrapper = root.join("git");
+    std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
+    let mut cmd = tokio::process::Command::new(&wrapper);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
+    let child = cmd.spawn().expect("spawn wrapper");
+    let pid = child.id().and_then(|id| i32::try_from(id).ok()).expect("wrapper pid");
+    let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
+    let hold = view.hold();
+    drop(view);
+    let started = std::time::Instant::now();
+    super::s4_git_runner::spawn_reaper_with(child, pid, Some(hold), |_| {
+        Err(std::io::Error::other("simulated thread limit"))
+    });
+    assert!(started.elapsed() < std::time::Duration::from_millis(500), "spawn failure blocked caller");
+    assert!(root.exists(), "unverified disposable view vanished when reaper thread spawn failed");
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    for _ in 0..200 {
+        if !std::path::PathBuf::from(format!("/proc/{leader}")).exists()
+            && !std::path::PathBuf::from(format!("/proc/{grandchild}")).exists()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(root.exists(), "retained scratch hold was not preserved across process exit");
+    std::fs::remove_dir_all(&root).expect("cleanup retained disposable view");
+}

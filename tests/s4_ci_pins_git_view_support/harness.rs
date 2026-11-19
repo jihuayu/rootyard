@@ -358,6 +358,10 @@ impl Cluster {
                 }),
             )
             .await?;
+        let raw = body.to_string();
+        for key in ["closure_grant", "authority_epoch", "history_incarnation", "group_epoch", "cluster_incarnation"] {
+            ensure!(body.get(key).is_none() && !raw.contains(key), "checkout leaked internal authority field {key}");
+        }
         body["token"].as_str().map(str::to_owned).ok_or_else(|| anyhow!("checkout response has no token"))
     }
 

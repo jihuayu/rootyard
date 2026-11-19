@@ -308,7 +308,6 @@ pub(crate) async fn issue(
             Json(serde_json::json!({
                 "plan": plan,
                 "token": token,
-                "closure_grant": grant,
                 "submodule_credentials": [],
             })),
         )

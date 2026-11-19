@@ -225,24 +225,38 @@ fn signal_group(child: &mut Child, pid: i32) {
     let _ = child.start_kill();
 }
 
+type ReaperTask = Box<dyn FnOnce() + Send + 'static>;
+
 fn spawn_reaper_thread(child: Child, pid: i32, holds: Vec<ScratchHold>) {
-    let mut fallback = FallbackReap { state: Some((child, pid, holds)) };
-    let spawned = std::thread::Builder::new().name("s4-git-reap".into()).spawn(move || {
+    spawn_reaper_with(child, pid, holds, |task| {
+        std::thread::Builder::new().name("s4-git-reap".into()).spawn(task).map(|_| ())
+    });
+}
+
+fn spawn_reaper_with<F>(child: Child, pid: i32, holds: Vec<ScratchHold>, spawn_fn: F)
+where
+    F: FnOnce(ReaperTask) -> std::io::Result<()>,
+{
+    let mut fallback = SpawnFallback { state: Some((child, pid, holds)) };
+    let spawned = spawn_fn(Box::new(move || {
         if let Some((child, pid, holds)) = fallback.state.take() {
             reap_until_confirmed(child, pid, holds);
         }
-    });
+    }));
     drop(spawned);
 }
 
-struct FallbackReap {
+struct SpawnFallback {
     state: Option<(Child, i32, Vec<ScratchHold>)>,
 }
 
-impl Drop for FallbackReap {
+impl Drop for SpawnFallback {
     fn drop(&mut self) {
-        if let Some((child, pid, holds)) = self.state.take() {
-            reap_until_confirmed(child, pid, holds);
+        if let Some((mut child, pid, holds)) = self.state.take() {
+            signal_group(&mut child, pid);
+            eprintln!("rootyard: failed to spawn Git reaper thread; retaining unverified scratch hold");
+            std::mem::forget(holds);
+            std::mem::forget(child);
         }
     }
 }

@@ -141,3 +141,35 @@ async fn expired_timeout_cleanup_hands_scratch_to_reaper_until_group_exits() {
     assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
     assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_reaper_failure_bounds_caller_and_retains_scratch() {
+    let scratch = ScratchDir::create("rootyard-s4-proc-spawn-fail").unwrap();
+    let root = scratch.root().to_path_buf();
+    let pidfile = root.join("spawn-fail.pid");
+    let mut cmd = command(&pidfile);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
+    let child = cmd.spawn().unwrap();
+    let pid = i32::try_from(child.id().unwrap()).unwrap();
+    let (leader, grandchild) = wait_pids(&pidfile).await;
+    let holds = vec![scratch.hold()];
+    drop(scratch);
+    let started = std::time::Instant::now();
+    spawn_reaper_with(child, pid, holds, |_| Err(io::Error::other("simulated thread limit")));
+    assert!(started.elapsed() < Duration::from_millis(500), "spawn failure blocked caller");
+    assert!(root.exists(), "unverified scratch vanished when reaper thread spawn failed");
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    for _ in 0..200 {
+        if !PathBuf::from(format!("/proc/{leader}")).exists()
+            && !PathBuf::from(format!("/proc/{grandchild}")).exists()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(root.exists(), "retained scratch hold was not preserved across process exit");
+    std::fs::remove_dir_all(&root).unwrap();
+}

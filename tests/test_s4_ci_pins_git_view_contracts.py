@@ -261,10 +261,13 @@ class SourceContracts(unittest.TestCase):
             self.assertIn("ClusterAuthorityRestoreGuard", text(rel), rel)
         proc = text(SRC / "namespace_service" / "s4_git_proc.rs")
         transport = text(CI_PINS / "s4_transport.rs")
+        self.assertNotIn('"closure_grant"', text(CI_PINS / "s4_checkout.rs"))
         for body in (runner, proc):
             self.assertNotIn("Ok(true) | Err(_)", body, "cleanup must not treat a wait error as confirmed")
             self.assertIn("TIMEOUT_CLEANUP_BOUND", body)
             self.assertIn("spawn_reaper_thread", body)
+            self.assertIn("spawn_reaper_with", body)
+            self.assertIn("std::mem::forget", body)
             self.assertNotIn("kill_group_child", body)
         for body in (runner, transport):
             self.assertIn("finish(deadline)", body)
