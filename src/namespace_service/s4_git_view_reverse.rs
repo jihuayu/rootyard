@@ -4,7 +4,8 @@
 //! repositories; the projected tree is grafted back under `subdir` and the ref
 //! update, artifact holds, registration, decision and changeset use the A4 path.
 use super::views::s4_git_proc::{
-    GitInputSpec, git_bytes, git_clone, git_input, git_oid, new_pack, replace_tree, verify_candidate_budget,
+    GitInputSpec, ReverseGitStage, git_bytes, git_clone, git_input, git_oid, new_pack, replace_tree,
+    verify_candidate_budget,
 };
 use crate::namespace_service::{
     changesets::{ChangeSet, Step},
@@ -44,48 +45,9 @@ use std::{
 use uuid::Uuid;
 const HOLD_NAMESPACE: &str = "gateway-pack";
 const ISSUER_LANE: &str = "s4-view-reverse";
-struct Binding {
-    root_id: Uuid,
-    source_oid: String,
-    projected_oid: String,
-    subdir: String,
-    owner_tenant_id: Uuid,
-    storage_generation: i64,
-}
-async fn load_binding(state: &AppState, view: &View) -> Result<Binding, Error> {
-    crate::ci_pins::s4_schema::ensure_s4_schema(&state.pool).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let cluster_inc = crate::ci_pins::s4_authority::require_cluster_incarnation_nowait(&tx).await?;
-    let row = tx
-        .query_opt(
-            "SELECT b.retention_root_id, b.source_oid, b.projected_oid, b.subdir, b.owner_tenant_id, \
-                    r.owner_id, r.storage_generation, r.state \
-             FROM s4_ci_retention.git_view_bindings b JOIN repositories r ON r.id=b.repository_id \
-             JOIN ref_store_core_gates cg ON cg.repository_id=b.repository_id \
-             WHERE b.view_id=$1 AND b.state='active' AND b.repository_id=$2 \
-               AND cg.authority_epoch=b.authority_epoch \
-               AND cg.history_incarnation=b.history_incarnation AND cg.group_epoch=b.group_epoch \
-               AND b.cluster_incarnation=$3",
-            &[&view.id, &view.repository_id, &cluster_inc],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    let _ = tx.rollback().await;
-    drop(client);
-    if row.get::<_, String>(7) != "ready" || Some(row.get::<_, Uuid>(5)) != Some(row.get(4)) {
-        return Err(Error::not_found());
-    }
-    Ok(Binding {
-        root_id: row.get(0),
-        source_oid: row.get(1),
-        projected_oid: row.get(2),
-        subdir: row.get(3),
-        owner_tenant_id: row.get(4),
-        storage_generation: row.get(6),
-    })
-}
+#[path = "s4_git_view_reverse_binding.rs"]
+mod binding;
+use binding::{Binding, load_binding};
 fn write_bundle(path: &FsPath, bytes: &[u8]) -> Result<(), Error> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -103,8 +65,9 @@ async fn run_git(
     repo: &FsPath,
     args: &[&str],
     deadline: tokio::time::Instant,
+    stage: ReverseGitStage,
 ) -> Result<Vec<u8>, Error> {
-    git_bytes(&state.config.git, repo, args, deadline, "Git View reverse mapping conflict").await
+    git_bytes(&state.config.git, repo, args, deadline, "Git View reverse mapping conflict", Some(stage)).await
 }
 fn planned_pack(pack: &[u8], idx: &[u8]) -> Result<(PlannedPack, Uuid), Error> {
     let pack_digest = ContentDigest::parse(hex::encode(Sha256::digest(pack))).map_err(Error::internal)?;
@@ -156,27 +119,72 @@ pub(super) async fn create(
                 &work,
                 &["--no-local", "--no-hardlinks", "--no-tags"],
                 deadline,
+                Some(ReverseGitStage::SourceProjection),
             )
             .await?;
             let work_text = work.to_str().ok_or_else(Error::bad_request)?;
-            let projected = views::s4_git_view::project(git, &work, &binding.source_oid, subdir, deadline).await?;
+            let projected = views::s4_git_view::project_with_stage(
+                git,
+                &work,
+                &binding.source_oid,
+                subdir,
+                deadline,
+                Some(ReverseGitStage::SourceProjection),
+            )
+            .await?;
             if projected != binding.projected_oid {
                 return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
             }
             let bundle_path = scratch.root().join("proposal.bundle");
             write_bundle(&bundle_path, bundle)?;
             let bundle_text = bundle_path.to_str().ok_or_else(Error::bad_request)?;
-            run_git(state, &work, &["bundle", "verify", bundle_text], deadline).await?;
-            run_git(state, &work, &["fetch", "--no-tags", bundle_text, input.bundle_ref.as_str()], deadline).await?;
-            let candidate = git_oid(&state.config.git, &work, &["rev-parse", "FETCH_HEAD^{commit}"], deadline).await?;
+            run_git(state, &work, &["bundle", "verify", bundle_text], deadline, ReverseGitStage::ProposalVerifyFetch)
+                .await?;
+            run_git(
+                state,
+                &work,
+                &["fetch", "--no-tags", bundle_text, input.bundle_ref.as_str()],
+                deadline,
+                ReverseGitStage::ProposalVerifyFetch,
+            )
+            .await?;
+            let candidate = git_oid(
+                &state.config.git,
+                &work,
+                &["rev-parse", "FETCH_HEAD^{commit}"],
+                deadline,
+                Some(ReverseGitStage::ProposalVerifyFetch),
+            )
+            .await?;
             let merge_base = ["merge-base", "--is-ancestor", binding.projected_oid.as_str(), candidate.as_str()];
-            run_git(state, &work, &merge_base, deadline).await?;
+            run_git(state, &work, &merge_base, deadline, ReverseGitStage::AncestryIntegrity).await?;
             let candidate_bytes = verify_candidate_budget(git, &work, &candidate, projected_oid, deadline).await?;
-            run_git(state, &work, &["fsck", "--strict", "--no-reflogs", candidate.as_str()], deadline).await?;
+            run_git(
+                state,
+                &work,
+                &["fsck", "--strict", "--no-reflogs", candidate.as_str()],
+                deadline,
+                ReverseGitStage::AncestryIntegrity,
+            )
+            .await?;
             let candidate_tree = format!("{candidate}^{{tree}}");
-            let projected_tree = git_oid(&state.config.git, &work, &["rev-parse", &candidate_tree], deadline).await?;
+            let projected_tree = git_oid(
+                &state.config.git,
+                &work,
+                &["rev-parse", &candidate_tree],
+                deadline,
+                Some(ReverseGitStage::AncestryIntegrity),
+            )
+            .await?;
             let old_tree_arg = format!("{}^{{tree}}", binding.projected_oid);
-            let old_projected_tree = git_oid(&state.config.git, &work, &["rev-parse", &old_tree_arg], deadline).await?;
+            let old_projected_tree = git_oid(
+                &state.config.git,
+                &work,
+                &["rev-parse", &old_tree_arg],
+                deadline,
+                Some(ReverseGitStage::AncestryIntegrity),
+            )
+            .await?;
             if projected_tree == old_projected_tree {
                 return Err(Error(StatusCode::CONFLICT, "projected tree is unchanged"));
             }
@@ -185,16 +193,31 @@ pub(super) async fn create(
             if source_bytes.saturating_add(candidate_bytes) > max_repo {
                 return Err(Error(StatusCode::INSUFFICIENT_STORAGE, "repository quota reached"));
             }
-            run_git(state, &work, &["update-ref", "refs/heads/reverse-import", candidate.as_str()], deadline).await?;
+            run_git(
+                state,
+                &work,
+                &["update-ref", "refs/heads/reverse-import", candidate.as_str()],
+                deadline,
+                ReverseGitStage::SubtreeExportRefUpdate,
+            )
+            .await?;
             run_git(
                 state,
                 source,
                 &["fetch", "--no-tags", "--no-write-fetch-head", work_text, "refs/heads/reverse-import"],
                 deadline,
+                ReverseGitStage::SubtreeSourceFetch,
             )
             .await?;
             let source_tree_arg = format!("{}^{{tree}}", binding.source_oid);
-            let old_tree = git_oid(&state.config.git, source, &["rev-parse", &source_tree_arg], deadline).await?;
+            let old_tree = git_oid(
+                &state.config.git,
+                source,
+                &["rev-parse", &source_tree_arg],
+                deadline,
+                Some(ReverseGitStage::SubtreeSourceTreeResolve),
+            )
+            .await?;
             let new_tree = if binding.subdir.is_empty() {
                 projected_tree
             } else {
@@ -211,6 +234,7 @@ pub(super) async fn create(
                     input: body.as_bytes(),
                     actor: Some(actor.username.as_str()),
                     max_out: 64 * 1024 * 1024,
+                    stage: ReverseGitStage::CommitSynthesize,
                 },
                 deadline,
             )
