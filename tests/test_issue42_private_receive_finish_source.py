@@ -68,6 +68,24 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertNotIn("get_legacy_locked(", probe)
         self.assertNotIn("admit_slot_zero_in_tx(", probe)
 
+    def test_private_route_has_one_pre_admission_pause_after_baseline(self):
+        private = slice_between(
+            self.publish,
+            "pub(super) async fn push_private(",
+            "async fn complete_private_probe(",
+        )
+        pause = "state.pause_before_admission(verified.operation_id()).await;"
+        self.assertEqual(private.count(pause), 1)
+        self.assertIn("if rebases == 0 {", private)
+        self.assertLess(private.index("capture_baseline("), private.index(pause))
+        self.assertLess(private.index(pause), private.index("operation::probe_public("))
+        self.assertLess(private.index(pause), private.index("begin_slot_zero("))
+        self.assertEqual(private.count("state.pause_after_admission(verified.operation_id()).await;"), 1)
+        self.assertLess(
+            private.index("Start::Fresh { plan, _token: token }"),
+            private.index("state.pause_after_admission(verified.operation_id()).await;"),
+        )
+
     def test_native_failure_never_closes_a_private_pending_operation_with_raw_ng(self):
         block = slice_between(
             self.receive_prod,
@@ -95,8 +113,8 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
             "async fn mirror_public_terminal_with_request(",
             "/// The one terminal produced",
         )
-        self.assertIn("lock_public_attempt(&**tx, public_request, record.identity().operation_id()", mirror)
-        self.assertIn("lookup_public_attempt_finish(&**tx, public_request, deadline)", mirror)
+        self.assertIn("lock_public_attempt(&tx, public_request, record.identity().operation_id()", mirror)
+        self.assertIn("lookup_public_attempt_finish(&tx, public_request, deadline)", mirror)
         self.assertIn("found.wrapper_state == OperationState::Pending", mirror)
         self.assertIn("crate::ref_store::serving::lookup_in_tx(", mirror)
         self.assertIn("fresh.gate.repository_id() != public_request.repository_id", mirror)
@@ -114,6 +132,14 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertNotIn("loop {", mirror)
         self.assertNotIn("private_id", mirror)
         self.assertNotIn("format!(", mirror)
+        self.assertNotIn("&**tx", mirror, "the owned mirror transaction must use &tx deref coercion")
+        preflight = slice_between(
+            self.publish,
+            "async fn slot_zero_public_preflight(",
+            "/// One fresh slot-zero admission transaction",
+        )
+        self.assertIn("lock_public_attempt(&**tx", preflight)
+        self.assertIn("lookup_in_tx(&**tx", preflight)
 
     def test_private_fresh_entry_selects_begin_slot_zero_and_never_the_legacy_writer(self):
         private = slice_between(
@@ -229,7 +255,7 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         )
         self.assertIn("a.slot = w.current_slot", binding)
         self.assertIn("current_private != private_id", binding)
-        self.assertIn("wrapper_backend != backend_hex", binding)
+        self.assertIn("wrapper_backend.as_str() != backend_hex", binding)
         self.assertIn("rootyard_ref_store_attempt_current_scope(w)", binding)
         self.assertIn("rootyard_ref_store_verify_public_operation($1,$2)", binding)
         self.assertIn("private_event != wrapper_event", binding)
