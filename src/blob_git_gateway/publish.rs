@@ -77,6 +77,11 @@ use super::{
     state::BlobGitState,
 };
 
+/// Crate-private exact slot-zero-retirement handoff. No route selects it until
+/// the separate reviewed HTTP admission switch is opened.
+#[allow(dead_code)]
+pub(super) mod slot_one;
+
 const HOLD_NAMESPACE: &str = "gateway-pack";
 const ISSUER_LANE: &str = "blob-git-receive";
 
