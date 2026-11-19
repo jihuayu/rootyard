@@ -361,9 +361,9 @@ impl SafeGcRepoTrustConfig {
             ..
         } = &arm.lane
         {
-            let threshold = self.quorum_threshold.ok_or_else(|| {
-                SafeGcError::ArmingRejected("repository trust has no independent voter quorum threshold")
-            })?;
+            let threshold = self
+                .quorum_threshold
+                .ok_or(SafeGcError::ArmingRejected("repository trust has no independent voter quorum threshold"))?;
             quorum_evidence
                 .verify_against_trusted_voters(
                     *ref_cas_authority_id,

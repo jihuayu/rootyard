@@ -118,6 +118,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("reconcile_refcas_cut_with_pg", dist)
+        self.assertNotIn("lookup_production_refcas_source", dist)
 
         coordinator = (
             ROOT / "src" / "pulls" / "remote_merge_finalizer" / "coordinator.rs"
@@ -135,6 +136,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             ROOT / "tests" / "storage_safe_gc_support" / "pg_child_worker.rs"
         ).read_text(encoding="utf-8")
         self.assertIn("storage_lifecycle::run", child)
+        self.assertNotIn("UPDATE storage_maintenance_repo_state", child)
         self.assertIn("Command::new", child)
         cases = (ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs").read_text(
             encoding="utf-8"

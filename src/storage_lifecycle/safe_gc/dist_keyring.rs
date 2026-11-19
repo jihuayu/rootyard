@@ -127,12 +127,12 @@ pub fn validate_trusted_voter(voter: &TrustedConsensusVoter, arm_pubkey_hex: &st
     Ok(())
 }
 
-fn gate_matches<'a>(
-    snapshot: &'a RefCasSnapshot,
+fn gate_matches(
+    snapshot: &RefCasSnapshot,
     history_id: Uuid,
     group_epoch: i64,
     authority_epoch: i64,
-) -> Option<&'a crate::ref_store::core::state_machine::GateState> {
+) -> Option<&crate::ref_store::core::state_machine::GateState> {
     snapshot.body.gates.iter().find(|gate| {
         gate.history_incarnation == history_id
             && gate.group_epoch == group_epoch

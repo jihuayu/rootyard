@@ -8,7 +8,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Result, bail, ensure};
@@ -145,68 +145,19 @@ impl RefCasCutpointSource for InMemoryRefCasCutpointSource {
     }
 }
 
-type RefCasSourceKey = (PathBuf, Uuid);
-type RefCasSourceMap = BTreeMap<RefCasSourceKey, Arc<dyn RefCasCutpointSource>>;
-
-static PRODUCTION_REFCAS_SOURCES: OnceLock<RwLock<RefCasSourceMap>> = OnceLock::new();
-
-fn production_sources() -> &'static RwLock<RefCasSourceMap> {
-    PRODUCTION_REFCAS_SOURCES.get_or_init(|| RwLock::new(BTreeMap::new()))
-}
-
-fn canonical_source_key(storage_root: &Path, repo_id: Uuid) -> RefCasSourceKey {
-    (storage_root.canonicalize().unwrap_or_else(|_| storage_root.to_path_buf()), repo_id)
-}
-
-pub fn register_production_refcas_source(storage_root: &Path, repo_id: Uuid, source: Arc<dyn RefCasCutpointSource>) {
-    production_sources()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(canonical_source_key(storage_root, repo_id), source);
-}
-
-pub fn unregister_production_refcas_source(storage_root: &Path, repo_id: Uuid) {
-    production_sources()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&canonical_source_key(storage_root, repo_id));
-}
-
-pub fn lookup_production_refcas_source(storage_root: &Path, repo_id: Uuid) -> Option<Arc<dyn RefCasCutpointSource>> {
-    production_sources()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&canonical_source_key(storage_root, repo_id))
-        .cloned()
-}
-
-struct WeakSmCutpointSource {
-    group_id: i64,
-    sm: Weak<Mutex<RefCasStateMachine>>,
-}
-
-impl RefCasCutpointSource for WeakSmCutpointSource {
-    fn capture_state_machine(&self, _repo_id: Uuid) -> Result<Option<(i64, RefCasStateMachine)>, SafeGcError> {
-        let Some(sm) = self.sm.upgrade() else {
-            return Ok(None);
-        };
-        let guard = sm.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(Some((self.group_id, guard.clone())))
-    }
-}
-
-/// Publish the running authority's live state machine without owning it.
+/// Compatibility hook for `InProcessRefCasBackend::register_safe_gc_repo`.
+///
+/// Production distributed GC strictly requires independently attested consensus voters and
+/// never reads in-process state machines, so registering one is deliberately a no-op.
 pub fn register_live_sm_cutpoint_source(
-    storage_root: &Path,
-    repo_id: Uuid,
-    group_id: i64,
-    sm: &Arc<Mutex<RefCasStateMachine>>,
+    _storage_root: &Path,
+    _repo_id: Uuid,
+    _group_id: i64,
+    _sm: &Arc<Mutex<RefCasStateMachine>>,
 ) {
-    let source: Arc<dyn RefCasCutpointSource> = Arc::new(WeakSmCutpointSource { group_id, sm: Arc::downgrade(sm) });
-    register_production_refcas_source(storage_root, repo_id, source);
 }
 
-/// Production cutpoint source preferring the live registered authority over sealed files.
+/// Production cutpoint source for the distributed lane: independent consensus voters only.
 #[derive(Clone, Debug)]
 pub struct ProductionRefCasAuthoritySource {
     storage_root: PathBuf,
@@ -216,16 +167,15 @@ impl ProductionRefCasAuthoritySource {
     pub fn new(storage_root: impl Into<PathBuf>) -> Self {
         Self { storage_root: storage_root.into() }
     }
+
+    pub fn storage_root(&self) -> &Path {
+        &self.storage_root
+    }
 }
 
 impl RefCasCutpointSource for ProductionRefCasAuthoritySource {
-    fn capture_state_machine(&self, repo_id: Uuid) -> Result<Option<(i64, RefCasStateMachine)>, SafeGcError> {
-        if let Some(source) = lookup_production_refcas_source(&self.storage_root, repo_id)
-            && let Some(captured) = source.capture_state_machine(repo_id)?
-        {
-            return Ok(Some(captured));
-        }
-        FsSealedRefCasCutpointSource::new(self.storage_root.as_path()).capture_state_machine(repo_id)
+    fn capture_state_machine(&self, _repo_id: Uuid) -> Result<Option<(i64, RefCasStateMachine)>, SafeGcError> {
+        Ok(None)
     }
 
     fn is_production_authority_source(&self) -> bool {
@@ -273,10 +223,10 @@ pub(super) async fn reconcile_worker_refcas_cut_if_needed<C: GenericClient + Syn
             .map_err(|e| anyhow::anyhow!("capture verified Ref-CAS cutpoint: {e}"))?;
         verified_quorum = Some(quorum);
         Some((group_id, sm))
-    } else {
-        let fs_default = FsSealedRefCasCutpointSource::new(storage_root);
-        let source: &dyn RefCasCutpointSource = explicit_source.unwrap_or(&fs_default);
+    } else if let Some(source) = explicit_source {
         source.capture_state_machine(repo_id).map_err(|e| anyhow::anyhow!("capture Ref-CAS state machine: {e}"))?
+    } else {
+        None
     };
     let requires_cut = destructive_env
         && (is_armed_dist || snap.paired_cursors.refcas_freshness != SourceFreshness::Reconciled || captured.is_some());

@@ -55,8 +55,8 @@ async fn run_once_scoped_with_refcas(
     operation: &OperationContext,
     refcas_source: Option<&dyn super::safe_gc::RefCasCutpointSource>,
 ) -> Result<Option<JobOutcome>> {
-    // The scheduled worker must read Ref-CAS authority from the live registered
-    // state machine (or its sealed volume), never from a caller's stale handle.
+    // The scheduled worker must read Ref-CAS authority only from independently attested
+    // quorum voters; sealed volumes and in-process state machines never authorize deletion.
     let production_source = if refcas_source.is_none() {
         Some(super::safe_gc::ProductionRefCasAuthoritySource::new(state.storage.root.as_path()))
     } else {

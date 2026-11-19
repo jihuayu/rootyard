@@ -224,13 +224,6 @@ fn run_child(mode: &str) -> Result<()> {
             }
             MODE_PASS2 => {
                 let skip: Uuid = std::env::var(CHILD_SKIP_JOB_ID_ENV).context("child skip job id")?.parse()?;
-                pool.get()
-                    .await?
-                    .execute(
-                        "UPDATE storage_maintenance_repo_state SET last_scan_at = NULL WHERE repository_id = $1",
-                        &[&repo_id],
-                    )
-                    .await?;
                 unsafe {
                     std::env::set_var("ROOTYARD_STORAGE_MAINTENANCE", "true");
                     std::env::set_var("ROOTYARD_STORAGE_MAINTENANCE_POLL_SECONDS", "1");

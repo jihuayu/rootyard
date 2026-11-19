@@ -1,11 +1,22 @@
 //! Fail-closed legacy safe-gc trust migration tests (#122).
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use tempfile::tempdir;
 use uuid::Uuid;
 
-use super::super::SafeGcError;
+use crate::ref_store::core::state_machine::RefCasStateMachine;
+
+use super::super::{
+    SafeGcError,
+    pg_maintenance_dist::{
+        ProductionRefCasAuthoritySource, RefCasCutpointSource, persist_refcas_cutpoint_snapshot,
+        register_live_sm_cutpoint_source,
+    },
+};
 use super::{
     SafeGcEd25519Signer, SafeGcRepoTrustConfig, TrustedConsensusVoter, ensure_private_dir, write_private_file,
 };
@@ -95,4 +106,18 @@ fn migrate_legacy_trust_file_preserves_identity_and_is_idempotent() {
     let again = SafeGcRepoTrustConfig::migrate_legacy_trust_file(root.path(), repo_id, 2, voters()).unwrap();
     assert_eq!(again, migrated);
     assert_eq!(SafeGcRepoTrustConfig::load(root.path(), repo_id).unwrap(), migrated);
+}
+
+#[test]
+fn production_authority_source_never_falls_back_to_sealed_file_or_in_process_sm() {
+    let root = tempdir().unwrap();
+    let repo_id = Uuid::new_v4();
+    let sm = RefCasStateMachine::new();
+    let sealed = persist_refcas_cutpoint_snapshot(root.path(), repo_id, 0, &sm, &[]).unwrap();
+    assert!(sealed.is_file(), "sealed envelope must exist to prove it is ignored");
+    register_live_sm_cutpoint_source(root.path(), repo_id, 0, &Arc::new(Mutex::new(RefCasStateMachine::new())));
+
+    let source = ProductionRefCasAuthoritySource::new(root.path());
+    assert_eq!(source.storage_root(), root.path());
+    assert!(source.capture_state_machine(repo_id).unwrap().is_none(), "production authority must fail closed");
 }
