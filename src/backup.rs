@@ -40,6 +40,7 @@ mod blob_closure;
 mod catalog;
 mod lfs_inventory;
 mod lifetime;
+pub mod w8a_paired;
 use catalog::{
     FORMAT, FORMAT_PAIRED, catalogs as schema_catalogs, digest as schema_contract_digest, versions as schema_versions,
 };
