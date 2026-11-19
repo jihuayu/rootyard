@@ -73,6 +73,13 @@ pub(super) fn pick_any_object_oid_from_pack(
 /// `MAX_ACK_BODY_BYTES` bound (64 KiB) so pack/scope/digest fields can never overflow one ACK body.
 pub(super) const MAX_REBIND_REF_ACK_BYTES: usize = 32 * 1024;
 
+/// Hard per-plan cap on rebind refs. `ensure_pack_terminal_budget` (see
+/// `ref_store::core::pack_commit::receipt`) charges every ref name in a `PackCommitPlan` at the
+/// worst-case `WORST_CASE_REF_NAME_BYTES = 1024`, so a plan tops out at 51 refs against the 64 KiB
+/// `TerminalResult` ceiling. 48 leaves headroom for the pack/scope/digest fields while still
+/// letting a `136`-ref repository rebind across three canonical plans.
+pub(super) const MAX_REBIND_PLAN_REFS: usize = 48;
+
 /// Split restored refs into non-empty A4 plan chunks bounded by both the per-plan ref count and a
 /// conservative ACK-body byte estimate. A ref is always admitted into empty chunks, so even a name
 /// longer than the whole budget still makes progress in a chunk of its own.
@@ -329,9 +336,9 @@ mod tests {
         let oid = "a".repeat(64);
         let refs: Vec<(String, String)> =
             (0..135).map(|index| (format!("refs/tags/bulk-{index:03}"), oid.clone())).collect();
-        let chunks = chunk_refs_for_plans(&refs, 128, MAX_REBIND_REF_ACK_BYTES);
-        assert_eq!(chunks.len(), 2, "135 refs above a 128-ref plan limit must split into two plans");
-        assert_eq!((chunks[0].len(), chunks[1].len()), (128, 7));
+        let chunks = chunk_refs_for_plans(&refs, MAX_REBIND_PLAN_REFS, MAX_REBIND_REF_ACK_BYTES);
+        assert_eq!(chunks.len(), 3, "135 refs above the 51-ref terminal budget must split into three plans");
+        assert_eq!((chunks[0].len(), chunks[1].len(), chunks[2].len()), (48, 48, 39));
         let flattened: Vec<(String, String)> = chunks.iter().flatten().cloned().collect();
         assert_eq!(flattened, refs, "chunking must preserve the exact ref set and order");
 

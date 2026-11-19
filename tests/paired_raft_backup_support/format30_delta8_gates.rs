@@ -101,18 +101,20 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
         fs::write(clone.join("f.txt"), "gate8\n")?;
         ensure!(run_git_cli(&git, &clone, &["add", "."]).status.success());
         ensure!(run_git_cli(&git, &clone, &["commit", "-q", "-m", "gate8"]).status.success());
-        // A non-HEAD branch keeps the pack membership but is legally deleted again through the
-        // Smart-HTTP ref protocol, leaving the repository with real packs and zero refs.
-        let pushed = run_git_cli(&git, &clone, &["push", "origin", "HEAD:refs/heads/scratch"]);
+        // An ephemeral tag keeps the pack membership but is legally deleted again through the
+        // Smart-HTTP ref protocol, leaving the repository with real packs and zero refs. A tag must be
+        // used here, not a `refs/heads/*` branch: pushing the first branch into an unborn repository
+        // retargets HEAD (`publish.rs`), so deleting it would trip `rejected:head_dependency`.
+        let pushed = run_git_cli(&git, &clone, &["push", "origin", "HEAD:refs/tags/scratch"]);
         ensure!(pushed.status.success(), "push failed: {}", String::from_utf8_lossy(&pushed.stderr));
-        let deleted = run_git_cli(&git, &clone, &["push", "origin", ":refs/heads/scratch"]);
-        ensure!(deleted.status.success(), "branch delete failed: {}", String::from_utf8_lossy(&deleted.stderr));
+        let deleted = run_git_cli(&git, &clone, &["push", "origin", ":refs/tags/scratch"]);
+        ensure!(deleted.status.success(), "tag delete failed: {}", String::from_utf8_lossy(&deleted.stderr));
         {
             let c = pool.get().await?;
             let refs =
                 repo_count(&c, "SELECT count(*) FROM public.ref_store_core_refs WHERE repository_id = $1", repo_id)
                     .await?;
-            ensure!(refs == 0i64, "the ephemeral branch must be gone again");
+            ensure!(refs == 0i64, "the ephemeral tag must be gone again");
             let memberships = repo_count(
                 &c,
                 "SELECT count(*) FROM public.ref_store_core_pack_memberships WHERE repository_id = $1",

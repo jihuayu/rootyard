@@ -30,8 +30,8 @@ use crate::ref_store::core::types::{
 };
 
 use super::format30_pack_consolidate::{
-    MAX_REBIND_REF_ACK_BYTES, RebindTempDir, chunk_refs_for_plans, needs_consolidation_with_limit,
-    select_packs_for_rebind_with_limit,
+    MAX_REBIND_PLAN_REFS, MAX_REBIND_REF_ACK_BYTES, RebindTempDir, chunk_refs_for_plans,
+    needs_consolidation_with_limit, select_packs_for_rebind_with_limit,
 };
 use super::format30_paired::Format30PairedManifest;
 use super::format30_rebind_plans::{adopt_tag_updates, commit_followup_ref_plan, ref_updates_for};
@@ -241,7 +241,10 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
         // chunk keeps HEAD while the A4 pipeline adopts the freshly registered packs exactly once.
         let mut ordered_refs = repo.refs.clone();
         ordered_refs.sort_by_key(|(name, _)| name != &repo.head_ref);
-        let chunks = chunk_refs_for_plans(&ordered_refs, MAX_PLAN_REFS, MAX_REBIND_REF_ACK_BYTES);
+        // A4's own `MAX_PLAN_REFS` (128) is well above `ensure_pack_terminal_budget`'s 51-ref
+        // terminal ceiling, so the rebind chunker must honour the tighter of the two bounds.
+        let max_plan_refs = MAX_REBIND_PLAN_REFS.min(MAX_PLAN_REFS);
+        let chunks = chunk_refs_for_plans(&ordered_refs, max_plan_refs, MAX_REBIND_REF_ACK_BYTES);
         // A restored repository may legitimately hold zero refs while owning real packs; the A4
         // pipeline requires a non-empty ref batch, so the packs are adopted under an ephemeral
         // tag that the delete-only follow-up plan removes again.

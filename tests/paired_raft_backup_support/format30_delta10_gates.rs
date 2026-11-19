@@ -39,17 +39,21 @@ async fn repo_count(client: &tokio_postgres::Client, sql: &str, repo_id: Uuid) -
     Ok(client.query_one(sql, &[&repo_id]).await?.get(0))
 }
 
-/// Push `REF_COUNT` refs in batches of at most the canonical 128-command wire limit.
+/// Push `REF_COUNT` refs while never exceeding the 51-ref `ensure_pack_terminal_budget` ceiling of a
+/// single Smart-HTTP push: `ensure_pack_terminal_budget` pads every ref name to `1024` bytes against
+/// the 64 KiB `TerminalResult` bound, so one `PackCommitPlan` admits at most 51 refs. The pushes
+/// therefore accumulate `REF_COUNT = 136 > MAX_PLAN_REFS = 128` refs *in the repository* while each
+/// batch stays at 45. Those 136 refs then rebind across the three canonical A4 plans of the restore.
 fn push_many_refs(git: &std::path::Path, clone: &std::path::Path) -> Result<()> {
-    let bulk: Vec<String> = (0..REF_COUNT - 1).map(|index| format!("HEAD:refs/heads/bulk-{index:03}")).collect();
-    for window in [&bulk[..127], &bulk[127..]] {
+    let main = run_git_cli(git, clone, &["push", "origin", "HEAD:refs/heads/main"]);
+    ensure!(main.status.success(), "main ref push failed: {}", String::from_utf8_lossy(&main.stderr));
+    let bulk: Vec<String> = (0..REF_COUNT - 1).map(|index| format!("HEAD:refs/tags/bulk-{index:03}")).collect();
+    for window in bulk.chunks(45) {
         let mut args: Vec<&str> = vec!["push", "origin"];
         args.extend(window.iter().map(String::as_str));
         let out = run_git_cli(git, clone, &args);
         ensure!(out.status.success(), "bulk ref push failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    let main = run_git_cli(git, clone, &["push", "origin", "HEAD:refs/heads/main"]);
-    ensure!(main.status.success(), "main ref push failed: {}", String::from_utf8_lossy(&main.stderr));
     Ok(())
 }
 
