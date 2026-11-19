@@ -482,6 +482,10 @@ fn checkpoint(_name: &'static str) -> Result<(), CloneKitError> {
 mod publication_child_fixture;
 
 #[cfg(test)]
+#[path = "publication_active_fixture.rs"]
+mod fixture;
+
+#[cfg(test)]
 #[path = "publication_tests.rs"]
 mod publication_tests;
 

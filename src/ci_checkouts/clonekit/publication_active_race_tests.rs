@@ -6,11 +6,9 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use super::fixture;
 use super::{CP_BEFORE_LOCK, CloneKitPublicationStore, publish_clonekit_versioned, test_seam};
 use crate::ci_checkouts::clonekit::{BuiltCloneKitArtifacts, CloneKitError, CloneKitManifest, CloneKitStatus};
-
-#[path = "publication_active_fixture.rs"]
-mod fixture;
 
 struct CandidateBytes {
     pack: Vec<u8>,

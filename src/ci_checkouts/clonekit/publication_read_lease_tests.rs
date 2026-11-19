@@ -12,6 +12,7 @@ use std::{
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use super::fixture;
 use super::publication_child_fixture::OwnedChild;
 use super::publication_tests::empty_artifacts;
 use super::{CloneKitPublicationStore, publish_clonekit_versioned, test_seam};
@@ -30,9 +31,6 @@ fn child_test_name(helper: &str) -> String {
     let module = module.split_once("::").map_or(module, |(_, relative)| relative);
     format!("{module}::{helper}")
 }
-
-#[path = "publication_active_fixture.rs"]
-mod fixture;
 
 #[path = "publication_read_lease_guard_tests.rs"]
 mod guard_tests;
