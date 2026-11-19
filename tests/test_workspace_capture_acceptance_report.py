@@ -10,6 +10,8 @@ from workspace_capture_acceptance import (
     scheduled_test_ids,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def _synthetic_suite() -> unittest.TestSuite:
     """Build a tiny suite: one passing case and one unconditionally skipped case."""
@@ -58,6 +60,18 @@ class WorkspaceCaptureAcceptanceReportTest(unittest.TestCase):
         self.assertEqual(len(legacy_tests), 2)
         self.assertEqual(legacy_tests[0]["status"], "success")
         self.assertEqual(legacy_tests[1]["status"], "skipped")
+
+
+class WorkspaceEventsReplaySourceTest(unittest.TestCase):
+    """Pure source contract for the bounded replay query shape."""
+
+    def test_page_limit_is_shared_and_emitted_order_is_explicit(self) -> None:
+        source = (ROOT / "src/workspaces/events.rs").read_text(encoding="utf-8")
+        self.assertIn("const PAGE_LIMIT: i64 = 100;", source)
+        self.assertIn("ORDER BY revision LIMIT $3", source)
+        self.assertIn(") ev ON true ORDER BY ev.revision", source)
+        self.assertIn("(events.len() as i64) < PAGE_LIMIT", source)
+        self.assertNotIn("LIMIT 100", source)
 
 
 if __name__ == "__main__":

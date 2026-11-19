@@ -144,7 +144,7 @@ def write_event(h, workspace, index):
     raise AssertionError(f"workspace event write for event-{index}.txt kept conflicting")
 
 
-def sse_frames(h, workspace, after=None, last_event_id=None, max_frames=1, timeout=8.0):
+def sse_frames(h, workspace, after=None, last_event_id=None, max_frames=1, timeout=8.0, on_open=None):
     """Read a bounded number of real SSE frames from one response and close it."""
     suffix = "" if after is None else f"?after_revision={after}"
     headers = {
@@ -175,6 +175,8 @@ def sse_frames(h, workspace, after=None, last_event_id=None, max_frames=1, timeo
 
     with urllib.request.urlopen(request, timeout=timeout) as response:
         try:
+            if on_open is not None:
+                on_open()
             while len(frames) < max_frames and consumed < 65536:
                 try:
                     chunk = response.read(1)
@@ -637,6 +639,41 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             self.assertEqual(json.loads(frames[0]["data"]), {"snapshot_revision": latest})
             self.assertFalse(any(frame["event"] == "workspace" for frame in frames))
 
+            # A contiguous short page ending below the same durable watermark
+            # is a trailing gap, even though its retained rows are contiguous.
+            h.sql(
+                "DELETE FROM workspace_events WHERE workspace_id='%s' AND revision>%d"
+                % (workspace["id"], second["revision"])
+            )
+            self.assertEqual(
+                h.sql(
+                    "SELECT count(*) FROM workspace_events WHERE workspace_id='%s' AND revision>%d"
+                    % (workspace["id"], cursor)
+                ),
+                "1",
+                "short-page fixture did not retain exactly one trailing row",
+            )
+            self.assertEqual(
+                h.sql("SELECT revision FROM workspaces WHERE id='%s'" % workspace["id"]),
+                str(latest),
+            )
+            resync = json.loads(
+                h.expect(
+                    f"/api/workspaces/{workspace['id']}/events?after_revision={cursor}",
+                    200,
+                    token=h.alice,
+                )
+            )
+            self.assertEqual(resync.get("kind"), "RESYNC_REQUIRED")
+            self.assertEqual(resync.get("snapshot_revision"), latest)
+            self.assertNotIn("events", resync)
+
+            frames = sse_frames(h, workspace, after=cursor, max_frames=4)
+            self.assertEqual(len(frames), 1, frames)
+            self.assertEqual(frames[0]["event"], "RESYNC_REQUIRED")
+            self.assertEqual(json.loads(frames[0]["data"]), {"snapshot_revision": latest})
+            self.assertFalse(any(frame["event"] == "workspace" for frame in frames))
+
             # Retaining nothing after the cursor while the durable revision is
             # ahead is also a gap, not an idle stream.
             h.sql(
@@ -670,6 +707,56 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             self.assertEqual(idle.get("events"), [])
             self.assertEqual(idle.get("snapshot_revision"), latest)
             self.assertNotEqual(idle.get("kind"), "RESYNC_REQUIRED")
+
+            # A fresh future cursor is still a bad request for JSON and SSE.
+            future = latest + 1
+            status, _, _ = h.http(
+                f"/api/workspaces/{workspace['id']}/events?after_revision={future}",
+                token=h.alice,
+            )
+            self.assertEqual(status, 400)
+            status, _, _ = h.http(
+                f"/api/workspaces/{workspace['id']}/events/stream?after_revision={future}",
+                token=h.alice,
+            )
+            self.assertEqual(status, 400)
+
+            # The connected stream may outlive a durable revision rollback. It
+            # must terminate at the lower watermark without first emitting any
+            # stale workspace frame.
+            self.assertEqual(
+                h.sql(
+                    "SELECT count(*) FROM workspace_events WHERE workspace_id='%s' AND revision>%d"
+                    % (workspace["id"], latest)
+                ),
+                "0",
+                "active-stream fixture has an unread event above its cursor",
+            )
+            lower = first["revision"]
+            self.assertLess(lower, latest)
+
+            def rollback():
+                h.sql(
+                    "UPDATE workspaces SET revision=%d WHERE id='%s'"
+                    % (lower, workspace["id"])
+                )
+                self.assertEqual(
+                    h.sql("SELECT revision FROM workspaces WHERE id='%s'" % workspace["id"]),
+                    str(lower),
+                )
+
+            frames = sse_frames(
+                h,
+                workspace,
+                after=latest,
+                max_frames=4,
+                on_open=rollback,
+            )
+            self.assertEqual(len(frames), 1, frames)
+            self.assertEqual(frames[0]["event"], "RESYNC_REQUIRED")
+            self.assertIsNone(frames[0]["id"], "rolled-back resync must not carry an event ID")
+            self.assertEqual(json.loads(frames[0]["data"]), {"snapshot_revision": lower})
+            self.assertFalse(any(frame["event"] == "workspace" for frame in frames))
         finally:
             h.cleanup()
 

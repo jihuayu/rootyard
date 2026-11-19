@@ -133,3 +133,30 @@ pub async fn stream(
     };
     Ok(Sse::new(output).keep_alive(KeepAlive::default()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{PAGE_LIMIT, gap};
+    use serde_json::{Value, json};
+
+    fn events(revisions: impl IntoIterator<Item = i64>) -> Vec<Value> {
+        revisions.into_iter().map(|revision| json!({"revision":revision})).collect()
+    }
+
+    #[test]
+    fn full_page_is_not_a_gap_but_a_short_tail_is() {
+        let full = events(1..=PAGE_LIMIT);
+        assert!(!gap(0, PAGE_LIMIT, &full));
+        assert!(!gap(0, PAGE_LIMIT + 1, &full));
+        assert!(gap(0, PAGE_LIMIT, &events(1..PAGE_LIMIT)));
+        assert!(!gap(0, PAGE_LIMIT - 1, &events(1..PAGE_LIMIT)));
+    }
+
+    #[test]
+    fn gap_distinguishes_empty_idle_from_empty_missing() {
+        assert!(!gap(PAGE_LIMIT, PAGE_LIMIT, &[]));
+        assert!(gap(PAGE_LIMIT, PAGE_LIMIT + 1, &[]));
+        assert!(gap(0, 3, &events([1, 3])));
+        assert!(!gap(0, 2, &events([1, 2])));
+    }
+}
