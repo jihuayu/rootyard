@@ -719,29 +719,6 @@ async fn read_public_snapshot_sql(
         .map_err(|_| ledger("public attempt lookup snapshot shape is not recognized"))
 }
 
-/// Prove that migration 152's whole public-attempt catalog is absent. This is
-/// the only evidence a GET adapter may use to preserve pre-152 legacy wire
-/// semantics; a partial or broken catalog is not a fallback.
-pub(crate) async fn public_attempt_catalog_absent(
-    tx: &Transaction<'_>,
-    deadline: Instant,
-) -> Result<bool, RefStoreError> {
-    bound(tx, deadline).await?;
-    let absent = tx
-        .query_one(
-            "SELECT NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152)
-                    AND to_regclass('ref_store_public_operations') IS NULL
-                    AND to_regclass('ref_store_private_attempts') IS NULL
-                    AND to_regprocedure('rootyard_ref_store_attempt_has_binding(
-                        ref_store_public_operations,ref_store_private_attempts)') IS NULL",
-            &[],
-        )
-        .await
-        .map_err(lookup_db_error)?
-        .get(0);
-    Ok(absent)
-}
-
 /// Shared catalog probe for the lock and read adapters. A missing or partial
 /// migration 152 is an explicit unsupported outcome before any relation or SQL
 /// function is referenced.

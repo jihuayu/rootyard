@@ -42,6 +42,48 @@ pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
 pub const OPERATION_LOCK_SQL: &str =
     "SELECT pg_advisory_xact_lock(hashtextextended($1::text || '/' || $2::uuid::text || '/' || $3::uuid::text,0))";
 
+/// Exact migration-152 catalog state for the legacy status read. Migration 152
+/// is either wholly absent (pre-152 legacy semantics), wholly present, or a
+/// partial catalog that must fail closed rather than fall through to legacy.
+const LEGACY_STATUS_SCHEMA_PROBE: &str = "SELECT \
+        EXISTS(SELECT 1 FROM schema_migrations WHERE version=152), \
+        to_regclass('ref_store_public_operations') IS NOT NULL, \
+        to_regclass('ref_store_private_attempts') IS NOT NULL, \
+        to_regprocedure('rootyard_ref_store_attempt_has_binding(\
+            ref_store_public_operations,ref_store_private_attempts)') IS NOT NULL";
+
+/// One MVCC snapshot for the legacy status route: the eligible legacy operation
+/// row (columns 0..6, read by `record_from_row`), whether this exact UUID is a
+/// migration-152 public wrapper, and whether it is a private attempt claim.
+/// Keeping all three in one statement prevents a concurrent admission commit
+/// from being split between a claim probe and a private core-row read.
+const LEGACY_STATUS_SNAPSHOT: &str = "SELECT \
+        o.issuer_id, o.lane, o.sequence, o.request_digest, o.state, o.terminal_result, o.operation_id, \
+        (w.public_id IS NOT NULL) AS public_wrapper, \
+        (p.private_id IS NOT NULL) AS private_claimed, \
+        (sp.private_id IS NOT NULL) AS selected_private \
+    FROM (VALUES (1)) AS anchor(one) \
+    LEFT JOIN ref_store_operations o \
+        ON o.repository_id=$1 AND o.operation_id=$2 \
+    LEFT JOIN ref_store_public_operations w \
+        ON w.repository_id=$1 AND w.public_id=$2 \
+    LEFT JOIN ref_store_private_attempts p \
+        ON p.repository_id=$1 AND p.private_id=$2 \
+    LEFT JOIN ref_store_private_attempts sp \
+        ON sp.repository_id=w.repository_id AND sp.public_id=w.public_id AND sp.slot=w.current_slot";
+
+const LEGACY_STATUS_SCHEMA_REQUIRED: &str = "legacy operation status requires a complete migration 152 catalog";
+
+/// Read-only legacy status classification. Only `Legacy` carries durable state;
+/// `PublicWrapper`, `PrivateIdentifier` and `Unknown` carry no identity or
+/// payload. A private claim must be rendered exactly like an unknown id.
+pub(crate) enum LegacyStatusLookup {
+    Legacy(OperationRecord),
+    PublicWrapper,
+    PrivateIdentifier,
+    Unknown,
+}
+
 pub(crate) async fn before_deadline<T, F>(deadline: Instant, future: F) -> Result<T, RefStoreError>
 where
     F: Future<Output = Result<T, RefStoreError>>,
@@ -445,7 +487,8 @@ impl PgRefStore {
     }
 
     /// Internal repository-scoped core lookup, including private identities.
-    /// Legacy HTTP callers use `get_legacy_locked`. A missing row is
+    /// Mutation/cancel callers that must serialize use `get_legacy_locked`; the
+    /// read-only status route uses `get_legacy_status`. A missing row is
     /// [`OperationLookup::Unknown`], never an aborted result.
     pub async fn get(
         &self,
@@ -457,8 +500,9 @@ impl PgRefStore {
         before_deadline(deadline, self.get_inner(tx, repository_id, operation_id, deadline)).await
     }
 
-    /// Resolve a legacy operation for an authorized HTTP caller. The caller
-    /// must already hold the migration-138 operation lock in this transaction.
+    /// Resolve a legacy operation for an authorized HTTP caller that must
+    /// serialize with operation mutations. The caller must already hold the
+    /// migration-138 operation lock in this transaction.
     pub(crate) async fn get_legacy_locked(
         &self,
         tx: &Transaction<'_>,
@@ -470,6 +514,68 @@ impl PgRefStore {
             bound(tx, deadline).await?;
             refuse_legacy_collision(tx, repository_id, operation_id).await?;
             self.get_inner(tx, repository_id, operation_id, deadline).await
+        })
+        .await
+    }
+
+    /// Classify one repository-scoped identifier for the authenticated read-only
+    /// status route.
+    ///
+    /// A complete migration-152 catalog is classified by one statement over one
+    /// MVCC snapshot: the eligible legacy operation row, this exact UUID's public
+    /// wrapper, and this exact UUID's private attempt claim are read together.
+    /// A concurrent admission commit therefore cannot be split between a claim
+    /// check and a core-row read, and a private core row is never exposed as a
+    /// legacy operation. Private claims return a marker the caller renders as the
+    /// same 404 as an unknown id; a public wrapper remains a non-legacy marker.
+    ///
+    /// A wholly absent migration 152 uses the pre-152 legacy read. A partial
+    /// catalog fails closed. This method takes no migration-138 operation key,
+    /// writes no row and does not change any writer path.
+    pub(crate) async fn get_legacy_status(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        operation_id: Uuid,
+        deadline: Instant,
+    ) -> Result<LegacyStatusLookup, RefStoreError> {
+        if repository_id.is_nil() || operation_id.is_nil() {
+            return Err(RefStoreError::InvalidIdentity("lookup ids must be non-nil".into()));
+        }
+        before_deadline(deadline, async {
+            bound(tx, deadline).await?;
+            let schema = tx.query_one(LEGACY_STATUS_SCHEMA_PROBE, &[]).await.map_err(db_error)?;
+            let version = schema.get::<_, bool>(0);
+            let wrapper_relation = schema.get::<_, bool>(1);
+            let attempt_relation = schema.get::<_, bool>(2);
+            let binding_function = schema.get::<_, bool>(3);
+            if !version && !wrapper_relation && !attempt_relation && !binding_function {
+                return match self.get_inner(tx, repository_id, operation_id, deadline).await? {
+                    OperationLookup::Known(record) => Ok(LegacyStatusLookup::Legacy(record)),
+                    OperationLookup::Unknown => Ok(LegacyStatusLookup::Unknown),
+                };
+            }
+            if !version || !wrapper_relation || !attempt_relation || !binding_function {
+                return Err(RefStoreError::Unsupported(LEGACY_STATUS_SCHEMA_REQUIRED));
+            }
+            let row = tx.query_one(LEGACY_STATUS_SNAPSHOT, &[&repository_id, &operation_id]).await.map_err(db_error)?;
+            let legacy_present = row.get::<_, Option<Uuid>>(6).is_some();
+            let public_wrapper: bool = row.get(7);
+            let private_claimed: bool = row.get(8);
+            let selected_private: bool = row.get(9);
+            if public_wrapper {
+                if legacy_present || private_claimed || !selected_private {
+                    return Err(RefStoreError::IdentityConflict);
+                }
+                return Ok(LegacyStatusLookup::PublicWrapper);
+            }
+            if private_claimed {
+                return Ok(LegacyStatusLookup::PrivateIdentifier);
+            }
+            if legacy_present {
+                return Ok(LegacyStatusLookup::Legacy(record_from_row(&row, repository_id)?));
+            }
+            Ok(LegacyStatusLookup::Unknown)
         })
         .await
     }

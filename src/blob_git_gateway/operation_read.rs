@@ -1,22 +1,26 @@
 //! Narrow gate-owned read adapter for `GET /api/repos/{owner}/{name}/operations/{id}`.
 //!
 //! The route keeps the existing authenticated read-or-scoped-write-only serving
-//! lookup and the migration-138 operation advisory key acquired before the fresh
-//! lookup/row locks. This adapter then distinguishes the durable public wrapper,
-//! a private attempt identifier, an unknown identifier and a genuine legacy
-//! operation inside the same caller-owned transaction and deadline.
+//! lookup and the fresh lookup/row locks, but deliberately takes no
+//! migration-138 operation advisory key on the read-only path. This adapter
+//! then distinguishes the durable public wrapper, a private attempt identifier,
+//! an unknown identifier and a genuine legacy operation inside the same
+//! caller-owned transaction and deadline.
 //!
-//! A public status is first resolved with the authenticated live issuer marker.
-//! Only a data-free issuer mismatch triggers the same current-role lookup as the
-//! legacy resolver; a current owner/admin re-resolves the public status with the
-//! explicit admin marker in the same transaction. The role query takes the same
-//! `FOR SHARE` policy fences as the legacy path, and a revocation blocks behind
-//! the transaction. No state from the issuer-mismatch probe is returned.
+//! A public status is resolved first through the existing GET-only snapshot with
+//! the authenticated live issuer marker, so the wrapper, selected attempt, live
+//! realm and issuer/admin authorization are still proved before output. Only a
+//! data-free issuer mismatch triggers the same current-role lookup as the legacy
+//! resolver; a current owner/admin re-resolves with the explicit admin marker in
+//! the same transaction. The role query takes the same `FOR SHARE` policy fences
+//! as the legacy path, and a revocation blocks behind the transaction. No state
+//! from the issuer-mismatch probe is returned.
 //!
-//! A pre-migration-152 catalog may take the legacy path only when the status
-//! lookup reports the exact schema refusal *and* an explicit catalog probe
-//! proves the migration row and both relations absent. Every other
-//! database/integrity/realm/unsupported/composite error fails closed.
+//! Every legacy fallthrough then reclassifies the exact UUID in one core
+//! statement: the public wrapper, private claim and eligible legacy row share one
+//! MVCC snapshot. A wholly absent migration 152 keeps the pre-152 legacy read; a
+//! partial catalog fails closed. A wrapper that appears between the public probe
+//! and the atomic classifier is a change, not a legacy payload.
 use deadpool_postgres::Transaction;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -25,11 +29,14 @@ use crate::{
     db::Identity,
     members::{models::Role, rbac::resolve_effective_role},
     ref_store::{
-        OperationLookup, OperationRecord, PgRefStore, RefStoreError,
+        OperationRecord, PgRefStore, RefStoreError,
         core::pack_commit::PackCommitError,
-        pg::public_attempt::{
-            PUBLIC_ATTEMPT_SCHEMA_REQUIRED, PublicOperationReadAuthorization, PublicOperationStatus,
-            PublicOperationStatusLookup, PublicOperationStatusRequest, public_attempt_catalog_absent,
+        pg::{
+            LegacyStatusLookup,
+            public_attempt::{
+                PUBLIC_ATTEMPT_SCHEMA_REQUIRED, PublicOperationReadAuthorization, PublicOperationStatus,
+                PublicOperationStatusLookup, PublicOperationStatusRequest,
+            },
         },
     },
 };
@@ -58,22 +65,22 @@ pub(super) async fn resolve(
         request(repository_id, operation_id, PublicOperationReadAuthorization::LiveIssuer { issuer_id: identity.id });
     match PgRefStore.lookup_public_operation_status(&**tx, &live, deadline).await {
         Ok(PublicOperationStatusLookup::Found(status)) => Ok(OperationRead::Public(status)),
-        Ok(PublicOperationStatusLookup::Unknown) => Err(GatewayError::NotFound),
-        // A private attempt id is never handed to the legacy resolver.
-        Ok(PublicOperationStatusLookup::PrivateIdentifier) => Err(private_conflict()),
+        // A private attempt identifier is indistinguishable from an unknown
+        // public UUID on this route: both are opaque 404s after the repository
+        // authorization above.
+        Ok(PublicOperationStatusLookup::Unknown | PublicOperationStatusLookup::PrivateIdentifier) => {
+            Err(GatewayError::NotFound)
+        }
         Ok(PublicOperationStatusLookup::Forbidden) => {
             resolve_admin(tx, identity, repository_id, owner_id, operation_id, deadline).await
         }
         Ok(PublicOperationStatusLookup::LegacyPath) => {
-            resolve_legacy(tx, identity, repository_id, owner_id, operation_id, deadline).await
+            resolve_legacy_status(tx, identity, repository_id, owner_id, operation_id, deadline).await
         }
         Err(error) if missing_public_schema(&error) => {
-            let absent = public_attempt_catalog_absent(&**tx, deadline).await.map_err(GatewayError::from)?;
-            if absent {
-                resolve_legacy(tx, identity, repository_id, owner_id, operation_id, deadline).await
-            } else {
-                Err(error.into())
-            }
+            // The atomic classifier proves a wholly absent migration 152 and
+            // preserves the pre-152 legacy read; a partial catalog fails closed.
+            resolve_legacy_status(tx, identity, repository_id, owner_id, operation_id, deadline).await
         }
         Err(error) => Err(error.into()),
     }
@@ -109,7 +116,7 @@ async fn resolve_admin(
     }
 }
 
-async fn resolve_legacy(
+async fn resolve_legacy_status(
     tx: &Transaction<'_>,
     identity: &Identity,
     repository_id: Uuid,
@@ -117,9 +124,16 @@ async fn resolve_legacy(
     operation_id: Uuid,
     deadline: Instant,
 ) -> Result<OperationRead, GatewayError> {
-    let record = match PgRefStore.get_legacy_locked(&**tx, repository_id, operation_id, deadline).await? {
-        OperationLookup::Known(record) => record,
-        OperationLookup::Unknown => return Err(GatewayError::NotFound),
+    let record = match PgRefStore.get_legacy_status(&**tx, repository_id, operation_id, deadline).await? {
+        LegacyStatusLookup::Legacy(record) => record,
+        // The public probe said this UUID was legacy-only; a wrapper appearing
+        // in the atomic classifier is a concurrent change, never a legacy row.
+        LegacyStatusLookup::PublicWrapper => return Err(GatewayError::Conflict(OPERATION_CHANGED)),
+        // Private and unknown identifiers are the same opaque 404. Neither
+        // marker carries a private attempt id or terminal payload.
+        LegacyStatusLookup::PrivateIdentifier | LegacyStatusLookup::Unknown => {
+            return Err(GatewayError::NotFound);
+        }
     };
     let role = effective_role(tx, repository_id, owner_id, identity.id, deadline).await?;
     if !operation_visible(record.identity().issuer_id(), identity.id, role) {
@@ -166,11 +180,6 @@ fn missing_public_schema(error: &PackCommitError) -> bool {
     )
 }
 
-fn private_conflict() -> GatewayError {
-    // The shared RefStore -> GatewayError mapping for IdentityConflict.
-    GatewayError::Conflict("operation identity conflicts with a durable record")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,12 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn private_and_changed_identifiers_use_fixed_conflicts() {
-        assert_eq!(private_conflict(), GatewayError::Conflict("operation identity conflicts with a durable record"));
+    fn changed_and_forbidden_paths_keep_fixed_errors() {
         assert_eq!(
             GatewayError::Conflict(OPERATION_CHANGED),
             GatewayError::Conflict("operation identity changed during authorization; retry")
         );
         assert!(!OPERATION_FORBIDDEN.contains("uuid"));
+        assert!(!OPERATION_CHANGED.contains("uuid"));
     }
 }

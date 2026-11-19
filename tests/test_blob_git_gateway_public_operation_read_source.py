@@ -1,7 +1,7 @@
 """Offline source checks for the public UUID operation GET adapter.
 
-Pins the gate-owned transaction order, live issuer/admin distinction, exact
-legacy fallback probe and fixed refusals. No PostgreSQL, Cargo, service or
+Pins the gate-owned transaction order, live issuer/admin distinction, atomic
+legacy reclassification and fixed refusals. No PostgreSQL, Cargo, service or
 network is touched.
 """
 from pathlib import Path
@@ -26,11 +26,10 @@ class PublicOperationReadSourceTest(unittest.TestCase):
         cls.mod = MOD.read_text()
         cls.public = PUBLIC.read_text()
 
-    def test_get_keeps_lock_then_fresh_lookup_then_capture_then_resolve(self):
+    def test_get_skips_operation_key_then_fresh_lookup_then_capture_then_resolve(self):
         body = between(self.api, 'let loaded: Result<OperationRead, GatewayError> = async {',
                        'let _ = tokio::time::timeout_at(deadline, tx.rollback()).await;')
         markers = [
-            'crate::ref_store::pg::lock_operation(&tx, repository_id, operation_id, deadline)',
             'crate::ref_store::serving::lookup_in_tx(',
             'fresh.cluster_incarnation != serving.cluster_incarnation',
             'authorization.ensure_same_realm(&fresh)?',
@@ -38,6 +37,8 @@ class PublicOperationReadSourceTest(unittest.TestCase):
         ]
         positions = [body.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
+        self.assertNotIn('lock_operation(', body)
+        self.assertNotIn('get_legacy_locked(', body)
         self.assertIn('mod operation_read;', self.mod)
         self.assertIn('operation_read::resolve(', self.api)
         self.assertNotIn('PgRefStore.get(&tx', body)
@@ -52,40 +53,46 @@ class PublicOperationReadSourceTest(unittest.TestCase):
         self.assertIn('PublicOperationReadAuthorization::LiveIssuer', body)
         self.assertIn('issuer_id: identity.id', body)
         self.assertIn('PublicOperationStatusLookup::Found(status)', body)
-        self.assertIn('PublicOperationStatusLookup::Unknown) => Err(GatewayError::NotFound)', body)
-        self.assertIn('PublicOperationStatusLookup::PrivateIdentifier) => Err(private_conflict())', body)
+        self.assertIn('PublicOperationStatusLookup::Unknown | PublicOperationStatusLookup::PrivateIdentifier', body)
+        self.assertIn('Err(GatewayError::NotFound)', body)
         self.assertIn('PublicOperationStatusLookup::Forbidden)', body)
         self.assertIn('resolve_admin(', body)
-        self.assertIn('resolve_legacy(', body)
-        admin = between(self.adapter, 'async fn resolve_admin(', 'async fn resolve_legacy(')
+        self.assertIn('resolve_legacy_status(', body)
+        self.assertNotIn('private_conflict', body)
+        admin = between(self.adapter, 'async fn resolve_admin(', 'async fn resolve_legacy_status(')
         self.assertIn('effective_role(tx, repository_id, owner_id, identity.id, deadline)', admin)
         self.assertIn('PublicOperationReadAuthorization::RepositoryAdmin', admin)
         self.assertIn('lookup_public_operation_status(&**tx, &admin, deadline)', admin)
 
-    def test_legacy_resolution_preserves_get_then_role_and_exact_message(self):
-        legacy = between(self.adapter, 'async fn resolve_legacy(', 'async fn effective_role(')
-        self.assertLess(legacy.index('get_legacy_locked('), legacy.index('effective_role('))
+    def test_legacy_resolution_uses_atomic_classifier_then_role(self):
+        legacy = between(self.adapter, 'async fn resolve_legacy_status(', 'async fn effective_role(')
+        self.assertEqual(legacy.count('get_legacy_status('), 1)
+        self.assertNotIn('get_legacy_locked(', legacy)
+        self.assertNotIn('get_inner(', legacy)
+        self.assertIn('LegacyStatusLookup::Legacy(record) => record', legacy)
+        self.assertIn('LegacyStatusLookup::PublicWrapper => return Err(GatewayError::Conflict(OPERATION_CHANGED))', legacy)
+        self.assertIn('LegacyStatusLookup::PrivateIdentifier | LegacyStatusLookup::Unknown', legacy)
+        self.assertIn('Err(GatewayError::NotFound)', legacy)
+        self.assertLess(legacy.index('get_legacy_status('), legacy.index('effective_role('))
         self.assertIn('operation_visible(record.identity().issuer_id(), identity.id, role)', legacy)
         self.assertIn('operation is visible only to its issuer or a current repository admin', self.adapter)
-        self.assertIn('operation identity conflicts with a durable record', self.adapter)
 
-    def test_only_proven_missing_152_catalog_can_fall_back_to_legacy(self):
+    def test_missing_152_uses_atomic_classifier_and_partial_fails_closed(self):
         body = between(self.adapter, 'pub(super) async fn resolve(', 'async fn resolve_admin(')
         self.assertIn('missing_public_schema(&error)', body)
-        self.assertIn('public_attempt_catalog_absent(&**tx, deadline)', body)
-        self.assertIn('if absent {', body)
+        self.assertIn('resolve_legacy_status(', body)
+        self.assertNotIn('public_attempt_catalog_absent', body)
+        self.assertNotIn('if absent {', body)
         self.assertIn('Err(error.into())', body)
         self.assertIn('PUBLIC_ATTEMPT_SCHEMA_REQUIRED', self.adapter)
         self.assertIn('pack_commit::PackCommitError', self.adapter)
         self.assertNotIn('Unsupported(_)', body)
 
-        probe = between(self.public, 'pub(crate) async fn public_attempt_catalog_absent(',
-                        'fn validate_request(')
-        self.assertIn("NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152)", probe)
-        self.assertIn("to_regclass('ref_store_public_operations') IS NULL", probe)
-        self.assertIn("to_regclass('ref_store_private_attempts') IS NULL", probe)
+        probe = between(self.public, 'const SCHEMA_PROBE: &str = ', ';')
+        self.assertIn('schema_migrations WHERE version=152', probe)
+        self.assertIn("to_regclass('ref_store_public_operations')", probe)
+        self.assertIn("to_regclass('ref_store_private_attempts')", probe)
         self.assertIn('rootyard_ref_store_attempt_has_binding', probe)
-        self.assertIn("to_regprocedure(", probe)
         self.assertIn('pub(crate) const PUBLIC_ATTEMPT_SCHEMA_REQUIRED', self.public)
         self.assertIn('Unsupported(PUBLIC_ATTEMPT_SCHEMA_REQUIRED)', self.public)
 
@@ -96,7 +103,7 @@ class PublicOperationReadSourceTest(unittest.TestCase):
         self.assertIn('enum OperationRead', self.adapter)
         self.assertIn('Public(PublicOperationStatus)', self.adapter)
         self.assertIn('Legacy(OperationRecord)', self.adapter)
-        self.assertIn('private_conflict()', self.adapter)
+        self.assertIn('LegacyStatusLookup::PrivateIdentifier | LegacyStatusLookup::Unknown', self.adapter)
         self.assertIn('operation_visibility_is_exact_issuer_or_current_admin', self.adapter)
         self.assertIn('only_the_exact_missing_schema_refusal_can_consider_legacy_fallback', self.adapter)
 
