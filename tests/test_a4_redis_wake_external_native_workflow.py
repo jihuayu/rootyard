@@ -51,6 +51,7 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         self.case_evidence = namespace["case_evidence"]
         self.case_stages = namespace["CASE_STAGES"]
         self.repo_create_codes = namespace["REPO_CREATE_CODES"]
+        self.worker_startup_codes = namespace["WORKER_STARTUP_CODES"]
         self.phase_path = self.runner / "a4" / "native-tools-phase.json"
         self.wrapper_sha = hashlib.sha256(
             (self.workspace / "scripts" / "install_ci_native_tools.sh").read_bytes()
@@ -258,6 +259,39 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         self.assertIn("image: postgres:17", text)
         upload = text[text.index("Upload closed report and typed evidence"):]
         self.assertNotIn("public-migrate.log", upload)
+
+
+    def test_worker_startup_evidence_uses_only_whitelisted_codes(self):
+        self.assertEqual(self.worker_startup_codes, set(a4.WORKER_STARTUP_CODES))
+        observations = {"owned_cleanup_completed": False}
+        failed = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "worker_startup",
+             "worker_startup": "catch_up"}, observations
+        )
+        self.assertEqual(failed["stage"], "worker_startup")
+        self.assertEqual(failed["worker_startup"], "catch_up")
+        missing = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "worker_startup"}, observations
+        )
+        self.assertEqual(missing["worker_startup"], "unavailable")
+        for bad_code in ("private/worker/log", "", 7, ["catch_up"], {"code": "claim"}):
+            with self.subTest(code=bad_code):
+                rejected = self.case_evidence(
+                    {"name": a4.CASE, "status": "failed", "stage": "worker_startup",
+                     "worker_startup": bad_code}, observations
+                )
+                self.assertEqual(rejected["worker_startup"], "unavailable")
+                self.assertNotIn("private", repr(rejected))
+        other_stage = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "healthy_push",
+             "worker_startup": "catch_up"}, observations
+        )
+        self.assertNotIn("worker_startup", other_stage)
+        passed = self.case_evidence(
+            {"name": a4.CASE, "status": "passed", "stage": "worker_startup",
+             "worker_startup": "catch_up"}, observations
+        )
+        self.assertNotIn("worker_startup", passed)
 
 
 

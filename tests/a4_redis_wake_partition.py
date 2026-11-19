@@ -92,6 +92,17 @@ REPO_CREATE_CODES = (
     "object_format_mismatch",
     "clone_path_mismatch",
 )
+WORKER_STARTUP_CODES = (
+    "spawn",
+    "worker_exit_zero",
+    "worker_exit_nonzero",
+    "subscribe",
+    "relay",
+    "catch_up",
+    "claim",
+    "durable_binding",
+    "settle_idle",
+)
 REPORT_KIND = "rootyard/a4-redis-wake-external-acceptance"
 WORKER_NAME = "rootyard_a4_redis_wake_worker"
 TARGET_KIND = "pg_refstore_core_commit_audit"
@@ -205,6 +216,7 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         self.redis_started = False
         self.case_stage = None
         self.repo_create_code = None
+        self.worker_startup_code = None
 
     # ---- owned processes -------------------------------------------------
     def stop_workers(self):
@@ -622,16 +634,48 @@ class A4RedisWakeHarness(BlobOnlyHarness):
 
     def start_external_worker(self, repo, operation, oid):
         start = time.monotonic()
-        self.spawn_worker()
-        self.until(
-            lambda: self.subscriber_count() == 1 and self.relay.counts().active >= 1,
-            "external A4 worker subscribed through relay",
-            10,
-        )
-        self.until(lambda: self.audit_count(operation) == 1, "external worker initial catch-up delivery", 10)
-        self.assert_claim(operation)
-        self.assert_operation(repo["id"], operation, oid, delivered=True)
-        self.settle_worker()
+        self.worker_startup_code = None
+        try:
+            self.spawn_worker()
+        except Exception:
+            self.worker_startup_code = self._worker_failure_code("spawn")
+            raise
+        try:
+            self.until(
+                lambda: self.subscriber_count() == 1 and self.relay.counts().active >= 1,
+                "external A4 worker subscribed through relay",
+                10,
+            )
+        except Exception:
+            code = self._worker_failure_code("subscribe")
+            if code == "subscribe":
+                try:
+                    if self.subscriber_count() == 1 and self.relay.counts().active == 0:
+                        code = "relay"
+                except Exception:
+                    pass
+            self.worker_startup_code = code
+            raise
+        try:
+            self.until(lambda: self.audit_count(operation) == 1, "external worker initial catch-up delivery", 10)
+        except Exception:
+            self.worker_startup_code = self._worker_failure_code("catch_up")
+            raise
+        try:
+            self.assert_claim(operation)
+        except Exception:
+            self.worker_startup_code = self._worker_failure_code("claim")
+            raise
+        try:
+            self.assert_operation(repo["id"], operation, oid, delivered=True)
+        except Exception:
+            self.worker_startup_code = self._worker_failure_code("durable_binding")
+            raise
+        try:
+            self.settle_worker()
+        except Exception:
+            self.worker_startup_code = self._worker_failure_code("settle_idle")
+            raise
         return start
 
     def healthy_push(self, work, repo, deadline):
@@ -735,6 +779,15 @@ class A4RedisWakeHarness(BlobOnlyHarness):
     def observe_repo_create(self, code):
         if self.repo_create_code is None and code in REPO_CREATE_CODES:
             self.repo_create_code = code
+
+    def _worker_failure_code(self, default):
+        try:
+            for proc, _ in self.workers:
+                if proc.poll() is not None:
+                    return "worker_exit_zero" if proc.returncode == 0 else "worker_exit_nonzero"
+        except Exception:
+            return default
+        return default
 
     def run_case(self):
         self.case_stage = "repo_create"
@@ -938,6 +991,9 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None, containment
                 if stage == "repo_create":
                     code = getattr(harness, "repo_create_code", None)
                     case["repo_create"] = code if isinstance(code, str) and code in REPO_CREATE_CODES else "unavailable"
+                if stage == "worker_startup":
+                    code = getattr(harness, "worker_startup_code", None)
+                    case["worker_startup"] = code if isinstance(code, str) and code in WORKER_STARTUP_CODES else "unavailable"
         if cleanup_error is not None:
             case["cleanup_failed"] = True
         if primary is not None and cleanup_error is not None:

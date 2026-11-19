@@ -310,6 +310,10 @@ jobs:
               "get_shape", "get_terminal_state", "get_timeout", "identity_mismatch",
               "backend_mismatch", "object_format_mismatch", "clone_path_mismatch",
           }
+          WORKER_STARTUP_CODES = {
+              "spawn", "worker_exit_zero", "worker_exit_nonzero", "subscribe", "relay",
+              "catch_up", "claim", "durable_binding", "settle_idle",
+          }
           HEX = re.compile(r"^[0-9a-f]{64}$")
           FAIL = {"preflight", "fixture", "case", "receipt_changed", "cleanup"}
           ROOT = pathlib.Path.cwd()
@@ -394,6 +398,13 @@ jobs:
               return code if isinstance(code, str) and code in REPO_CREATE_CODES else "unavailable"
 
 
+          def failed_worker_startup_code(case):
+              if not isinstance(case, dict) or case.get("status") != "failed" or case.get("stage") != "worker_startup":
+                  return None
+              code = case.get("worker_startup")
+              return code if isinstance(code, str) and code in WORKER_STARTUP_CODES else "unavailable"
+
+
           def case_evidence(case, observations):
               case = case if isinstance(case, dict) else {}
               view = {"name": case.get("name"), "status": case.get("status"), "observations": observations}
@@ -403,6 +414,9 @@ jobs:
               repo_create = failed_repo_create_code(case)
               if repo_create is not None:
                   view["repo_create"] = repo_create
+              worker_startup = failed_worker_startup_code(case)
+              if worker_startup is not None:
+                  view["worker_startup"] = worker_startup
               return view
 
 

@@ -222,6 +222,47 @@ class ReportTest(unittest.TestCase):
         )])
         self.assertNotIn("stage", repr(report["cases"]))
         self.assertNotIn("repo_create", repr(report["cases"]))
+        self.assertNotIn("worker_startup", repr(report["cases"]))
+
+    def test_worker_startup_failure_reports_fixed_code(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private worker log")
+        harness.case_stage = "worker_startup"
+        harness.worker_startup_code = "catch_up"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case",
+            stage="worker_startup", worker_startup="catch_up",
+        )])
+        self.assertNotIn("private", repr(report))
+
+    def test_worker_startup_failure_rejects_unknown_or_missing_code(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private worker log")
+        harness.case_stage = "worker_startup"
+        for code in (None, "private/worker/log", ["catch_up"], 7):
+            with self.subTest(code=code):
+                harness.worker_startup_code = code
+                report = a4.acceptance_report(self.args)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["cases"], [dict(
+                    name=a4.CASE, status="failed", error="case",
+                    stage="worker_startup", worker_startup="unavailable",
+                )])
+                self.assertNotIn("private", repr(report))
+
+    def test_worker_startup_code_not_emitted_for_other_stage(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private worker log")
+        harness.case_stage = "healthy_push"
+        harness.worker_startup_code = "catch_up"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case", stage="healthy_push",
+        )])
+        self.assertNotIn("worker_startup", repr(report["cases"]))
 
     def test_repo_create_failure_reports_fixed_code(self):
         harness = self.factory.return_value
@@ -339,6 +380,71 @@ class CaseStageTest(unittest.TestCase):
         harness.repo_create_code = None
         harness.observe_repo_create("private/repo/url")
         self.assertIsNone(harness.repo_create_code)
+
+
+class WorkerStartupTest(unittest.TestCase):
+    def _harness(self, exit_code=None, subscriber=0, relay_active=0):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.worker_startup_code = None
+        harness.spawn_worker = Mock()
+        harness.until = Mock()
+        proc = Mock()
+        proc.poll.return_value = exit_code
+        proc.returncode = exit_code if exit_code is not None else 0
+        harness.workers = [(proc, Mock())]
+        harness.subscriber_count = Mock(return_value=subscriber)
+        harness.relay = Mock()
+        harness.relay.counts.return_value = SimpleNamespace(active=relay_active)
+        harness.assert_claim = Mock()
+        harness.assert_operation = Mock()
+        harness.settle_worker = Mock()
+        return harness
+
+    def test_worker_startup_classifies_spawn_exit_subscribe_relay_and_catch_up(self):
+        cases = (
+            ("spawn", {"exit_code": None, "subscriber": 0, "relay_active": 0}, "spawn"),
+            ("worker_exit_zero", {"exit_code": 0}, "worker_exit_zero"),
+            ("worker_exit_nonzero", {"exit_code": 1}, "worker_exit_nonzero"),
+            ("subscribe", {"exit_code": None}, "subscribe"),
+            ("relay", {"exit_code": None, "subscriber": 1, "relay_active": 0}, "relay"),
+            ("catch_up", {"exit_code": None}, "catch_up"),
+        )
+        for name, options, expected in cases:
+            with self.subTest(name=name):
+                harness = self._harness(**options)
+                if name == "spawn":
+                    harness.workers = []
+                    harness.spawn_worker.side_effect = RuntimeError("private worker log")
+                elif name == "catch_up":
+                    harness.until.side_effect = [None, AssertionError("private worker log")]
+                else:
+                    harness.until.side_effect = AssertionError("private worker log")
+                with self.assertRaises(Exception):
+                    harness.start_external_worker({"id": "repo"}, "operation", "oid")
+                self.assertEqual(harness.worker_startup_code, expected)
+
+    def test_worker_startup_classifies_claim_binding_idle_and_success(self):
+        for name, expected in (
+            ("claim", "claim"),
+            ("durable_binding", "durable_binding"),
+            ("settle_idle", "settle_idle"),
+        ):
+            with self.subTest(name=name):
+                harness = self._harness(exit_code=None)
+                harness.until.side_effect = [None, None]
+                if name == "claim":
+                    harness.assert_claim.side_effect = RuntimeError("private worker log")
+                elif name == "durable_binding":
+                    harness.assert_operation.side_effect = RuntimeError("private worker log")
+                else:
+                    harness.settle_worker.side_effect = RuntimeError("private worker log")
+                with self.assertRaises(Exception):
+                    harness.start_external_worker({"id": "repo"}, "operation", "oid")
+                self.assertEqual(harness.worker_startup_code, expected)
+        harness = self._harness(exit_code=None)
+        harness.until.side_effect = [None, None]
+        harness.start_external_worker({"id": "repo"}, "operation", "oid")
+        self.assertIsNone(harness.worker_startup_code)
 
 
 class RepoCreateObserverTest(unittest.TestCase):
