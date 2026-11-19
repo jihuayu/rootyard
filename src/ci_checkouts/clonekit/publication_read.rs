@@ -13,8 +13,9 @@ impl CloneKitPublicationStore {
     ///
     /// The returned lease is acquired before the current pointer is read and verified against
     /// the exact generation directory, so a concurrent local `try_gc_generation` cannot remove
-    /// the selected generation. Drop the lease only after all pack/idx bytes have been copied
-    /// into owned scratch.
+    /// the selected generation. The lease retains the verified generation directory descriptor;
+    /// drop it immediately after the final local pack/idx copy, before hashing or Git/provider
+    /// calls.
     pub fn load_latest_leased(&self, repo_id: Uuid) -> Result<Option<LeasedCloneKitManifest>, CloneKitError> {
         let pointer = self.current_pointer_path(repo_id);
         match fs::symlink_metadata(&pointer) {
