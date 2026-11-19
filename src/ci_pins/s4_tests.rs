@@ -18,6 +18,15 @@ use std::sync::{
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+#[cfg(unix)]
+#[path = "s4_tests/fixture.rs"]
+mod fixture;
+#[cfg(unix)]
+use self::fixture::wait_pids;
+#[cfg(target_os = "linux")]
+#[path = "s4_tests/proc_identity.rs"]
+mod proc_identity;
+
 fn sample_grant(target: &str) -> S4ClosureGrant {
     let packs = "b".repeat(64);
     S4ClosureGrant::new(NewGrant {
@@ -220,57 +229,10 @@ exec >/dev/null; sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > 
 trap "" TERM; while :; do sleep 1; done
 "#;
 
-#[cfg(unix)]
-fn wait_pids(path: &std::path::Path) -> (i32, i32) {
-    for _ in 0..200 {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let mut values = text.split_whitespace().filter_map(|value| value.parse::<i32>().ok());
-        if let (Some(leader), Some(grandchild)) = (values.next(), values.next()) {
-            return (leader, grandchild);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    panic!("the Git wrapper did not publish its process group");
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProcState {
-    /// No `/proc` entry: the PID was reaped (or the process exited before inspection).
-    Gone,
-    /// The PID is still listed, but only as `Z` (zombie) or `X` (dead/exiting).
-    Exited,
-    /// The PID can still run, so it is a live descendant for this contract.
-    Live,
-}
-
-#[cfg(target_os = "linux")]
-fn proc_state(pid: i32) -> ProcState {
-    let path = format!("/proc/{pid}/stat");
-    match std::fs::read_to_string(&path) {
-        Ok(stat) => {
-            let (_, rest) = stat
-                .rsplit_once(") ")
-                .unwrap_or_else(|| panic!("unparseable {path}: missing command terminator"));
-            let state = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or_else(|| panic!("unparseable {path}: missing process state"));
-            match state {
-                "Z" | "X" => ProcState::Exited,
-                _ => ProcState::Live,
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => {
-            ProcState::Gone
-        }
-        Err(error) => panic!("cannot inspect {path}: {error}"),
-    }
-}
-
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes() {
+    use self::proc_identity::{ProcState, wait_for_original_pair};
     use super::s4_authority::{DisposableCiView, run_git_dir_bounded};
     use std::os::unix::fs::PermissionsExt;
     let view = DisposableCiView::create().expect("disposable view");
@@ -279,25 +241,31 @@ async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes
     std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
-    let error = run_git_dir_bounded(
+    // This awaits the fixture's pid file under the product's own deadline, then proves
+    // both original processes are live and that the stdout write ends are already closed.
+    let pids = wrapper.with_extension("pids");
+    let observed = wait_for_original_pair(&pids, deadline);
+    let call = run_git_dir_bounded(
         &wrapper,
         None,
         &[],
         deadline,
         || super::Error(StatusCode::CONFLICT, "failed"),
         Some(view.hold()),
-    )
-    .await
-    .unwrap_err();
+    );
+    let (result, (leader, descendant)) = tokio::join!(call, observed);
+    let error = result.unwrap_err();
     assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
-    let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
     assert!(root.exists(), "the disposable view vanished before the final wait was confirmed");
-    // The direct leader is our child, so cleanup must reap it rather than leave a zombie.
-    assert_eq!(proc_state(leader), ProcState::Gone, "the direct leader was not reaped");
-    // A descendant killed during cleanup can remain visible as Z/X until its new parent
-    // reaps it. The production contract is quiescence (dead or exiting), not disappearance:
-    // a process that can still run after the timeout is the failure this test must catch.
-    assert_ne!(proc_state(grandchild), ProcState::Live, "a live original descendant survived the timeout");
+    // The direct leader is our child; a zombie here means cleanup did not reap it.
+    assert_eq!(leader.state(), ProcState::Gone, "the original direct leader was not reaped");
+    // A descendant killed during cleanup may remain visible as Z/X until its new parent
+    // reaps it. The production contract is quiescence, not disappearance.
+    let descendant_state = descendant.state();
+    assert!(
+        matches!(descendant_state, ProcState::Gone | ProcState::Exited),
+        "the original descendant is still live after the timeout: {descendant_state:?}"
+    );
     drop(view);
     assert!(!root.exists());
 }
