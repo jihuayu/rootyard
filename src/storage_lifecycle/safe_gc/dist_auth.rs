@@ -1,9 +1,5 @@
-//! Ed25519-authenticated distributed authority for Safe GC (#122/#151/#153).
-//!
-//! `DistributedRefCas` arming binds a non-deserializable Ed25519 arm signer, independently
-//! operated voter public keys, `#151` hold-bridge evidence and `#153` backup-root evidence.
-//! The worker volume holds exactly one arm seed: voter, quorum, bridge and backup signers are
-//! external, so no local directory can mint a quorum cutpoint.
+//! Ed25519-authenticated distributed authority for Safe GC (#122/#151/#153): `DistributedRefCas` binds one arm signer,
+//! independent voter keys, `#151` bridge and `#153` backup evidence; voter/quorum/bridge/backup signers stay external.
 
 use std::{
     fmt,
@@ -22,6 +18,8 @@ use super::model::{AuthorityLane, PairedCursorReconciliation, SafeGcArmReceipt, 
 
 #[path = "dist_evidence.rs"]
 mod evidence;
+#[path = "dist_journal_migration.rs"]
+mod journal_migration;
 #[path = "dist_keyring.rs"]
 mod keyring;
 #[path = "dist_trust_migration.rs"]
@@ -29,6 +27,9 @@ mod migration;
 
 pub use evidence::{
     BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, QuorumCommitSeal, compute_holds_digest,
+};
+pub use journal_migration::{
+    JournalMigrationReport, LegacyQuorumCommitEvidence, is_unmigrated_legacy_distributed_journal,
 };
 pub use keyring::{
     TrustedConsensusVoter, VoterCutpointAttestation, VoterCutpointClaims, VoterCutpointSignature,
@@ -470,6 +471,9 @@ pub(super) fn verify_distributed_cursor_coverage(
 #[path = "tests_dist_auth.rs"]
 pub(crate) mod tests;
 
+#[cfg(test)]
+#[path = "tests_dist_migration_fixtures.rs"]
+mod migration_fixtures;
 #[cfg(test)]
 #[path = "tests_dist_migration.rs"]
 mod migration_tests;

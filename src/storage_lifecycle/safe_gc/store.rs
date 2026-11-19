@@ -145,7 +145,17 @@ impl DurableSafeGcAuthority {
         let existed = path.exists();
         let mut snap = if existed {
             let raw = std::fs::read(&path).map_err(|e| SafeGcError::Io(e.to_string()))?;
-            serde_json::from_slice(&raw).map_err(|e| SafeGcError::Serialization(e.to_string()))?
+            match serde_json::from_slice(&raw) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    if super::dist_auth::is_unmigrated_legacy_distributed_journal(&raw) {
+                        return Err(SafeGcError::ArmingRejected(
+                            "legacy DistributedRefCas journal snapshot requires explicit migration and safe re-arm",
+                        ));
+                    }
+                    return Err(SafeGcError::Serialization(err.to_string()));
+                }
+            }
         } else {
             let Some(seed) = initial else {
                 return Err(SafeGcError::Io("journal missing and no initial snapshot provided".into()));

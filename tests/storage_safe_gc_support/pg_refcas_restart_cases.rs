@@ -38,7 +38,7 @@ use super::{
     isolated_pg_pool_with_schema, pg_child_worker,
     pg_refcas_merge_fixture::{build_refcas_merge_rig, force_scan_and_schedule, production_refcas_pr_merge},
     provision_pg_refstore_repo,
-    raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin},
+    raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin, resolve_voter_bin},
     s3_harness::{LoopbackS3, build_pack_via_opendal, build_snapshot, git_cmd, make_serving_record},
     test_policy,
 };
@@ -105,6 +105,7 @@ async fn pg17_distributed_refcas_sigkill_recovery_requires_new_pg_fence_and_resu
         return Ok(());
     };
     let Some(node_bin) = resolve_raft_node_bin()? else { return Ok(()) };
+    let Some(_voter_bin) = resolve_voter_bin()? else { return Ok(()) };
 
     let s3 = LoopbackS3::shared();
     let (blob_store, provider) = s3.open_store_and_provider()?;
@@ -320,3 +321,6 @@ async fn pg17_distributed_refcas_sigkill_recovery_requires_new_pg_fence_and_resu
     }
     Ok(())
 }
+
+#[path = "pg_refcas_migration_cases.rs"]
+mod pg_refcas_migration_cases;

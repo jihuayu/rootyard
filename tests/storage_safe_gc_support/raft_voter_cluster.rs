@@ -1,43 +1,37 @@
-//! Real 3-node mTLS `raft-node` cluster with three independent cutpoint voter servers (#122).
+//! Real 3-node mTLS `raft-node` cluster with three deployed `rootyard-safe-gc-voter` OS processes (#122).
 //!
-//! Each voter process holds exactly one replica connection, replays the committed `pm/*` KV
-//! entries from ONLY its own replica, and signs its own Ed25519 cutpoint attestation. The
-//! worker test never holds a voter, quorum, bridge or backup private key.
+//! Each voter process holds exactly one replica connection, replays committed `pm/*` entries from
+//! ONLY its own replica, and signs its own Ed25519 cutpoint attestation. Tests never hold a voter.
 
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{BufRead, BufReader, Read, Write},
-    net::TcpStream,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use axum::{
-    Json, Router, extract::Path as AxumPath, extract::State, http::StatusCode, response::IntoResponse, routing::get,
+use rootyard::{
+    ref_store::core::state_machine::{
+        AppliedLogId, ApplyResponse, RefCasCommand, RefCasStateMachine, StateMachineError,
+    },
+    storage_lifecycle::safe_gc::{
+        SafeGcEd25519Signer, TrustedConsensusVoter,
+        voter_service::{
+            MtlsReplicaEndpoint, ReplicaReplay, SafeGcVoterReadyReceipt, SafeGcVoterServiceConfig,
+            build_mtls_client_config, raft_mtls_rpc, replay_raft_replica,
+        },
+    },
 };
-use rootyard::ref_store::core::state_machine::{
-    AppliedLogId, ApplyResponse, RefCasCommand, RefCasStateMachine, StateMachineError,
-};
-use rootyard::storage_lifecycle::safe_gc::{
-    SafeGcEd25519Signer, TrustedConsensusVoter, VoterCutpointAttestation, VoterCutpointClaims,
-    sign_single_voter_cutpoint_attestation,
-};
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::ClientConfig;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::task::JoinHandle;
-use uuid::Uuid;
 
 pub const RAFT_NODE_BIN_ENV: &str = "ROOTYARD_REFCAS_NODE_BIN";
+pub const SAFE_GC_VOTER_BIN_ENV: &str = "ROOTYARD_SAFE_GC_VOTER_BIN";
 const VOTER_KEY_ID: u8 = 1;
 const VOTER_SEEDS: [[u8; 32]; 3] = [[0x71; 32], [0x72; 32], [0x73; 32]];
 
@@ -55,6 +49,30 @@ pub fn resolve_raft_node_bin() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// Resolve the deployed `rootyard-safe-gc-voter` binary, or `Ok(None)` when optional tests may skip.
+pub fn resolve_voter_bin() -> Result<Option<PathBuf>> {
+    let required = std::env::var_os("ROOTYARD_SAFE_GC_REQUIRE_PG").is_some();
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os(SAFE_GC_VOTER_BIN_ENV) {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("rootyard-safe-gc-voter"));
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.join("rootyard-safe-gc-voter"));
+        }
+    }
+    candidates.push(PathBuf::from("target/debug/rootyard-safe-gc-voter"));
+    if let Some(found) = candidates.into_iter().find(|path| path.is_file()) {
+        return Ok(Some(found));
+    }
+    ensure!(!required, "ROOTYARD_SAFE_GC_REQUIRE_PG=1 but the rootyard-safe-gc-voter binary is missing");
+    eprintln!("skipping: rootyard-safe-gc-voter binary not found");
+    Ok(None)
+}
+
 struct OwnedChild(Option<Child>);
 
 impl Drop for OwnedChild {
@@ -67,46 +85,37 @@ impl Drop for OwnedChild {
 }
 
 struct MtlsNode {
-    id: u64,
-    addr: String,
-    cfg: Arc<ClientConfig>,
-    _child: std::sync::Mutex<OwnedChild>,
+    endpoint: MtlsReplicaEndpoint,
+    _child: Mutex<OwnedChild>,
 }
 
 impl MtlsNode {
-    fn spawn(
-        bin: &Path,
-        ca: &Path,
-        crt: &Path,
-        key: &Path,
-        id: u64,
-        dir: PathBuf,
-        cfg: Arc<ClientConfig>,
-    ) -> Result<Self> {
+    fn spawn(bin: &Path, ca: &Path, crt: &Path, key: &Path, id: u64, dir: PathBuf) -> Result<Self> {
         let stderr = File::create(dir.join("node.stderr"))?;
-        let args = [
-            "--id",
-            &id.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--tls-ca",
-            &ca.to_string_lossy(),
-            "--tls-cert",
-            &crt.to_string_lossy(),
-            "--tls-key",
-            &key.to_string_lossy(),
-            "--check-on-open",
-            "true",
-            "--heartbeat-ms",
-            "250",
-            "--election-min-ms",
-            "800",
-            "--election-max-ms",
-            "1300",
-            "--write-timeout-ms",
-            "8000",
-        ];
-        let mut child = Command::new(bin).args(args).stdout(Stdio::piped()).stderr(Stdio::from(stderr)).spawn()?;
+        let mut child = Command::new(bin)
+            .arg("--id")
+            .arg(id.to_string())
+            .arg("--dir")
+            .arg(&dir)
+            .arg("--tls-ca")
+            .arg(ca)
+            .arg("--tls-cert")
+            .arg(crt)
+            .arg("--tls-key")
+            .arg(key)
+            .arg("--check-on-open")
+            .arg("true")
+            .arg("--heartbeat-ms")
+            .arg("250")
+            .arg("--election-min-ms")
+            .arg("800")
+            .arg("--election-max-ms")
+            .arg("1300")
+            .arg("--write-timeout-ms")
+            .arg("8000")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr))
+            .spawn()?;
         let stdout = child.stdout.take().context("raft-node stdout")?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -116,29 +125,18 @@ impl MtlsNode {
         let raw = rx.recv_timeout(Duration::from_secs(15))??;
         let banner: Value = serde_json::from_str(raw.trim().strip_prefix("READY ").context("raft-node READY banner")?)?;
         let addr = banner["addr"].as_str().context("raft-node addr")?.to_owned();
-        Ok(Self { id, addr, cfg, _child: std::sync::Mutex::new(OwnedChild(Some(child))) })
+        let client = build_mtls_client_config(ca, &crt.with_file_name("cli.crt"), &key.with_file_name("cli.key"))?;
+        let endpoint = MtlsReplicaEndpoint {
+            addr,
+            server_name: format!("raft-node-{id}.refcas.internal"),
+            tls_config: client,
+            timeout: Duration::from_secs(10),
+        };
+        Ok(Self { endpoint, _child: Mutex::new(OwnedChild(Some(child))) })
     }
 
     async fn rpc(&self, req: Value) -> Result<Value> {
-        let (addr, cfg, dns) = (self.addr.clone(), self.cfg.clone(), format!("raft-node-{}.refcas.internal", self.id));
-        tokio::task::spawn_blocking(move || {
-            let tcp = TcpStream::connect(addr)?;
-            tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
-            tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
-            let mut tls = StreamOwned::new(ClientConnection::new(cfg, ServerName::try_from(dns)?)?, tcp);
-            let payload = serde_json::to_vec(&req)?;
-            tls.write_all(&(payload.len() as u32).to_be_bytes())?;
-            tls.write_all(&payload)?;
-            tls.flush()?;
-            let mut len = [0_u8; 4];
-            tls.read_exact(&mut len)?;
-            let mut buf = vec![0_u8; u32::from_be_bytes(len) as usize];
-            tls.read_exact(&mut buf)?;
-            tls.conn.send_close_notify();
-            let _ = tls.flush();
-            Ok(serde_json::from_slice(&buf)?)
-        })
-        .await?
+        Ok(raft_mtls_rpc(&self.endpoint, req).await?)
     }
 }
 
@@ -147,110 +145,76 @@ async fn inspect_value(node: &MtlsNode, key: &str) -> Result<Option<String>> {
     Ok(response.pointer("/KvValue/value").and_then(Value::as_str).map(str::to_owned))
 }
 
-struct Replay {
-    sm: RefCasStateMachine,
-    entries: Vec<(u64, RefCasCommand)>,
-    last: Option<std::result::Result<ApplyResponse, StateMachineError>>,
+async fn replay_node(node: &MtlsNode) -> Result<ReplicaReplay> {
+    Ok(replay_raft_replica(&node.endpoint).await?)
 }
 
-async fn replay_node(node: &MtlsNode) -> Result<Replay> {
-    let head = inspect_value(node, "pm/head").await?.unwrap_or_else(|| "0".into());
-    let n: u64 = head.parse()?;
-    let (mut sm, mut entries, mut last) = (RefCasStateMachine::new(), Vec::new(), None);
-    for slot in 1..=n {
-        let raw = inspect_value(node, &format!("pm/{slot:08}")).await?.context("committed Ref-CAS command")?;
-        let command: RefCasCommand = serde_json::from_str(&raw)?;
-        let index = inspect_value(node, &format!("pm/{slot:08}/idx"))
-            .await?
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(slot);
-        let term = inspect_value(node, &format!("pm/{slot:08}/term"))
-            .await?
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(1);
-        last = Some(sm.apply(AppliedLogId { term, index }, command.clone()));
-        entries.push((index, command));
-    }
-    Ok(Replay { sm, entries, last })
-}
-
-fn commit_digest(entries: &[(u64, RefCasCommand)]) -> Result<String> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"rootyard/safe-gc-refcas-raft-commit/v1");
-    hasher.update((entries.len() as u64).to_be_bytes());
-    for (log_index, command) in entries {
-        let payload = serde_json::to_vec(command)?;
-        hasher.update(log_index.to_be_bytes());
-        hasher.update((payload.len() as u64).to_be_bytes());
-        hasher.update(&payload);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-struct VoterHttpState {
+struct VoterProcess {
     voter_id: u64,
-    pubkey_hex: String,
-    signer: SafeGcEd25519Signer,
-    node: Arc<MtlsNode>,
-    enabled: Arc<AtomicBool>,
-}
-
-impl VoterHttpState {
-    async fn attest(&self, repo_id: Uuid) -> Result<VoterCutpointAttestation> {
-        let replay = replay_node(&self.node).await?;
-        let snapshot = replay.sm.snapshot()?;
-        let (raft_term, committed_log_index) =
-            replay.sm.last_applied().map(|id| (id.term, id.index)).context("voter has no committed entry")?;
-        let gate = snapshot
-            .body
-            .gates
-            .iter()
-            .find(|gate| gate.repository_id == repo_id)
-            .context("committed snapshot has no gate for the repository")?;
-        let claims = VoterCutpointClaims {
-            voter_id: self.voter_id,
-            key_id: VOTER_KEY_ID,
-            group_id: 0,
-            history_incarnation: gate.history_incarnation,
-            group_epoch: gate.group_epoch,
-            authority_epoch: gate.authority_epoch,
-            raft_term,
-            committed_log_index,
-            raft_commit_digest_hex: commit_digest(&replay.entries)?,
-        };
-        Ok(sign_single_voter_cutpoint_attestation(&self.signer, &claims, &snapshot)?)
-    }
-}
-
-async fn voter_cutpoint(
-    State(state): State<Arc<VoterHttpState>>,
-    AxumPath(repo_id): AxumPath<Uuid>,
-) -> impl IntoResponse {
-    if !state.enabled.load(Ordering::SeqCst) {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "voter disabled" })));
-    }
-    match state.attest(repo_id).await {
-        Ok(attestation) => match serde_json::to_value(&attestation) {
-            Ok(body) => (StatusCode::OK, Json(body)),
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "encode" }))),
-        },
-        Err(err) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": format!("{err:#}") }))),
-    }
-}
-
-struct VoterHandle {
+    bin: PathBuf,
+    dir: PathBuf,
+    config_path: PathBuf,
+    ready_file: PathBuf,
     endpoint_url: String,
     pubkey_hex: String,
-    enabled: Arc<AtomicBool>,
-    task: JoinHandle<()>,
+    child: Option<Child>,
 }
 
-/// Live 3-node mTLS OpenRaft cluster plus three independent voter HTTP endpoints.
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_voter_config(path: &Path, config: &SafeGcVoterServiceConfig) -> Result<()> {
+    fs::write(path, serde_json::to_vec_pretty(config)?)?;
+    Ok(())
+}
+
+fn launch_voter(voter: &VoterProcess) -> Result<(Child, SafeGcVoterReadyReceipt)> {
+    let _ = fs::remove_file(&voter.ready_file);
+    let stderr = File::create(voter.dir.join("voter.stderr"))?;
+    let mut child = Command::new(&voter.bin)
+        .arg("--config")
+        .arg(&voter.config_path)
+        .arg("--ready-file")
+        .arg(&voter.ready_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            bail!("rootyard-safe-gc-voter {} exited before readiness: {status}", voter.voter_id);
+        }
+        if let Ok(raw) = fs::read(&voter.ready_file)
+            && let Ok(receipt) = serde_json::from_slice::<SafeGcVoterReadyReceipt>(&raw)
+            && receipt.voter_id == voter.voter_id
+        {
+            return Ok((child, receipt));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("rootyard-safe-gc-voter {} readiness timeout", voter.voter_id);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+pub type ApplyOutcome = Option<std::result::Result<ApplyResponse, StateMachineError>>;
+
+/// Live 3-node mTLS OpenRaft cluster plus three deployed voter OS processes.
 pub struct LiveRaftVoterCluster {
     _pki: TempDir,
     _data: TempDir,
     nodes: BTreeMap<u64, Arc<MtlsNode>>,
-    voters: BTreeMap<u64, VoterHandle>,
+    voters: BTreeMap<u64, VoterProcess>,
     seq: u64,
 }
 
@@ -291,35 +255,24 @@ fn generate_pki(pki: &Path) -> Result<Arc<ClientConfig>> {
     let (client_crt, client_key) = sign("cli", "raft-client.refcas.internal")?;
     for id in [1_u64, 2, 3] {
         let _ = sign(&format!("n{id}"), &format!("raft-node-{id}.refcas.internal"))?;
+        let _ = sign(&format!("v{id}"), "raft-client.refcas.internal")?;
     }
-    let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(File::open(pki.join("ca.crt"))?)) {
-        roots.add(cert?)?;
-    }
-    let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(&client_crt)?))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(&client_key)?))?.context("client key")?;
-    Ok(Arc::new(
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_client_auth_cert(certs, key)?,
-    ))
+    Ok(build_mtls_client_config(&pki.join("ca.crt"), &client_crt, &client_key)?)
 }
 
 impl LiveRaftVoterCluster {
     pub async fn start(bin: PathBuf) -> Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let voter_bin = resolve_voter_bin()?.context("rootyard-safe-gc-voter binary required alongside raft-node")?;
         let (pki, data) = (TempDir::new()?, TempDir::new()?);
-        let cfg = generate_pki(pki.path())?;
+        let _cfg = generate_pki(pki.path())?;
         let mut nodes = BTreeMap::new();
         let mut peers = BTreeMap::new();
         for id in [1_u64, 2, 3] {
             let (crt, key) = (pki.path().join(format!("n{id}.crt")), pki.path().join(format!("n{id}.key")));
             let dir = data.path().join(format!("n{id}"));
             fs::create_dir_all(&dir)?;
-            let node = MtlsNode::spawn(&bin, &pki.path().join("ca.crt"), &crt, &key, id, dir, cfg.clone())?;
-            peers.insert(id, node.addr.clone());
+            let node = MtlsNode::spawn(&bin, &pki.path().join("ca.crt"), &crt, &key, id, dir)?;
+            peers.insert(id, node.endpoint.addr.clone());
             nodes.insert(id, Arc::new(node));
         }
         for node in nodes.values() {
@@ -328,37 +281,53 @@ impl LiveRaftVoterCluster {
         ensure!(nodes[&1].rpc(json!({ "Bootstrap": { "members": peers } })).await? == json!("Ok"));
         let mut cluster = Self { _pki: pki, _data: data, nodes, voters: BTreeMap::new(), seq: 0 };
         let _ = cluster.wait_leader().await?;
-        cluster.spawn_voters().await?;
+        cluster.spawn_voters(&voter_bin)?;
         Ok(cluster)
     }
 
-    async fn spawn_voters(&mut self) -> Result<()> {
+    fn spawn_voters(&mut self, voter_bin: &Path) -> Result<()> {
+        let pki = self._pki.path();
         for voter_id in [1_u64, 2, 3] {
+            let dir = self._data.path().join(format!("voter-{voter_id}"));
+            create_private_dir(&dir)?;
+            let seed_path = dir.join("voter.seed");
             let signer = SafeGcEd25519Signer::from_seed(VOTER_SEEDS[(voter_id - 1) as usize])?;
-            let state = Arc::new(VoterHttpState {
+            signer.write_seed_file(&seed_path)?;
+            let config_path = dir.join("config.json");
+            let ready_file = dir.join("voter.ready");
+            let mut voter = VoterProcess {
                 voter_id,
+                bin: voter_bin.to_path_buf(),
+                dir,
+                config_path,
+                ready_file,
+                endpoint_url: String::new(),
                 pubkey_hex: signer.pubkey_hex().to_owned(),
-                signer,
-                node: Arc::clone(&self.nodes[&voter_id]),
-                enabled: Arc::new(AtomicBool::new(false)),
-            });
-            let app = Router::new()
-                .route("/v1/safe-gc/cutpoint/{repo_id}", get(voter_cutpoint))
-                .with_state(Arc::clone(&state));
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
-            let addr = listener.local_addr()?;
-            let task = tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
-            });
-            self.voters.insert(
+                child: None,
+            };
+            let config = SafeGcVoterServiceConfig {
                 voter_id,
-                VoterHandle {
-                    endpoint_url: format!("http://{addr}"),
-                    pubkey_hex: state.pubkey_hex.clone(),
-                    enabled: Arc::clone(&state.enabled),
-                    task,
-                },
-            );
+                key_id: VOTER_KEY_ID,
+                group_id: 0,
+                bind_addr: "127.0.0.1:0".into(),
+                signer_seed_path: seed_path,
+                raft_node_addr: self.nodes[&voter_id].endpoint.addr.clone(),
+                raft_server_name: format!("raft-node-{voter_id}.refcas.internal"),
+                ca_cert_pem: pki.join("ca.crt"),
+                client_cert_pem: pki.join(format!("v{voter_id}.crt")),
+                client_key_pem: pki.join(format!("v{voter_id}.key")),
+                rpc_timeout_ms: 5_000,
+            };
+            write_voter_config(&voter.config_path, &config)?;
+            let (mut child, receipt) = launch_voter(&voter)?;
+            ensure!(receipt.pubkey_hex == voter.pubkey_hex, "voter receipt pubkey disagrees with its own seed");
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&voter.ready_file);
+            voter.endpoint_url = receipt.endpoint_url;
+            let fixed = SafeGcVoterServiceConfig { bind_addr: receipt.bind_addr, ..config };
+            write_voter_config(&voter.config_path, &fixed)?;
+            self.voters.insert(voter_id, voter);
         }
         Ok(())
     }
@@ -376,13 +345,30 @@ impl LiveRaftVoterCluster {
     }
 
     pub fn set_voter_enabled(&mut self, voter_id: u64, enabled: bool) {
-        if let Some(voter) = self.voters.get(&voter_id) {
-            voter.enabled.store(enabled, Ordering::SeqCst);
+        let Some(voter) = self.voters.get_mut(&voter_id) else { return };
+        if enabled {
+            if voter.child.is_some() {
+                return;
+            }
+            let expected = voter.pubkey_hex.clone();
+            match launch_voter(voter) {
+                Ok((child, receipt)) if receipt.pubkey_hex == expected => voter.child = Some(child),
+                Ok((mut child, _)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!("rootyard-safe-gc-voter {voter_id} readiness receipt mismatch");
+                }
+                Err(err) => eprintln!("rootyard-safe-gc-voter {voter_id} failed to start: {err:#}"),
+            }
+        } else if let Some(mut child) = voter.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&voter.ready_file);
         }
     }
 
     pub fn enabled_voter_ids(&self) -> Vec<u64> {
-        self.voters.iter().filter(|(_, voter)| voter.enabled.load(Ordering::SeqCst)).map(|(id, _)| *id).collect()
+        self.voters.iter().filter(|(_, voter)| voter.child.is_some()).map(|(id, _)| *id).collect()
     }
 
     pub async fn current_term(&self) -> Result<u64> {
@@ -461,7 +447,7 @@ impl LiveRaftVoterCluster {
     pub async fn append(
         &mut self,
         command: &RefCasCommand,
-    ) -> Result<(AppliedLogId, RefCasStateMachine, Option<std::result::Result<ApplyResponse, StateMachineError>>)> {
+    ) -> Result<(AppliedLogId, RefCasStateMachine, ApplyOutcome)> {
         let slot = self.seq + 1;
         let payload = serde_json::to_string(command)?;
         let index = self.kv_put(&format!("pm/{slot:08}"), &payload).await?;
@@ -482,8 +468,11 @@ impl LiveRaftVoterCluster {
 
 impl Drop for LiveRaftVoterCluster {
     fn drop(&mut self) {
-        for voter in self.voters.values() {
-            voter.task.abort();
+        for voter in self.voters.values_mut() {
+            if let Some(mut child) = voter.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }

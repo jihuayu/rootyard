@@ -41,7 +41,7 @@ use super::{
     pg_refcas_merge_fixture::{build_refcas_merge_attempt, build_refcas_merge_rig, force_scan_and_schedule},
     pg_refcas_restart_cases::project_all_refcas_events,
     provision_pg_refstore_repo,
-    raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin},
+    raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin, resolve_voter_bin},
     s3_harness::{LoopbackS3, build_pack_via_opendal, build_snapshot, git_cmd, make_serving_record},
     test_policy,
 };
@@ -95,6 +95,7 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
         return Ok(());
     };
     let Some(node_bin) = resolve_raft_node_bin()? else { return Ok(()) };
+    let Some(_voter_bin) = resolve_voter_bin()? else { return Ok(()) };
 
     let s3 = LoopbackS3::shared();
     let (blob_store, provider) = s3.open_store_and_provider()?;

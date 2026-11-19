@@ -248,6 +248,44 @@ impl DurableSafeGcAuthority {
             Ok(())
         })
     }
+
+    /// Replace only the armed lane while preserving every pending-delete batch field byte-for-byte.
+    pub fn rearm_preserving_pending_delete(&self, arm: SafeGcArmReceipt) -> Result<(), SafeGcError> {
+        arm.validate()?;
+        self.update_persisted(|s| {
+            if arm.tenant_id != s.authority.tenant_id
+                || arm.repo_id != s.authority.repo_id
+                || arm.history_id != s.authority.history_id
+                || arm.incarnation_id != s.authority.incarnation_id
+                || arm.incarnation_epoch != s.authority.incarnation_epoch
+                || arm.arm_pubkey_hex != s.authority.trusted_arm_pubkey_hex
+            {
+                return Err(SafeGcError::ArmingRejected("re-arm receipt disagrees with live authority"));
+            }
+            if let Some(batch) = s.pending_delete.as_mut() {
+                if batch.incarnation_id != s.authority.incarnation_id
+                    || batch.incarnation_epoch != s.authority.incarnation_epoch
+                    || batch.lease_epoch != s.authority.lease_epoch
+                {
+                    return Err(SafeGcError::StaleDeleterFenced(
+                        "pending delete batch epochs disagree with live authority",
+                    ));
+                }
+                if !matches!(
+                    (&batch.proof.lane, &arm.lane),
+                    (AuthorityLane::DistributedRefCas { .. }, AuthorityLane::DistributedRefCas { .. })
+                        | (AuthorityLane::SingleNodePg { .. }, AuthorityLane::SingleNodePg { .. })
+                ) {
+                    return Err(SafeGcError::ArmingRejected("re-arm lane variant disagrees with pending delete batch"));
+                }
+                batch.proof.lane = arm.lane.clone();
+                batch.proof.proof_digest = compute_proof_digest(&batch.proof);
+            }
+            s.gc_mode = GcMode::ArmedDestructive(Box::new(arm.clone()));
+            s.push_audit("rearm_preserving_pending_delete", &s.authority.incarnation_epoch.to_string());
+            Ok(())
+        })
+    }
 }
 
 pub(super) struct PgReconciledBundle {

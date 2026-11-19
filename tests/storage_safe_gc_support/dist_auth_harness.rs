@@ -116,7 +116,7 @@ pub fn test_dist_lane(
             raft_commit_digest_hex: sha("raft-commit"),
         };
         let attested = sign_single_voter_cutpoint_attestation(&voter_signer(voter_id), &claims, &snapshot).unwrap();
-        snapshot_sha256 = attested.snapshot_sha256.clone();
+        snapshot_sha256 = attested.snapshot_sha256;
         signatures.push(attested.signature);
     }
     let quorum = QuorumCommitEvidence::from_verified_voters(
@@ -239,4 +239,61 @@ pub fn assert_worker_volume_has_no_external_signing_keys(storage_root: &Path, re
     assert!(!dir.join(format!("{repo_id}.quorum.seed")).exists());
     assert!(!dir.join(format!("{repo_id}.bridge.seed")).exists());
     assert!(!dir.join(format!("{repo_id}.backup.seed")).exists());
+}
+
+fn legacy_quorum(mut quorum: serde_json::Value) -> serde_json::Value {
+    let object = quorum.as_object_mut().unwrap();
+    object.remove("quorum_threshold");
+    object.remove("voter_signatures");
+    object.insert("quorum_pubkey_hex".into(), serde_json::json!("1".repeat(64)));
+    object.insert("quorum_signer_pubkey_hex".into(), serde_json::json!("1".repeat(64)));
+    object.insert("quorum_signature_hex".into(), serde_json::json!("2".repeat(128)));
+    object.insert("voter_hmacs".into(), serde_json::json!([[1_u16, "3".repeat(64)]]));
+    quorum
+}
+
+/// Rotate the deployed trust doc and journal back to the exact legacy shape, keeping the arm seed.
+pub fn rewrite_legacy_distributed_bundle(
+    storage_root: &Path,
+    repo_id: Uuid,
+    journal: &Path,
+) -> Result<(), SafeGcError> {
+    let trust_path = SafeGcRepoTrustConfig::trust_dir(storage_root).join(format!("{repo_id}.json"));
+    let mut trust: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&trust_path).map_err(|e| SafeGcError::Io(e.to_string()))?)
+            .map_err(|e| SafeGcError::Serialization(e.to_string()))?;
+    let object = trust.as_object_mut().unwrap();
+    object.remove("quorum_threshold");
+    object.remove("trusted_consensus_voters");
+    object.insert("trusted_quorum_pubkey_hex".into(), serde_json::json!("1".repeat(64)));
+    object.insert("refcas_keyring_dir".into(), serde_json::json!("/var/lib/rootyard/refcas-keyring"));
+    std::fs::write(
+        &trust_path,
+        serde_json::to_vec_pretty(&trust).map_err(|e| SafeGcError::Serialization(e.to_string()))?,
+    )
+    .map_err(|e| SafeGcError::Io(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| SafeGcError::Io(e.to_string()))?;
+    }
+    SafeGcEd25519Signer::from_seed([0x55; 32])?.write_seed_file(&SafeGcRepoTrustConfig::seed_path(
+        storage_root,
+        repo_id,
+        "quorum",
+    ))?;
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journal).map_err(|e| SafeGcError::Io(e.to_string()))?)
+            .map_err(|e| SafeGcError::Serialization(e.to_string()))?;
+    for pointer in ["/gc_mode/ArmedDestructive/lane", "/pending_delete/proof/lane"] {
+        if let Some(lane) = doc.pointer_mut(pointer) {
+            let legacy = legacy_quorum(lane["DistributedRefCas"]["quorum_evidence"].clone());
+            lane["DistributedRefCas"]["quorum_evidence"] = legacy;
+        }
+    }
+    std::fs::write(journal, serde_json::to_vec_pretty(&doc).map_err(|e| SafeGcError::Serialization(e.to_string()))?)
+        .map_err(|e| SafeGcError::Io(e.to_string()))?;
+    Ok(())
 }

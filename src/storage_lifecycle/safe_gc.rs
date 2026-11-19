@@ -1,10 +1,5 @@
-//! Safe destructive Blob GC and two-phase read-back compaction (#122).
-//!
-//! Destructive physical deletion is disabled by default
-//! ([`SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT`] = `false` / [`GcMode::DisabledByDefault`]).
-//! Enabling deletion requires explicit arming, live reader quiescence, `#184`
-//! `GcEligible` pack-cover retention classification, a complete [`DeletionProof`],
-//! and continuous fence verification across real OpenDAL S3 provider operations.
+//! Safe destructive Blob GC and two-phase read-back compaction (#122): disabled by default and
+//! requiring explicit arming, quiescence, `#184` eligibility, a complete [`DeletionProof`], and provider fences.
 
 #[path = "safe_gc/anti_aba.rs"]
 pub mod anti_aba;
@@ -57,14 +52,16 @@ mod tests_concurrency;
 #[cfg(test)]
 #[path = "safe_gc/tests_reconcile.rs"]
 mod tests_reconcile;
+#[path = "safe_gc/voter_service.rs"]
+pub mod voter_service;
 
 pub use anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey};
 pub use compaction::{SafeGcCompactionRequest, SafeGcCompactionResult, execute_two_phase_compaction};
 pub use dist_auth::{
-    BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcRepoTrustConfig,
-    TrustedConsensusVoter, VoterCutpointAttestation, VoterCutpointClaims, VoterCutpointSignature,
-    fetch_quorum_cutpoint_from_voters, sign_single_voter_cutpoint_attestation, verify_quorum_voter_attestations,
-    verify_single_voter_cutpoint_attestation,
+    BackupRootEvidence, HoldBridgeEvidence, JournalMigrationReport, LegacyQuorumCommitEvidence, QuorumCommitEvidence,
+    SafeGcEd25519Signer, SafeGcRepoTrustConfig, TrustedConsensusVoter, VoterCutpointAttestation, VoterCutpointClaims,
+    VoterCutpointSignature, fetch_quorum_cutpoint_from_voters, sign_single_voter_cutpoint_attestation,
+    verify_quorum_voter_attestations, verify_single_voter_cutpoint_attestation,
 };
 pub use domain::{
     ActiveDeleteFence, AuthorityRecord, BlobStoreReadbackBackend, CasCompactionPublish, CompactionPublishResult,
@@ -97,3 +94,4 @@ pub use provider_delete::{OpenDalS3GcProvider, S3OperatorCredentials};
 pub use quiescence::{ActiveReaderLease, ReaderLeaseRegistry, ReaderQuiescenceObservation};
 pub use refcas_cut::{RefCasReconciledCut, reconcile_refcas_cut_with_pg};
 pub use store::{DurableSafeGcAuthority, SafeGcRepoSnapshot, ServingPackRecord};
+pub use voter_service::{SafeGcVoterReadyReceipt, SafeGcVoterServiceConfig, serve_safe_gc_voter};

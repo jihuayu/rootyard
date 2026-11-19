@@ -100,6 +100,42 @@ fn pinned_trust(bytes: &[u8], repo_id: Uuid) -> Result<SafeGcRepoTrustConfig, Sa
     Ok(config)
 }
 
+/// Validate a legacy or pinned trust document and build the migrated in-memory config.
+pub(super) fn prepare_migrated_trust(
+    storage_root: &Path,
+    repo_id: Uuid,
+    quorum_threshold: usize,
+    trusted_consensus_voters: Vec<TrustedConsensusVoter>,
+) -> Result<SafeGcRepoTrustConfig, SafeGcError> {
+    verify_trust_dir(&SafeGcRepoTrustConfig::trust_dir(storage_root))?;
+    let bytes =
+        read_private_file(&SafeGcRepoTrustConfig::config_path(storage_root, repo_id), MAX_TRUST_DOCUMENT_BYTES)?;
+    let pinned = pinned_trust(&bytes, repo_id)?;
+    let config = SafeGcRepoTrustConfig {
+        repo_id,
+        tenant_id: pinned.tenant_id,
+        history_id: pinned.history_id,
+        trusted_arm_pubkey_hex: pinned.trusted_arm_pubkey_hex,
+        quorum_threshold: Some(quorum_threshold),
+        trusted_hold_bridge_pubkey_hex: pinned.trusted_hold_bridge_pubkey_hex,
+        trusted_backup_pubkey_hex: pinned.trusted_backup_pubkey_hex,
+        trusted_consensus_voters,
+    };
+    config.validate_identity()?;
+    Ok(config)
+}
+
+/// Atomically persist the migrated trust document and delete legacy external signing seeds.
+pub(super) fn commit_migrated_trust(storage_root: &Path, config: &SafeGcRepoTrustConfig) -> Result<(), SafeGcError> {
+    for kind in ["quorum", "bridge", "backup"] {
+        let p = SafeGcRepoTrustConfig::seed_path(storage_root, config.repo_id, kind);
+        if p.exists() {
+            fs::remove_file(p).map_err(io_error)?;
+        }
+    }
+    SafeGcRepoTrustConfig::write_config(storage_root, config)
+}
+
 impl SafeGcRepoTrustConfig {
     /// Explicitly promote a legacy trust bundle to pinned independent consensus voters.
     pub fn migrate_legacy_trust_file(
@@ -108,27 +144,8 @@ impl SafeGcRepoTrustConfig {
         quorum_threshold: usize,
         trusted_consensus_voters: Vec<TrustedConsensusVoter>,
     ) -> Result<Self, SafeGcError> {
-        verify_trust_dir(&Self::trust_dir(storage_root))?;
-        let bytes = read_private_file(&Self::config_path(storage_root, repo_id), MAX_TRUST_DOCUMENT_BYTES)?;
-        let pinned = pinned_trust(&bytes, repo_id)?;
-        let config = Self {
-            repo_id,
-            tenant_id: pinned.tenant_id,
-            history_id: pinned.history_id,
-            trusted_arm_pubkey_hex: pinned.trusted_arm_pubkey_hex,
-            quorum_threshold: Some(quorum_threshold),
-            trusted_hold_bridge_pubkey_hex: pinned.trusted_hold_bridge_pubkey_hex,
-            trusted_backup_pubkey_hex: pinned.trusted_backup_pubkey_hex,
-            trusted_consensus_voters,
-        };
-        config.validate_identity()?;
-        for kind in ["quorum", "bridge", "backup"] {
-            let p = Self::seed_path(storage_root, repo_id, kind);
-            if p.exists() {
-                fs::remove_file(p).map_err(io_error)?;
-            }
-        }
-        Self::write_config(storage_root, &config)?;
+        let config = prepare_migrated_trust(storage_root, repo_id, quorum_threshold, trusted_consensus_voters)?;
+        commit_migrated_trust(storage_root, &config)?;
         Ok(config)
     }
 }

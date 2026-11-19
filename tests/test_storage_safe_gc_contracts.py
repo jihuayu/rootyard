@@ -23,6 +23,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "compaction.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_auth.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_evidence.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_journal_migration.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_keyring.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_trust_migration.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "domain.rs",
@@ -48,13 +49,17 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_concurrency.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_auth.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_migration.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_migration_fixtures.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_reconcile.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_service.rs",
+    ROOT / "src" / "bin" / "rootyard-safe-gc-voter.rs",
     ROOT / "tests" / "storage_safe_gc.rs",
     ROOT / "tests" / "storage_safe_gc_maintenance.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "dist_auth_harness.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_child_worker.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_merge_fixture.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_migration_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_restart_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_lifecycle_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "raft_voter_cluster.rs",
@@ -96,8 +101,10 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             "pg_maintenance_dist.rs",
             "dist_auth.rs",
             "dist_evidence.rs",
+            "dist_journal_migration.rs",
             "dist_keyring.rs",
             "dist_trust_migration.rs",
+            "voter_service.rs",
         ):
             src = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / name).read_text(encoding="utf-8")
             for m in re.finditer(r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*pub struct (\w+)", src):
@@ -167,6 +174,24 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             self.assertNotIn("persist_refcas_cutpoint_snapshot", support)
         self.assertIn("persist_refcas_cutpoint_snapshot", cases)
 
+        voter_service = (
+            ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_service.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pub struct SafeGcVoterServiceConfig", voter_service)
+        self.assertIn("pub async fn serve_safe_gc_voter", voter_service)
+        voter_bin = (ROOT / "src" / "bin" / "rootyard-safe-gc-voter.rs").read_text(encoding="utf-8")
+        self.assertIn("serve_safe_gc_voter", voter_bin)
+        live_voters = (
+            ROOT / "tests" / "storage_safe_gc_support" / "raft_voter_cluster.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ROOTYARD_SAFE_GC_VOTER_BIN", live_voters)
+        self.assertNotIn("axum::Router", live_voters)
+        journal_migration = (
+            ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_journal_migration.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("migrate_legacy_trust_and_journal", journal_migration)
+        self.assertIn("rearm_distributed_from_voters", journal_migration)
+
         keyring = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_keyring.rs").read_text(
             encoding="utf-8"
         )
@@ -221,6 +246,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
                 "src/storage_lifecycle.rs",
                 "src/storage_lifecycle/safe_gc.rs",
                 "src/storage_lifecycle/safe_gc/**",
+                "src/bin/rootyard-safe-gc-voter.rs",
                 "tests/storage_safe_gc.rs",
                 "tests/storage_safe_gc_maintenance.rs",
                 "scripts/eval_storage_safe_gc.py",
@@ -237,8 +263,10 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             "cargo test --locked --no-default-features --test storage_safe_gc",
             "cargo test --locked --no-default-features --test storage_safe_gc_maintenance",
             "ROOTYARD_REFCAS_NODE_BIN",
+            "ROOTYARD_SAFE_GC_VOTER_BIN",
             "crates/refcas-log/Cargo.toml",
             "--bin raft-node",
+            "--bin rootyard-safe-gc-voter",
             "scripts/eval_storage_safe_gc.py",
         ):
             self.assertIn(token, wf_text)
