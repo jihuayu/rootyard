@@ -26,6 +26,10 @@ pub const UPLOAD_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const ADVERTISE_LIMIT: usize = 4 * 1024 * 1024;
 const UPLOAD_RESULT_CAP: usize = 64 * 1024 * 1024;
 
+#[rustfmt::skip]
+#[path = "s4_git_view_http.rs"]
+mod s4_git_view_http;
+
 #[derive(Debug)]
 struct TempFileGuard(Option<PathBuf>);
 impl Drop for TempFileGuard {
@@ -202,20 +206,31 @@ pub async fn info_refs(
     Path(view_git): Path<String>,
     uri: Uri,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, Error> {
+) -> Result<axum::response::Response, Error> {
     let id = parse_view_git_id(&view_git)?;
     match uri.query() {
         Some("service=git-upload-pack") => {}
         Some("service=git-receive-pack") => {
             let actor = auth::authenticate(&state.pool, &headers).await?;
-            let _ = authorize_view_git_read(&state, &actor, id).await?;
+            let view = views::load_for_actor(&state, &actor, id).await?;
+            auth::verify_active(&state.pool, &actor, view.repository_id, RepoAction::ContentsRead, Role::Read).await?;
+            if views::s4_git_view::is_refstore(&state, view.repository_id).await? {
+                s4_git_view_http::verify_active_binding(&state, &view, id).await?;
+            } else {
+                let _ = git_dir_for_view(&state, id)?;
+            }
             return Err(Error(StatusCode::FORBIDDEN, "projected Git views are read-only"));
         }
         _ => return Err(Error::bad_request()),
     }
     let protocol = validate_git_protocol(&headers)?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    let (view, git_dir) = authorize_view_git_read(&state, &actor, id).await?;
+    let view = views::load_for_actor(&state, &actor, id).await?;
+    auth::verify_active(&state.pool, &actor, view.repository_id, RepoAction::ContentsRead, Role::Read).await?;
+    if views::s4_git_view::is_refstore(&state, view.repository_id).await? {
+        return s4_git_view_http::info_refs(&state, &actor, &view, protocol.as_deref()).await;
+    }
+    let git_dir = git_dir_for_view(&state, id)?;
     let _slot = state
         .git_slots
         .clone()
@@ -260,7 +275,8 @@ pub async fn info_refs(
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         body,
-    ))
+    )
+        .into_response())
 }
 
 pub async fn upload_pack(
@@ -268,10 +284,15 @@ pub async fn upload_pack(
     Path(view_git): Path<String>,
     headers: HeaderMap,
     body: Body,
-) -> Result<impl IntoResponse, Error> {
+) -> Result<axum::response::Response, Error> {
     let id = parse_view_git_id(&view_git)?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    let (view, git_dir) = authorize_view_git_read(&state, &actor, id).await?;
+    let view = views::load_for_actor(&state, &actor, id).await?;
+    auth::verify_active(&state.pool, &actor, view.repository_id, RepoAction::ContentsRead, Role::Read).await?;
+    if views::s4_git_view::is_refstore(&state, view.repository_id).await? {
+        return s4_git_view_http::upload_pack(&state, &actor, &view, &headers, body).await;
+    }
+    let git_dir = git_dir_for_view(&state, id)?;
     let max_req = state.config.max_request_bytes.min(UPLOAD_BODY_LIMIT as u64);
     let (gzipped, protocol) = validate_upload_headers(&headers, max_req)?;
     let _slot = state
@@ -328,7 +349,8 @@ pub async fn upload_pack(
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         pack,
-    ))
+    )
+        .into_response())
 }
 
 pub async fn reject_receive_pack(
@@ -338,7 +360,13 @@ pub async fn reject_receive_pack(
 ) -> Result<StatusCode, Error> {
     let id = parse_view_git_id(&view_git)?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    let _ = authorize_view_git_read(&state, &actor, id).await?;
+    let view = views::load_for_actor(&state, &actor, id).await?;
+    auth::verify_active(&state.pool, &actor, view.repository_id, RepoAction::ContentsRead, Role::Read).await?;
+    if views::s4_git_view::is_refstore(&state, view.repository_id).await? {
+        s4_git_view_http::verify_active_binding(&state, &view, id).await?;
+        return Err(Error(StatusCode::FORBIDDEN, "projected Git views are read-only"));
+    }
+    let _ = git_dir_for_view(&state, id)?;
     Err(Error(StatusCode::FORBIDDEN, "projected Git views are read-only"))
 }
 
