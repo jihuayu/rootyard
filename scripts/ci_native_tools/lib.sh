@@ -30,16 +30,22 @@ require_command() {
 }
 
 resolve_absolute() {
-  mkdir -p -- "$1"
+  # Return the real mkdir status. Callers that capture the status suppress
+  # errexit inside the command substitution; without this check a failed
+  # directory creation would be masked by a later successful cd.
+  mkdir -p -- "$1" || return $?
   (cd -- "$1" && pwd -P)
 }
 
 append_github_path() {
   local directory=$1
   if [ -n "${GITHUB_PATH:-}" ]; then
-    printf '%s\n' "$directory" >>"$GITHUB_PATH"
+    # Propagate a failed append: the installer runs this helper while it is
+    # capturing the phase status, so a masked failure would continue a gate
+    # that previously aborted here.
+    printf '%s\n' "$directory" >>"$GITHUB_PATH" || return $?
   fi
-  log "tool prefix bin directory for later steps: $directory"
+  log "tool prefix bin directory for later steps: $directory" || return $?
 }
 
 ubuntu_archive_keyring() {
