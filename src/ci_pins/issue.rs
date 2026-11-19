@@ -19,6 +19,12 @@ pub(super) async fn pin_inner(
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
+    // `pg_refstore` repositories have no local GitFS directory: their pin is a
+    // durable RetentionRoot capture registered together with the pin row.
+    if super::s4_pin::refstore_repository(&state, &owner, &name).await?.is_some() {
+        let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+        return super::s4_pin::pin(&state, &actor, &owner, &name, &input, deadline).await;
+    }
     if owner != actor.username || !db::valid_name(&owner) || !db::valid_name(&name) {
         return Err(Error::not_found());
     }
