@@ -462,12 +462,137 @@ esac
         self.no_bare(repo, fmt + " push")
         self.exact_clone(remote, self.root / (name + "-clone"), oid, fmt, files, self.reader)
         return oid
+_DIAGNOSTIC_PORCELAIN_FLAGS = frozenset("*+=!- ")
+_DIAGNOSTIC_PORCELAIN_CLASSES = (
+    ("porcelain-remote-rejected", ("remote rejected",)),
+    ("porcelain-non-fast-forward", ("non-fast-forward",)),
+    ("porcelain-fetch-first", ("fetch first",)),
+    ("porcelain-stale-info", ("stale info",)),
+    ("porcelain-hook-declined", ("hook declined", "pre-receive hook declined")),
+    ("porcelain-protected-branch", ("protected branch",)),
+    ("porcelain-unpacker-error", ("unpacker error",)),
+    ("porcelain-remote-failure", ("remote failure",)),
+)
+_DIAGNOSTIC_REPORT_CLASSES = (
+    ("report-status-non-fast-forward", ("non-fast-forward",)),
+    ("report-status-remote-rejected", ("remote rejected", "rejected")),
+    ("report-status-fetch-first", ("fetch first",)),
+    ("report-status-stale-info", ("stale info",)),
+    ("report-status-hook-declined", ("hook declined",)),
+    ("report-status-protected-branch", ("protected branch",)),
+    ("report-status-unpacker-error", ("unpacker error",)),
+)
+_DIAGNOSTIC_STDERR_CLASSES = (
+    ("stderr-non-fast-forward", ("non-fast-forward",)),
+    ("stderr-rejected", ("[rejected]",)),
+    ("stderr-fetch-first", ("fetch first",)),
+    ("stderr-authentication-failed", ("authentication failed", "could not read username",
+                                      "terminal prompts disabled")),
+    ("stderr-not-found", ("not found", "repository not found")),
+    ("stderr-does-not-support", ("does not support",)),
+    ("stderr-could-not-resolve", ("could not resolve",)),
+    ("stderr-unable-to-access", ("unable to access",)),
+    ("stderr-rpc-failed", ("rpc failed",)),
+    ("stderr-remote-end-hung-up", ("remote end hung up", "unexpected disconnect")),
+    ("stderr-http-401", ("returned error: 401", "http 401")),
+    ("stderr-http-403", ("returned error: 403", "http 403")),
+    ("stderr-http-404", ("returned error: 404", "http 404")),
+    ("stderr-http-500", ("returned error: 500", "http 500")),
+    ("stderr-http-502", ("returned error: 502", "http 502")),
+    ("stderr-http-503", ("returned error: 503", "http 503")),
+    ("stderr-pre-receive-hook-declined", ("pre-receive hook declined",)),
+    ("stderr-unpacker-error", ("unpacker error",)),
+    ("stderr-bad-pack", ("bad pack", "pack has bad object")),
+    ("stderr-index-pack-failed", ("index-pack failed",)),
+    ("stderr-protocol-error", ("protocol error",)),
+    ("stderr-not-our-ref", ("not our ref",)),
+    ("stderr-failed-to-push", ("failed to push",)),
+    ("stderr-denied", ("denied",)),
+    ("stderr-refusing", ("refusing",)),
+)
+def _diagnostic_text(process, name):
+    value = getattr(process, name, None)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, str):
+        return value
+    return ""
+def _diagnostic_classes(text, mapping):
+    lower = text.lower()
+    return [name for name, needles in mapping if any(needle in lower for needle in needles)]
 def git_failure(process):
-    text = (process.stderr or b"").decode(errors="replace").lower()
+    """Closed, credential-free attribution for a failed stock Git invocation.
+
+    Only integer exit status, fixed class strings and fixed porcelain flags are
+    returned. Raw stdout/stderr, refnames, URLs, tokens, environment values and
+    repository paths are never copied into the diagnostic object.
+    """
+    stdout = _diagnostic_text(process, "stdout")
+    stderr = _diagnostic_text(process, "stderr")
+    text = stderr.lower()
     markers = [marker for marker in ("non-fast-forward", "[rejected]", "fetch first", "authentication failed",
                                      "not found", "does not support", "could not resolve", "unable to access",
                                      "repository not found") if marker in text]
-    return {"exit": process.returncode, "markers": markers}
+    classes = set(_diagnostic_classes(stderr, _DIAGNOSTIC_STDERR_CLASSES))
+    porcelain_entries = 0
+    porcelain_flags = set()
+    porcelain_ok = False
+    porcelain_rejected = False
+    for line in stdout.splitlines():
+        if len(line) < 3 or line[0] not in _DIAGNOSTIC_PORCELAIN_FLAGS or "\t" not in line:
+            continue
+        porcelain_entries += 1
+        porcelain_flags.add(line[0])
+        if line[0] == "!":
+            porcelain_rejected = True
+            classes.add("porcelain-rejected")
+        elif line[0] in "*+ ":
+            porcelain_ok = True
+            classes.add("porcelain-ok")
+        classes.update(_diagnostic_classes(line, _DIAGNOSTIC_PORCELAIN_CLASSES))
+    report_unpack_ok = False
+    report_unpack_failed = False
+    report_ok = False
+    report_ng = False
+    for line in stdout.splitlines():
+        lower = line.lower()
+        if lower.startswith("unpack "):
+            if lower.strip() == "unpack ok":
+                report_unpack_ok = True
+                classes.add("report-status-unpack-ok")
+            else:
+                report_unpack_failed = True
+                classes.add("report-status-unpack-failed")
+                classes.update(_diagnostic_classes(line, _DIAGNOSTIC_REPORT_CLASSES))
+        elif lower.startswith("ng "):
+            report_ng = True
+            classes.add("report-status-ng")
+            classes.update(_diagnostic_classes(line, _DIAGNOSTIC_REPORT_CLASSES))
+        elif lower.startswith("ok "):
+            report_ok = True
+            classes.add("report-status-ok")
+    classes_list = sorted(classes)
+    unknown = not classes_list
+    if unknown:
+        classes_list = ["unclassified"]
+    return {
+        "exit": process.returncode if type(getattr(process, "returncode", None)) is int else -1,
+        "markers": markers,
+        "classes": classes_list,
+        "porcelain": {
+            "entries": porcelain_entries,
+            "ok": porcelain_ok,
+            "rejected": porcelain_rejected,
+            "flags": sorted(porcelain_flags),
+        },
+        "report_status": {
+            "unpack_ok": report_unpack_ok,
+            "unpack_failed": report_unpack_failed,
+            "ok": report_ok,
+            "ng": report_ng,
+        },
+        "unknown": unknown,
+    }
 def parse_push(text):
     entries = []
     for line in text.splitlines():
