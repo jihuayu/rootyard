@@ -317,7 +317,7 @@ async fn assert_read_only_witness(
 
     for hold in &expected {
         let head = store
-            .head(&hold.locator, db::deadline())
+            .head(&hold.locator, db::deadline().into_std())
             .await
             .map_err(|error| anyhow!("retained object head failed: {error}"))?;
         ensure!(
