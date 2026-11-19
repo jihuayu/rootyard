@@ -4,13 +4,14 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
@@ -20,7 +21,7 @@ use uuid::Uuid;
 use crate::cache_wake::replica_cache::{DurablePinRegistry, lease_pin::AuthTask};
 
 use super::{
-    tests::{sample_keyring, sample_pack_bytes, sample_policy, sample_resolver, sample_subject},
+    tests::{ScopedAuthorizer, sample_keyring, sample_pack_bytes, sample_policy, sample_resolver, sample_subject},
     tests_audit::raw_http_exchange,
     *,
 };
@@ -161,6 +162,16 @@ fn build_stream_fixture(
     StreamFixture { state, leases, pin, desc, tenant, repo, pack_hash, raw_len: raw.len() }
 }
 
+fn distinct_pack_bytes(marker: u8, extra_pad: usize) -> (Vec<u8>, String, String) {
+    let mut raw = b"PACK\x00\x00\x00\x02\x00\x00\x00\x00".to_vec();
+    raw.resize(raw.len() + extra_pad, marker);
+    let trailer = [marker; 20];
+    raw.extend_from_slice(&trailer);
+    let pack_hash = hex::encode(trailer);
+    let sha256 = hex::encode(Sha256::digest(&raw));
+    (raw, pack_hash, sha256)
+}
+
 #[tokio::test]
 async fn stream_paused_live_auth_hits_absolute_deadline_without_yielding_and_releases_guards() {
     let (auth, mut entered, _release) = PausedAuthorizer::new(2);
@@ -268,4 +279,46 @@ async fn prestream_live_auth_denial_preserves_403_and_unknown_errors_fail_closed
         assert_eq!(fx.state.inflight_limiter.available_permits(), permits_before);
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn revoked_inflight_reader_retains_pack_until_exact_guard_drain() {
+    let auth = Arc::new(ScopedAuthorizer::permissive(Arc::new(AtomicBool::new(true))));
+    let fx = build_stream_fixture(auth, 30_000, 1);
+    let permits_before = fx.state.inflight_limiter.available_permits();
+    let body = serve_signed_packfile_stream(Arc::clone(&fx.state), &fx.request()).await.unwrap();
+    let mut stream = body.into_data_stream();
+    assert!(stream.next().await.unwrap().is_ok());
+    assert_eq!(fx.leases.inflight_download_count(), 1);
+
+    assert!(fx.leases.revoke_pin(fx.pin.pin_id()));
+    assert!(matches!(
+        serve_signed_packfile_stream(Arc::clone(&fx.state), &fx.request()).await,
+        Err(PackfileUriError::RetentionPinMissing(_))
+    ));
+    assert_eq!(fx.leases.inflight_download_count(), 1);
+
+    let (raw_b, pack_hash_b, sha256_b) = distinct_pack_bytes(0xcd, 4_096);
+    let next_pack = PackStreamMeta {
+        tenant_id: fx.tenant,
+        repository_id: fx.repo,
+        pack_oid: pack_hash_b.clone(),
+        pack_hash_hex: pack_hash_b,
+        object_format: PackObjectFormat::Sha1,
+        sha256_hex: sha256_b,
+        payload: Bytes::from(raw_b),
+    };
+    assert!(matches!(fx.state.insert_pack(next_pack.clone()), Err(PackfileUriError::CapacityExceeded(_))));
+    assert_eq!(fx.state.pack_count(), 1);
+
+    assert!(stream.next().await.unwrap().is_err());
+    drop(stream);
+    assert_eq!(fx.leases.inflight_download_count(), 0);
+    assert_eq!(fx.state.inflight_bytes.used_bytes(), 0);
+    assert_eq!(fx.state.inflight_limiter.available_permits(), permits_before);
+
+    // The caller's revoked issuance guard is still alive, but zero inflight readers keep the
+    // existing sweepable behavior, so the bounded store may evict the old verified pack.
+    fx.state.insert_pack(next_pack).unwrap();
+    assert_eq!(fx.state.pack_count(), 1);
 }
