@@ -27,6 +27,8 @@ mod tests_luna_gates;
 mod tests_pinned_dir;
 #[cfg(test)]
 mod tests_same_bytes;
+#[cfg(test)]
+mod tests_stream_revoke;
 
 pub use cover_builder::{
     CoverBuildOutcome, HelperResourceLimits, MaterializedCoverBundle, RepoCoverBuildParams, build_residual_pack_bytes,
