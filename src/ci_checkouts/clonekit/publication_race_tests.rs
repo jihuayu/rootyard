@@ -24,6 +24,13 @@ use crate::ci_checkouts::clonekit::{
     },
 };
 
+// Libtest names are crate-relative; `module_path!()` includes the crate name.
+fn child_test_name(helper: &str) -> String {
+    let module = module_path!();
+    let module = module.split_once("::").map_or(module, |(_, relative)| relative);
+    format!("{module}::{helper}")
+}
+
 fn git() -> &'static Path {
     Path::new("/usr/bin/git")
 }
@@ -177,7 +184,8 @@ fn cross_process_lock_excludes_and_releases_on_child_termination() {
     let mut child = OwnedChild::new(
         Command::new(std::env::current_exe().expect("current exe"))
             .arg("--nocapture")
-            .arg("ci_checkouts::clonekit::publication::publication_race_tests::publication_lock_child_helper")
+            .arg("--exact")
+            .arg(child_test_name("publication_lock_child_helper"))
             .env("ROOTYARD_CK_LOCK_ROOT", &root)
             .env("ROOTYARD_CK_LOCK_REPO", repository_id.to_string())
             .env("ROOTYARD_CK_LOCK_READY", &ready)

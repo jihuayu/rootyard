@@ -24,6 +24,13 @@ use crate::ci_checkouts::clonekit::{
 
 static SECRET: [u8; 32] = [0x42; 32];
 
+// Libtest names are crate-relative; `module_path!()` includes the crate name.
+fn child_test_name(helper: &str) -> String {
+    let module = module_path!();
+    let module = module.split_once("::").map_or(module, |(_, relative)| relative);
+    format!("{module}::{helper}")
+}
+
 #[path = "publication_active_fixture.rs"]
 mod fixture;
 
@@ -415,7 +422,8 @@ fn cross_process_reader_lease_blocks_gc_and_releases_on_child_exit() {
     let mut child = OwnedChild::new(
         Command::new(std::env::current_exe().expect("current exe"))
             .arg("--nocapture")
-            .arg("ci_checkouts::clonekit::publication::publication_read_lease_tests::publication_read_lease_child_helper")
+            .arg("--exact")
+            .arg(child_test_name("publication_read_lease_child_helper"))
             .env("ROOTYARD_CK_READ_LEASE_ROOT", &root)
             .env("ROOTYARD_CK_READ_LEASE_REPO", repository_id.to_string())
             .env("ROOTYARD_CK_READ_LEASE_READY", &ready)
