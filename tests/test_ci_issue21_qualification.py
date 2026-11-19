@@ -231,6 +231,63 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIsNone(_step(PANDO_CLI_STEP)["timeout-minutes"])
         self.assertEqual(_step(PANDO_PITR_STEP)["timeout-minutes"], "10")
 
+    def test_python_suite_report_is_source_bound_for_277_and_283_only(self):
+        suite = _step("Run all Python unit and Tier-5 adversarial contract suites")
+        env = suite["env"]
+        checkpoint_selector = (
+            "${{ github.event.pull_request.number == 283 && "
+            "'test-results/python-ci-result.json' || '' }}"
+        )
+        suite_selector = (
+            "${{ (github.event.pull_request.number == 277 || "
+            "github.event.pull_request.number == 283) && "
+            "'test-results/python-ci-result.json' || '' }}"
+        )
+        # The existing #283 checkpoint expression stays byte-for-byte intact.
+        # The full-suite report opts in both exact source-bound heads through
+        # a separate variable and the same bounded target.
+        self.assertEqual(env["ROOTYARD_PYTHON_CI_REPORT"], checkpoint_selector)
+        self.assertEqual(env["ROOTYARD_PYTHON_SUITE_REPORT"], suite_selector)
+        run = suite["run"]
+        self.assertIn(
+            'if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then', run
+        )
+        self.assertIn('--report-out "$ROOTYARD_PYTHON_SUITE_REPORT"', run)
+        self.assertIn('--expected-commit="${GITHUB_SHA:-}"', run)
+        self.assertIn(
+            'python3 scripts/run_python_ci_tests.py "${report_args[@]}"', run
+        )
+        self.assertNotIn('--report-out "$ROOTYARD_PYTHON_CI_REPORT"', run)
+        selector = re.fullmatch(
+            r"\$\{\{ \(github\.event\.pull_request\.number == (\d+) \|\| "
+            r"github\.event\.pull_request\.number == (\d+)\) && "
+            r"'([^']+)' \|\| '' \}\}",
+            suite_selector,
+        )
+        self.assertIsNotNone(selector)
+        first, second, target = selector.groups()
+        for number, expected in (
+            (277, target),
+            (283, target),
+            (276, ""),
+            (None, ""),
+        ):
+            with self.subTest(pull_request=number):
+                selected = (
+                    target
+                    if number is not None
+                    and number in (int(first), int(second))
+                    else ""
+                )
+                self.assertEqual(selected, expected)
+        upload = _step(UPLOAD_STEP)
+        self.assertEqual(upload.get("if"), "always()")
+        paths = [line.strip() for line in upload["with"]["path"].splitlines()
+                 if line.strip()]
+        # The old always-on e2e artifact already collects the exact bounded
+        # file; no new artifact, path or raw log is introduced.
+        self.assertIn("test-results/*.json", paths)
+
     def test_single_native_batch_exports_the_pando_receipt(self):
         steps = _steps()
         builds = [step for step in steps

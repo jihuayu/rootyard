@@ -4,8 +4,8 @@ use crate::{
     pulls::models::context_valid,
     webhooks::{
         ci_classification::{
-            CheckoutStateClass, CheckoutTarget, ClassificationInput, classified_error,
-            classified_response, classify_checkout_state, error_with_classification,
+            CheckoutStateClass, CheckoutTarget, ClassificationInput, SnapshotRoute, classified_error,
+            classified_response, classify_checkout_state, error_with_classification, route_from_snapshot,
         },
         ci_controller,
         signing::{constant_time_eq, sha256_hex},
@@ -123,33 +123,29 @@ pub(crate) async fn verify_hook_tx(tx: &Transaction<'_>, hook_id: Uuid, repo: Uu
     Ok(())
 }
 
+/// Callers hold the 1062026 advisory lock in a preceding statement so this
+/// decision query observes a fresh READ COMMITTED snapshot after any wait.
 pub(crate) async fn choose_checkout_source(
     tx: &Transaction<'_>,
     target: CheckoutTarget<'_>,
     prefer_mirror: bool,
     wait_requested: bool,
 ) -> Result<Result<String, Response>, Error> {
-    if let Some(mirror) = ci_controller::select_ready_mirror(
+    let snapshot = ci_controller::select_ready_mirror(
         &**tx,
         target.repo_id,
         target.storage_generation,
         target.audience,
         target.head_oid,
         target.excluded,
-    )
-    .await?
-    {
-        return Ok(Ok(mirror));
-    }
-    let summary = ci_controller::probe_availability(
-        &**tx,
-        target.repo_id,
-        target.storage_generation,
-        target.audience,
-        target.head_oid,
-        target.excluded,
+        true,
     )
     .await?;
+    let summary = match route_from_snapshot(snapshot.source, snapshot.availability) {
+        SnapshotRoute::Selected(source) => return Ok(Ok(source)),
+        SnapshotRoute::Unavailable(availability) => availability,
+        SnapshotRoute::Inconsistent => return Err(Error::internal("inconsistent checkout snapshot")),
+    };
     let (global, per_repo) = ci_controller::origin_fallback_limits();
     let allow_origin = !prefer_mirror && !target.excluded.iter().any(|s| s == "origin");
     let class = classify_checkout_state(ClassificationInput {
