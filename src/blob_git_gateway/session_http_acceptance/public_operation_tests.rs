@@ -81,14 +81,12 @@ async fn case(db: &Db) -> Result<()> {
     ensure!(body["terminal"].is_null(), "pending public operation GET carried a terminal");
     ensure_public_safe(&body, &[private_id], "pending public operation GET")?;
 
-    // A private attempt identifier is a fixed non-legacy refusal.
+    // A private attempt identifier is an opaque 404, indistinguishable from an
+    // unknown public UUID on this route.
     let private = client.get(format!("{base}/operations/{private_id}")).bearer_auth(&owner.token).send().await?;
-    ensure!(private.status() == StatusCode::CONFLICT, "private identifier GET was not a conflict");
+    ensure!(private.status() == StatusCode::NOT_FOUND, "private identifier GET was not an opaque 404");
     let private_body: Value = private.json().await?;
-    ensure!(
-        private_body["error"] == json!("operation identity conflicts with a durable record"),
-        "private identifier refusal changed"
-    );
+    ensure!(private_body["error"] == json!("not found"), "private identifier refusal changed");
     ensure_public_safe(&private_body, &[public_id, private_id], "private identifier refusal")?;
 
     Ok(())

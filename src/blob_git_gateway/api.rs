@@ -324,10 +324,10 @@ async fn get_operation_authorized(
         .map_err(|_| GatewayError::Timeout)?
         .map_err(|_| GatewayError::Internal("authorization transaction failed"))?;
     let loaded: Result<OperationRead, GatewayError> = async {
-        // Take the operation key before the authorization checks take row locks.
-        crate::ref_store::pg::lock_operation(&tx, repository_id, operation_id, deadline)
-            .await
-            .map_err(GatewayError::from)?;
+        // The status route is read-only and deliberately does not take the
+        // migration-138 operation advisory key, so a writer or test barrier that
+        // holds it cannot stall this view. Legacy fallthrough is reclassified in
+        // one atomic core snapshot by the operation reader.
         let fresh = crate::ref_store::serving::lookup_in_tx(&tx, &identity, &owner, name, writable, backend, deadline)
             .await
             .map_err(authority_error)?;
