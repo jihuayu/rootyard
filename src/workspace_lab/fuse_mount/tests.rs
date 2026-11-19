@@ -226,6 +226,7 @@ fn unproved_identity_is_a_static_failure_category_without_a_path() {
 fn typed_teardown_classes_keep_equal_errno_distinct_and_unknown_status_separate() {
     let identity = MountTeardownError::UnmountIdentity;
     let busy = MountTeardownError::UnmountBusy(io::Error::from_raw_os_error(libc::EBUSY));
+    assert_eq!(MountTeardownError::IdentityUnproved.class(), MountTeardownClass::IdentityOrProbe);
     assert_eq!(identity.class(), MountTeardownClass::IdentityOrProbe);
     assert_eq!(busy.class(), MountTeardownClass::MatchedIdBusy);
     assert_eq!(
@@ -246,4 +247,10 @@ fn classified_teardown_keeps_the_borrowed_owner_contract() {
         handle.teardown_owned_classified()
     }
     let _: for<'a> fn(&'a mut MountHandle) -> Result<(), MountTeardownClass> = classified;
+}
+
+#[test]
+fn identity_unmount_display_keeps_the_historical_ebusy_text() {
+    let expected = format!("exact FUSE unmount failed: {}", io::Error::from_raw_os_error(libc::EBUSY));
+    assert_eq!(MountTeardownError::UnmountIdentity.to_string(), expected);
 }
