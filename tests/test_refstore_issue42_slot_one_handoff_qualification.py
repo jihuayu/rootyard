@@ -141,53 +141,96 @@ class InventoryTests(unittest.TestCase):
 
 
 class FailureStageTests(unittest.TestCase):
-    def raw(self, *stages):
-        case = qualification.CASES[0]
+    def raw(self, *stages, case=None):
+        case = case or qualification.CASES[0]
         body = "".join("ROOTYARD_SLOT_ONE_STAGE=" + stage + "\n" for stage in stages)
-        return (f"test {case} ... FAILED\n---- {case} stderr ----\n" + body).encode()
+        return (
+            "running 1 test\n"
+            f"test {case} ... FAILED\n\n"
+            "failures:\n\n"
+            f"---- {case} stdout ----\n"
+            f"---- {case} stderr ----\n"
+            f"{body}"
+            "\nfailures:\n"
+            f"    {case}\n\n"
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; "
+            "0 measured; 0 filtered out; finished in 0.01s\n"
+        ).encode()
+
+    def stage(self, raw, case=None):
+        case = case or qualification.CASES[0]
+        return checkpoint.classify_failure_stage(
+            raw, expected=case, sequence=qualification.STAGE_SEQUENCES[case])
 
     def test_ordered_markers_return_the_last_known_stage(self):
-        raw = self.raw("fixture_guard", "retire_p0", "retire_admit", "retire_stage")
-        self.assertEqual(
-            checkpoint.classify_failure_stage(
-                raw, expected=qualification.CASES[0]),
-            "retire_stage")
+        raw = self.raw(
+            "fixture_guard", "db_setup", "postgres17", "blob_git",
+            "retire_p0", "retire_serving", "retire_admit", "retire_stage")
+        self.assertEqual(self.stage(raw), "retire_stage")
 
     def test_missing_unknown_order_duplicate_and_unbound_are_closed(self):
         expected = qualification.CASES[0]
         self.assertEqual(
-            checkpoint.classify_failure_stage(
-                f"test {expected} ... FAILED\n".encode(), expected=expected),
-            "stage_missing")
+            self.stage(self.raw()),
+            "stage_unavailable")
+        self.assertEqual(
+            self.stage(self.raw("fixture_guard", "not_a_stage")),
+            "stage_unavailable")
+        self.assertEqual(
+            self.stage(self.raw("retire_stage", "fixture_guard")),
+            "stage_unavailable")
+        self.assertEqual(
+            self.stage(self.raw("fixture_guard", "fixture_guard")),
+            "stage_unavailable")
         self.assertEqual(
             checkpoint.classify_failure_stage(
-                self.raw("fixture_guard", "not_a_stage"), expected=expected),
-            "stage_unknown")
+                b"ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n",
+                expected=expected, sequence=qualification.STAGE_SEQUENCES[expected]),
+            "stage_unavailable")
         self.assertEqual(
             checkpoint.classify_failure_stage(
-                self.raw("retire_stage", "fixture_guard"), expected=expected),
-            "stage_order")
-        self.assertEqual(
-            checkpoint.classify_failure_stage(
-                self.raw("fixture_guard", "fixture_guard"), expected=expected),
-            "stage_order")
-        self.assertEqual(
-            checkpoint.classify_failure_stage(
-                b"ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n", expected=expected),
-            "stage_unbound")
-        self.assertEqual(
-            checkpoint.classify_failure_stage(b"\xff", expected=expected),
+                b"\xff", expected=expected,
+                sequence=qualification.STAGE_SEQUENCES[expected]),
             "stage_unavailable")
 
     def test_arbitrary_injected_stage_cannot_move_backwards(self):
+        raw = self.raw("fixture_guard", "authorized_commit", "fixture_guard")
+        self.assertEqual(self.stage(raw), "stage_unavailable")
+
+    def test_duplicate_rows_and_foreign_capture_blocks_are_rejected(self):
         expected = qualification.CASES[0]
-        raw = (f"test {expected} ... FAILED\n"
-               "ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n"
-               "ROOTYARD_SLOT_ONE_STAGE=authorized_commit\n"
-               "ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n").encode()
-        self.assertEqual(
-            checkpoint.classify_failure_stage(raw, expected=expected),
-            "stage_order")
+        duplicate = self.raw("fixture_guard").replace(
+            b"running 1 test\n",
+            b"running 1 test\n" + f"test {expected} ... FAILED\n".encode())
+        self.assertEqual(self.stage(duplicate), "stage_unavailable")
+        foreign = self.raw("fixture_guard").replace(
+            f"---- {expected} stderr ----".encode(),
+            b"---- other-case stderr ----")
+        self.assertEqual(self.stage(foreign), "stage_unavailable")
+        duplicate_block = self.raw("fixture_guard").replace(
+            f"---- {expected} stderr ----".encode(),
+            f"---- {expected} stderr ----\n---- {expected} stderr ----".encode())
+        self.assertEqual(self.stage(duplicate_block), "stage_unavailable")
+
+    def test_malformed_marker_after_valid_and_sibling_stage_are_rejected(self):
+        expected = qualification.CASES[0]
+        malformed = self.raw("fixture_guard").replace(
+            b"ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n",
+            b"ROOTYARD_SLOT_ONE_STAGE=fixture_guard\n"
+            b"ROOTYARD_SLOT_ONE_STAGE=bad marker\n")
+        self.assertEqual(self.stage(malformed), "stage_unavailable")
+        sibling = self.raw("fixture_guard", "revoked_replay")
+        self.assertEqual(self.stage(sibling), "stage_unavailable")
+
+    def test_typed_partial_and_missing_summaries_never_yield_a_stage(self):
+        expected = qualification.CASES[0]
+        missing_summary = self.raw("fixture_guard").split(
+            b"test result:", 1)[0]
+        self.assertEqual(self.stage(missing_summary), "stage_unavailable")
+        wrong_summary = self.raw("fixture_guard").replace(
+            b"FAILED. 0 passed; 1 failed; 0 ignored",
+            b"FAILED. 1 passed; 0 failed; 0 ignored")
+        self.assertEqual(self.stage(wrong_summary), "stage_unavailable")
 
     def test_fixture_marker_source_is_fixed_and_allowlisted(self):
         gateway = (ROOT / "src/ref_store/pg/slot_one/tests/native/gateway.rs").read_text()
@@ -199,16 +242,23 @@ class FailureStageTests(unittest.TestCase):
         self.assertIn('eprintln!("{FAILURE_STAGE_PREFIX}{stage}")', native)
         self.assertNotIn("println!", gateway)
         self.assertIn("super::mark_stage(", gateway)
+        self.assertIn("retire_p0_inner(db, store, git, false).await", retirement)
+        self.assertIn("retire_p0_inner(db, store, git, true).await", retirement)
+        self.assertIn("if producer_request {", retirement)
+        self.assertIn("if handoff {", retirement)
+        self.assertIn('super::mark_stage("retire_admit");', retirement)
         calls = set(re.findall(
-            r'mark_stage\("([a-z0-9_]+)"\)', gateway + retirement))
-        self.assertTrue(calls)
-        self.assertLessEqual(calls, set(checkpoint.FAILURE_STAGES))
+            r'(?:mark_stage|handoff_stage)\("([a-z0-9_]+)"\)', gateway + retirement))
+        self.assertEqual(calls, set(checkpoint.FAILURE_STAGES))
         for selector in qualification.CASES:
             name = selector.rsplit("::", 1)[-1]
             start = gateway.index(f"async fn {name}()")
             end = gateway.find("#[tokio::test]", start)
             body = gateway[start:end if end != -1 else len(gateway)]
             self.assertIn("super::mark_stage(", body)
+            body_calls = set(re.findall(
+                r'mark_stage\("([a-z0-9_]+)"\)', body))
+            self.assertLessEqual(body_calls, set(qualification.STAGE_SEQUENCES[selector]))
 
 
 class QualificationRunTests(unittest.TestCase):

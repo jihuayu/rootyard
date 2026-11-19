@@ -37,6 +37,27 @@ REPORTS = (
     "slot-one-handoff-fresh.json",
     "slot-one-handoff-replay.json",
 )
+# Per-case known phase order. The fixture emits every phase in this order; a
+# failure necessarily leaves a prefix. `cleanup` is only valid after the full
+# prior sequence, and no sibling-case phase can appear in this case's block.
+SHARED_STAGES = (
+    "fixture_guard", "db_setup", "postgres17", "blob_git", "retire_p0",
+    "retire_serving", "retire_admit", "retire_stage", "retire_p1",
+    "retire_reject", "retire_mirror", "retire_evidence", "gateway_state",
+    "live_serving", "baseline",
+)
+STAGE_SEQUENCES = {
+    CASES[0]: SHARED_STAGES
+    + (
+        "rotation", "fresh_assertions", "a3_a4_stage", "authorized_commit",
+        "a5_snapshot", "terminal", "wrapper", "public_status", "cleanup",
+    ),
+    CASES[1]: SHARED_STAGES
+    + (
+        "revoke", "restore", "fresh_positive", "later_gate", "replay",
+        "revoked_replay", "restored_replay", "cleanup",
+    ),
+}
 CASE_SCHEMA = "rootyard/refstore-issue42-slot-one-handoff-case/v1"
 MANIFEST_SCHEMA = "rootyard/refstore-issue42-slot-one-handoff-qualification/v2"
 LIB_LABEL = "preflighted-#174-libtest"
@@ -65,8 +86,6 @@ REPORT_ATTESTATION_FIELDS = tuple(
 CASE_ERROR_CLASSES = frozenset(
     set(checkpoint.ERROR_CLASSES)
     | {"setup", "report_invalid", "attestation_mismatch", "returned_mismatch"})
-FAILURE_STAGE_VALUES = frozenset(
-    set(checkpoint.FAILURE_STAGES) | set(checkpoint.FAILURE_STAGE_SENTINELS))
 MANIFEST_ERROR_CLASSES = frozenset(
     set(CASE_ERROR_CLASSES) | {"probe_count", "manifest"})
 SAFE_LABEL = re.compile(r"^[A-Za-z0-9._#-]{1,64}$")
@@ -223,6 +242,7 @@ def _case_args(args, case, report):
         report=str(report),
         timeout=args.timeout,
         stdout_limit=args.stdout_limit,
+        stage_sequence=STAGE_SEQUENCES[case],
     )
 
 
@@ -285,7 +305,8 @@ def run_qualification(args, run_checkpoint=None):
                 _discard(final_path)
                 records.append(_closed_failure(case, label, failure))
                 continue
-            if not isinstance(failure_stage, str) or failure_stage not in FAILURE_STAGE_VALUES:
+            allowed_stages = set(STAGE_SEQUENCES[case]) | {"stage_unavailable"}
+            if not isinstance(failure_stage, str) or failure_stage not in allowed_stages:
                 failure_stage = "stage_unavailable"
             records.append(_case_record(final, label, failure_stage))
     finally:
@@ -360,9 +381,10 @@ def validate_manifest(manifest):
         if item.get("selection") not in ("unique", "unavailable"):
             raise checkpoint_failed("manifest_case_selection")
         failure_stage = item.get("failure_stage")
+        allowed_stages = set(STAGE_SEQUENCES.get(item.get("case"), ())) | {"stage_unavailable"}
         if failure_stage is not None and (
                 not isinstance(failure_stage, str)
-                or failure_stage not in FAILURE_STAGE_VALUES):
+                or failure_stage not in allowed_stages):
             raise checkpoint_failed("manifest_case_failure_stage")
         error = item.get("error_class")
         if error is not None and (not isinstance(error, str) or error not in CASE_ERROR_CLASSES):

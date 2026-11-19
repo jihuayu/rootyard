@@ -70,20 +70,9 @@ FAILURE_STAGES = (
     "restored_replay",
     "cleanup",
 )
-FAILURE_STAGE_INDEX = {name: index for index, name in enumerate(FAILURE_STAGES)}
-FAILURE_STAGE_MISSING = "stage_missing"
 FAILURE_STAGE_UNAVAILABLE = "stage_unavailable"
-FAILURE_STAGE_UNKNOWN = "stage_unknown"
-FAILURE_STAGE_ORDER = "stage_order"
-FAILURE_STAGE_UNBOUND = "stage_unbound"
-FAILURE_STAGE_SENTINELS = (
-    FAILURE_STAGE_MISSING,
-    FAILURE_STAGE_UNAVAILABLE,
-    FAILURE_STAGE_UNKNOWN,
-    FAILURE_STAGE_ORDER,
-    FAILURE_STAGE_UNBOUND,
-)
 FAILURE_STAGE_LINE = re.compile(r"^ROOTYARD_SLOT_ONE_STAGE=([a-z0-9_]+)$")
+CAPTURE_HEADER = re.compile(r"^---- (.+) (stdout|stderr) ----$")
 
 DEFAULT_TIMEOUT_SECONDS = 600.0
 DEFAULT_STDOUT_LIMIT = 16 * 1024
@@ -241,37 +230,75 @@ def classify_result(raw, exit_code, *, outcome="exited", error_class=None,
     }
 
 
-def classify_failure_stage(raw, *, expected=CASE):
-    """Return only a fixed, ordered failure-stage value from bounded output.
+def classify_failure_stage(raw, *, expected=CASE, sequence=FAILURE_STAGES):
+    """Return one stage only from the exact FAILED row and its stderr block.
 
-    The fixture emits fixed ``ROOTYARD_SLOT_ONE_STAGE=<name>`` lines as it
-    advances. On failure the last strictly increasing allowlisted value is the
-    stage attribution. Missing, unknown, out-of-order/duplicate and unbound
-    output are closed sentinels; no raw line is ever returned or persisted.
+    The caller must already have projected ``case_failed``; this function
+    independently requires one exact FAILED row, one exact failure summary, and
+    one uniquely delimited stderr capture block for the same case. All other
+    rows, capture blocks, markers and ordering are closed as
+    ``stage_unavailable``. No raw output is returned or persisted.
     """
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return FAILURE_STAGE_UNAVAILABLE
-    if expected not in text:
-        return FAILURE_STAGE_UNBOUND
+    summaries = SUMMARY.findall(text)
+    if len(summaries) != 1 or tuple(summaries[0][:5]) != ("FAILED", "0", "1", "0", "0"):
+        return FAILURE_STAGE_UNAVAILABLE
+    lines = text.splitlines()
+    rows = []
+    for line in lines:
+        match = CASE_LINE.fullmatch(line.strip())
+        if match is not None:
+            rows.append((match.group(1), match.group(2)))
+    if len(rows) != 1:
+        return FAILURE_STAGE_UNAVAILABLE
+    name, status = rows[0]
+    if name != expected or status not in ("FAILED", "failed"):
+        return FAILURE_STAGE_UNAVAILABLE
+    headers = []
+    for index, line in enumerate(lines):
+        match = CAPTURE_HEADER.fullmatch(line.strip())
+        if match is not None:
+            headers.append((index, match.group(1), match.group(2)))
+    if any(header_name != expected for _index, header_name, _stream in headers):
+        return FAILURE_STAGE_UNAVAILABLE
+    if sum(1 for _index, _name, stream in headers if stream == "stderr") != 1:
+        return FAILURE_STAGE_UNAVAILABLE
+    if sum(1 for _index, _name, stream in headers if stream == "stdout") > 1:
+        return FAILURE_STAGE_UNAVAILABLE
+    start = next(index for index, _name, stream in headers if stream == "stderr") + 1
+    end = None
+    for index in range(start, len(lines)):
+        stripped = lines[index].strip()
+        if CAPTURE_HEADER.fullmatch(stripped) is not None:
+            end = index
+            break
+        if stripped.startswith("failures:") or stripped.startswith("test result:"):
+            end = index
+            break
+    if end is None:
+        return FAILURE_STAGE_UNAVAILABLE
     stages = []
-    for line in text.splitlines():
-        match = FAILURE_STAGE_LINE.fullmatch(line.strip())
-        if match is None:
+    for line in lines[start:end]:
+        stripped = line.strip()
+        if not stripped.startswith(FAILURE_STAGE_PREFIX):
             continue
-        name = match.group(1)
-        if name not in FAILURE_STAGE_INDEX:
-            return FAILURE_STAGE_UNKNOWN
-        stages.append(name)
+        match = FAILURE_STAGE_LINE.fullmatch(stripped)
+        if match is None:
+            return FAILURE_STAGE_UNAVAILABLE
+        stage = match.group(1)
+        if stage not in sequence:
+            return FAILURE_STAGE_UNAVAILABLE
+        stages.append(stage)
     if not stages:
-        return FAILURE_STAGE_MISSING
-    previous = -1
-    for name in stages:
-        index = FAILURE_STAGE_INDEX[name]
-        if index <= previous:
-            return FAILURE_STAGE_ORDER
-        previous = index
+        return FAILURE_STAGE_UNAVAILABLE
+    if stages[-1] == "cleanup":
+        if tuple(stages[:-1]) != tuple(sequence[:-1]):
+            return FAILURE_STAGE_UNAVAILABLE
+    elif tuple(stages) != tuple(sequence[:len(stages)]):
+        return FAILURE_STAGE_UNAVAILABLE
     return stages[-1]
 
 
@@ -588,7 +615,7 @@ def run_bounded(command, *, timeout, stdout_limit, environment=None):
             "stdout": b"".join(raw), "error_class": error_class}
 
 
-def run_checkpoint_observed(args):
+def _run_checkpoint(args, *, observe_stage):
     attestation = build_attestation(
         args.lib, args.receipt, args.preflight, args.workspace,
         args.expected_commit, schema=args.report_schema, case=args.case)
@@ -607,11 +634,13 @@ def run_checkpoint_observed(args):
         run["stdout"], run["exit_code"], outcome=run["outcome"],
         error_class=run["error_class"], expected=args.case)
     failure_stage = None
-    if not projection["complete"]:
-        if run["outcome"] != "exited":
-            failure_stage = FAILURE_STAGE_UNAVAILABLE
+    if observe_stage and not projection["complete"]:
+        if run["outcome"] == "exited" and projection["error_class"] == "case_failed":
+            sequence = getattr(args, "stage_sequence", FAILURE_STAGES)
+            failure_stage = classify_failure_stage(
+                run["stdout"], expected=args.case, sequence=sequence)
         else:
-            failure_stage = classify_failure_stage(run["stdout"], expected=args.case)
+            failure_stage = FAILURE_STAGE_UNAVAILABLE
     report = make_report(
         attestation, projection, run["exit_code"], run["outcome"],
         schema=args.report_schema, case=args.case)
@@ -621,8 +650,12 @@ def run_checkpoint_observed(args):
 
 
 def run_checkpoint(args):
-    report, _failure_stage = run_checkpoint_observed(args)
+    report, _failure_stage = _run_checkpoint(args, observe_stage=False)
     return report
+
+
+def run_checkpoint_observed(args):
+    return _run_checkpoint(args, observe_stage=True)
 
 
 def main(argv=None):
