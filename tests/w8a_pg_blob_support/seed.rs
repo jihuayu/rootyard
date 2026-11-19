@@ -333,7 +333,7 @@ async fn seed_runtime_rows(
         sequence: 1,
         storage_generation: 1,
         outcome: "recorded".into(),
-        evidence: json!({"kind": "w8a_paired_seed"}),
+        evidence: json!({"kind": "observed_immutable_ci_root"}),
         admission: None,
     };
     let change = RefEventInput {
