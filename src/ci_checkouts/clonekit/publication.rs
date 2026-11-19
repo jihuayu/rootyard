@@ -13,12 +13,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    BuildFailurePoint, BuiltCloneKitArtifacts, RetentionPinLedger, copy_private_file, read_regular_file, sync_dir,
-    verify_idx_in_ephemeral_repo, verify_prepared_artifact, write_private_file,
+    BuildFailurePoint, BuiltCloneKitArtifacts, RetentionPinLedger, copy_private_file, read_lease, read_regular_file,
+    sync_dir, verify_idx_in_ephemeral_repo, verify_prepared_artifact, write_private_file,
 };
 use crate::ci_checkouts::clonekit::manifest::{
     CloneKitError, CloneKitManifest, CloneKitStatus, MAX_MANIFEST_JSON_BYTES, ensure_not_cancelled, ensure_private_dir,
 };
+
+#[path = "publication_read.rs"]
+mod read;
 
 const REPOSITORY_PREFIX: &str = "repo-";
 const ATTEMPT_PREFIX: &str = ".publish-";
@@ -66,6 +69,10 @@ impl CloneKitPublicationStore {
     }
 
     /// Load the latest verified published manifest for `repo_id`, if any.
+    ///
+    /// This lock-free read preserves existing callers. Callers that consume local generation
+    /// bytes must use [`Self::load_latest_leased`] so local GC cannot remove the selected
+    /// generation before the read completes.
     pub fn load_latest(&self, repo_id: Uuid) -> Result<Option<CloneKitManifest>, CloneKitError> {
         let bytes = match fs::read(self.current_pointer_path(repo_id)) {
             Ok(bytes) => bytes,
@@ -88,6 +95,7 @@ impl CloneKitPublicationStore {
         kit_generation: u64,
         ledger: &RetentionPinLedger,
     ) -> Result<bool, CloneKitError> {
+        read_lease::require_supported_backend()?;
         match fs::symlink_metadata(self.repo_dir(repo_id)) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => return Err(CloneKitError::GitFailed(format!("stat publication repository: {err}"))),
@@ -103,6 +111,7 @@ impl CloneKitPublicationStore {
         if kit_generation > latest.kit_generation {
             return Ok(false);
         }
+        let _read_lease = read_lease::acquire_exclusive(&self.repo_dir(repo_id))?;
         let dir = self.version_dir(repo_id, kit_generation);
         ledger.with_unpinned_generation(repo_id, kit_generation, || match fs::symlink_metadata(&dir) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -485,6 +494,14 @@ fn checkpoint(_name: &'static str) -> Result<(), CloneKitError> {
 }
 
 #[cfg(test)]
+#[path = "publication_child_fixture.rs"]
+mod publication_child_fixture;
+
+#[cfg(test)]
+#[path = "publication_active_fixture.rs"]
+mod fixture;
+
+#[cfg(test)]
 #[path = "publication_tests.rs"]
 mod publication_tests;
 
@@ -499,3 +516,7 @@ mod publication_barrier_tests;
 #[cfg(test)]
 #[path = "publication_active_race_tests.rs"]
 mod publication_active_race_tests;
+
+#[cfg(test)]
+#[path = "publication_read_lease_tests.rs"]
+mod publication_read_lease_tests;
