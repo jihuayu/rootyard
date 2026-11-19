@@ -264,6 +264,11 @@ jobs:
           SCHEMA = "rootyard/a4-redis-wake-external-native-evidence/v1"
           CASE = "real_a4_redis_wake_external_pg_fallback"
           KIND = "rootyard/a4-redis-wake-external-acceptance"
+          CASE_STAGES = {
+              "repo_create", "empty_clone", "initial_push", "pre_worker_assertions",
+              "worker_startup", "healthy_push", "invalid_hints", "redis_cut_pg_fallback",
+              "healed_wake", "denials", "final_assertions",
+          }
           HEX = re.compile(r"^[0-9a-f]{64}$")
           FAIL = {"preflight", "fixture", "case", "receipt_changed", "cleanup"}
           ROOT = pathlib.Path.cwd()
@@ -332,6 +337,22 @@ jobs:
                   and phase.get("phase") == "provenance"
                   and phase.get("state") == "complete"
               )
+
+
+          def failed_case_stage(case):
+              if not isinstance(case, dict) or case.get("status") != "failed":
+                  return None
+              stage = case.get("stage")
+              return stage if isinstance(stage, str) and stage in CASE_STAGES else "unavailable"
+
+
+          def case_evidence(case, observations):
+              case = case if isinstance(case, dict) else {}
+              view = {"name": case.get("name"), "status": case.get("status"), "observations": observations}
+              stage = failed_case_stage(case)
+              if stage is not None:
+                  view["stage"] = stage
+              return view
 
 
           def load(path):
@@ -464,7 +485,7 @@ jobs:
                   "binary": {"sha256": binary_sha, "build_receipt_sha256": receipt_sha, "receipt": view},
                   "runtime": {"postgres_major": report.get("postgres_major"), "postgres_server_version_num": report.get("postgres_server_version_num"), "git_version": version(["git", "--version"]), "redis_version": version(["/usr/bin/redis-server", "--version"]), "psql_version": version(["psql", "--version"]), "rustc_version": version(["rustc", "-V"]), "cargo_version": version(["cargo", "-vV"]), "garage_version": garage.get("version"), "garage_image_digest": garage.get("image_digest")},
                   "report": {"kind": kind, "passed": passed},
-                  "case": {"name": case.get("name"), "status": case.get("status"), "observations": observations},
+                  "case": case_evidence(case, observations),
                   "cleanup": {"harness_outcome": harness, "garage_start_outcome": garage_start, "garage_outcome": garage_outcome, "owned_cleanup_completed": detail.get("owned_cleanup_completed") is True, "cleanup_failed": report.get("cleanup_failed"), "cleanup_error": report.get("cleanup_error"), "postgres_container": "job-owned"},
               }
               OUT.mkdir(parents=True, exist_ok=True)

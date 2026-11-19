@@ -61,6 +61,19 @@ from cross_process import CrossProcessHarness
 from redis_partition_relay import RedisPartitionRelay
 
 CASE = "real_a4_redis_wake_external_pg_fallback"
+CASE_STAGES = (
+    "repo_create",
+    "empty_clone",
+    "initial_push",
+    "pre_worker_assertions",
+    "worker_startup",
+    "healthy_push",
+    "invalid_hints",
+    "redis_cut_pg_fallback",
+    "healed_wake",
+    "denials",
+    "final_assertions",
+)
 REPORT_KIND = "rootyard/a4-redis-wake-external-acceptance"
 WORKER_NAME = "rootyard_a4_redis_wake_worker"
 TARGET_KIND = "pg_refstore_core_commit_audit"
@@ -172,6 +185,7 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         self.worker_count = 0
         self.channel = "rootyard:a4:test:" + self.schema
         self.redis_started = False
+        self.case_stage = None
 
     # ---- owned processes -------------------------------------------------
     def stop_workers(self):
@@ -700,25 +714,36 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         self.git("fsck", "--full", "--strict", cwd=clone)
 
     def run_case(self):
+        self.case_stage = "repo_create"
         repo, _ = self.create("a4wake", self.alice)
         remote = self.base + repo["clone_path"]
         work = self.root / "a4wake-work"
+        self.case_stage = "empty_clone"
         self.empty_clone(remote, work, self.alice)
         self.configure(work)
+        self.case_stage = "initial_push"
         initial_oid, initial_op, _ = self.commit_and_push(work, "initial")
         self.assert_ref(remote, TARGET_REF, initial_oid)
+        self.case_stage = "pre_worker_assertions"
         self.assert_no_embedded_delivery(repo, initial_op, initial_oid)
+        self.case_stage = "worker_startup"
         start = self.start_external_worker(repo, initial_op, initial_oid)
         first_poll = start + POLL_SECONDS
+        self.case_stage = "healthy_push"
         healthy_oid, healthy_op = self.healthy_push(work, repo, first_poll)
         self.assert_ref(remote, TARGET_REF, healthy_oid)
+        self.case_stage = "invalid_hints"
         self.duplicate_and_invalid_hints(repo)
+        self.case_stage = "redis_cut_pg_fallback"
         cut_oid, cut_op = self.cut_fallback_push(work, repo, first_poll)
         self.assert_ref(remote, TARGET_REF, cut_oid)
+        self.case_stage = "healed_wake"
         second_poll = start + 2 * POLL_SECONDS
         healed_oid, healed_op = self.healed_push(work, repo, second_poll)
         self.assert_ref(remote, TARGET_REF, healed_oid)
+        self.case_stage = "denials"
         self.assert_denials(repo, work, healed_oid)
+        self.case_stage = "final_assertions"
         final = self.snapshot(repo["id"])
         assert final["legacy_projection"] == "0", "legacy ref projection exists"
         assert final["projection_jobs"] == "0", "legacy Ref-CAS projection job exists"
@@ -882,6 +907,10 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None, containment
         case = dict(name=CASE, status="passed", detail=dict(detail, owned_cleanup_completed=True))
     else:
         case = dict(name=CASE, status="failed", error=primary or cleanup_error)
+        if primary == "case" and harness is not None:
+            stage = getattr(harness, "case_stage", None)
+            if isinstance(stage, str) and stage in CASE_STAGES:
+                case["stage"] = stage
         if cleanup_error is not None:
             case["cleanup_failed"] = True
         if primary is not None and cleanup_error is not None:

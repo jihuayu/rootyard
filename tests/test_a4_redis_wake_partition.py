@@ -185,6 +185,43 @@ class ReportTest(unittest.TestCase):
                     self.assertEqual(report["cases"], [dict(name=a4.CASE, status="failed", error=stage)])
                 harness.cleanup.assert_called_once()
 
+    def test_case_failure_reports_selected_fixed_stage_only(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private repo id url oid")
+        harness.case_stage = "healthy_push"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case", stage="healthy_push",
+        )])
+        self.assertNotIn("private", repr(report))
+
+    def test_case_failure_rejects_unknown_or_missing_stage(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private repo id url oid")
+        for stage in (None, "private/repo/url", ["healthy_push"], 7):
+            with self.subTest(stage=stage):
+                harness.case_stage = stage
+                report = a4.acceptance_report(self.args)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["cases"], [dict(
+                    name=a4.CASE, status="failed", error="case",
+                )])
+                self.assertNotIn("private", repr(report))
+
+    def test_passing_case_does_not_emit_stage(self):
+        harness = self.factory.return_value
+        harness.run_case.return_value = {"healthy_wake_before_poll": True}
+        harness.case_stage = "healthy_push"
+        report = a4.acceptance_report(self.args)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE,
+            status="passed",
+            detail={"healthy_wake_before_poll": True, "owned_cleanup_completed": True},
+        )])
+        self.assertNotIn("stage", repr(report["cases"]))
+
     def test_primary_failure_precedes_cleanup_failure_but_records_it(self):
         harness = self.factory.return_value
         harness.run_case.side_effect = RuntimeError("primary case failure")
@@ -222,6 +259,26 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(report["kind"], a4.REPORT_KIND)
         self.assertNotIn("trace", report)
         self.assertNotIn("fixture-specific", repr(report))
+
+
+class CaseStageTest(unittest.TestCase):
+    def test_real_run_case_tracks_last_top_level_stage(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.case_stage = None
+        harness.base = "http://fixture"
+        harness.root = Path("/tmp/a4-stage")
+        harness.alice = object()
+        harness.create = Mock(return_value=({"id": "repo", "clone_path": "/repo"}, None))
+        harness.empty_clone = Mock()
+        harness.configure = Mock()
+        harness.commit_and_push = Mock(return_value=("a" * 40, "op", None))
+        harness.assert_ref = Mock()
+        harness.assert_no_embedded_delivery = Mock()
+        harness.start_external_worker = Mock(return_value=0.0)
+        harness.healthy_push = Mock(side_effect=RuntimeError("private detail"))
+        with self.assertRaisesRegex(RuntimeError, "private detail"):
+            harness.run_case()
+        self.assertEqual(harness.case_stage, "healthy_push")
 
 
 class PreflightTest(unittest.TestCase):

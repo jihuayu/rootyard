@@ -6,11 +6,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests"))
+import a4_redis_wake_partition as a4
+
 WORKFLOW = ROOT / ".github" / "workflows" / "a4-redis-wake-external-native.yml"
 
 
@@ -44,6 +48,8 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         exec(compile(workflow_phase_prefix(), str(WORKFLOW), "exec"), namespace)
         self.phase = namespace["installer_phase"]
         self.complete = namespace["installer_complete"]
+        self.case_evidence = namespace["case_evidence"]
+        self.case_stages = namespace["CASE_STAGES"]
         self.phase_path = self.runner / "a4" / "native-tools-phase.json"
         self.wrapper_sha = hashlib.sha256(
             (self.workspace / "scripts" / "install_ci_native_tools.sh").read_bytes()
@@ -167,6 +173,34 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         self.assertIn("phase_complete = installer_complete(phase)", text)
         self.assertIn("elif phase_only:", text)
         self.assertIn('stage = "installer_phase"', text)
+
+    def test_failed_case_evidence_uses_only_whitelisted_stages(self):
+        self.assertEqual(self.case_stages, set(a4.CASE_STAGES))
+        observations = {"owned_cleanup_completed": True}
+        passed = self.case_evidence(
+            {"name": a4.CASE, "status": "passed", "stage": "healthy_push"}, observations
+        )
+        self.assertNotIn("stage", passed)
+        unrelated = self.case_evidence({"name": "other", "status": "skipped"}, observations)
+        self.assertNotIn("stage", unrelated)
+        failed = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "healthy_push"}, observations
+        )
+        self.assertEqual(failed["stage"], "healthy_push")
+        missing = self.case_evidence({"name": a4.CASE, "status": "failed"}, observations)
+        self.assertEqual(missing["stage"], "unavailable")
+        for bad_stage in ("private/repo/url", "", 7, ["healthy_push"], {"stage": "healthy_push"}):
+            with self.subTest(stage=bad_stage):
+                rejected = self.case_evidence(
+                    {"name": a4.CASE, "status": "failed", "stage": bad_stage}, observations
+                )
+                self.assertEqual(rejected["stage"], "unavailable")
+                self.assertNotIn("private", repr(rejected))
+
+    def test_evidence_payload_uses_case_evidence_projection(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('"case": case_evidence(case, observations)', text)
+
 
 
 if __name__ == "__main__":
