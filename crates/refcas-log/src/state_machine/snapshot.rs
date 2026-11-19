@@ -1,19 +1,22 @@
 use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::{self, Cursor, Write};
-use std::path::{Path, PathBuf};
+use std::io::Cursor;
+use std::path::Path;
 
-use openraft::{BasicNode, LogId, Snapshot, SnapshotMeta, StoredMembership};
+use openraft::{BasicNode, Snapshot, SnapshotMeta};
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::fault::{FaultController, FaultPoint};
+use crate::fault::FaultPoint;
 use crate::fixture::verify_same_device;
-use crate::state_machine::codec::{
-    MAX_KV_KEY_BYTES, MAX_KV_VAL_BYTES, hex_encode, is_valid_sha256_hex, sm_kv_checksum, validate_digest_and_boundary,
+use crate::state_machine::app::ApplicationStateMachine;
+use crate::state_machine::app_store::write_app_row;
+use crate::state_machine::codec::{MAX_KV_KEY_BYTES, MAX_KV_VAL_BYTES, hex_encode, sm_kv_checksum};
+use crate::state_machine::snapshot_app::{
+    ApplicationSnapshotEnvelope, SNAPSHOT_FORMAT_APP, build_application_body, restore_application_body,
+};
+use crate::state_machine::snapshot_stage::{
+    StageSpec, commit_staged_snapshot, stage_and_sync_file, validate_safe_filename,
 };
 use crate::state_machine::store::{
     K_APPLIED_COUNT, K_LAST_APPLIED, K_LAST_MEMBERSHIP, K_SNAP_BASE_BOUNDARY_DIGEST, K_SNAP_BASE_LOG_ID,
@@ -21,7 +24,9 @@ use crate::state_machine::store::{
 };
 use crate::{E, LogTypeConfig, Res, get_meta, idx_to_i64, je, meta, set_meta};
 
-pub(crate) const SNAPSHOT_FORMAT: &str = "rootyard-refcas-snapshot/1";
+use crate::state_machine::snapshot_v1::SNAPSHOT_FORMAT;
+pub use crate::state_machine::snapshot_v1::SnapshotEnvelope;
+
 pub(crate) const SNAPSHOTS_DIR: &str = "snapshots";
 pub(crate) const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -30,180 +35,41 @@ pub(crate) const K_ACTIVE_SNAP_SHA256: &str = "active_snapshot_sha256";
 pub(crate) const K_ACTIVE_SNAP_META: &str = "active_snapshot_meta";
 pub(crate) const K_SNAP_GEN: &str = "snapshot_generation";
 
-/// Self-verifying persisted snapshot payload transferred across Raft nodes and stored on disk.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SnapshotEnvelope {
-    pub format: String,
-    pub node_id: u64,
-    pub generation: u64,
-    pub meta: SnapshotMeta<u64, BasicNode>,
-    pub last_applied: Option<LogId<u64>>,
-    pub last_membership: StoredMembership<u64, BasicNode>,
-    pub state_digest_hex: String,
-    pub applied_count: u64,
-    pub boundary_entry_digest_hex: Option<String>,
-    pub kv: BTreeMap<String, String>,
-    pub payload_sha256_hex: String,
+/// Parsed snapshot format selected by the canonical `format` marker.
+enum DecodedSnapshot {
+    Legacy(SnapshotEnvelope),
+    Application(ApplicationSnapshotEnvelope),
 }
 
-impl SnapshotEnvelope {
-    /// Computes canonical SHA-256 digest over all payload fields (excluding `payload_sha256_hex`).
-    pub fn compute_payload_sha256(&self) -> Res<String> {
-        let mut copy = self.clone();
-        copy.payload_sha256_hex.clear();
-        let bytes = serde_json::to_vec(&copy).map_err(|e| E::Codec(format!("snapshot digest encode: {e}")))?;
-        Ok(hex_encode(&Sha256::digest(&bytes)))
-    }
+#[derive(Deserialize)]
+struct FormatProbe {
+    format: String,
+}
 
-    /// Verifies format marker, internal digest/boundary formats, embedded digest, and metadata consistency.
-    pub fn verify_integrity(&self) -> Res<()> {
-        if self.format != SNAPSHOT_FORMAT {
-            return Err(E::Refused(format!("unknown snapshot format {:?}; expected {SNAPSHOT_FORMAT}", self.format)));
+fn decode_snapshot(raw: &[u8]) -> Res<DecodedSnapshot> {
+    let probe: FormatProbe =
+        serde_json::from_slice(raw).map_err(|e| E::Codec(format!("corrupt snapshot envelope: {e}")))?;
+    match probe.format.as_str() {
+        SNAPSHOT_FORMAT => {
+            let envelope: SnapshotEnvelope =
+                serde_json::from_slice(raw).map_err(|e| E::Codec(format!("corrupt legacy snapshot: {e}")))?;
+            Ok(DecodedSnapshot::Legacy(envelope))
         }
-        if self.last_applied != self.meta.last_log_id {
-            return Err(E::Refused("snapshot envelope last_applied mismatches meta.last_log_id".into()));
+        SNAPSHOT_FORMAT_APP => {
+            let envelope: ApplicationSnapshotEnvelope =
+                serde_json::from_slice(raw).map_err(|e| E::Codec(format!("corrupt application snapshot: {e}")))?;
+            Ok(DecodedSnapshot::Application(envelope))
         }
-        if self.last_membership != self.meta.last_membership {
-            return Err(E::Refused("snapshot envelope membership mismatches meta.last_membership".into()));
-        }
-        validate_digest_and_boundary(
-            &self.state_digest_hex,
-            self.last_applied.as_ref(),
-            self.boundary_entry_digest_hex.as_deref(),
-        )?;
-        if !is_valid_sha256_hex(&self.payload_sha256_hex) {
-            return Err(E::Codec("invalid snapshot payload_sha256_hex format".into()));
-        }
-        let expected = self.compute_payload_sha256()?;
-        if expected != self.payload_sha256_hex {
-            return Err(E::Codec(format!(
-                "snapshot payload checksum mismatch: expected {}, got {}",
-                expected, self.payload_sha256_hex
-            )));
-        }
-        Ok(())
+        other => Err(E::Refused(format!("unknown snapshot format marker {other:?}"))),
     }
 }
 
-struct StagingCleanupGuard {
-    path: Option<PathBuf>,
-}
-
-impl StagingCleanupGuard {
-    fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for StagingCleanupGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.path.take() {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-struct StageSpec<'a> {
-    snapshots_dir: &'a Path,
-    store_dir: &'a Path,
-    pending_name: &'a str,
-    final_name: &'a str,
-    write_point: FaultPoint,
-    sync_point: FaultPoint,
-}
-
-fn stage_and_sync_file(
-    spec: &StageSpec<'_>,
-    bytes: &[u8],
-    fault: &FaultController,
-) -> Res<(PathBuf, StagingCleanupGuard)> {
-    std::fs::create_dir_all(spec.snapshots_dir)?;
-    let pending_path = spec.snapshots_dir.join(spec.pending_name);
-    let final_path = spec.snapshots_dir.join(spec.final_name);
-    let mut guard = StagingCleanupGuard { path: Some(pending_path.clone()) };
-
-    fault.check(spec.write_point)?;
-    {
-        let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&pending_path)?;
-        f.write_all(bytes)?;
-        f.flush()?;
-        fault.check(spec.sync_point)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&pending_path, &final_path)?;
-    guard.path = Some(final_path.clone());
-    sync_dir(spec.snapshots_dir)?;
-    verify_same_device(spec.store_dir, &final_path)?;
-    Ok((final_path, guard))
-}
-
-fn validate_safe_filename(name: &str) -> Res<()> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(E::Refused(format!("invalid snapshot filename {name:?}")));
-    }
-    Ok(())
-}
-
-fn cleanup_candidate_after_commit_err(conn: &Connection, snapshots_dir: &Path, final_name: &str) {
-    // Only unlink the candidate if committed SQLite state proves another (or no) file is active.
-    if let Ok(active) = get_meta(conn, K_ACTIVE_SNAP_FILE)
-        && active.as_deref() != Some(final_name)
-    {
-        let _ = std::fs::remove_file(snapshots_dir.join(final_name));
-    }
-}
-
-fn commit_staged_snapshot(
-    inner: &mut SmInner,
-    snapshots_dir: &Path,
-    final_name: &str,
-    mut guard: StagingCleanupGuard,
-    post_commit_point: Option<FaultPoint>,
-    populate: impl FnOnce(&rusqlite::Transaction<'_>) -> Res<()>,
+pub(crate) fn verify_on_open(
+    conn: &Connection,
+    store_dir: &Path,
+    _node_id: u64,
+    app: Option<&dyn ApplicationStateMachine>,
 ) -> Res<()> {
-    let fault = inner.fault.clone();
-    let tx = inner.tx()?;
-    populate(&tx)?;
-    // Disarm unconditional StagingCleanupGuard before SQLite COMMIT: if COMMIT fails after the
-    // commit point (e.g. IOERR_DIR_FSYNC), active metadata may already reference `final_name`.
-    guard.disarm();
-    if let Err(err) = tx.commit() {
-        cleanup_candidate_after_commit_err(&inner.conn, snapshots_dir, final_name);
-        return Err(err.into());
-    }
-    if let Some(point) = post_commit_point {
-        fault.check(point)?;
-    }
-    sweep_old_snapshots(snapshots_dir, final_name);
-    Ok(())
-}
-
-fn sweep_old_snapshots(snapshots_dir: &Path, keep_name: &str) {
-    let Ok(entries) = std::fs::read_dir(snapshots_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else { continue };
-        if name_str != keep_name && (name_str.starts_with("snap-") || name_str.starts_with("pending-")) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-    let _ = sync_dir(snapshots_dir);
-}
-
-pub(crate) fn verify_on_open(conn: &Connection, store_dir: &Path, _node_id: u64) -> Res<()> {
     let fname = get_meta(conn, K_ACTIVE_SNAP_FILE)?;
     let expected_sha = get_meta(conn, K_ACTIVE_SNAP_SHA256)?;
     let expected_meta: Option<SnapshotMeta<u64, BasicNode>> = meta(conn, K_ACTIVE_SNAP_META)?;
@@ -231,11 +97,39 @@ pub(crate) fn verify_on_open(conn: &Connection, store_dir: &Path, _node_id: u64)
                     snap_path.display()
                 )));
             }
-            let envelope: SnapshotEnvelope = serde_json::from_slice(&raw)
-                .map_err(|e| E::Codec(format!("corrupt active snapshot {}: {e}", snap_path.display())))?;
-            envelope.verify_integrity()?;
-            if envelope.meta != snap_meta {
-                return Err(E::Refused("active snapshot file metadata mismatches sqlite metadata".into()));
+            let mut snapshot_app_digest: Option<String> = None;
+            match decode_snapshot(&raw)? {
+                DecodedSnapshot::Legacy(envelope) => {
+                    if app.is_some() {
+                        return Err(E::Refused(
+                            "active snapshot is legacy KV format but state machine is in application mode".into(),
+                        ));
+                    }
+                    envelope.verify_integrity()?;
+                    if envelope.meta != snap_meta {
+                        return Err(E::Refused("active snapshot file metadata mismatches sqlite metadata".into()));
+                    }
+                }
+                DecodedSnapshot::Application(envelope) => {
+                    let Some(app) = app else {
+                        return Err(E::Refused(
+                            "active snapshot is application format but state machine is in KV mode".into(),
+                        ));
+                    };
+                    envelope.verify_integrity()?;
+                    if envelope.meta != snap_meta {
+                        return Err(E::Refused(
+                            "active application snapshot metadata mismatches sqlite metadata".into(),
+                        ));
+                    }
+                    let mut staged = app.clone_box();
+                    restore_application_body(&envelope.app, staged.as_mut(), snap_meta.last_log_id)?;
+                    snapshot_app_digest = Some(
+                        staged
+                            .state_digest_hex()
+                            .map_err(|e| E::Refused(format!("active snapshot reducer digest refused: {e}")))?,
+                    );
+                }
             }
             let (last_applied, _) = read_applied_state(conn)?;
             if last_applied < snap_meta.last_log_id {
@@ -243,6 +137,18 @@ pub(crate) fn verify_on_open(conn: &Connection, store_dir: &Path, _node_id: u64)
                     "sqlite last_applied {last_applied:?} precedes active snapshot {:?}",
                     snap_meta.last_log_id
                 )));
+            }
+            if let (Some(snapshot_digest), Some(app)) = (snapshot_app_digest, app)
+                && snap_meta.last_log_id == last_applied
+            {
+                let live_digest =
+                    app.state_digest_hex().map_err(|e| E::Refused(format!("live application digest refused: {e}")))?;
+                if snapshot_digest != live_digest {
+                    return Err(E::Refused(
+                        "active application snapshot digest differs from live state at the same applied coordinate"
+                            .into(),
+                    ));
+                }
             }
             Ok(())
         }
@@ -255,7 +161,6 @@ pub(crate) fn build_snapshot_blocking(inner: &mut SmInner) -> Res<Snapshot<LogTy
     let state_digest_hex = get_meta(&inner.conn, K_STATE_DIGEST)?.unwrap_or_else(|| ZERO_DIGEST_HEX.to_owned());
     let applied_count: u64 = meta(&inner.conn, K_APPLIED_COUNT)?.unwrap_or(0);
     let boundary_entry_digest_hex = read_boundary_entry_digest_hex(&inner.conn, last_applied)?;
-    let kv = read_kv_map(&inner.conn)?;
     let cur_gen: u64 = meta(&inner.conn, K_SNAP_GEN)?.unwrap_or(0);
     let next_gen = cur_gen.saturating_add(1);
 
@@ -265,22 +170,50 @@ pub(crate) fn build_snapshot_blocking(inner: &mut SmInner) -> Res<Snapshot<LogTy
     };
     let snap_meta = SnapshotMeta { last_log_id: last_applied, last_membership: last_membership.clone(), snapshot_id };
 
-    let mut envelope = SnapshotEnvelope {
-        format: SNAPSHOT_FORMAT.to_owned(),
-        node_id: inner.node_id,
-        generation: next_gen,
-        meta: snap_meta.clone(),
-        last_applied,
-        last_membership,
-        state_digest_hex,
-        applied_count,
-        boundary_entry_digest_hex,
-        kv,
-        payload_sha256_hex: String::new(),
+    let bytes = if let Some(app) = inner.app.as_ref() {
+        let body = build_application_body(app.as_ref(), last_applied)?;
+        let mut envelope = ApplicationSnapshotEnvelope {
+            format: SNAPSHOT_FORMAT_APP.to_owned(),
+            node_id: inner.node_id,
+            generation: next_gen,
+            meta: snap_meta.clone(),
+            last_applied,
+            last_membership,
+            state_digest_hex,
+            applied_count,
+            boundary_entry_digest_hex,
+            kv: BTreeMap::new(),
+            app: body,
+            payload_sha256_hex: String::new(),
+        };
+        envelope.payload_sha256_hex = envelope.compute_payload_sha256()?;
+        serde_json::to_vec(&envelope).map_err(|e| E::Codec(format!("encode application snapshot: {e}")))?
+    } else {
+        let mut envelope = SnapshotEnvelope {
+            format: SNAPSHOT_FORMAT.to_owned(),
+            node_id: inner.node_id,
+            generation: next_gen,
+            meta: snap_meta.clone(),
+            last_applied,
+            last_membership,
+            state_digest_hex,
+            applied_count,
+            boundary_entry_digest_hex,
+            kv: read_kv_map(&inner.conn)?,
+            payload_sha256_hex: String::new(),
+        };
+        envelope.payload_sha256_hex = envelope.compute_payload_sha256()?;
+        serde_json::to_vec(&envelope).map_err(|e| E::Codec(format!("encode snapshot: {e}")))?
     };
-    envelope.payload_sha256_hex = envelope.compute_payload_sha256()?;
+    finish_snapshot_build(inner, snap_meta, bytes, next_gen)
+}
 
-    let bytes = serde_json::to_vec(&envelope).map_err(|e| E::Codec(format!("encode snapshot: {e}")))?;
+fn finish_snapshot_build(
+    inner: &mut SmInner,
+    snap_meta: SnapshotMeta<u64, BasicNode>,
+    bytes: Vec<u8>,
+    next_gen: u64,
+) -> Res<Snapshot<LogTypeConfig>> {
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(E::Refused("serialized snapshot exceeds byte ceiling".into()));
     }
@@ -328,8 +261,21 @@ pub(crate) fn install_snapshot_blocking(
     if raw.len() > MAX_SNAPSHOT_BYTES {
         return Err(E::Refused("incoming snapshot exceeds byte ceiling".into()));
     }
-    let envelope: SnapshotEnvelope =
-        serde_json::from_slice(&raw).map_err(|e| E::Codec(format!("decode incoming snapshot: {e}")))?;
+    match decode_snapshot(&raw)? {
+        DecodedSnapshot::Legacy(envelope) => install_legacy_snapshot(inner, snap_meta, raw, envelope),
+        DecodedSnapshot::Application(envelope) => install_application_snapshot(inner, snap_meta, raw, envelope),
+    }
+}
+
+fn install_legacy_snapshot(
+    inner: &mut SmInner,
+    snap_meta: SnapshotMeta<u64, BasicNode>,
+    raw: Vec<u8>,
+    envelope: SnapshotEnvelope,
+) -> Res<()> {
+    if inner.app.is_some() {
+        return Err(E::Refused("application mode refuses a legacy KV snapshot; no empty/KV fallback".into()));
+    }
     envelope.verify_integrity()?;
     if envelope.meta != snap_meta {
         return Err(E::Refused("incoming snapshot envelope metadata does not match RPC meta".into()));
@@ -438,6 +384,115 @@ pub(crate) fn install_snapshot_blocking(
     Ok(())
 }
 
+fn install_application_snapshot(
+    inner: &mut SmInner,
+    snap_meta: SnapshotMeta<u64, BasicNode>,
+    raw: Vec<u8>,
+    envelope: ApplicationSnapshotEnvelope,
+) -> Res<()> {
+    let Some(live_app) = inner.app.as_ref() else {
+        return Err(E::Refused("KV mode refuses an application snapshot; no local/KV fallback".into()));
+    };
+    envelope.verify_integrity()?;
+    if envelope.meta != snap_meta {
+        return Err(E::Refused("incoming application snapshot metadata does not match RPC meta".into()));
+    }
+    let mut staged = live_app.clone_box();
+    restore_application_body(&envelope.app, staged.as_mut(), snap_meta.last_log_id)?;
+    let file_sha = hex_encode(&Sha256::digest(&raw));
+
+    let (cur_applied, cur_membership) = read_applied_state(&inner.conn)?;
+    let cur_state_digest = get_meta(&inner.conn, K_STATE_DIGEST)?.unwrap_or_else(|| ZERO_DIGEST_HEX.to_owned());
+    let cur_applied_count: u64 = meta(&inner.conn, K_APPLIED_COUNT)?.unwrap_or(0);
+    let cur_app_digest = crate::state_machine::app_store::read_app_row(&inner.conn)?.map(|row| row.state_digest_hex);
+    let cur_active_file = get_meta(&inner.conn, K_ACTIVE_SNAP_FILE)?;
+    let cur_active_sha = get_meta(&inner.conn, K_ACTIVE_SNAP_SHA256)?;
+    let cur_active_meta: Option<SnapshotMeta<u64, BasicNode>> = meta(&inner.conn, K_ACTIVE_SNAP_META)?;
+    let cur_gen: u64 = meta(&inner.conn, K_SNAP_GEN)?.unwrap_or(0);
+
+    if cur_active_meta.as_ref() == Some(&snap_meta) {
+        let same_sha = cur_active_sha.as_deref() == Some(file_sha.as_str());
+        let same_digest = cur_state_digest == envelope.state_digest_hex
+            && cur_app_digest.as_deref() == Some(envelope.app.state_digest_hex.as_str());
+        let same_file = cur_active_file.as_ref().is_some_and(|f| {
+            std::fs::read(inner.dir.join(SNAPSHOTS_DIR).join(f))
+                .map(|b| hex_encode(&Sha256::digest(&b)) == file_sha)
+                .unwrap_or(false)
+        });
+        if same_sha && same_digest && same_file {
+            return Ok(());
+        }
+        return Err(E::Refused("conflicting application snapshot replay for already-installed snapshot_id".into()));
+    }
+
+    if snap_meta.last_log_id < cur_applied {
+        return Err(E::Refused(format!(
+            "refusing regressive application snapshot {:?} older than applied state {:?}",
+            snap_meta.last_log_id, cur_applied
+        )));
+    }
+    if cur_applied.is_some()
+        && snap_meta.last_log_id == cur_applied
+        && (envelope.state_digest_hex != cur_state_digest
+            || envelope.last_membership != cur_membership
+            || envelope.applied_count != cur_applied_count
+            || cur_app_digest.as_deref() != Some(envelope.app.state_digest_hex.as_str()))
+    {
+        return Err(E::Refused("conflicting application snapshot state at equal last_applied log id".into()));
+    }
+
+    let next_gen = cur_gen.saturating_add(1);
+    let final_name = format!("snap-{next_gen:08}-{}.snap", &file_sha[..12]);
+    let snapshots_dir = inner.dir.join(SNAPSHOTS_DIR);
+    let store_dir = inner.dir.clone();
+    let fault = inner.fault.clone();
+
+    let pending_name = format!("pending-install-{next_gen}.snap");
+    let spec = StageSpec {
+        snapshots_dir: &snapshots_dir,
+        store_dir: &store_dir,
+        pending_name: &pending_name,
+        final_name: &final_name,
+        write_point: FaultPoint::SnapshotInstallWriteEnospc,
+        sync_point: FaultPoint::SnapshotInstallStageSync,
+    };
+    let (_final_path, guard) = stage_and_sync_file(&spec, &raw, &fault)?;
+
+    fault.pause_install_if_armed();
+
+    let meta_json = je(&snap_meta)?;
+    let last_json = snap_meta.last_log_id.as_ref().map(je).transpose()?;
+    let mem_json = je(&snap_meta.last_membership)?;
+    let install_fault = fault.clone();
+    commit_staged_snapshot(
+        inner,
+        &snapshots_dir,
+        &final_name,
+        guard,
+        Some(FaultPoint::SnapshotInstallPostCommitSync),
+        |tx| {
+            tx.execute("DELETE FROM sm_kv", [])?;
+            tx.execute("DELETE FROM sm_entries", [])?;
+            write_app_row(tx, staged.as_ref(), snap_meta.last_log_id)?;
+            set_meta(tx, K_LAST_APPLIED, last_json.as_deref())?;
+            set_meta(tx, K_LAST_MEMBERSHIP, Some(&mem_json))?;
+            set_meta(tx, K_STATE_DIGEST, Some(&envelope.state_digest_hex))?;
+            set_meta(tx, K_APPLIED_COUNT, Some(&envelope.applied_count.to_string()))?;
+            set_meta(tx, K_SNAP_BASE_LOG_ID, last_json.as_deref())?;
+            set_meta(tx, K_SNAP_BASE_BOUNDARY_DIGEST, envelope.boundary_entry_digest_hex.as_deref())?;
+            set_meta(tx, K_ACTIVE_SNAP_FILE, Some(&final_name))?;
+            set_meta(tx, K_ACTIVE_SNAP_SHA256, Some(&file_sha))?;
+            set_meta(tx, K_ACTIVE_SNAP_META, Some(&meta_json))?;
+            set_meta(tx, K_SNAP_GEN, Some(&next_gen.to_string()))?;
+
+            install_fault.check(FaultPoint::SnapshotInstallCommitSync)?;
+            Ok(())
+        },
+    )?;
+    inner.app = Some(staged);
+    Ok(())
+}
+
 pub(crate) fn read_current_snapshot_blocking(inner: &SmInner) -> Res<Option<Snapshot<LogTypeConfig>>> {
     let fname = get_meta(&inner.conn, K_ACTIVE_SNAP_FILE)?;
     let sha = get_meta(&inner.conn, K_ACTIVE_SNAP_SHA256)?;
@@ -455,42 +510,35 @@ pub(crate) fn read_current_snapshot_blocking(inner: &SmInner) -> Res<Option<Snap
             if hex_encode(&Sha256::digest(&raw)) != expected_sha {
                 return Err(E::Codec("stored active snapshot sha256 mismatch on read".into()));
             }
-            let envelope: SnapshotEnvelope = serde_json::from_slice(&raw)
-                .map_err(|e| E::Codec(format!("corrupt stored active snapshot on read: {e}")))?;
-            envelope.verify_integrity()?;
-            if envelope.meta != snap_meta {
-                return Err(E::Refused("stored active snapshot meta mismatch on read".into()));
+            match decode_snapshot(&raw)? {
+                DecodedSnapshot::Legacy(envelope) => {
+                    if inner.app.is_some() {
+                        return Err(E::Refused(
+                            "stored active snapshot is legacy KV format but state machine is in application mode"
+                                .into(),
+                        ));
+                    }
+                    envelope.verify_integrity()?;
+                    if envelope.meta != snap_meta {
+                        return Err(E::Refused("stored active snapshot meta mismatch on read".into()));
+                    }
+                }
+                DecodedSnapshot::Application(envelope) => {
+                    let Some(app) = inner.app.as_ref() else {
+                        return Err(E::Refused(
+                            "stored active snapshot is application format but state machine is in KV mode".into(),
+                        ));
+                    };
+                    envelope.verify_integrity()?;
+                    if envelope.meta != snap_meta {
+                        return Err(E::Refused("stored active application snapshot meta mismatch on read".into()));
+                    }
+                    let mut staged = app.clone_box();
+                    restore_application_body(&envelope.app, staged.as_mut(), snap_meta.last_log_id)?;
+                }
             }
             Ok(Some(Snapshot { meta: snap_meta, snapshot: Box::new(Cursor::new(raw)) }))
         }
         _ => Err(E::Refused("inconsistent active snapshot metadata markers on read".into())),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::META_SCHEMA;
-
-    #[test]
-    fn commit_err_cleanup_only_deletes_unreferenced_candidate() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_dir = dir.path().join(SNAPSHOTS_DIR);
-        std::fs::create_dir_all(&snap_dir).unwrap();
-        let old = snap_dir.join("snap-0001-old.snap");
-        let new_cand = snap_dir.join("snap-0002-new.snap");
-        std::fs::write(&old, b"old").unwrap();
-        std::fs::write(&new_cand, b"new").unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(META_SCHEMA).unwrap();
-
-        set_meta(&conn, K_ACTIVE_SNAP_FILE, Some("snap-0002-new.snap")).unwrap();
-        cleanup_candidate_after_commit_err(&conn, &snap_dir, "snap-0002-new.snap");
-        assert!(new_cand.exists(), "committed active candidate MUST be preserved after ambiguous commit error");
-
-        set_meta(&conn, K_ACTIVE_SNAP_FILE, Some("snap-0001-old.snap")).unwrap();
-        cleanup_candidate_after_commit_err(&conn, &snap_dir, "snap-0002-new.snap");
-        assert!(!new_cand.exists(), "proven-unreferenced candidate should be removed");
-        assert!(old.exists(), "prior active snapshot must stay intact");
     }
 }

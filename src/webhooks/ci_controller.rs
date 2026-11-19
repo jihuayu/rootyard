@@ -54,6 +54,32 @@ fn wait_queue_limit() -> usize {
         .clamp(1, 1024)
 }
 
+pub(crate) struct CheckoutSnapshot {
+    pub source: Option<String>,
+    pub availability: AvailabilitySummary,
+}
+
+/// One statement snapshot for eligibility, capacity, winner, and origin budget.
+/// `now_epoch` preserves prior heartbeat/second and lease/fractional comparisons.
+const CHECKOUT_SNAPSHOT_SQL: &str = "\
+WITH now_fact AS MATERIALIZED (SELECT extract(epoch FROM statement_timestamp()) AS now_epoch), \
+lease_counts AS MATERIALIZED (SELECT c.source_url,count(*) AS active_leases FROM ci_runs c CROSS JOIN now_fact \
+  WHERE c.state='leased' AND c.source_url IS NOT NULL AND c.lease_expires_unix>now_fact.now_epoch GROUP BY c.source_url), \
+mirror_facts AS MATERIALIZED (SELECT m.url,m.mirror_id,m.heartbeat_unix,m.capacity,coalesce(l.active_leases,0) AS active_leases, \
+    (m.ready_oids ? $5) AS target_ready FROM ci_mirror_nodes m CROSS JOIN now_fact LEFT JOIN lease_counts l ON l.source_url=m.url \
+  WHERE m.repository_id=$1 AND m.storage_generation=$2 AND m.active=true AND m.url<>'origin' AND m.audience=$3 \
+    AND m.heartbeat_unix>now_fact.now_epoch::bigint-$4 AND NOT (m.url = ANY($6::text[]))), \
+eligible AS MATERIALIZED (SELECT * FROM mirror_facts WHERE target_ready AND active_leases<capacity), \
+winner AS MATERIALIZED (SELECT url FROM eligible WHERE $7::boolean \
+  ORDER BY active_leases ASC,(capacity-active_leases) DESC,heartbeat_unix DESC,mirror_id ASC LIMIT 1), \
+origin_counts AS MATERIALIZED (SELECT count(*) AS global_active,count(*) FILTER (WHERE c.repository_id=$1) AS per_repo_active \
+  FROM ci_runs c CROSS JOIN now_fact WHERE c.state='leased' AND c.source_url='origin' AND c.lease_expires_unix>now_fact.now_epoch) \
+SELECT (SELECT count(*) FROM eligible) AS ready_avail, \
+  (SELECT count(*) FROM mirror_facts WHERE target_ready) AS ready_total, \
+  (SELECT count(*) FROM mirror_facts WHERE NOT target_ready) AS healthy_unready, \
+  (SELECT url FROM winner) AS selected_url,o.global_active AS origin_global,o.per_repo_active AS origin_repo \
+FROM origin_counts o";
+
 pub(crate) async fn select_ready_mirror(
     client: &(impl GenericClient + Sync),
     repo_id: Uuid,
@@ -61,26 +87,38 @@ pub(crate) async fn select_ready_mirror(
     audience: Uuid,
     head_oid: &str,
     excluded: &[String],
-) -> Result<Option<String>, Error> {
+    select_winner: bool,
+) -> Result<CheckoutSnapshot, Error> {
     let row = client
-        .query_opt(
-            "SELECT m.url FROM ci_mirror_nodes m \
-             WHERE m.repository_id=$1 AND m.storage_generation=$2 AND m.audience=$3 \
-               AND m.active=true AND m.url<>'origin' \
-               AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
-               AND m.ready_oids ? $5 AND NOT (m.url = ANY($6::text[])) \
-               AND (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
-                 AND c.source_url=m.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) < m.capacity \
-             ORDER BY (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
-                 AND c.source_url=m.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) ASC, \
-               (m.capacity - (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
-                 AND c.source_url=m.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()))) DESC, \
-               m.heartbeat_unix DESC, m.mirror_id ASC LIMIT 1",
-            &[&repo_id, &storage_generation, &audience, &MIRROR_HEARTBEAT_TTL_SECS, &head_oid, &excluded],
+        .query_one(
+            CHECKOUT_SNAPSHOT_SQL,
+            &[
+                &repo_id,
+                &storage_generation,
+                &audience,
+                &MIRROR_HEARTBEAT_TTL_SECS,
+                &head_oid,
+                &excluded,
+                &select_winner,
+            ],
         )
         .await
         .map_err(Error::internal)?;
-    Ok(row.map(|r| r.get(0)))
+    let (global_limit, per_repo_limit) = origin_fallback_limits();
+    Ok(CheckoutSnapshot {
+        source: row.get("selected_url"),
+        availability: AvailabilitySummary {
+            ready_available_mirrors: row.get::<_, i64>("ready_avail").max(0) as usize,
+            ready_total_mirrors: row.get::<_, i64>("ready_total").max(0) as usize,
+            healthy_unready_mirrors: row.get::<_, i64>("healthy_unready").max(0) as usize,
+            origin_budget: OriginBudgetStatus {
+                global_active: row.get("origin_global"),
+                global_limit,
+                per_repo_active: row.get("origin_repo"),
+                per_repo_limit,
+            },
+        },
+    })
 }
 
 pub(crate) async fn probe_availability(
@@ -91,31 +129,10 @@ pub(crate) async fn probe_availability(
     head_oid: &str,
     excluded: &[String],
 ) -> Result<AvailabilitySummary, Error> {
-    let row = client
-        .query_one(
-            "SELECT \
-               count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
-                 AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
-                 AND m.ready_oids ? $5 AND NOT (m.url = ANY($6::text[])) \
-                 AND (SELECT count(*) FROM ci_runs c WHERE c.state='leased' AND c.source_url=m.url \
-                   AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) < m.capacity) AS ready_avail, \
-               count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
-                 AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
-                 AND m.ready_oids ? $5 AND NOT (m.url = ANY($6::text[]))) AS ready_total, \
-               count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
-                 AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
-                 AND NOT (m.ready_oids ? $5) AND NOT (m.url = ANY($6::text[]))) AS healthy_unready \
-             FROM ci_mirror_nodes m WHERE m.repository_id=$1 AND m.storage_generation=$2",
-            &[&repo_id, &storage_generation, &audience, &MIRROR_HEARTBEAT_TTL_SECS, &head_oid, &excluded],
-        )
-        .await
-        .map_err(Error::internal)?;
-    Ok(AvailabilitySummary {
-        ready_available_mirrors: row.get::<_, i64>("ready_avail").max(0) as usize,
-        ready_total_mirrors: row.get::<_, i64>("ready_total").max(0) as usize,
-        healthy_unready_mirrors: row.get::<_, i64>("healthy_unready").max(0) as usize,
-        origin_budget: query_origin_budget(client, repo_id).await?,
-    })
+    // Polling reads the same facts without sorting a winner it cannot use.
+    Ok(select_ready_mirror(client, repo_id, storage_generation, audience, head_oid, excluded, false)
+        .await?
+        .availability)
 }
 
 pub(crate) async fn query_origin_budget(
@@ -460,33 +477,5 @@ pub(crate) async fn reconcile_runs(state: &Arc<AppState>) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_mirror_url_rejects_origin_spoof_and_paths() {
-        assert_eq!(validate_mirror_url("origin").unwrap_err().0, StatusCode::BAD_REQUEST);
-        assert_eq!(validate_mirror_url("ORIGIN").unwrap_err().0, StatusCode::BAD_REQUEST);
-        assert_eq!(validate_mirror_url("https://mirror.example/sub").unwrap_err().0, StatusCode::BAD_REQUEST);
-        assert_eq!(validate_mirror_url("http://mirror.example").unwrap_err().0, StatusCode::BAD_REQUEST);
-        assert_eq!(validate_mirror_url("https://mirror.example").unwrap(), "https://mirror.example");
-        assert_eq!(validate_mirror_url("http://127.0.0.1:8080/").unwrap(), "http://127.0.0.1:8080");
-    }
-
-    #[test]
-    fn prewarm_allowlist_filters_invalid_and_rejects_source_token_reuse() {
-        let origins = parse_prewarm_origins(
-            "https://mirror1.example/, http://169.254.169.254, origin, https://mirror2.example:8443/sub, http://127.0.0.1:18101/",
-        );
-        assert_eq!(
-            origins,
-            BTreeSet::from(["http://127.0.0.1:18101".to_owned(), "https://mirror1.example".to_owned()])
-        );
-        assert_eq!(validate_prewarm_token(Some("ryt_same"), Some("ryt_same")), None);
-        assert_eq!(validate_prewarm_token(None, Some("ryt_source_secret")), None);
-        assert_eq!(
-            validate_prewarm_token(Some("ryt_prewarm_scoped"), Some("ryt_source_secret")).as_deref(),
-            Some("ryt_prewarm_scoped")
-        );
-    }
-}
+#[path = "ci_controller_tests.rs"]
+mod tests;
