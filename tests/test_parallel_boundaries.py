@@ -61,45 +61,59 @@ class ParallelBoundariesTest(unittest.TestCase):
             'tests/schema_baseline.py CURRENT_BLOB_BACKUP_FORMAT must track src/backup/catalog.rs FORMAT_PAIRED')
         self.assertNotEqual(current, paired, 'metadata and paired backup formats must be distinct')
 
-        # Formats 29 (metadata) and 30 (paired PG+Blob) alias one checked-in
-        # schema 151 catalog and freeze the <=151 SCHEMA_VERSIONS prefix. They
-        # must not drift to LATEST_PREFIX or consume the live runtime tail.
-        expected_fixtures = {
-            f'{schema_baseline.CURRENT_SCHEMA_VERSION:03d}_{name}.json'
-            for name in ('catalog', 'restored_catalog', 'upgraded_catalog')
-        }
-        expected_versions = (
-            'Ok(crate::db::SCHEMA_VERSIONS.iter().copied()'
-            f'.filter(|version| *version <= {schema_baseline.CURRENT_SCHEMA_VERSION}).collect())'
-        )
-        format_contracts = {}
-        for preserved in (current, paired):
+        # Keep the mutable current-format expectation, then separately pin the
+        # immutable schema151 contracts for formats 29 and 30 so a future
+        # tag/schema bump cannot drop coverage of the old mappings.
+        def source_contract(preserved, schema_version):
+            expected_fixtures = {
+                f'{schema_version:03d}_{name}.json'
+                for name in ('catalog', 'restored_catalog', 'upgraded_catalog')
+            }
+            expected_versions = (
+                'Ok(crate::db::SCHEMA_VERSIONS.iter().copied()'
+                f'.filter(|version| *version <= {schema_version}).collect())'
+            )
             arm = re.search(schema_baseline.backup_format_arm(preserved) + r' \[(.*?)\n\s*\],', catalog_rs, re.S)
             self.assertIsNotNone(arm, f'catalog arm for preserved format {preserved} missing')
             fixtures = set(re.findall(r'schema/([A-Za-z0-9_]+\.json)', arm.group(1)))
             self.assertEqual(
                 fixtures, expected_fixtures,
-                f'format {preserved} must freeze the schema {schema_baseline.CURRENT_SCHEMA_VERSION} catalogs')
+                f'format {preserved} must freeze the schema {schema_version} catalogs')
             self.assertRegex(
                 catalog_rs,
                 schema_baseline.backup_format_arm(preserved) + r'\s*' + re.escape(expected_versions),
                 f'format {preserved} must freeze the schema '
-                f'{schema_baseline.CURRENT_SCHEMA_VERSION} SCHEMA_VERSIONS prefix in order')
-            format_contracts[preserved] = frozenset(fixtures)
+                f'{schema_version} SCHEMA_VERSIONS prefix in order')
+            return frozenset(fixtures)
+
+        current_contracts = {
+            preserved: source_contract(preserved, schema_baseline.CURRENT_SCHEMA_VERSION)
+            for preserved in (current, paired)
+        }
         self.assertEqual(
-            format_contracts[current], format_contracts[paired],
+            current_contracts[current], current_contracts[paired],
             f'formats {current} and {paired} must share one schema '
             f'{schema_baseline.CURRENT_SCHEMA_VERSION} catalog contract')
+        frozen_contracts = {
+            preserved: source_contract(preserved, schema_version)
+            for preserved, schema_version in (
+                (29, schema_baseline.FROZEN_FORMAT29_SCHEMA_VERSION),
+                (30, schema_baseline.FROZEN_FORMAT30_SCHEMA_VERSION),
+            )
+        }
+        self.assertEqual(
+            frozen_contracts[29], frozen_contracts[30],
+            'formats 29 and 30 must share the immutable schema151 catalog contract')
 
         restore_rs = (ROOT / 'src/backup/restore.rs').read_text()
         legacy_formats = {
             int(format)
             for format in re.findall(r'allow_legacy_schema\w* \|\| manifest\.format == (\d+)', restore_rs)
         }
-        for preserved in (current, paired):
+        for preserved in {current, paired, 29, 30}:
             self.assertNotIn(
                 preserved, legacy_formats,
-                f'preserved current format {preserved} must stay rejected without a legacy schema opt-in')
+                f'preserved format {preserved} must stay rejected without a legacy schema opt-in')
 
     def test_backup_tables_match_schema_baseline(self):
         # The backup now consumes the frozen catalog directly. Native schema

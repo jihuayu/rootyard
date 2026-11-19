@@ -7003,19 +7003,19 @@ class SchemaBoundaryIntegrationFixture:
         if fmt == paired:
             raise AssertionError(f"backup metadata and paired formats must be distinct, both are {fmt}")
 
-        # Formats 29 (metadata) and 30 (paired PG+Blob) are aliases of the same
-        # checked-in schema 151 catalog and frozen <=151 SCHEMA_VERSIONS prefix.
-        # They must not drift to LATEST_PREFIX or consume the live runtime tail.
-        suffixes = ("catalog.json", "restored_catalog.json", "upgraded_catalog.json")
-        expected_includes = [
-            f"../../schema/{schema_baseline.CURRENT_SCHEMA_VERSION:03d}_{suffix}" for suffix in suffixes
-        ]
-        expected_versions = (
-            "Ok(crate::db::SCHEMA_VERSIONS.iter().copied()"
-            f".filter(|version| *version <= {schema_baseline.CURRENT_SCHEMA_VERSION}).collect())"
-        )
-        format_contracts = {}
-        for preserved in (fmt, paired):
+        # The current formats must alias the current schema catalog and prefix.
+        # Keep that mutable expectation, then separately pin the immutable
+        # schema151 contracts for formats 29 and 30 so a future tag/schema bump
+        # cannot drop coverage of the old mappings.
+        def source_contract(preserved: int, schema_version: int) -> tuple[str, ...]:
+            suffixes = ("catalog.json", "restored_catalog.json", "upgraded_catalog.json")
+            expected_includes = [
+                f"../../schema/{schema_version:03d}_{suffix}" for suffix in suffixes
+            ]
+            expected_versions = (
+                "Ok(crate::db::SCHEMA_VERSIONS.iter().copied()"
+                f".filter(|version| *version <= {schema_version}).collect())"
+            )
             arm_match = re.search(
                 schema_baseline.backup_format_arm(preserved) + r"\s*\[(.*?)\n\s*\],", catalog_src, re.DOTALL
             )
@@ -7025,20 +7025,38 @@ class SchemaBoundaryIntegrationFixture:
             if includes != expected_includes:
                 raise AssertionError(
                     f"backup format {preserved} must consume the schema "
-                    f"{schema_baseline.CURRENT_SCHEMA_VERSION} catalogs {expected_includes}, got {includes}"
+                    f"{schema_version} catalogs {expected_includes}, got {includes}"
                 )
             if not re.search(
                 schema_baseline.backup_format_arm(preserved) + r"\s*" + re.escape(expected_versions), catalog_src
             ):
                 raise AssertionError(
                     f"backup format {preserved} must freeze the schema "
-                    f"{schema_baseline.CURRENT_SCHEMA_VERSION} SCHEMA_VERSIONS prefix in order"
+                    f"{schema_version} SCHEMA_VERSIONS prefix in order"
                 )
-            format_contracts[preserved] = tuple(includes)
-        if format_contracts[fmt] != format_contracts[paired]:
+            return tuple(includes)
+
+        current_contracts = {
+            preserved: source_contract(preserved, schema_baseline.CURRENT_SCHEMA_VERSION)
+            for preserved in (fmt, paired)
+        }
+        if current_contracts[fmt] != current_contracts[paired]:
             raise AssertionError(
                 f"backup formats {fmt} and {paired} must share the identical schema "
                 f"{schema_baseline.CURRENT_SCHEMA_VERSION} catalog contract"
+            )
+        frozen_contracts = {
+            preserved: source_contract(preserved, schema_version)
+            for preserved, schema_version in (
+                (29, schema_baseline.FROZEN_FORMAT29_SCHEMA_VERSION),
+                (30, schema_baseline.FROZEN_FORMAT30_SCHEMA_VERSION),
+            )
+        }
+        if frozen_contracts[29] != frozen_contracts[30]:
+            raise AssertionError(
+                "backup formats 29 and 30 must share the immutable schema "
+                f"{schema_baseline.FROZEN_FORMAT29_SCHEMA_VERSION}/{schema_baseline.FROZEN_FORMAT30_SCHEMA_VERSION} "
+                "catalog contract"
             )
 
         # catalog::relations() is the single source of the locked relation list:
@@ -7091,7 +7109,7 @@ class SchemaBoundaryIntegrationFixture:
             if needle not in postgres_src:
                 raise AssertionError(f"src/backup/postgres.rs must verify catalog relation parity ({needle})")
 
-        catalog_file = (catalog_path.parent / expected_includes[0]).resolve()
+        catalog_file = (catalog_path.parent / current_contracts[fmt][0]).resolve()
         if not catalog_file.is_file():
             raise AssertionError(f"backup consumes missing catalog fixture {catalog_file}")
         catalog_json = json.loads(catalog_file.read_text(encoding="utf-8"))
