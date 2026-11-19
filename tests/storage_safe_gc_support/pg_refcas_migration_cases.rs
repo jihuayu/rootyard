@@ -211,6 +211,7 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
     ));
 
     // Step 3: the legacy volume is released, then a cold runtime must delete nothing at all.
+    let storage_root = state.storage.root.clone();
     drop(state);
     pool.get()
         .await?
@@ -228,14 +229,14 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
 
     // Step 4: migrate trust + journal under the deployed voters and bind the mTLS Bearer boundary.
     let (mut trust, report) =
-        SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal(root, &journal, repo_id, 2, trusted_voters)?;
+        SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal(&storage_root, &journal, repo_id, 2, trusted_voters)?;
     let auth = cluster.lock().await.voter_client_auth();
-    trust.bind_voter_client_auth(root, auth)?;
+    trust.bind_voter_client_auth(&storage_root, auth)?;
     assert!(report.journal_migrated && report.disarmed_for_voter_rearm);
     assert_eq!(report.preserved_pending_batch_id, Some(batch.batch_id));
     assert!(report.preserved_deleted_keys.is_empty());
     assert_eq!(report.preserved_pending_keys, batch.pending_keys);
-    assert_worker_volume_has_no_external_signing_keys(root, repo_id);
+    assert_worker_volume_has_no_external_signing_keys(&storage_root, repo_id);
 
     // Step 5: a migrated but still disarmed volume must keep refusing every delete.
     pool.get()
@@ -253,10 +254,10 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
 
     // Step 6: a 1-of-3 voter quorum must fail closed; a 2-of-3 quorum re-arms and preserves the batch.
     cluster.lock().await.set_voter_enabled(2, false);
-    let failed = SafeGcRepoTrustConfig::rearm_distributed_from_voters(root, &journal, repo_id, None).await;
+    let failed = SafeGcRepoTrustConfig::rearm_distributed_from_voters(&storage_root, &journal, repo_id, None).await;
     assert!(matches!(failed, Err(SafeGcError::DistributedPrereqsMissing(_))));
     cluster.lock().await.set_voter_enabled(2, true);
-    let arm = SafeGcRepoTrustConfig::rearm_distributed_from_voters(root, &journal, repo_id, None).await?;
+    let arm = SafeGcRepoTrustConfig::rearm_distributed_from_voters(&storage_root, &journal, repo_id, None).await?;
     assert!(matches!(&arm.lane, AuthorityLane::DistributedRefCas { .. }));
     let rearmed = DurableSafeGcAuthority::open_with_journal(&journal, None)?.snapshot();
     assert!(matches!(&rearmed.gc_mode, GcMode::ArmedDestructive(_)));
