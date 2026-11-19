@@ -357,7 +357,7 @@ impl PublicationFactsEngine {
         // capacity returns now; the workspace and view budget stay owned.
         lease.release_native();
         let facts = VerifiedPublicationFacts::mint(&request, probe, packs, pairs, bytes, lease);
-        let attestation = verified_merge.map(|merge| merge.attest(plan, &facts));
+        let attestation = verified_merge.map(|merge| merge.attest(&facts));
         Ok((facts, attestation))
     }
 }
