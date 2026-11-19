@@ -34,6 +34,8 @@ impl Git {
             .env("GIT_COMMITTER_EMAIL", "s4@rootyard.invalid")
             .arg("-c")
             .arg("core.hooksPath=/dev/null")
+            .arg("-c")
+            .arg("http.postBuffer=16777216")
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

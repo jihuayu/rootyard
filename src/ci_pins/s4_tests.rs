@@ -244,10 +244,16 @@ async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes
     std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
-    let failed = super::Error::internal("failed");
-    let error = run_git_dir_bounded(&wrapper, None, &[], deadline, failed, Some(view.hold()))
-        .await
-        .unwrap_err();
+    let error = run_git_dir_bounded(
+        &wrapper,
+        None,
+        &[],
+        deadline,
+        || super::Error(StatusCode::CONFLICT, "failed"),
+        Some(view.hold()),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
     let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
     assert!(root.exists(), "the disposable view vanished before the final wait was confirmed");
@@ -281,4 +287,36 @@ async fn expired_timeout_cleanup_hands_scratch_to_reaper_until_group_exits() {
     assert!(!root.exists(), "the disposable view outlived the timed-out reaper handoff");
     assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists());
     assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists());
+}
+
+#[tokio::test]
+async fn upload_pack_advertise_and_spawn_pass_positional_directory() {
+    use super::s4_authority::{DisposableCiView, UploadPackGroup, run_git_dir_bounded};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let git_bin = std::env::var("ROOTYARD_TEST_GIT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("git"));
+    let view = DisposableCiView::create().expect("disposable view");
+    let repo_dir = view.path().to_str().expect("utf8 disposable path");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let init_args = ["init", "--bare", "--quiet", "--object-format=sha1", repo_dir];
+    let init_error = || super::Error(StatusCode::CONFLICT, "init failed");
+    run_git_dir_bounded(&git_bin, None, &init_args, deadline, init_error, Some(view.hold()))
+        .await
+        .expect("git init --bare");
+    let advertise_args = ["upload-pack", "--stateless-rpc", "--advertise-refs", repo_dir];
+    let advertise_error = || super::Error(StatusCode::CONFLICT, "advertise failed");
+    run_git_dir_bounded(&git_bin, Some(view.path()), &advertise_args, deadline, advertise_error, Some(view.hold()))
+        .await
+        .expect("upload-pack --advertise-refs");
+    let mut group = UploadPackGroup::spawn(&git_bin, view.path(), Some(view.hold())).expect("spawn upload-pack");
+    let (mut stdin, mut stdout) = group.take_pipes().expect("upload-pack pipes");
+    stdin.write_all(b"0000").await.expect("write flush packet");
+    stdin.shutdown().await.expect("close upload-pack stdin");
+    drop(stdin);
+    let mut out = Vec::new();
+    stdout.read_to_end(&mut out).await.expect("drain upload-pack stdout");
+    drop(stdout);
+    let status = group.finish(deadline).await.expect("finish upload-pack");
+    assert!(status.success(), "upload-pack failed: {status}");
 }

@@ -55,7 +55,7 @@ async fn git_dir(
         Some(holder.path()),
         args,
         deadline,
-        Error(StatusCode::CONFLICT, "retained root could not be materialized"),
+        || Error(StatusCode::CONFLICT, "retained root could not be materialized"),
         Some(holder.hold()),
     )
     .await
@@ -83,7 +83,7 @@ async fn init_bare(
         None,
         &["init", "--bare", "--quiet", &object_format, target],
         deadline,
-        Error::internal("bare repository initialization failed"),
+        || Error::internal("bare repository initialization failed"),
         Some(holder.hold()),
     )
     .await?;
@@ -335,7 +335,9 @@ pub(crate) async fn info_refs(
         deadline,
     )
     .await?;
-    let out = git_dir(&state, &holder, &["upload-pack", "--stateless-rpc", "--advertise-refs"], deadline).await?;
+    let repo_dir = holder.path().to_str().ok_or_else(|| Error::internal("invalid disposable repo path"))?;
+    let out = git_dir(&state, &holder, &["upload-pack", "--stateless-rpc", "--advertise-refs", repo_dir], deadline)
+        .await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-git-upload-pack-advertisement")

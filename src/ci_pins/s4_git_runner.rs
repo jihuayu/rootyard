@@ -60,13 +60,21 @@ pub(crate) struct UploadPackGroup {
 }
 impl UploadPackGroup {
     pub(crate) fn spawn(git_bin: &FsPath, dir: &FsPath, scratch_hold: Option<ScratchHold>) -> Result<Self, Error> {
-        Self::spawn_argv(git_bin, Some(dir), &["upload-pack", "--stateless-rpc"], Stdio::piped(), scratch_hold)
+        Self::spawn_argv(
+            git_bin,
+            Some(dir),
+            &["upload-pack", "--stateless-rpc"],
+            Some(dir),
+            Stdio::piped(),
+            scratch_hold,
+        )
     }
 
     fn spawn_argv(
         git_bin: &FsPath,
         dir: Option<&FsPath>,
         args: &[&str],
+        positional: Option<&FsPath>,
         stdin: Stdio,
         scratch_hold: Option<ScratchHold>,
     ) -> Result<Self, Error> {
@@ -75,8 +83,11 @@ impl UploadPackGroup {
         if let Some(dir) = dir {
             cmd.arg("--git-dir").arg(dir);
         }
-        cmd.args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
+        cmd.args(args);
+        if let Some(target) = positional {
+            cmd.arg(target);
+        }
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env_remove("GIT_PROTOCOL")
@@ -300,13 +311,13 @@ pub(crate) async fn run_git_dir_bounded(
     dir: Option<&FsPath>,
     args: &[&str],
     deadline: Instant,
-    fail_error: Error,
+    fail_error: impl FnOnce() -> Error,
     scratch_hold: Option<ScratchHold>,
 ) -> Result<Vec<u8>, Error> {
     if Instant::now() >= deadline {
         return Err(Error::timeout());
     }
-    let mut guard = UploadPackGroup::spawn_argv(git_bin, dir, args, Stdio::null(), scratch_hold)?;
+    let mut guard = UploadPackGroup::spawn_argv(git_bin, dir, args, None, Stdio::null(), scratch_hold)?;
     let mut stdout = guard.take_stdout()?;
     let mut output = Vec::new();
     let read =
@@ -329,7 +340,7 @@ pub(crate) async fn run_git_dir_bounded(
     }
     let status = guard.finish(deadline).await?;
     if !status.success() {
-        return Err(fail_error);
+        return Err(fail_error());
     }
     Ok(output)
 }

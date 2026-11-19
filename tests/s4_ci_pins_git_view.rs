@@ -384,8 +384,8 @@ async fn s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree() -
         let repo = cluster.create_repository("view-repo", "sha1").await?;
         let base = cluster.push_initial(&repo, &[("root.txt", "root\n"), ("dir/b.txt", "before\n")]).await?;
 
-        let namespace = cluster.namespace(&repo, &base, "/src").await?;
-        let view = cluster.view(&namespace, "/src", "dir").await?;
+        let namespace = cluster.namespace(&repo, &base, "src").await?;
+        let view = cluster.view(&namespace, "src", "dir").await?;
         let bundle = cluster.get_bundle(&view).await?;
         let tree = clone_bundle(&cluster, &bundle, "sha1").await?;
         ensure!(tree.join("b.txt").is_file(), "the projected bundle lost the selected subtree");
@@ -439,8 +439,8 @@ async fn s4_sha256_pin_clone_and_reverse_round_trip() -> Result<()> {
         let token = cluster.checkout(&repo, job, &base).await?;
         ensure!(cluster.ci_clone(&repo, &base, &token).await? == base, "SHA-256 CI clone lost its pin");
 
-        let namespace = cluster.namespace(&repo, &base, "/src").await?;
-        let view = cluster.view(&namespace, "/src", "").await?;
+        let namespace = cluster.namespace(&repo, &base, "src").await?;
+        let view = cluster.view(&namespace, "src", "").await?;
         let bundle = cluster.get_bundle(&view).await?;
         let tree = clone_bundle(&cluster, &bundle, "sha256").await?;
         ensure!(tree.join("note.txt").is_file(), "the SHA-256 projected bundle is empty");

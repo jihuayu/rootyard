@@ -243,8 +243,8 @@ pub async fn bounded_child_lifecycle() -> Result<()> {
         let view_repo = cluster.create_repository("view-child-repo", "sha1").await?;
         let view_oid =
             cluster.push_initial(&view_repo, &[("root.txt", "root\n"), ("dir/b.txt", "projected\n")]).await?;
-        let namespace = cluster.namespace(&view_repo, &view_oid, "/src").await?;
-        let view = cluster.view(&namespace, "/src", "dir").await?;
+        let namespace = cluster.namespace(&view_repo, &view_oid, "src").await?;
+        let view = cluster.view(&namespace, "src", "dir").await?;
         let git = cluster.git.binary().to_path_buf();
         let pidfile = cluster.scratch.join("stall-git.pids");
         let wrapper = cluster.scratch.join("stall-git.sh");
