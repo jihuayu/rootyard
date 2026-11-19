@@ -159,6 +159,9 @@ pub async fn propose_raft_ref_write_guarded(
         return Err(PairedBackupError::StaleGrantRefused("Ref-CAS write authz_epoch below durable repo_access floor"));
     }
     let (_, resp) = raft.commit_and_apply(cmd)?;
+    if matches!(&resp, ApplyResponse::RefsCommitted(_)) {
+        super::format30_pg_raft_sync::ensure_raft_commit_refs_committed(&resp, "guarded Raft ref write")?;
+    }
     Ok(resp)
 }
 

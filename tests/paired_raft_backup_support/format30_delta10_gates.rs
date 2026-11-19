@@ -2,6 +2,7 @@
 //! canonical plans, and a thaw that cannot reach quorum must leave the staged volume unpublished (#153).
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,12 +12,13 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use rootyard::db;
+use rootyard::maintenance::paired_raft_backup::format30_boot::restore_and_boot_format30_with_pre_publish_hook;
 use rootyard::maintenance::paired_raft_backup::install_paired_write_raft_binding as bind_paired_write;
 use rootyard::maintenance::paired_raft_backup::{
-    DurableFreezeRequest, DurableRaftBackend, Format30PairedBackupRequest, MtlsLiveRaftBackend,
-    create_format30_paired_raft_backup, enter_durable_pg_raft_freeze, load_pg_repo_backup_specs,
-    read_pg_database_freeze_marker, read_pg_database_read_only, restore_and_boot_format30_new_incarnation,
-    restore_and_boot_format30_with_pre_thaw_hook,
+    DurableFreezeRequest, DurableRaftBackend, DurableRaftFreezeRecord, Format30PairedBackupRequest,
+    MtlsLiveRaftBackend, PairedBackupError, create_format30_paired_raft_backup, enter_durable_pg_raft_freeze,
+    load_pg_repo_backup_specs, read_pg_database_freeze_marker, read_pg_database_read_only,
+    restore_and_boot_format30_new_incarnation, restore_and_boot_format30_with_pre_thaw_hook,
 };
 use rootyard::ref_store::core::decision_commit::{PgDecisionProtocol, RealmExpectation};
 use rootyard::ref_store::serving::lookup;
@@ -37,6 +39,22 @@ fn guard_of(data_dir: &std::path::Path) -> std::path::PathBuf {
 /// `SELECT count(*)` for a single bound repository.
 async fn repo_count(client: &tokio_postgres::Client, sql: &str, repo_id: Uuid) -> Result<i64> {
     Ok(client.query_one(sql, &[&repo_id]).await?.get(0))
+}
+
+/// Prove the four durable PostgreSQL fences are still continuously armed: the freeze marker, the
+/// `default_transaction_read_only` setting, the `restore_in_progress` GUC and the delete fence.
+async fn assert_pg_fully_fenced(client: &tokio_postgres::Client) -> Result<()> {
+    ensure!(read_pg_database_freeze_marker(client).await?.is_some(), "the durable PG freeze marker must stay armed");
+    ensure!(read_pg_database_read_only(client).await?, "the restored target database must stay READ ONLY");
+    let rip: Option<String> =
+        client.query_one("SELECT NULLIF(current_setting('rootyard.restore_in_progress', true), '')", &[]).await?.get(0);
+    ensure!(rip.is_some(), "rootyard.restore_in_progress must stay armed");
+    let fenced: bool = client
+        .query_one("SELECT remote_delete_fenced FROM public.pando_storage_authorities WHERE singleton = true", &[])
+        .await?
+        .get(0);
+    ensure!(fenced, "remote_delete_fenced must stay true");
+    Ok(())
 }
 
 /// Push `REF_COUNT` refs while never exceeding the 51-ref `ensure_pack_terminal_budget` ceiling of a
@@ -64,8 +82,9 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
     let admin = db::pool(&base_url)?;
     let suffix = &Uuid::new_v4().simple().to_string()[..12];
     let (db_name, blocked_db) = (format!("gate10_db_{suffix}"), format!("gate10_blocked_{suffix}"));
+    let pub_fail_db = format!("gate10_pub_fail_{suffix}");
     let published_db = format!("gate10_published_{suffix}");
-    for name in [&db_name, &blocked_db, &published_db] {
+    for name in [&db_name, &blocked_db, &pub_fail_db, &published_db] {
         admin.get().await?.batch_execute(&format!("CREATE DATABASE {name}")).await?;
     }
     let url = replace_db_in_url(&base_url, &db_name)?;
@@ -170,8 +189,8 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
         .await?;
         drop(s3_env);
 
-        // A thaw that loses quorum *inside* the hook happens after every fallible Raft/PG step, so the
-        // staged volume must stay unpublished behind the armed guard and the PG fences.
+        // A thaw that loses quorum *inside* the hook happens after the frozen boot record has
+        // committed, so `boot_thaw` must be refused while the staged volume stays unpublished.
         let blocked_url = replace_db_in_url(&base_url, &blocked_db)?;
         let blocked_vol = dir.path().join("gate10-blocked-vol");
         ensure!(!blocked_vol.exists(), "the blocked target volume must start absent");
@@ -180,6 +199,8 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
         let thaw_fail_grp = LiveMtlsRaftGroup::start_three(42)?;
         let mut blocked_raft = thaw_fail_grp.connect_backend(1)?;
         let mut blocked_peers: BTreeMap<i64, MtlsLiveRaftBackend> = BTreeMap::new();
+        let pre_thaw_hook_ran = Arc::new(AtomicBool::new(false));
+        let thaw_flag = pre_thaw_hook_ran.clone();
         let restore_env = s3.apply_env("paired-fmt30-delta10");
         let rejected = restore_and_boot_format30_with_pre_thaw_hook(
             &archive_dir,
@@ -189,24 +210,78 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
             &mut blocked_raft,
             &mut blocked_peers,
             || {
+                thaw_flag.store(true, Ordering::SeqCst);
                 thaw_fail_grp.nodes[&2].kill_hard();
                 thaw_fail_grp.nodes[&3].kill_hard();
             },
         )
         .await;
         drop(restore_env);
-        ensure!(rejected.is_err(), "a restore whose thaw loses quorum must fail closed");
+        ensure!(
+            pre_thaw_hook_ran.load(Ordering::SeqCst),
+            "pre-thaw hook must have run after rebind and cursor verification"
+        );
+        ensure!(
+            matches!(&rejected, Err(PairedBackupError::BootThawRefused(_))),
+            "expected BootThawRefused when quorum dies before thaw, got {rejected:?}"
+        );
         ensure!(!blocked_vol.exists(), "a failed thaw must never publish the target volume");
         ensure!(blocked_guard.is_file(), "a failed thaw must leave the crash-persistent guard armed");
+        // Voter #1 survived: it must hold the committed frozen `boot_freeze`, never the thawed record.
+        let kv = thaw_fail_grp.nodes[&1].rpc(&json!({ "InspectReplicaKv": { "key": "refcas/paired_freeze" } }))?;
+        let raw = kv
+            .pointer("/KvValue/value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("missing freeze KV"))?;
+        let record: DurableRaftFreezeRecord = serde_json::from_str(raw)?;
+        ensure!(record.frozen, "boot_freeze must have committed before the pre-thaw hook");
+        ensure!(record.seal_receipt_digest.is_none(), "boot_thaw must not commit when quorum dies before thaw");
         let blocked_pg = db::connect_url(&blocked_url).await?;
+        assert_pg_fully_fenced(&blocked_pg).await?;
+
+        // Item 3 witness: a target that appears after every Raft/PG step but before the single
+        // RENAME_NOREPLACE must keep its contents and leave every PostgreSQL fence armed.
+        let pub_fail_url = replace_db_in_url(&base_url, &pub_fail_db)?;
+        let pub_fail_vol = dir.path().join("gate10-pub-fail-vol");
+        ensure!(!pub_fail_vol.exists(), "the pre-publish target volume must start absent");
+        let pub_fail_cfg = make_backup_config(pub_fail_url.clone(), pub_fail_vol.clone(), git.clone());
+        let pub_fail_guard = guard_of(&pub_fail_vol);
+        let pub_fail_grp = LiveMtlsRaftGroup::start_three(44)?;
+        let mut pub_fail_raft = pub_fail_grp.connect_backend(1)?;
+        let mut pub_fail_peers: BTreeMap<i64, MtlsLiveRaftBackend> = BTreeMap::new();
+        let pre_publish_hook_ran = Arc::new(AtomicBool::new(false));
+        let publish_flag = pre_publish_hook_ran.clone();
+        let restore_env = s3.apply_env("paired-fmt30-delta10");
+        let pub_rejected = restore_and_boot_format30_with_pre_publish_hook(
+            &archive_dir,
+            &dir.path().join("gate10-work-pub-fail"),
+            &pub_fail_cfg,
+            &store,
+            &mut pub_fail_raft,
+            &mut pub_fail_peers,
+            || {
+                publish_flag.store(true, Ordering::SeqCst);
+                fs::create_dir_all(&pub_fail_vol).expect("create colliding target");
+                fs::write(pub_fail_vol.join("live.txt"), "keep-live").expect("write colliding target");
+            },
+        )
+        .await;
+        drop(restore_env);
         ensure!(
-            read_pg_database_freeze_marker(&blocked_pg).await?.is_some(),
-            "the durable PG freeze marker must stay armed after a failed thaw"
+            pre_publish_hook_ran.load(Ordering::SeqCst),
+            "pre-publish hook must have run immediately before the atomic rename"
         );
         ensure!(
-            read_pg_database_read_only(&blocked_pg).await?,
-            "the restored target database must stay READ ONLY after a failed thaw"
+            matches!(&pub_rejected, Err(PairedBackupError::FreezeNotHeld(_))),
+            "a colliding target must fail closed on FreezeNotHeld, got {pub_rejected:?}"
         );
+        ensure!(
+            fs::read_to_string(pub_fail_vol.join("live.txt"))? == "keep-live",
+            "a rejected publish must never clobber the live target"
+        );
+        ensure!(pub_fail_guard.is_file(), "a rejected publish must leave the crash-persistent guard armed");
+        let pub_fail_pg = db::connect_url(&pub_fail_url).await?;
+        assert_pg_fully_fenced(&pub_fail_pg).await?;
 
         // The same archive restores on a pristine target and rebinds through more than one A4 plan.
         let published_vol = dir.path().join("gate10-published-vol");
@@ -255,7 +330,7 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
     }
     .await;
     if let Ok(c) = admin.get().await {
-        for name in [&db_name, &blocked_db, &published_db] {
+        for name in [&db_name, &blocked_db, &pub_fail_db, &published_db] {
             let _ = c.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).await;
         }
     }

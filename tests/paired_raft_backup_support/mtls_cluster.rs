@@ -412,16 +412,24 @@ impl LiveMtlsRaftGroup {
 
     pub fn isolate_nodes(&self, isolated: &[u64]) -> Result<()> {
         let iso: BTreeSet<u64> = isolated.iter().copied().collect();
-        let rest: BTreeSet<u64> = self.nodes.keys().copied().filter(|id| !iso.contains(id)).collect();
         for &id in &iso {
-            if let Some(n) = self.nodes.get(&id) {
-                let _ = n.rpc(&json!({ "PartitionPeers": { "blocked": rest } }));
-            }
+            anyhow::ensure!(self.nodes.contains_key(&id), "unknown voter node_id {id}");
         }
-        for &id in &rest {
-            if let Some(n) = self.nodes.get(&id) {
-                let _ = n.rpc(&json!({ "PartitionPeers": { "blocked": iso } }));
-            }
+        let rest: BTreeSet<u64> = self.nodes.keys().copied().filter(|id| !iso.contains(id)).collect();
+        for (&id, blocked) in iso.iter().map(|id| (id, &rest)).chain(rest.iter().map(|id| (id, &iso))) {
+            let resp = self.nodes[&id].rpc(&json!({ "PartitionPeers": { "blocked": blocked } }))?;
+            anyhow::ensure!(resp == json!("Ok"), "PartitionPeers on voter {id} rejected: {resp}");
+        }
+        Ok(())
+    }
+
+    /// Partition every voter from every other voter (`{1} | {2} | {3}`): no pair retains a 2-of-3
+    /// quorum anywhere, while direct test-client RPC probes still reach all three voters.
+    pub fn partition_all_nodes(&self) -> Result<()> {
+        for (&id, node) in &self.nodes {
+            let others: BTreeSet<u64> = self.nodes.keys().copied().filter(|&other| other != id).collect();
+            let resp = node.rpc(&json!({ "PartitionPeers": { "blocked": others } }))?;
+            anyhow::ensure!(resp == json!("Ok"), "PartitionPeers on voter {id} rejected: {resp}");
         }
         Ok(())
     }

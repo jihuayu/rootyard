@@ -175,12 +175,13 @@ fn replay_gate(
         RefName::branch(gate.head_ref).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
     )
     .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-    raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
+    let (_, init_resp) = raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
         gate: WireGateInit::from(&init),
         pack_mode: gate.pack_mode,
         lane: gate.lane,
         authz_floor,
     }))?;
+    super::format30_pg_raft_sync::ensure_raft_gate_initialized(&init_resp, "format30 Raft boot")?;
     if gate.refs.is_empty() {
         return Ok(());
     }
@@ -218,13 +219,14 @@ fn replay_gate(
             chunk.to_vec(),
         )
         .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-        raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
+        let (_, commit_resp) = raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
             request: WireCommitRefsRequest::from(&req),
             decision_id: None,
             required_holds: Vec::new(),
             policy_rejects: BTreeMap::new(),
             logical_tick: (authz_floor as u64).saturating_add(chunk_idx as u64),
         }))?;
+        super::format30_pg_raft_sync::ensure_raft_commit_refs_committed(&commit_resp, "format30 Raft boot")?;
     }
     Ok(())
 }

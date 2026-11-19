@@ -349,12 +349,13 @@ async fn restore_new_incarnation_full(
             RefName::branch(&head_branch).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
         )
         .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-        wal_raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
+        let (_, init_resp) = wal_raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
             gate: WireGateInit::from(&init),
             pack_mode: SmPackMode::MetadataOnly,
             lane: RepositoryLane::ServingRefStore,
             authz_floor: inc.new_authz_floor,
         }))?;
+        super::format30_pg_raft_sync::ensure_raft_gate_initialized(&init_resp, "format30 restore")?;
 
         let mut updates = Vec::with_capacity(repo.refs.len());
         for (k, v) in &repo.refs {
@@ -386,13 +387,14 @@ async fn restore_new_incarnation_full(
                 chunk.to_vec(),
             )
             .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-            wal_raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
+            let (_, commit_resp) = wal_raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
                 request: WireCommitRefsRequest::from(&req),
                 decision_id: None,
                 required_holds: Vec::new(),
                 policy_rejects: BTreeMap::new(),
                 logical_tick: (inc.new_authz_floor as u64).saturating_add(chunk_idx as u64),
             }))?;
+            super::format30_pg_raft_sync::ensure_raft_commit_refs_committed(&commit_resp, "format30 restore")?;
         }
 
         specs.push(RepoBackupRegistrationSpec {

@@ -254,7 +254,7 @@ pub fn verify_mtls_auth_and_quorum_faults() -> Result<()> {
     ensure!(local1.durable_state().map_err(|e| anyhow!("{e}"))?.0.body.last_applied.unwrap().index == 2);
 
     // (b) 1/3 minority partition refuses quorum writes!
-    gf.isolate_nodes(&[2, 3])?;
+    gf.partition_all_nodes()?;
     let init = CoreGateInit::new(
         Uuid::new_v4(),
         Uuid::new_v4(),

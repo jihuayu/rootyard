@@ -49,7 +49,7 @@ pub async fn restore_and_boot_format30_new_incarnation(
         target_store,
         booted_active_raft,
         booted_peer_rafts,
-        || {},
+        (|| {}, || {}),
     )
     .await
 }
@@ -74,7 +74,33 @@ pub async fn restore_and_boot_format30_with_pre_thaw_hook(
         target_store,
         booted_active_raft,
         booted_peer_rafts,
-        before_thaw,
+        (before_thaw, || {}),
+    )
+    .await
+}
+
+/// Fault-injection entry point: `before_publish` runs after every Raft/PG step has committed and
+/// immediately before the single atomic `RENAME_NOREPLACE` publication, while PostgreSQL is still
+/// fully fenced, so a live test can prove that a colliding target keeps the old volume untouched and
+/// every PostgreSQL fence continuously armed.
+#[doc(hidden)]
+pub async fn restore_and_boot_format30_with_pre_publish_hook(
+    archive_dir: &Path,
+    work_dir: &Path,
+    dst_config: &Config,
+    target_store: &BlobStore,
+    booted_active_raft: &mut MtlsLiveRaftBackend,
+    booted_peer_rafts: &mut BTreeMap<i64, MtlsLiveRaftBackend>,
+    before_publish: impl FnOnce(),
+) -> Result<(RestoreOutcome, IncarnationAdmissionGuard), PairedBackupError> {
+    restore_and_boot_format30_inner(
+        archive_dir,
+        work_dir,
+        dst_config,
+        target_store,
+        booted_active_raft,
+        booted_peer_rafts,
+        (|| {}, before_publish),
     )
     .await
 }
@@ -86,8 +112,9 @@ async fn restore_and_boot_format30_inner(
     target_store: &BlobStore,
     booted_active_raft: &mut MtlsLiveRaftBackend,
     booted_peer_rafts: &mut BTreeMap<i64, MtlsLiveRaftBackend>,
-    before_thaw: impl FnOnce(),
+    hooks: (impl FnOnce(), impl FnOnce()),
 ) -> Result<(RestoreOutcome, IncarnationAdmissionGuard), PairedBackupError> {
+    let (before_thaw, before_publish) = hooks;
     let backend_hex = target_store.backend_identity().as_hex().to_owned();
     let manifest = verify_format30_paired_archive(archive_dir, Some(&backend_hex))?;
     let fmt30_dir = archive_dir.join(FORMAT30_SUBDIR);
@@ -216,11 +243,15 @@ async fn restore_and_boot_format30_inner(
         // frozen, the admission guard on disk and `dst_config.data_dir` unpublished.
         let boot_thaw =
             boot_record(&manifest, &inc, false, boot_freeze.barrier_id, Some(manifest.paired_cut_digest.clone()))?;
-        for pr in booted_peer_rafts.values() {
-            pr.write_freeze_record(&boot_thaw)?;
+        for (&gid, pr) in booted_peer_rafts.iter() {
+            pr.write_freeze_record(&boot_thaw)
+                .map_err(|e| PairedBackupError::BootThawRefused(format!("peer group {gid}: {e}")))?;
         }
-        booted_active_raft.write_freeze_record(&boot_thaw)?;
-        clear_restored_pg_freeze(&dst_client).await?;
+        booted_active_raft
+            .write_freeze_record(&boot_thaw)
+            .map_err(|e| PairedBackupError::BootThawRefused(format!("active group: {e}")))?;
+        // Every PostgreSQL fence stays armed here on purpose: the volume is still unpublished and
+        // only `publish_staged_dir_noreplace` + `sync_parent_dir` may commit it.
         Ok((dst_client, inc, git_verified_refs))
     }
     .await;
@@ -233,20 +264,25 @@ async fn restore_and_boot_format30_inner(
             return Err(err);
         }
     };
+    before_publish();
 
-    // Everything that can still fail has committed: publish the staged volume with one atomic
-    // no-replace rename that can never clobber a live or previously restored incarnation.
-    if let Err(err) = publish_staged_dir_noreplace(&staged_data, &dst_config.data_dir) {
-        let _ = set_pg_database_freeze_marker(&dst_client, Some(&marker)).await;
-        let _ = set_pg_database_read_only(&dst_client, true).await;
+    // Publish the staged volume with one atomic no-replace rename while PostgreSQL is still 100%
+    // frozen and read-only: if either the rename or the parent-directory fsync fails, the four
+    // PostgreSQL fences were never dropped and need no best-effort re-arming.
+    if let Err(err) = publish_staged_dir_noreplace(&staged_data, &dst_config.data_dir)
+        .and_then(|()| sync_parent_dir(&dst_config.data_dir))
+    {
         let _ = std::fs::remove_dir_all(&stage_root);
         return Err(err);
     }
     let _ = std::fs::remove_dir_all(&stage_root);
-    sync_parent_dir(&dst_config.data_dir)?;
+    // Only now, with the target published and its parent fsynced, may PostgreSQL be unfenced. The
+    // guard is still on disk, so a failure here keeps startup blocked by `ensure_not_restoring`.
+    clear_restored_pg_freeze(&dst_client).await?;
     // The crash-persistent admission guard is removed last: only a fully thawed, published
     // incarnation may become visible to service startup.
     std::fs::remove_file(&guard_path)?;
+    sync_parent_dir(&dst_config.data_dir)?;
 
     let guard = IncarnationAdmissionGuard { live: inc.clone() };
     super::startup_wiring::set_installed_production_runtime_guard(Some(
@@ -263,8 +299,9 @@ async fn restore_and_boot_format30_inner(
     Ok((outcome, guard))
 }
 
-/// Clear every restored PostgreSQL fence after the Raft thaw has committed. The volume is still
-/// unpublished and the admission guard is still on disk, so no service can observe this window.
+/// Clear every restored PostgreSQL fence only after the staged volume has been published and its
+/// parent directory fsynced. The admission guard is still on disk, so no service can observe this
+/// window.
 async fn clear_restored_pg_freeze(client: &Client) -> Result<(), PairedBackupError> {
     client
         .execute(

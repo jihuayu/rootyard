@@ -1,16 +1,12 @@
-//! Stock-Git pack consolidation for restored `format 30` repositories whose archived membership
-//! exceeds `MAX_BATCH_NEW_PACKS`, including repositories that legitimately hold zero refs (#153).
-//!
-//! The workspace is private, disposable and never published: restored `.pack`/`.idx` pairs are
-//! copied under collision-free stems, every object id is enumerated from the *packs themselves*
-//! (not from refs), and one canonical pack is emitted whose object count must match exactly.
-use std::io::Write;
+//! Stock-Git pack consolidation for restored `format 30` repositories above `MAX_BATCH_NEW_PACKS` (#153).
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use uuid::Uuid;
 
 use crate::ref_store::GitObjectFormat;
+use crate::ref_store::core::pack_commit::VERIFIER_MAX_OBJECTS;
 
 use super::backup::stream_sha256_file;
 use super::format30_realm_rehome::RestoredRepoPackFile;
@@ -40,9 +36,7 @@ impl Drop for RebindTempDir {
 }
 
 /// Pick one object id from a restored pack through its `.idx`, without needing a repository.
-/// `--object-format` is mandatory: without it `git show-index` parses a SHA-256 `.idx` as a
-/// 20-byte SHA-1 index and reports a truncated object id. `show-index` prints
-/// `<byte_offset> <oid_hex> (<crc32>)`, so the object id is the *second* whitespace column.
+/// `--object-format` is mandatory: `show-index` prints `<offset> <oid_hex> (<crc32>)`.
 pub(super) fn pick_any_object_oid_from_pack(
     git: &Path,
     object_format: GitObjectFormat,
@@ -69,20 +63,16 @@ pub(super) fn pick_any_object_oid_from_pack(
         .ok_or_else(|| PairedBackupError::StateMachine("restored pack holds no object id".into()))
 }
 
-/// Conservative per-plan ACK budget for rebind ref chunks. It is half of the canonical
-/// `MAX_ACK_BODY_BYTES` bound (64 KiB) so pack/scope/digest fields can never overflow one ACK body.
+/// Half of the canonical `MAX_ACK_BODY_BYTES` bound (64 KiB), leaving room for pack/scope/digest fields.
 pub(super) const MAX_REBIND_REF_ACK_BYTES: usize = 32 * 1024;
 
-/// Hard per-plan cap on rebind refs. `ensure_pack_terminal_budget` (see
-/// `ref_store::core::pack_commit::receipt`) charges every ref name in a `PackCommitPlan` at the
-/// worst-case `WORST_CASE_REF_NAME_BYTES = 1024`, so a plan tops out at 51 refs against the 64 KiB
-/// `TerminalResult` ceiling. 48 leaves headroom for the pack/scope/digest fields while still
-/// letting a `136`-ref repository rebind across three canonical plans.
+/// Hard per-plan cap on rebind refs: `ensure_pack_terminal_budget` charges every ref name at the
+/// worst-case `1024` bytes, so a plan tops out at 51 refs against the 64 KiB `TerminalResult`
+/// ceiling. 48 leaves headroom while still letting a `136`-ref repository rebind across three plans.
 pub(super) const MAX_REBIND_PLAN_REFS: usize = 48;
 
-/// Split restored refs into non-empty A4 plan chunks bounded by both the per-plan ref count and a
-/// conservative ACK-body byte estimate. A ref is always admitted into empty chunks, so even a name
-/// longer than the whole budget still makes progress in a chunk of its own.
+/// Split restored refs into non-empty A4 plans bounded by ref count and a conservative ACK-byte
+/// estimate; a single over-budget ref still makes progress in a chunk of its own.
 pub(super) fn chunk_refs_for_plans(
     refs: &[(String, String)],
     max_refs: usize,
@@ -123,9 +113,8 @@ pub(super) fn needs_consolidation_with_limit(packs: &[RestoredRepoPackFile], max
             || total_pack_bytes(packs) > max_plan_bytes)
 }
 
-/// Choose the pack set for the first rebind plan, consolidating into one canonical pack whenever the
-/// archived membership exceeds the pack-count or byte budget. A consolidated closure that still
-/// exceeds the verifier byte bound is a typed refusal, never an oversized plan handed to A4.
+/// Choose the pack set for the first rebind plan, consolidating whenever the archived membership
+/// exceeds the pack-count or byte budget; an oversized consolidated closure is a typed refusal.
 pub(super) fn select_packs_for_rebind_with_limit(
     git: &Path,
     object_format: GitObjectFormat,
@@ -138,7 +127,7 @@ pub(super) fn select_packs_for_rebind_with_limit(
     }
     let root = repo_workspace
         .ok_or_else(|| PairedBackupError::StateMachine("restore pack consolidation workspace is missing".into()))?;
-    let single = consolidate_packs_with_git(git, object_format, packs, root)?;
+    let single = consolidate_packs_with_git(git, object_format, packs, root, max_plan_bytes)?;
     if single.pack_len.saturating_add(single.idx_len) > max_plan_bytes {
         return Err(PairedBackupError::StateMachine(
             "consolidated pack closure exceeds verifier total byte bound".into(),
@@ -153,6 +142,7 @@ pub(super) fn consolidate_packs_with_git(
     object_format: GitObjectFormat,
     packs: &[RestoredRepoPackFile],
     root: &Path,
+    max_plan_bytes: u64,
 ) -> Result<RestoredRepoPackFile, PairedBackupError> {
     let init = Command::new(git)
         .args(["init", "--bare", "--object-format", object_format.as_str()])
@@ -174,11 +164,11 @@ pub(super) fn consolidate_packs_with_git(
     }
     let object_ids = list_all_object_ids(git, root)?;
     let expected = object_ids.len();
-    // Ephemeral workspace-only tag: the copy is trusted only once Git resolves a packed object
-    // through a real ref, and it is deleted again before the workspace is dropped.
+    // Ephemeral workspace-only tag: the copy is trusted once Git resolves a packed object through a
+    // real ref; the tag is deleted again before the workspace is dropped.
     let tag = format!("refs/tags/rootyard-rebind-{}", Uuid::new_v4());
     run_git_dir(git, root, &["update-ref", &tag, &object_ids[0]])?;
-    let (pack_path, idx_path) = write_single_pack(git, root, &object_ids)?;
+    let (pack_path, idx_path) = write_single_pack(git, root, &object_ids, max_plan_bytes)?;
     run_git_dir(git, root, &["update-ref", "-d", &tag])?;
     let counted = count_pack_objects(git, root, &idx_path)?;
     if counted != expected {
@@ -207,87 +197,151 @@ fn run_git_dir(git: &Path, root: &Path, args: &[&str]) -> Result<std::process::O
     Ok(output)
 }
 
+fn spawn_piped(
+    git: &Path,
+    root: &Path,
+    args: &[&str],
+    idx: Option<&Path>,
+    what: &str,
+) -> Result<(std::process::Child, std::process::ChildStdout, std::process::ChildStderr), PairedBackupError> {
+    let mut cmd = Command::new(git);
+    cmd.arg("--git-dir").arg(root).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(idx) = idx {
+        cmd.arg(idx);
+    }
+    let mut child = cmd.spawn().map_err(PairedBackupError::Io)?;
+    let out =
+        child.stdout.take().ok_or_else(|| PairedBackupError::StateMachine(format!("{what} stdout unavailable")))?;
+    let err =
+        child.stderr.take().ok_or_else(|| PairedBackupError::StateMachine(format!("{what} stderr unavailable")))?;
+    Ok((child, out, err))
+}
+
+fn drain_stderr(stderr: std::process::ChildStderr) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut err = String::new();
+        let _ = BufReader::new(stderr.take(4096)).read_to_string(&mut err);
+        err
+    })
+}
+
+fn reap_checked(
+    child: &mut std::process::Child,
+    reader: std::thread::JoinHandle<String>,
+    what: &str,
+) -> Result<(), PairedBackupError> {
+    let status = child.wait()?;
+    let err = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(PairedBackupError::GitVerificationFailed(format!("{what} failed: {err}")));
+    }
+    Ok(())
+}
+
 fn list_all_object_ids(git: &Path, root: &Path) -> Result<Vec<String>, PairedBackupError> {
-    let output = run_git_dir(git, root, &["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"])?;
-    let ids: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let args = ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"];
+    let (mut child, stdout, stderr) = spawn_piped(git, root, &args, None, "git cat-file")?;
+    let reader = drain_stderr(stderr);
+    let mut ids = Vec::new();
+    for line in BufReader::new(stdout.take((VERIFIER_MAX_OBJECTS + 2) * 68)).lines() {
+        let oid = line?.trim().to_owned();
+        if !oid.is_empty() {
+            ids.push(oid);
+        }
+        if ids.len() > VERIFIER_MAX_OBJECTS as usize {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(PairedBackupError::StateMachine(
+                "consolidated pack closure exceeds verifier object count bound".into(),
+            ));
+        }
+    }
+    reap_checked(&mut child, reader, "git cat-file for restore pack consolidation")?;
     if ids.is_empty() {
         return Err(PairedBackupError::StateMachine("restored pack closure holds no object ids".into()));
     }
     Ok(ids)
 }
 
-fn write_single_pack(git: &Path, root: &Path, object_ids: &[String]) -> Result<(PathBuf, PathBuf), PairedBackupError> {
-    let mut child = Command::new(git)
-        .arg("--git-dir")
-        .arg(root)
-        .args(["pack-objects", "--stdout", "-q"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(PairedBackupError::Io)?;
+fn write_single_pack(
+    git: &Path,
+    root: &Path,
+    object_ids: &[String],
+    max_plan_bytes: u64,
+) -> Result<(PathBuf, PathBuf), PairedBackupError> {
+    let (mut child, mut stdout, stderr) = spawn_piped(git, root, &["pack-objects", "--stdout", "-q"], None, "pack")?;
     let stdin = child
         .stdin
         .take()
         .ok_or_else(|| PairedBackupError::StateMachine("git pack-objects stdin is unavailable".into()))?;
-    {
-        let mut writer = std::io::BufWriter::new(stdin);
-        for oid in object_ids {
-            writer.write_all(oid.as_bytes())?;
-            writer.write_all(b"\n")?;
-        }
-        writer.flush()?;
-    }
-    let output = child.wait_with_output().map_err(PairedBackupError::Io)?;
-    if !output.status.success() {
-        return Err(PairedBackupError::GitVerificationFailed(format!(
-            "git pack-objects for restore pack consolidation failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
     let pack_path = root.join("pack-consolidated.pack");
-    std::fs::write(&pack_path, &output.stdout)?;
-    let index = Command::new(git)
-        .arg("--git-dir")
-        .arg(root)
-        .arg("index-pack")
-        .arg(&pack_path)
-        .output()
-        .map_err(PairedBackupError::Io)?;
+    let mut pack_out = std::io::BufWriter::new(std::fs::File::create(&pack_path)?);
+    std::thread::scope(|scope| -> Result<(), PairedBackupError> {
+        scope.spawn(move || {
+            let mut writer = std::io::BufWriter::new(stdin);
+            for oid in object_ids {
+                if writer.write_all(oid.as_bytes()).and_then(|()| writer.write_all(b"\n")).is_err() {
+                    return;
+                }
+            }
+            let _ = writer.flush();
+        });
+        let reader = drain_stderr(stderr);
+        let mut buf = [0u8; 64 * 1024];
+        let mut written = 0u64;
+        loop {
+            let n = stdout.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            written = written.saturating_add(n as u64);
+            if written > max_plan_bytes {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(pack_out);
+                let _ = std::fs::remove_file(&pack_path);
+                return Err(PairedBackupError::StateMachine(
+                    "consolidated pack closure exceeds verifier total byte bound".into(),
+                ));
+            }
+            pack_out.write_all(&buf[..n])?;
+        }
+        pack_out.flush()?;
+        drop(pack_out);
+        reap_checked(&mut child, reader, "git pack-objects for restore pack consolidation")?;
+        Ok(())
+    })?;
+    let mut index_cmd = Command::new(git);
+    index_cmd.arg("--git-dir").arg(root).arg("index-pack").arg(&pack_path);
+    let index = index_cmd.output().map_err(PairedBackupError::Io)?;
     if !index.status.success() {
+        let err = String::from_utf8_lossy(&index.stderr);
         return Err(PairedBackupError::GitVerificationFailed(format!(
-            "git index-pack for restore pack consolidation failed: {}",
-            String::from_utf8_lossy(&index.stderr)
+            "git index-pack for restore pack consolidation failed: {err}"
         )));
     }
     let idx_path = pack_path.with_extension("idx");
     if !idx_path.is_file() {
         return Err(PairedBackupError::StateMachine("consolidated idx is missing".into()));
     }
+    let pack_len = std::fs::metadata(&pack_path)?.len();
+    let idx_len = std::fs::metadata(&idx_path)?.len();
+    if pack_len.saturating_add(idx_len) > max_plan_bytes {
+        let _ = std::fs::remove_file(&pack_path);
+        let _ = std::fs::remove_file(&idx_path);
+        return Err(PairedBackupError::StateMachine(
+            "consolidated pack closure exceeds verifier total byte bound".into(),
+        ));
+    }
     Ok((pack_path, idx_path))
 }
 
 fn count_pack_objects(git: &Path, root: &Path, idx_path: &Path) -> Result<usize, PairedBackupError> {
-    let output = Command::new(git)
-        .arg("--git-dir")
-        .arg(root)
-        .args(["verify-pack", "-v"])
-        .arg(idx_path)
-        .output()
-        .map_err(PairedBackupError::Io)?;
-    if !output.status.success() {
-        return Err(PairedBackupError::GitVerificationFailed(format!(
-            "git verify-pack for restore pack consolidation failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    let (mut child, stdout, stderr) = spawn_piped(git, root, &["verify-pack", "-v"], Some(idx_path), "verify-pack")?;
+    let reader = drain_stderr(stderr);
+    let counted = BufReader::new(stdout.take((VERIFIER_MAX_OBJECTS + 32) * 160))
         .lines()
+        .map_while(Result::ok)
         .filter(|line| {
             let mut fields = line.split_whitespace();
             let (Some(oid), Some(kind)) = (fields.next(), fields.next()) else {
@@ -297,7 +351,9 @@ fn count_pack_objects(git: &Path, root: &Path, idx_path: &Path) -> Result<usize,
                 && oid.bytes().all(|b| b.is_ascii_hexdigit())
                 && matches!(kind, "commit" | "tree" | "blob" | "tag")
         })
-        .count())
+        .count();
+    reap_checked(&mut child, reader, "git verify-pack for restore pack consolidation")?;
+    Ok(counted)
 }
 
 #[cfg(test)]
@@ -315,10 +371,12 @@ mod tests {
                 .spawn()
                 .expect("git hash-object");
             child.stdin.take().expect("stdin").write_all(content).expect("write blob");
-            let out = child.wait_with_output().expect("hash-object");
-            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+            let mut out = String::new();
+            child.stdout.take().expect("stdout").read_to_string(&mut out).expect("hash-object");
+            assert!(child.wait().expect("hash-object").success(), "git hash-object failed");
+            out.trim().to_owned()
         };
-        let (pack_path, idx_path) = write_single_pack(git, scratch, &[blob]).expect("single pack");
+        let (pack_path, idx_path) = write_single_pack(git, scratch, &[blob], u64::MAX).expect("single pack");
         std::fs::create_dir_all(target).expect("pack dir");
         // Every restored pair carries the same archive-local file name, exactly like a real
         // format 30 archive path `blob/<repo>/<pack_id>/pack.pack` + `idx.idx`.
@@ -375,16 +433,38 @@ mod tests {
         let total = total_pack_bytes(&pairs);
         assert!(pairs.len() <= 8 && total > 0, "three packs alone stay under the pack-count limit");
         let out_dir = root.0.join("selected-consolidated");
-        let selected = select_packs_for_rebind_with_limit(
-            &git,
-            GitObjectFormat::Sha256,
-            &pairs,
-            total - 1,
-            Some(out_dir.as_path()),
-        )
-        .expect("consolidate on byte overflow");
+        let limit = total - 1;
+        let selected = select_packs_for_rebind_with_limit(&git, GitObjectFormat::Sha256, &pairs, limit, Some(&out_dir))
+            .expect("consolidate on byte overflow");
         assert_eq!(selected.len(), 1, "a byte-overflowing membership must consolidate into one pack");
         assert_eq!(count_pack_objects(&git, &out_dir, &selected[0].idx_path).expect("count"), 3);
+    }
+
+    #[test]
+    fn consolidate_packs_aborts_when_pack_or_idx_exceeds_byte_bound() {
+        let git = PathBuf::from("git");
+        if Command::new(&git).arg("--version").output().is_err() {
+            return;
+        }
+        let root = RebindTempDir::create().expect("workspace");
+        let scratch = root.0.join("scratch.git");
+        Command::new(&git).args(["init", "--bare", "--object-format", "sha256"]).arg(&scratch).output().expect("init");
+        let mut pairs = Vec::new();
+        for index in 0..2u8 {
+            let target = root.0.join(format!("restored-{index}"));
+            pairs.push(seed_pack(&git, &scratch, &target, format!("object-{index}\n").as_bytes()));
+        }
+        // A `.pack` above the stream bound is killed mid-stream; `.pack + .idx` overflow fails after index-pack.
+        let out_a = root.0.join("bounded-pack");
+        let packed = select_packs_for_rebind_with_limit(&git, GitObjectFormat::Sha256, &pairs, 16, Some(&out_a));
+        assert!(matches!(packed, Err(PairedBackupError::StateMachine(_))));
+        assert!(!out_a.join("pack-consolidated.pack").exists());
+        let measure_dir = root.0.join("measure-consolidated");
+        let pack = consolidate_packs_with_git(&git, GitObjectFormat::Sha256, &pairs, &measure_dir, u64::MAX).unwrap();
+        let (out_b, limit) = (root.0.join("bounded-idx"), pack.pack_len + 1);
+        let r = select_packs_for_rebind_with_limit(&git, GitObjectFormat::Sha256, &pairs, limit, Some(&out_b));
+        assert!(matches!(r, Err(PairedBackupError::StateMachine(_))));
+        assert!(!out_b.join("pack-consolidated.pack").exists() && !out_b.join("pack-consolidated.idx").exists());
     }
 
     #[test]
@@ -402,10 +482,10 @@ mod tests {
             pairs.push(seed_pack(&git, &scratch, &target, format!("object-{index}\n").as_bytes()));
         }
         let out_dir = root.0.join("consolidated");
-        let consolidated = consolidate_packs_with_git(&git, GitObjectFormat::Sha256, &pairs, &out_dir).expect("pack");
-        assert_eq!(count_pack_objects(&git, &out_dir, &consolidated.idx_path).expect("count"), 9);
-        assert!(consolidated.pack_len > 0 && consolidated.idx_len > 0);
-        let oid = pick_any_object_oid_from_pack(&git, GitObjectFormat::Sha256, &consolidated.idx_path).expect("oid");
+        let pack = consolidate_packs_with_git(&git, GitObjectFormat::Sha256, &pairs, &out_dir, u64::MAX).unwrap();
+        assert_eq!(count_pack_objects(&git, &out_dir, &pack.idx_path).expect("count"), 9);
+        assert!(pack.pack_len > 0 && pack.idx_len > 0);
+        let oid = pick_any_object_oid_from_pack(&git, GitObjectFormat::Sha256, &pack.idx_path).expect("oid");
         assert!(oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }

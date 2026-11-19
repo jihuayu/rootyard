@@ -98,6 +98,36 @@ pub(super) async fn read_pg_repo_state(
     Ok((spec, row.get(5), refs))
 }
 
+/// A Raft `InitializeGate` replay is accepted only for the three idempotent gate responses.
+pub(super) fn ensure_raft_gate_initialized(resp: &ApplyResponse, context: &str) -> Result<(), PairedBackupError> {
+    match resp {
+        ApplyResponse::GateInitialized { .. } | ApplyResponse::AlreadyApplied { .. } | ApplyResponse::Noop => Ok(()),
+        other => Err(PairedBackupError::StateMachine(format!(
+            "{context}: unexpected Raft InitializeGate response: {other:?}"
+        ))),
+    }
+}
+
+/// A Raft `CommitRefs` replay is accepted only for a genuinely Committed terminal: a `Rejected`
+/// terminal is a durable refusal and must never be mirrored or replayed as success.
+pub(super) fn ensure_raft_commit_refs_committed(resp: &ApplyResponse, context: &str) -> Result<(), PairedBackupError> {
+    match resp {
+        ApplyResponse::RefsCommitted(receipt)
+            if receipt.terminal.kind == crate::ref_store::core::terminal::TerminalKind::Committed
+                && receipt.is_committed() =>
+        {
+            Ok(())
+        }
+        ApplyResponse::RefsCommitted(receipt) => Err(PairedBackupError::StateMachine(format!(
+            "{context}: Raft CommitRefs terminal rejected: {:?}",
+            receipt.terminal
+        ))),
+        other => {
+            Err(PairedBackupError::StateMachine(format!("{context}: unexpected Raft CommitRefs response: {other:?}")))
+        }
+    }
+}
+
 /// Reconcile the local Raft gate/refs of one repository with PostgreSQL through exact CAS deltas.
 /// The helper is synchronous so callers can run it inside `spawn_blocking` without ever holding a
 /// `std::sync::MutexGuard` across an `.await`.
@@ -126,12 +156,7 @@ pub(super) fn apply_pg_repo_state_to_raft(
             lane: RepositoryLane::ServingRefStore,
             authz_floor: floor.max(1),
         }))?;
-        if !matches!(
-            init_resp,
-            ApplyResponse::GateInitialized { .. } | ApplyResponse::AlreadyApplied { .. } | ApplyResponse::Noop
-        ) {
-            return Err(PairedBackupError::StateMachine("Raft InitializeGate replication was rejected".into()));
-        }
+        ensure_raft_gate_initialized(&init_resp, "PG->Raft sync")?;
     }
     let (snap, _) = raft.durable_state()?;
     let raft_gate = snap
@@ -193,11 +218,93 @@ pub(super) fn apply_pg_repo_state_to_raft(
             policy_rejects: BTreeMap::new(),
             logical_tick: next_tick,
         }))?;
-        if !matches!(commit_resp, ApplyResponse::RefsCommitted(_)) {
-            return Err(PairedBackupError::StateMachine("Raft CommitRefs PG replication was rejected".into()));
-        }
+        ensure_raft_commit_refs_committed(&commit_resp, "PG->Raft sync")?;
         expected_rev += 1;
         next_tick = next_tick.saturating_add(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ref_store::core::state_machine::{AppliedLogId, RefCasStateMachine};
+    use crate::ref_store::core::terminal::TerminalKind;
+
+    fn log(index: u64) -> AppliedLogId {
+        AppliedLogId { term: 1, index }
+    }
+
+    fn commit_command(repo: Uuid, tenant: Uuid, history: Uuid, revision: i64, oid_byte: char) -> RefCasCommand {
+        let oid = oid_byte.to_string().repeat(64);
+        let update = RefUpdate::new(
+            RefName::new("refs/heads/main").expect("ref name"),
+            RefPrecondition::Absent,
+            RefTarget::Oid(GitOid::parse(GitObjectFormat::Sha256, &oid).expect("oid")),
+        );
+        let request = CommitRefsRequest::new(
+            repo,
+            tenant,
+            Uuid::new_v4(),
+            IssuerLane::new("paired-pg-raft-sync-test").expect("lane"),
+            revision,
+            Uuid::new_v4(),
+            GitObjectFormat::Sha256,
+            history,
+            1,
+            1,
+            revision,
+            HeadUpdate::Keep,
+            CommitMode::Atomic,
+            vec![update],
+        )
+        .expect("commit request");
+        RefCasCommand::CommitRefs(CommitRefsCommand {
+            request: WireCommitRefsRequest::from(&request),
+            decision_id: None,
+            required_holds: Vec::new(),
+            policy_rejects: BTreeMap::new(),
+            logical_tick: revision as u64,
+        })
+    }
+
+    #[test]
+    fn rejected_raft_commit_refs_terminal_fails_closed() {
+        let (repo, tenant, history) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut sm = RefCasStateMachine::new();
+        let gate = WireGateInit {
+            repository_id: repo,
+            tenant_id: tenant,
+            object_format: GitObjectFormat::Sha256,
+            history_incarnation: history,
+            authority_epoch: 1,
+            group_epoch: 1,
+            head_ref: "refs/heads/main".into(),
+        };
+        let r1 = sm
+            .apply(
+                log(1),
+                RefCasCommand::InitializeGate(InitializeGateCommand {
+                    gate,
+                    lane: RepositoryLane::ServingRefStore,
+                    pack_mode: SmPackMode::MetadataOnly,
+                    authz_floor: 1,
+                }),
+            )
+            .expect("initialize gate");
+        assert!(ensure_raft_gate_initialized(&r1, "test").is_ok());
+        assert!(ensure_raft_commit_refs_committed(&r1, "test").is_err());
+
+        let r2 = sm.apply(log(2), commit_command(repo, tenant, history, 1, 'a')).expect("commit");
+        assert!(matches!(&r2, ApplyResponse::RefsCommitted(_)));
+        assert!(ensure_raft_commit_refs_committed(&r2, "test").is_ok());
+
+        let r3 = sm.apply(log(3), commit_command(repo, tenant, history, 2, 'b')).expect("rejected commit applies");
+        let ApplyResponse::RefsCommitted(receipt) = &r3 else {
+            panic!("expected a RefsCommitted response carrying the rejected terminal");
+        };
+        assert_eq!(receipt.terminal.kind, TerminalKind::Rejected);
+        let rejected = ensure_raft_commit_refs_committed(&r3, "test");
+        assert!(matches!(rejected, Err(PairedBackupError::StateMachine(_))));
+    }
 }

@@ -178,9 +178,9 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
         let blocked_group = LiveMtlsRaftGroup::start_three(32)?;
         let mut blocked_raft = blocked_group.connect_backend(1)?;
         let mut blocked_peers: BTreeMap<i64, MtlsLiveRaftBackend> = BTreeMap::new();
-        // The pristine probe still reaches every voter directly, but the local voter can never
-        // form a quorum with the rest of its group once the others are partitioned away.
-        blocked_group.isolate_nodes(&[2, 3])?;
+        // Every voter is mutually partitioned `{1} | {2} | {3}` so no pair retains a 2-of-3 quorum,
+        // while direct pristine probes from the test client still reach all three voters.
+        blocked_group.partition_all_nodes()?;
         let restore_env = s3.apply_env("paired-fmt30-delta8");
         let rejected = restore_and_boot_format30_new_incarnation(
             &archive_dir,
@@ -192,7 +192,10 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
         )
         .await;
         drop(restore_env);
-        ensure!(rejected.is_err(), "a restore whose Raft boot loses quorum must fail closed");
+        ensure!(
+            matches!(&rejected, Err(rootyard::maintenance::paired_raft_backup::PairedBackupError::FreezeNotHeld(_))),
+            "a restore whose Raft boot loses quorum must fail closed on FreezeNotHeld, got {rejected:?}"
+        );
         ensure!(!blocked_vol.exists(), "a failed restore must never publish the target volume");
         ensure!(blocked_guard.is_file(), "a failed restore must leave the crash-persistent guard armed");
         ensure!(
@@ -208,6 +211,11 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
             read_pg_database_read_only(&blocked_pg).await?,
             "the restored target database must stay READ ONLY after a mid-flight failure"
         );
+        let rip: Option<String> = blocked_pg
+            .query_one("SELECT NULLIF(current_setting('rootyard.restore_in_progress', true), '')", &[])
+            .await?
+            .get(0);
+        ensure!(rip.is_some(), "rootyard.restore_in_progress must stay armed after a mid-flight failure");
 
         // The same archive restores, publishes and disarms the guard on a pristine target.
         let published_vol = dir.path().join("gate8-dst-published");

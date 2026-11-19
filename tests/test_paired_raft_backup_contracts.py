@@ -309,15 +309,26 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             ("publish_staged_dir_noreplace", "RENAME_NOREPLACE", "boot_thaw"),
             "atomic no-replace staged publication contract",
         )
-        self.assertLess(
-            boot_src.index("boot_thaw"),
-            boot_src.index("publish_staged_dir_noreplace(&staged_data"),
-            "the Raft/PG thaw must stay inside the fallible block before the single publish rename",
+        order = ("boot_thaw", "publish_staged_dir_noreplace(&staged_data", "clear_restored_pg_freeze(&dst_client)")
+        order += ("remove_file(&guard_path)",)
+        self.assertEqual(order, tuple(sorted(order, key=boot_src.index)), "PG unfreeze after publish; guard last")
+        self.assertIn("BootThawRefused", read("types.rs"), "boot thaw must be a typed refusal")
+        self.assertIn("BootThawRefused", boot_src, "boot thaw refusal must be raised in format30_boot")
+        self.assertIn("VERIFIER_MAX_OBJECTS", consolidate_src, "consolidation must bound the verifier object count")
+        self.assertNotIn("wait_with_output", consolidate_src, "the consolidated pack must never be buffered in heap RAM")
+        mtls_cluster_src = (ROOT / "tests" / "paired_raft_backup_support" / "mtls_cluster.rs").read_text(encoding="utf-8")
+        self.assertIn("partition_all_nodes", mtls_cluster_src, "gate 8 must be able to partition every voter")
+        self.assertNotIn("let _ = n.rpc", mtls_cluster_src, "partition RPC results must never be discarded")
+        require(
+            read("format30_pg_raft_sync.rs"),
+            ("ensure_raft_commit_refs_committed", "TerminalKind::Committed"),
+            "a rejected Raft terminal must never be mirrored or replayed as success",
         )
+        self.assertIn("ensure_raft_commit_refs_committed", read("format30_boot_raft.rs"))
         self.assertIn("replicate_pg_repo_to_raft_guarded", read("durable_guarded_ops.rs"))
         delta8 = ROOT / "tests" / "paired_raft_backup_support" / "format30_delta8_gates.rs"
         self.assertTrue(delta8.exists(), "gate-8 delta module is missing")
-        require(delta8.read_text(encoding="utf-8"), ("gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished", "rootyard-restoring"), "gate-8 ref-less rebind and unpublished-restore coverage")
+        require(delta8.read_text(encoding="utf-8"), ("gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished", "rootyard-restoring", "partition_all_nodes"), "gate-8 ref-less rebind and unpublished-restore coverage")
         self.assertIn("format30_delta8_gates", (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8"), "gate-8 module must be wired into the integration test target")
         luna = (ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_startup_gates.rs")
         require(luna.read_text(encoding="utf-8"), ("min_committed_index", "durable_sqlite_sha256", "wrong_san_cert", "rogue_client_cert", "unpinned_client_cert"), "gate-6")
@@ -346,8 +357,11 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
                 "restore_and_boot_format30_with_pre_thaw_hook",
                 "kill_hard",
                 "paired-restore-rebind",
+                "BootThawRefused",
+                "pre_thaw_hook_ran",
+                "restore_and_boot_format30_with_pre_publish_hook",
             ),
-            "gate-10 multi-plan rebind and thaw-failure coverage",
+            "gate-10 multi-plan rebind, thaw-failure and pre-publish collision coverage",
         )
         self.assertIn(
             "format30_delta10_gates",
