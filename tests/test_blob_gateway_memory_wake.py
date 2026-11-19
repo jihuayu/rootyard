@@ -55,7 +55,8 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         events = source("src/events.rs")
         self.assertIn('pub const TARGET_AUDIT_CONSUMER: &str = "audit-log"', events)
         self.assertIn('pub const TARGET_AUDIT_KIND: &str = "pg_refstore_core_commit_audit"', events)
-        claim = body(events, "async fn claim_scoped(", "async fn lock_valid_lease")
+        consumer = source("src/events/consumer.rs")
+        claim = body(consumer, "async fn claim_scoped(", "async fn lock_valid_lease")
         for marker in (
             "$3::text IS NULL OR",
             "o.evidence->>'kind'=$3",
@@ -69,7 +70,7 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
             "o.evidence->>'core_outcome'='committed'",
         ):
             self.assertIn(marker, claim)
-        scoped = body(events, "pub async fn worker_once_with_lease_scoped(", "async fn run_claims")
+        scoped = body(consumer, "pub async fn worker_once_with_lease_scoped(", "async fn run_claims")
         self.assertIn("claim_scoped", scoped)
 
     def test_state_holds_only_a_unit_signal_not_event_data(self):
@@ -159,7 +160,7 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         self.assertIn("row.get::<_, serde_json::Value>(9) == operation.evidence", bridge)
         self.assertIn("return Err(crate::ref_store::contract::RefStoreError::IdentityConflict)", bridge)
         self.assertIn("publish_in_tx_guarded(tx, operation, changes, None, None, false)", bridge)
-        guarded = body(text, "async fn publish_in_tx_guarded(", "fn claim_from_row")
+        guarded = body(text, "async fn publish_in_tx_guarded(", "pub async fn process_ref_cas_projection_jobs(")
         self.assertIn("if enqueue_ref_index", guarded)
         self.assertIn("VALUES($1,'audit-log')", guarded)
         # The audit-only path must never enqueue the legacy ref-index effect.
@@ -226,7 +227,7 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         self.assertEqual(webhooks.count("o.evidence->>'kind'"), 2)
         self.assertIn("<> 'pg_refstore_core_commit_audit'", webhooks)
         events = source("src/events.rs")
-        guarded = body(events, "async fn publish_in_tx_guarded(", "fn claim_from_row")
+        guarded = body(events, "async fn publish_in_tx_guarded(", "pub async fn process_ref_cas_projection_jobs(")
         self.assertIn("if enqueue_ref_index", guarded)
         self.assertNotIn("VALUES($1,'audit-log'),($1,'ref-index')", guarded)
 
