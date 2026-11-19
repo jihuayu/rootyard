@@ -252,14 +252,7 @@ fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
 }
 
 fn child_gone(child: &mut Child) -> bool {
-    match child.try_wait() {
-        Ok(Some(_)) => true,
-        #[cfg(unix)]
-        Err(err) => err.raw_os_error() == Some(libc::ECHILD),
-        #[cfg(not(unix))]
-        Err(_) => true,
-        Ok(None) => false,
-    }
+    child.id().is_none() || matches!(child.try_wait(), Ok(Some(_)))
 }
 
 pub(crate) async fn run_git_bounded(

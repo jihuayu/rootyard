@@ -13,6 +13,7 @@ const GIT_DIR_CAP: usize = 64 * 1024 * 1024;
 const TIMEOUT_CLEANUP_BOUND: Duration = Duration::from_secs(2);
 const LEADER_REAP_BOUND: Duration = Duration::from_millis(100);
 const FALLBACK_ASYNC_BUDGET: Duration = Duration::from_millis(250);
+const UNRESOLVED_OWNER_CAP: usize = 256;
 
 /// One refcounted scratch owner that must outlive a child process group.
 pub(crate) type ScratchHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
@@ -306,41 +307,102 @@ impl Drop for SpawnFallback {
         }
         eprintln!("rootyard: Git reaper fallback timed out or group probe failed; preserving unverified scratch");
         std::mem::forget(holds);
-        drop(child);
+        handoff_unresolved_child(child, pid);
     }
 }
 
-async fn reap_fallback_bounded(mut child: Child, pid: i32, holds: Vec<ScratchHold>, probe: GroupProbe) {
-    #[cfg(unix)]
-    let confirmed = if pid > 1 && child.id().is_some() {
-        tokio::time::timeout(FALLBACK_ASYNC_BUDGET, async {
+pub(super) type WaitFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<ExitStatus>> + Send + 'a>>;
+pub(super) type WaitChildFn = for<'a> fn(&'a mut Child) -> WaitFuture<'a>;
+fn default_wait_child(child: &mut Child) -> WaitFuture<'_> {
+    Box::pin(child.wait())
+}
+async fn reap_fallback_bounded(child: Child, pid: i32, holds: Vec<ScratchHold>, probe: GroupProbe) {
+    reap_fallback_with_wait(child, pid, holds, probe, default_wait_child).await;
+}
+pub(super) async fn reap_fallback_with_wait(
+    mut child: Child,
+    pid: i32,
+    holds: Vec<ScratchHold>,
+    probe: GroupProbe,
+    wait_child: WaitChildFn,
+) {
+    signal_group(&mut child, pid);
+    let confirmed = pid <= 1
+        || child.id().is_none()
+        || tokio::time::timeout(FALLBACK_ASYNC_BUDGET, async {
             while !matches!(probe(pid), Ok(true)) {
-                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                signal_group(&mut child, pid);
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .is_ok()
-    } else {
-        let _ = probe;
-        true
-    };
-    #[cfg(not(unix))]
-    let confirmed = {
-        let _ = (pid, probe);
-        true
-    };
+        .is_ok();
     let reaped = confirmed
-        && (tokio::time::timeout(Duration::from_secs(1), child.wait()).await.is_ok() || child_gone(&mut child));
+        && (matches!(tokio::time::timeout(Duration::from_secs(1), wait_child(&mut child)).await, Ok(Ok(_)))
+            || child.id().is_none());
     if !reaped {
         eprintln!("rootyard: Git reaper fallback timed out or group probe failed; preserving unverified scratch");
         std::mem::forget(holds);
-        let _ = tokio::time::timeout(LEADER_REAP_BOUND, child.wait()).await;
-        drop(child);
+        handoff_unresolved_child(child, pid);
         return;
     }
     drop(child);
     drop(holds);
+}
+static UNRESOLVED_QUEUE: std::sync::Mutex<std::collections::VecDeque<(Child, i32)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static UNRESOLVED_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct ActiveOwnerGuard(bool);
+impl Drop for ActiveOwnerGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            UNRESOLVED_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+fn handoff_unresolved_child(mut child: Child, pid: i32) {
+    if child.id().is_none() {
+        return;
+    }
+    signal_group(&mut child, pid);
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        let _ = child_gone(&mut child);
+        return;
+    };
+    let mut queue = UNRESOLVED_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.len() < UNRESOLVED_OWNER_CAP {
+        queue.push_back((child, pid));
+        drop(queue);
+        ensure_unresolved_owner(&handle);
+        return;
+    }
+    drop(queue);
+    let _ = child_gone(&mut child);
+}
+fn pop_unresolved(active: &mut ActiveOwnerGuard) -> Option<(Child, i32)> {
+    let mut queue = UNRESOLVED_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let popped = queue.pop_front();
+    if popped.is_none() {
+        UNRESOLVED_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        active.0 = false;
+    }
+    popped
+}
+fn ensure_unresolved_owner(handle: &tokio::runtime::Handle) {
+    if UNRESOLVED_ACTIVE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    handle.spawn(async move {
+        let mut active = ActiveOwnerGuard(true);
+        while let Some((mut child, pid)) = pop_unresolved(&mut active) {
+            signal_group(&mut child, pid);
+            let waited = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            if !matches!(waited, Ok(Ok(_))) && !child_gone(&mut child) {
+                drop(child);
+            }
+        }
+    });
 }
 
 fn reap_until_confirmed(mut child: Child, pid: i32, holds: Vec<ScratchHold>, probe: GroupProbe) {
@@ -379,14 +441,7 @@ fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
 }
 
 fn child_gone(child: &mut Child) -> bool {
-    match child.try_wait() {
-        Ok(Some(_)) => true,
-        #[cfg(unix)]
-        Err(err) => err.raw_os_error() == Some(libc::ECHILD),
-        #[cfg(not(unix))]
-        Err(_) => true,
-        Ok(None) => false,
-    }
+    child.id().is_none() || matches!(child.try_wait(), Ok(Some(_)))
 }
 
 pub(crate) async fn run_git_dir_bounded(

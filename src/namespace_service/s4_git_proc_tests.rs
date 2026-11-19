@@ -207,7 +207,12 @@ async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_chi
     }
     assert!(!PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
     assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(root.exists(), "uncertain scratch was deleted despite unknown group outcome");
+    let post_budget = Duration::from_millis(400);
+    if let Some(remaining) = post_budget.checked_sub(started.elapsed()) {
+        tokio::time::sleep(remaining).await;
+    }
+    assert!(!PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
+    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
+    assert!(root.exists(), "uncertain scratch was deleted after fallback budget expired");
     std::fs::remove_dir_all(&root).unwrap();
 }

@@ -396,7 +396,54 @@ async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_chi
     }
     assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
     assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(root.exists(), "uncertain disposable view was deleted despite unknown group outcome");
+    let post_budget = std::time::Duration::from_millis(400);
+    if let Some(remaining) = post_budget.checked_sub(started.elapsed()) {
+        tokio::time::sleep(remaining).await;
+    }
+    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
+    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
+    assert!(root.exists(), "uncertain disposable view was deleted after fallback budget expired");
+    std::fs::remove_dir_all(&root).expect("cleanup preserved disposable view");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inner_wait_error_preserves_scratch_and_hands_child_to_bounded_owner() {
+    use super::s4_authority::DisposableCiView;
+    use std::{os::unix::fs::PermissionsExt, process::Stdio};
+    fn failing_wait(_child: &mut tokio::process::Child) -> super::s4_git_runner::WaitFuture<'_> {
+        Box::pin(std::future::ready(Err(std::io::Error::other("simulated inner wait error"))))
+    }
+    let view = DisposableCiView::create().expect("disposable view");
+    let root = view.path().to_path_buf();
+    let wrapper = root.join("git");
+    std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
+    let mut cmd = tokio::process::Command::new(&wrapper);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
+    let child = cmd.spawn().expect("spawn wrapper");
+    let pid = child.id().and_then(|id| i32::try_from(id).ok()).expect("wrapper pid");
+    let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
+    let holds = vec![view.hold()];
+    drop(view);
+    super::s4_git_runner::reap_fallback_with_wait(
+        child,
+        pid,
+        holds,
+        crate::git_http::group_quiescent,
+        failing_wait,
+    )
+    .await;
+    for _ in 0..300 {
+        if !std::path::PathBuf::from(format!("/proc/{leader}")).exists()
+            && !std::path::PathBuf::from(format!("/proc/{grandchild}")).exists()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "unresolved owner did not reap leader");
+    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
+    assert!(root.exists(), "inner wait error released scratch without reap proof");
     std::fs::remove_dir_all(&root).expect("cleanup preserved disposable view");
 }
