@@ -303,10 +303,15 @@ deadline/breaker bounds, singleflight coalescing, explicit leader abort with
 follower wake and generation-safe cleanup, URL/TLS policy, channel bounds and
 eviction-policy allowlist. `src/dispatch.rs` unit tests cover the explicit A4
 worker scope, the A4-scoped valid channel, the default-off transport selection
-and the no-feature Redis refusal. Source-only Python guards in
-`tests/test_a4_redis_wake.py` and `tests/test_blob_gateway_memory_wake.py` cover
-the producer/subscriber wiring, publisher stop ownership, post-commit trigger
-ordering and the absence of legacy consumer/projection enrollment. Redis unit
+the explicit external/embedded placement and the no-feature Redis refusal.
+Source-only Python guards in `tests/test_a4_redis_wake.py` and
+`tests/test_blob_gateway_memory_wake.py` cover the producer/subscriber wiring,
+publisher stop ownership, conditional external consumer removal, post-commit
+trigger ordering and the absence of legacy consumer/projection enrollment. The
+opt-in external acceptance entry point and its pure timing/report/cleanup guards
+live in `tests/a4_redis_wake_partition.py` and
+`tests/test_a4_redis_wake_partition.py`; they do not replace the required native
+PASSED report. Redis unit
 tests cover bounded-read length/corruption as a miss, cheap pre-encode oversize
 rejection, whole-deadline permit wait and refusal to operate without a validated
 server contract. Real-Redis contract tests are `#[ignore]`d and require a
@@ -335,9 +340,11 @@ executable, fixture version and case counts in
 HA/Sentinel/Cluster, PG failover, production performance and least-privilege
 production ACLs remain pending. The `serve-blob`/A4 advisory producer and
 subscriber wiring is implemented behind the explicit variables above, but the
-real PG17/Garage/Redis external A4 acceptance remains pending. This increment
-keeps #111 open for that acceptance and never makes Redis a hard quota or
-authority. The default build still needs no Redis.
+real PG17/Garage/Redis external A4 acceptance remains pending: the opt-in entry
+point is `tests/a4_redis_wake_partition.py` with pure tests in
+`tests/test_a4_redis_wake_partition.py`, but no native PASSED report is claimed
+in this worktree. This increment keeps #111 open for that run and never makes
+Redis a hard quota or authority. The default build still needs no Redis.
 
 The full ignored real-Redis suite includes destructive FLUSHALL and CONFIG SET
 checks. Run it only against a disposable, task-owned instance and explicitly set
