@@ -110,6 +110,10 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         self.assertIn("&committed.terminal", commit)
         self.assertIn("backend_identity", commit)
         self.assertLess(commit.index("write_verified_commit("), commit.index("enqueue_core_audit("))
+        # The wake-producing audit kind is narrowed to the serving gateway's
+        # captured-and-matched A4 call; generic commit passes None.
+        self.assertIn("if let Some((incarnation, false)) = captured_cluster_incarnation", commit)
+        self.assertNotIn("captured_cluster_incarnation.map(|(incarnation, _)| incarnation)", commit)
         helper = body(text, "async fn enqueue_core_audit(", "fn receipt(")
         self.assertIn('"kind": "pg_refstore_core_commit_audit"', helper)
         self.assertIn("crate::events::publish_core_commit_audit_in_tx", helper)
@@ -124,8 +128,12 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         self.assertIn("b.backend_identity", helper)
         self.assertIn("backend_identity", helper)
         self.assertIn("core_outcome", helper)
-        self.assertIn("FROM cluster_authority", helper)
+        # The helper must consume the captured-and-compared value, never read a
+        # then-current incarnation after core mutation.
+        self.assertIn("restore_incarnation: Uuid", helper)
         self.assertIn("restore_incarnation", helper)
+        self.assertNotIn("FROM cluster_authority", helper)
+        self.assertNotIn("None => tx", helper)
         self.assertIn("RefStoreError::GateConflict", helper)
         self.assertIn("RefStoreError::IdentityConflict", helper)
         self.assertNotIn("SAVEPOINT", helper)
@@ -167,24 +175,47 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         commit = source("src/ref_store/core/pack_commit/authorized/commit.rs")
         inner = body(commit, "async fn commit_inner(", "async fn commit_in_tx(")
         self.assertIn("expected_cluster_incarnation", inner)
-        tx = body(commit, "async fn commit_in_tx(", "// SHARE NOWAIT is taken")
+        tx = body(commit, "async fn commit_in_tx(", "fn audit_changes(")
         self.assertIn("crate::ref_store::pg::bound", tx)
         self.assertIn("public_cluster_incarnation_nowait", tx)
         self.assertLess(tx.index("public_cluster_incarnation_nowait"), tx.index("PgRefStore.begin"))
+        self.assertIn("Some((current, current != expected))", tx)
         pending = body(tx, "OperationState::Pending => {", "}\n")
         self.assertIn("RestoreIncarnationMismatch", pending)
         replay = body(tx, "OperationState::Committed | OperationState::Rejected", "OperationState::Cancelled")
         self.assertIn("return Ok(receipt", replay)
+        # Only the already-compared equality may reach the audit bridge.
+        self.assertIn("if let Some((incarnation, false)) = captured_cluster_incarnation", tx)
         audit = body(commit, "async fn enqueue_core_audit(", "fn receipt(")
-        self.assertIn("captured_restore_incarnation", audit)
-        self.assertIn("Some(incarnation) => incarnation", audit)
-        self.assertIn("None => tx", audit)
+        self.assertIn("restore_incarnation: Uuid", audit)
+        self.assertNotIn("captured_restore_incarnation", audit)
+        self.assertNotIn("Some(incarnation) => incarnation", audit)
+        self.assertNotIn("None => tx", audit)
+        self.assertNotIn("FROM cluster_authority", audit)
 
         contract = source("src/ref_store/contract.rs")
         self.assertIn("RestoreIncarnationMismatch", contract)
         gateway = source("src/blob_git_gateway/error.rs")
         self.assertIn("Ref::RestoreIncarnationMismatch =>", gateway)
         self.assertIn('Self::Unavailable("repository authority changed; retry the same operation")', gateway)
+
+    def test_generic_commit_does_not_opt_into_the_target_audit_wake(self):
+        text = source("src/ref_store/core/pack_commit/authorized/commit.rs")
+        generic = body(text, "pub async fn commit(", "/// Final A4 commit")
+        self.assertIn("self.commit_inner(pool, verified, None, deadline).await", generic)
+        self.assertNotIn("commit_with_expected_cluster_incarnation", generic)
+        tx = body(text, "async fn commit_in_tx(", "fn audit_changes(")
+        self.assertIn("Some((current, current != expected))", tx)
+        self.assertIn("if let Some((incarnation, false)) = captured_cluster_incarnation", tx)
+        self.assertEqual(tx.count("enqueue_core_audit("), 1)
+        self.assertLess(
+            tx.index("if let Some((incarnation, false)) = captured_cluster_incarnation"),
+            tx.index("enqueue_core_audit("),
+        )
+        self.assertNotIn("captured_cluster_incarnation.map(|(incarnation, _)| incarnation)", tx)
+        self.assertNotIn("SELECT incarnation FROM cluster_authority", tx)
+        helper = body(text, "async fn enqueue_core_audit(", "fn receipt(")
+        self.assertNotIn("FROM cluster_authority", helper)
 
     def test_audit_projection_is_not_a_legacy_push_webhook_or_ref_index_event(self):
         bridge = source("src/events.rs")

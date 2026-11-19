@@ -40,6 +40,11 @@ impl AuthorizedCommitReceipt {
 }
 
 impl PgAuthorizedCommit {
+    /// Generic authorized commit used by non-serving producers (for example
+    /// namespace pushes). It deliberately does not opt into the serving
+    /// gateway's target-audit outbox/wake bridge: this path predates that
+    /// bridge and keeps its prior durable core/terminal behavior without a
+    /// wakeable `audit-log` job.
     pub async fn commit(
         &self,
         pool: &deadpool_postgres::Pool,
@@ -288,16 +293,26 @@ async fn commit_in_tx(
         // returned flag is the only authority for a later wake hint: it is true
         // only when the exact applied refs are durably present in the existing
         // `audit-log` delivery queue. The core commit never waits on the hint.
-        audit_enqueued = enqueue_core_audit(
-            tx,
-            plan,
-            selection.actor(),
-            &committed.terminal,
-            gate.object_format(),
-            backend_identity,
-            captured_cluster_incarnation.map(|(incarnation, _)| incarnation),
-        )
-        .await?;
+        //
+        // The new target-audit outbox kind is opt-in only to the serving
+        // gateway's captured-and-matched A4 path. Generic `commit` callers
+        // (including namespace push) keep their previous behavior: no target
+        // audit row and therefore no wakeable job. `false` is the equality
+        // already established before the operation prefix; a mismatch was
+        // refused above, and an immutable replay returned before any write, so
+        // only the exact trusted capture is stamped here.
+        if let Some((incarnation, false)) = captured_cluster_incarnation {
+            audit_enqueued = enqueue_core_audit(
+                tx,
+                plan,
+                selection.actor(),
+                &committed.terminal,
+                gate.object_format(),
+                backend_identity,
+                incarnation,
+            )
+            .await?;
+        }
         committed
     } else {
         let record =
@@ -345,11 +360,14 @@ fn audit_changes(
 
 /// Enqueue the audit-only outbox projection of one fresh core commit.
 ///
-/// Every field is read from the same DB-owned A4 completion transaction: the
-/// exact locked repository generation, the core gate/serving-binding realm, the
-/// just-written `ref_store_core_events` outcome and the cluster restore
-/// incarnation. A mismatch is a typed fail-closed error, so the core commit
-/// rolls back rather than ACKing content without its audit delivery. A local
+/// Called only for a captured-and-matched A4 commit. Every DB-owned field is
+/// read from the same A4 completion transaction: the exact locked repository
+/// generation, the core gate/serving-binding realm and the just-written
+/// `ref_store_core_events` outcome. `restore_incarnation` is the exact value
+/// already read under `FOR SHARE NOWAIT` and compared before any write; this
+/// helper never re-reads a mutable current value. A missing/nil incarnation or
+/// a realm mismatch is a typed fail-closed error, so the core commit rolls back
+/// rather than ACKing content without its audit delivery. A local
 /// byte-identical duplicate is the only case that may be confirmed.
 async fn enqueue_core_audit(
     tx: &Transaction<'_>,
@@ -358,7 +376,7 @@ async fn enqueue_core_audit(
     terminal: &PackCommitTerminal,
     format: crate::ref_store::core::types::GitObjectFormat,
     backend_identity: &str,
-    captured_restore_incarnation: Option<Uuid>,
+    restore_incarnation: Uuid,
 ) -> Result<bool, crate::ref_store::contract::RefStoreError> {
     let changes = audit_changes(format, &terminal.refs);
     if changes.is_empty() {
@@ -419,17 +437,8 @@ async fn enqueue_core_audit(
     if core_outcome != "committed" {
         return Err(crate::ref_store::contract::RefStoreError::GateConflict);
     }
-    // The serving A4 path passes the incarnation already locked and compared at
-    // the start of this transaction; it is never re-read after core mutation.
-    // Other authorized callers keep their existing late read.
-    let restore_incarnation = match captured_restore_incarnation {
-        Some(incarnation) => incarnation,
-        None => tx
-            .query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true FOR SHARE", &[])
-            .await
-            .map_err(crate::ref_store::pg::db_error)?
-            .get(0),
-    };
+    // This is the exact incarnation already locked and compared at the start
+    // of this transaction. It is never re-read after core mutation.
     if restore_incarnation.is_nil() {
         return Err(crate::ref_store::contract::RefStoreError::GateConflict);
     }
