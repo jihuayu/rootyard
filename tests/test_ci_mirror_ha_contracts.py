@@ -3,16 +3,31 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import io
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci-mirror-ha.yml"
 QUAL_SCRIPT = ROOT / "tests" / "ci_mirror_ha_qualification.py"
 DOCS = ROOT / "docs" / "ci-mirror.md"
+
+
+def _load_qualification_module():
+    spec = importlib.util.spec_from_file_location("ci_mirror_ha_qualification_under_test", QUAL_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load the HA qualification harness")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+QUAL_MODULE = _load_qualification_module()
 
 PINNED_CARGO_FORK_REV = "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
 PINNED_CARGO_FORK_VER = "1.101.0"
@@ -182,6 +197,334 @@ class CiMirrorHaContractsTest(unittest.TestCase):
             "UUID",
         ):
             self.assertIn(anchor, docs_src, f"docs/ci-mirror.md missing {anchor}")
+
+    def test_bounded_response_and_report_helpers(self) -> None:
+        module = QUAL_MODULE
+        limit = 7
+        self.assertEqual(module.read_bounded(io.BytesIO(b"a" * limit), limit), b"a" * limit)
+        with self.assertRaises(AssertionError) as raised:
+            module.read_bounded(io.BytesIO(b"a" * (limit + 1)), limit)
+        self.assertEqual(str(raised.exception), "HTTP response exceeded 7 byte bounded cap")
+        self.assertNotIn("a" * (limit + 1), str(raised.exception))
+
+        payload = "x" * (limit + 1)
+        kept, within_limit = module.bounded_report_payload(payload, limit)
+        self.assertEqual(kept, payload)
+        self.assertFalse(within_limit)
+        kept, within_limit = module.bounded_report_payload("x" * limit, limit)
+        self.assertEqual(kept, "x" * limit)
+        self.assertTrue(within_limit)
+
+        self.assertTrue(issubclass(module.HttpTransportError, OSError))
+
+        src = QUAL_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("read_bounded(resp)", src)
+        self.assertIn("read_bounded(err)", src)
+        self.assertIn("bounded_report_payload(payload)", src)
+        self.assertIn('raise HttpTransportError("HTTP request failed") from None', src)
+
+    def test_checkout_token_registration_is_immediate_and_fixed(self) -> None:
+        class FakeHarness:
+            def __init__(self) -> None:
+                self.secrets: list[str] = []
+
+            def add_secret(self, value: str) -> None:
+                if value and value not in self.secrets:
+                    self.secrets.append(value)
+
+        fake = FakeHarness()
+        token = "ryj_" + "a" * 64
+        returned = QUAL_MODULE.HaQualificationHarness.register_checkout_token(
+            fake, {"checkout": {"token": token}}
+        )
+        self.assertEqual(returned, token)
+        self.assertEqual(fake.secrets, [token])
+        for claimed in (
+            {},
+            [],
+            {"checkout": {}},
+            {"checkout": {"token": ""}},
+            {"checkout": {"token": "not-a-token"}},
+            {"checkout": {"token": token + "\n"}},
+        ):
+            with self.assertRaises(AssertionError) as raised:
+                QUAL_MODULE.HaQualificationHarness.register_checkout_token(fake, claimed)
+            self.assertEqual(
+                str(raised.exception),
+                "claim response did not contain a bounded checkout token",
+            )
+            self.assertNotIn(token, str(raised.exception))
+
+    def test_scenario_d_registers_token_before_any_assert(self) -> None:
+        tree = ast.parse(QUAL_SCRIPT.read_text(encoding="utf-8"))
+        cls = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "HaQualificationHarness"
+        )
+        scenario = next(
+            node for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "scenario_d_controlled_readiness_claim_transition"
+        )
+        token_line = None
+        for node in ast.walk(scenario):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "checkout_token"
+            ):
+                self.assertIsInstance(node.value, ast.Call)
+                self.assertIsInstance(node.value.func, ast.Attribute)
+                self.assertEqual(node.value.func.attr, "register_checkout_token")
+                token_line = node.lineno
+        self.assertIsNotNone(token_line)
+        first_claimed_assert = None
+        for node in ast.walk(scenario):
+            if isinstance(node, ast.Assert):
+                if not (isinstance(node.msg, ast.Constant) and isinstance(node.msg.value, str)):
+                    self.fail(f"Scenario D assert at line {node.lineno} does not use a fixed message")
+                if "claimed" in {name.id for name in ast.walk(node) if isinstance(name, ast.Name)} and first_claimed_assert is None:
+                    first_claimed_assert = node.lineno
+        self.assertIsNotNone(first_claimed_assert)
+        self.assertLess(token_line, first_claimed_assert)
+
+    def test_all_checkout_tokens_register_before_assertions(self) -> None:
+        tree = ast.parse(QUAL_SCRIPT.read_text(encoding="utf-8"))
+        cls = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "HaQualificationHarness"
+        )
+        methods = {
+            node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)
+        }
+        direct = {
+            "scenario_a_pr_prewarm_and_live_mirror_checkout": {"claimed": False},
+            "scenario_b_sigkill_dual_crash_and_failover": {
+                "c_b1": False,
+                "c_b2": False,
+                "c2_test": False,
+                "c_lint": False,
+                "fo_direct": False,
+            },
+            "scenario_c_coalesced_prewarm_and_origin_burst": {
+                "waiting_doc": True,
+                "woken_doc": False,
+            },
+            "scenario_d_controlled_readiness_claim_transition": {"claimed": False},
+        }
+        response_lists = {
+            "scenario_c_coalesced_prewarm_and_origin_burst": ("res1", "res2", "wq_res"),
+        }
+
+        def parent_blocks(func):
+            blocks = {}
+            for node in ast.walk(func):
+                for field_name in ("body", "orelse", "finalbody"):
+                    block = getattr(node, field_name, None)
+                    if isinstance(block, list):
+                        for statement in block:
+                            blocks.setdefault(statement, block)
+            return blocks
+
+        def assigned_names(node):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = set()
+            for target in targets:
+                for child in ast.walk(target):
+                    if isinstance(child, ast.Name):
+                        names.add(child.id)
+            return names
+
+        def find_assignment(func, name):
+            for node in ast.walk(func):
+                if isinstance(node, (ast.Assign, ast.AnnAssign)) and name in assigned_names(node):
+                    return node
+            return None
+
+        def immediate_call(func, name):
+            assignment = find_assignment(func, name)
+            self.assertIsNotNone(assignment, f"missing assignment for {name}")
+            block = parent_blocks(func).get(assignment)
+            self.assertIsNotNone(block, f"missing parent block for {name}")
+            index = block.index(assignment)
+            self.assertLess(index + 1, len(block), f"missing immediate registration for {name}")
+            statement = block[index + 1]
+            if isinstance(statement, ast.Expr):
+                call = statement.value
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                call = statement.value
+            else:
+                call = None
+            self.assertIsInstance(call, ast.Call, f"immediate registration is not a call for {name}")
+            self.assertIsInstance(call.func, ast.Attribute)
+            self.assertTrue(call.args, f"immediate registration has no argument for {name}")
+            self.assertIsInstance(call.args[0], ast.Name)
+            self.assertEqual(call.args[0].id, name)
+            return call
+
+        token_names = set()
+        for scenario, names in direct.items():
+            func = methods[scenario]
+            for name, optional in names.items():
+                call = immediate_call(func, name)
+                self.assertEqual(call.func.attr, "register_checkout_token")
+                required = next((kw.value for kw in call.keywords if kw.arg == "required"), None)
+                if optional:
+                    self.assertIsInstance(required, ast.Constant)
+                    self.assertFalse(required.value)
+                else:
+                    self.assertIsNone(required)
+                token_names.add(name)
+        for scenario, names in response_lists.items():
+            func = methods[scenario]
+            for name in names:
+                call = immediate_call(func, name)
+                self.assertEqual(call.func.attr, "register_checkout_tokens")
+                token_names.add(name)
+        token_names.update({"ready1", "over1", "ready2", "over2", "wq_res", "leased2_ids", "release_doc"})
+        for func in methods.values():
+            for node in ast.walk(func):
+                if isinstance(node, ast.Assert):
+                    names = {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+                    if names & token_names:
+                        self.assertIsInstance(node.msg, ast.Constant)
+                        self.assertIsInstance(node.msg.value, str)
+        self.assertNotIn('["checkout"]["token"]', QUAL_SCRIPT.read_text(encoding="utf-8"))
+
+    def test_initialization_failure_is_bounded_and_cleans_root(self) -> None:
+        src = QUAL_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('root = Path(tempfile.mkdtemp(prefix="rootyard-ci-mirror-ha-"))', src)
+        self.assertIn("harness = HaQualificationHarness(args, root)", src)
+        self.assertIn('"error": "qualification harness initialization failed"', src)
+        self.assertIn("shutil.rmtree(root, ignore_errors=True)", src)
+        self.assertIn("harness.cleanup(stop_daemons=False)", src)
+        self.assertLess(
+            src.index("    try:\n        root = Path(tempfile.mkdtemp"),
+            src.index("        harness = HaQualificationHarness(args, root)"),
+        )
+        self.assertLess(
+            src.index("        harness = HaQualificationHarness(args, root)"),
+            src.index("shutil.rmtree(root, ignore_errors=True)"),
+        )
+
+    def test_source_token_scan_states_and_final_scan_order(self) -> None:
+        src = QUAL_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("live_pgid_processes(self.tracked_pgids)", src)
+        self.assertIn('"live_writer"', src)
+        self.assertIn('"oversize"', src)
+        self.assertIn("MAX_LOG_BYTES", src)
+        self.assertIn("MAX_TOTAL_LOG_BYTES", src)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clean = root / "clean.log"
+            clean.write_text("ordinary content\n", encoding="utf-8")
+            leaked = root / "leaked.log"
+            leaked.write_text("prefix TOKEN suffix\n", encoding="utf-8")
+            clean_bytes = len("ordinary content\n".encode("utf-8"))
+            leaked_bytes = len("prefix TOKEN suffix\n".encode("utf-8"))
+            self.assertEqual(
+                QUAL_MODULE.scan_token_in_logs([clean], "TOKEN"),
+                {"state": "clean", "scanned": 1, "bytes": clean_bytes},
+            )
+            result = QUAL_MODULE.scan_token_in_logs([clean, leaked], "TOKEN")
+            self.assertEqual(
+                result,
+                {"state": "leaked", "scanned": 2, "bytes": clean_bytes + leaked_bytes},
+            )
+            self.assertNotIn("leaked.log", repr(result))
+            self.assertNotIn("prefix", repr(result))
+            self.assertEqual(
+                QUAL_MODULE.scan_token_in_logs([clean], ""),
+                {"state": "unavailable", "scanned": 0, "bytes": 0},
+            )
+            self.assertEqual(
+                QUAL_MODULE.scan_token_in_logs([clean, root / "missing.log"], "TOKEN"),
+                {"state": "missing", "scanned": 1, "bytes": clean_bytes},
+            )
+            per_log_oversized = root / "per-log-oversized.log"
+            per_log_oversized.write_bytes(b"x" * 8)
+            self.assertEqual(
+                QUAL_MODULE.scan_token_in_logs(
+                    [per_log_oversized], "TOKEN", per_log_limit=7, total_limit=100
+                ),
+                {"state": "oversize", "scanned": 0, "bytes": 0},
+            )
+            first = root / "first.log"
+            first.write_bytes(b"a" * 4)
+            second = root / "second.log"
+            second.write_bytes(b"b" * 4)
+            self.assertEqual(
+                QUAL_MODULE.scan_token_in_logs(
+                    [first, second], "TOKEN", per_log_limit=100, total_limit=6
+                ),
+                {"state": "oversize", "scanned": 1, "bytes": 4},
+            )
+
+        tree = ast.parse(QUAL_SCRIPT.read_text(encoding="utf-8"))
+        main = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        outer_try = next(node for node in main.body if isinstance(node, ast.Try) and node.finalbody)
+        nodes = [node for statement in outer_try.finalbody for node in ast.walk(statement)]
+
+        def call_lines(attribute: str) -> list[int]:
+            return [
+                node.lineno for node in nodes
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == attribute
+            ]
+
+        scan_lines = call_lines("scan_source_token_logs")
+        cleanup_lines = call_lines("cleanup")
+        write_lines = call_lines("write_text")
+        print_lines = [
+            node.lineno for node in nodes
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+        ]
+        size_guard_lines = [
+            node.lineno for node in nodes
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "bounded_report_payload"
+        ]
+        payload_print_lines = [
+            node.lineno for node in nodes
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "payload"
+        ]
+        failure_print_lines = [
+            node.lineno for node in nodes
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "failure_trace"
+        ]
+        for found in (
+            scan_lines,
+            cleanup_lines,
+            write_lines,
+            print_lines,
+            size_guard_lines,
+            payload_print_lines,
+            failure_print_lines,
+        ):
+            self.assertTrue(found)
+        self.assertLess(min(scan_lines), min(cleanup_lines))
+        self.assertLess(min(scan_lines), min(write_lines))
+        self.assertLess(min(scan_lines), min(failure_print_lines))
+        self.assertLess(min(size_guard_lines), min(write_lines))
+        self.assertLess(min(size_guard_lines), min(payload_print_lines))
 
 
 if __name__ == "__main__":

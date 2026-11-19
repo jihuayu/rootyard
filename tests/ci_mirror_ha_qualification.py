@@ -21,6 +21,13 @@ Scenarios covered:
      ``serve-mirror`` daemons killed -> simultaneous burst exercising global
      (4) and per-repo (2) origin fallback budgets and bounded wait wakeup, zero
      ``ROOTYARD_CI_MIRROR_SOURCE_TOKEN`` leaks, and zero leaked child processes.
+  D. A fresh unlisted real ``serve-mirror`` is alive but cannot serve a fresh
+     target -> ``claim`` returns a genuine ``202`` ``waiting`` with no lease or
+     checkout grant; an explicit named-mirror auto-fetch commits target-OID
+     readiness through the same controller/PostgreSQL/storage, after which the
+     same durable queued run claims ``200`` from that exact mirror with the
+     persisted ``(attempt, lease_generation, grant)`` bound to
+     repository/target/storage generation.
 """
 from __future__ import annotations
 
@@ -43,6 +50,64 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+
+
+# Conservative bounds for fixture-owned HTTP responses, daemon logs, and the final report.
+# Existing qualification responses, logs, and reports are far below these caps.
+MAX_HTTP_RESPONSE_BYTES = 1 * 1024 * 1024
+MAX_REPORT_BYTES = 8 * 1024 * 1024
+MAX_LOG_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_LOG_BYTES = 32 * 1024 * 1024
+
+
+class HttpTransportError(OSError):
+    """Fixed-message transport failure carrying no URL or credential detail."""
+
+
+def read_bounded(stream, limit: int = MAX_HTTP_RESPONSE_BYTES) -> bytes:
+    """Read at most ``limit`` bytes, rejecting oversized responses without echoing them."""
+    data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise AssertionError(f"HTTP response exceeded {limit} byte bounded cap")
+    return data
+
+
+def scan_token_in_logs(
+    log_paths: list[Path],
+    token: str,
+    *,
+    per_log_limit: int = MAX_LOG_BYTES,
+    total_limit: int = MAX_TOTAL_LOG_BYTES,
+) -> dict[str, object]:
+    """Scan bounded bytes and return only a closed state, count and byte total."""
+    if not token:
+        return {"state": "unavailable", "scanned": 0, "bytes": 0}
+    token_bytes = token.encode("utf-8")
+    scanned = 0
+    total = 0
+    for log_path in log_paths:
+        if not log_path.is_file():
+            return {"state": "missing", "scanned": scanned, "bytes": total}
+        if per_log_limit <= 0 or total_limit <= 0:
+            return {"state": "oversize", "scanned": scanned, "bytes": total}
+        read_limit = min(per_log_limit, total_limit - total)
+        try:
+            with log_path.open("rb") as handle:
+                data = handle.read(read_limit + 1)
+        except OSError:
+            return {"state": "unreadable", "scanned": scanned, "bytes": total}
+        if len(data) > per_log_limit or total + len(data) > total_limit:
+            return {"state": "oversize", "scanned": scanned, "bytes": total}
+        total += len(data)
+        scanned += 1
+        if token_bytes in data:
+            return {"state": "leaked", "scanned": scanned, "bytes": total}
+    return {"state": "clean", "scanned": scanned, "bytes": total}
+
+
+def bounded_report_payload(payload: str, limit: int = MAX_REPORT_BYTES) -> tuple[str, bool]:
+    """Report whether the complete payload fits; never truncate a report."""
+    return payload, len(payload.encode("utf-8")) <= limit
 
 
 def free_port() -> int:
@@ -84,9 +149,9 @@ def live_pgid_processes(pgids: set[int]) -> list[tuple[int, int, int, str]]:
 
 
 class HaQualificationHarness:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, root: Path | None = None):
         self.args = args
-        self.root = Path(tempfile.mkdtemp(prefix="rootyard-ci-mirror-ha-"))
+        self.root = root if root is not None else Path(tempfile.mkdtemp(prefix="rootyard-ci-mirror-ha-"))
         self.schema = "rootyard_ha_" + uuid.uuid4().hex
         self.schema_created = False
         self.base_db = os.environ["ROOTYARD_TEST_DATABASE_URL"]
@@ -103,24 +168,34 @@ class HaQualificationHarness:
         self.m1_id = str(uuid.uuid4())
         self.m2_id = str(uuid.uuid4())
         self.m3_id = str(uuid.uuid4())
+        self.m4_id = str(uuid.uuid4())
 
         self.c1_port = free_port()
         self.c2_port = free_port()
         self.m1_port = free_port()
         self.m2_port = free_port()
         self.m3_port = free_port()
+        self.m4_port = free_port()
+        for _ in range(32):
+            if self.m4_port not in {self.c1_port, self.c2_port, self.m1_port, self.m2_port, self.m3_port}:
+                break
+            self.m4_port = free_port()
+        else:
+            raise AssertionError("could not allocate a distinct mirror-4 port")
 
         self.c1_base = f"http://127.0.0.1:{self.c1_port}"
         self.c2_base = f"http://127.0.0.1:{self.c2_port}"
         self.m1_base = f"http://127.0.0.1:{self.m1_port}"
         self.m2_base = f"http://127.0.0.1:{self.m2_port}"
         self.m3_base = f"http://127.0.0.1:{self.m3_port}"
+        self.m4_base = f"http://127.0.0.1:{self.m4_port}"
 
         self.ctrl1_data = self.root / "ctrl1-data"
         self.ctrl2_data = self.root / "ctrl2-data"
         self.mirror1_data = self.root / "mirror1-data"
         self.mirror2_data = self.root / "mirror2-data"
         self.mirror3_data = self.root / "mirror3-data"
+        self.mirror4_data = self.root / "mirror4-data"
 
         self.base_env = os.environ.copy()
         self.base_env.update(
@@ -162,6 +237,27 @@ class HaQualificationHarness:
     def add_secret(self, value: str) -> None:
         if value and value not in self.secrets:
             self.secrets.append(value)
+
+    def register_checkout_token(self, claimed: object, *, required: bool = True) -> str | None:
+        """Register the claim credential before any assertion can stringify the response."""
+        checkout = claimed.get("checkout") if isinstance(claimed, dict) else None
+        token = checkout.get("token") if isinstance(checkout, dict) else None
+        if token is None and not required:
+            return None
+        if (
+            not isinstance(token, str)
+            or not token.startswith("ryj_")
+            or len(token) > 256
+            or not token.isascii()
+            or not token.isprintable()
+        ):
+            raise AssertionError("claim response did not contain a bounded checkout token")
+        self.add_secret(token)
+        return token
+
+    def register_checkout_tokens(self, responses: list[tuple[int, object, object]]) -> None:
+        for status, claimed, _ in responses:
+            self.register_checkout_token(claimed, required=status == 200)
 
     def run(self, argv: list[str], cwd: Path | None = None, check: bool = True, env: dict | None = None):
         proc = subprocess.run(
@@ -227,14 +323,23 @@ class HaQualificationHarness:
         req = urllib.request.Request(base + path, data=payload, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+                return resp.status, read_bounded(resp), {k.lower(): v for k, v in resp.headers.items()}
         except urllib.error.HTTPError as err:
-            return err.code, err.read(), {k.lower(): v for k, v in err.headers.items()}
+            try:
+                raw = read_bounded(err)
+            finally:
+                try:
+                    err.close()
+                except OSError:
+                    pass
+            return err.code, raw, {k.lower(): v for k, v in err.headers.items()}
+        except (urllib.error.URLError, OSError):
+            raise HttpTransportError("HTTP request failed") from None
 
     def document(self, base: str, path: str, expected: int | tuple[int, ...] = 200, **kwargs) -> tuple[dict, dict[str, str]]:
         codes = expected if isinstance(expected, tuple) else (expected,)
         status, raw, hdrs = self.http(base, path, **kwargs)
-        assert status in codes, self.redact(f"{method_of(kwargs)} {base}{path} -> {status} (expected {codes}): {raw[:400]!r}")
+        assert status in codes, f"{method_of(kwargs)} request returned HTTP {status}, expected one of {codes}"
         return json.loads(raw.decode("utf-8")), hdrs
 
     def git(
@@ -510,12 +615,11 @@ class HaQualificationHarness:
             bearer=self.hook_secret, method="POST",
             body={"runner_id": "runner-a1", "prefer_mirror": True, "wait_for_ready_ms": 5000, "exclude_sources": [self.m2_base]},
         )
-        assert claim_hdrs.get("x-rootyard-ci-state") == "ready", claim_hdrs
-        assert claimed["source"] == self.m1_base, claimed
-        assert claimed["attempt"] == 1 and claimed["lease_generation"] == 1, claimed
-        ryj1 = claimed["checkout"]["token"]
-        assert ryj1.startswith("ryj_")
-        self.add_secret(ryj1)
+        ryj1 = self.register_checkout_token(claimed)
+        assert claim_hdrs.get("x-rootyard-ci-state") == "ready", "scenario A: claim state header is not ready"
+        assert claimed.get("source") == self.m1_base, "scenario A: claim selected an unexpected source"
+        assert claimed.get("attempt") == 1, "scenario A: claim attempt mismatch"
+        assert claimed.get("lease_generation") == 1, "scenario A: claim lease generation mismatch"
 
         self.verify_git_checkout(
             f"{self.m1_base}/ci/{feat_a_oid}/git/alice/forge.git",
@@ -573,9 +677,10 @@ class HaQualificationHarness:
             bearer=self.hook_secret, method="POST",
             body={"runner_id": "runner-b1", "prefer_mirror": True, "exclude_sources": [self.m2_base]},
         )
-        assert c_b1["source"] == self.m1_base and c_b1["attempt"] == 1 and c_b1["lease_generation"] == 1
-        ryj_stale = c_b1["checkout"]["token"]
-        self.add_secret(ryj_stale)
+        ryj_stale = self.register_checkout_token(c_b1)
+        assert c_b1.get("source") == self.m1_base, "scenario B: first claim selected an unexpected source"
+        assert c_b1.get("attempt") == 1, "scenario B: first claim attempt mismatch"
+        assert c_b1.get("lease_generation") == 1, "scenario B: first claim lease generation mismatch"
 
         # Claim ci/lint on mirror-1 as well, then expire its lease timestamp so controller-2's
         # reconcile_runs proves automated lease reaping preserves immutable target_oid.
@@ -584,7 +689,8 @@ class HaQualificationHarness:
             bearer=self.hook_secret, method="POST",
             body={"runner_id": "runner-b2", "prefer_mirror": True, "exclude_sources": [self.m2_base]},
         )
-        assert c_b2["source"] == self.m1_base
+        self.register_checkout_token(c_b2)
+        assert c_b2.get("source") == self.m1_base, "scenario B: second claim selected an unexpected source"
         self.sql(f"UPDATE ci_runs SET lease_expires_unix=0 WHERE id='{runs2['ci/lint']}'")
 
         # Mid-job SIGKILL of BOTH active serve-mirror #1 AND controller-1 simultaneously.
@@ -650,12 +756,12 @@ class HaQualificationHarness:
             bearer=self.hook_secret, method="POST",
             body={"runner_id": "runner-b1-retry", "prefer_mirror": True, "wait_for_ready_ms": 5000},
         )
-        assert c2_hdrs.get("x-rootyard-ci-state") == "ready"
-        assert c2_test["source"] == self.m2_base, c2_test
-        assert c2_test["head_oid"] == feat_b_oid, c2_test
-        assert c2_test["attempt"] == 2 and c2_test["lease_generation"] == 3, c2_test
-        ryj2 = c2_test["checkout"]["token"]
-        self.add_secret(ryj2)
+        ryj2 = self.register_checkout_token(c2_test)
+        assert c2_hdrs.get("x-rootyard-ci-state") == "ready", "scenario B: failover claim state header is not ready"
+        assert c2_test.get("source") == self.m2_base, "scenario B: failover claim selected an unexpected source"
+        assert c2_test.get("head_oid") == feat_b_oid, "scenario B: failover claim target OID mismatch"
+        assert c2_test.get("attempt") == 2, "scenario B: failover claim attempt mismatch"
+        assert c2_test.get("lease_generation") == 3, "scenario B: failover claim lease generation mismatch"
 
         # Stale attempt #1 ryj token must fail against live mirror-2 AND controller-2 report.
         stale_git = self.git(
@@ -686,24 +792,35 @@ class HaQualificationHarness:
             bearer=self.hook_secret, method="POST",
             body={"runner_id": "runner-b2-retry", "prefer_mirror": True},
         )
-        assert c_lint["source"] == self.m2_base and c_lint["head_oid"] == feat_b_oid
+        self.register_checkout_token(c_lint)
+        assert c_lint.get("source") == self.m2_base, "scenario B: ci/lint claim selected an unexpected source"
+        assert c_lint.get("head_oid") == feat_b_oid, "scenario B: ci/lint claim target OID mismatch"
+        c_lint_attempt = c_lint.get("attempt")
+        c_lint_lease = c_lint.get("lease_generation")
+        if type(c_lint_attempt) is not int or type(c_lint_lease) is not int:
+            raise AssertionError("scenario B: ci/lint claim lease counters are not integers")
         fo_direct, fo_hdrs = self.document(
             self.c2_base, prefix1 + runs2["ci/lint"] + "/failover", 200,
             bearer=self.hook_secret, method="POST",
             body={
-                "attempt": c_lint["attempt"], "lease_generation": c_lint["lease_generation"],
+                "attempt": c_lint_attempt, "lease_generation": c_lint_lease,
                 "runner_id": "runner-b2-retry", "failed_source": self.m2_base, "reason": "rotate to origin",
             },
         )
-        assert fo_hdrs.get("x-rootyard-ci-state") == "ready"
-        assert fo_direct["source"] == "origin" and fo_direct["head_oid"] == feat_b_oid
-        assert fo_direct["attempt"] == c_lint["attempt"] + 1 and fo_direct["lease_generation"] == c_lint["lease_generation"] + 1
-        ryj_lint2 = fo_direct["checkout"]["token"]
-        self.add_secret(ryj_lint2)
+        ryj_lint2 = self.register_checkout_token(fo_direct)
+        assert fo_hdrs.get("x-rootyard-ci-state") == "ready", "scenario B: direct failover state header is not ready"
+        assert fo_direct.get("source") == "origin", "scenario B: direct failover selected an unexpected source"
+        assert fo_direct.get("head_oid") == feat_b_oid, "scenario B: direct failover target OID mismatch"
+        fo_attempt = fo_direct.get("attempt")
+        fo_lease = fo_direct.get("lease_generation")
+        if type(fo_attempt) is not int or type(fo_lease) is not int:
+            raise AssertionError("scenario B: direct failover lease counters are not integers")
+        assert fo_attempt == c_lint_attempt + 1, "scenario B: direct failover attempt mismatch"
+        assert fo_lease == c_lint_lease + 1, "scenario B: direct failover lease generation mismatch"
         self.document(
             self.c2_base, prefix1 + runs2["ci/lint"] + "/report", 409,
             bearer=self.hook_secret, method="POST",
-            body={"attempt": c_lint["attempt"], "lease_generation": c_lint["lease_generation"], "conclusion": "success", "output": "stale"},
+            body={"attempt": c_lint_attempt, "lease_generation": c_lint_lease, "conclusion": "success", "output": "stale"},
         )
         self.verify_git_checkout(
             f"{self.c2_base}/ci/{feat_b_oid}/git/alice/forge.git",
@@ -712,7 +829,7 @@ class HaQualificationHarness:
         self.document(
             self.c2_base, prefix1 + runs2["ci/lint"] + "/report", 200,
             bearer=self.hook_secret, method="POST",
-            body={"attempt": fo_direct["attempt"], "lease_generation": fo_direct["lease_generation"], "conclusion": "success", "output": "ok"},
+            body={"attempt": fo_attempt, "lease_generation": fo_lease, "conclusion": "success", "output": "ok"},
         )
         checks2, _ = self.document(self.c2_base, f"/api/repos/alice/forge/pulls/{self.pr2_num}/checks", 200, token=self.alice)
         by_ctx2 = {c["context"]: c["conclusion"] for c in checks2["items"]}
@@ -800,6 +917,9 @@ class HaQualificationHarness:
             bearer=self.hook_secret, method="POST",
             body={"runner_id": "runner-c-wait", "prefer_mirror": True, "wait_for_ready_ms": 0},
         )
+        waiting_token = self.register_checkout_token(waiting_doc, required=False)
+        if waiting_doc.get("source") is not None and waiting_token is None:
+            raise AssertionError("scenario C: claim published a source without a checkout token")
         if waiting_hdrs.get("x-rootyard-ci-state") == "waiting":
             observed_states.add("waiting")
         # Trigger failover requeue_only on any run or wait cleanly for prewarm convergence.
@@ -932,11 +1052,12 @@ class HaQualificationHarness:
                 for i, rid in enumerate(burst_runs1.values())
             ]
             res1 = [(st, json.loads(raw), hdrs) for st, raw, hdrs in (f.result(timeout=20) for f in futs1)]
+            self.register_checkout_tokens(res1)
         ready1 = [r for r in res1 if r[0] == 200]
         over1 = [r for r in res1 if r[0] == 429]
-        assert len(ready1) == 2 and len(over1) == 1, res1
-        assert all(d["source"] == "origin" and h.get("x-rootyard-ci-state") == "ready" for _, d, h in ready1), ready1
-        assert over1[0][2].get("x-rootyard-ci-state") == "overloaded" and over1[0][1]["classification"] == "overloaded", over1
+        assert len(ready1) == 2 and len(over1) == 1, "scenario C: repo1 burst ready/overloaded counts differ"
+        assert all(d["source"] == "origin" and h.get("x-rootyard-ci-state") == "ready" for _, d, h in ready1), "scenario C: repo1 burst ready response is not origin-ready"
+        assert over1[0][2].get("x-rootyard-ci-state") == "overloaded" and over1[0][1]["classification"] == "overloaded", "scenario C: repo1 burst overloaded classification differs"
         observed_states.update({"ready", "overloaded"})
 
         # Burst repo 2 -> 2 more ready (origin), hitting global_limit=4, 3rd returns 429 overloaded.
@@ -950,11 +1071,12 @@ class HaQualificationHarness:
                 for i, rid in enumerate(burst_runs2.values())
             ]
             res2 = [(st, json.loads(raw), hdrs) for st, raw, hdrs in (f.result(timeout=20) for f in futs2)]
+            self.register_checkout_tokens(res2)
         ready2 = [r for r in res2 if r[0] == 200]
         over2 = [r for r in res2 if r[0] == 429]
-        assert len(ready2) == 2 and len(over2) == 1, res2
-        assert all(d["source"] == "origin" and h.get("x-rootyard-ci-state") == "ready" for _, d, h in ready2), ready2
-        assert over2[0][2].get("x-rootyard-ci-state") == "overloaded", over2
+        assert len(ready2) == 2 and len(over2) == 1, "scenario C: repo2 burst ready/overloaded counts differ"
+        assert all(d["source"] == "origin" and h.get("x-rootyard-ci-state") == "ready" for _, d, h in ready2), "scenario C: repo2 burst ready response is not origin-ready"
+        assert over2[0][2].get("x-rootyard-ci-state") == "overloaded", "scenario C: repo2 burst overloaded classification differs"
 
         # Test bounded wait wakeup when an origin slot is released: wait_for_ready_ms=5000 blocks until
         # one of forge2's leased origin runs reports completion, then clones strictly from origin.
@@ -975,9 +1097,9 @@ class HaQualificationHarness:
                       "conclusion": "success", "output": "slot freed"},
             )
             woken_doc, woken_hdrs = waiter.result(timeout=15)
-        assert woken_hdrs.get("x-rootyard-ci-state") == "ready" and woken_doc["source"] == "origin", woken_doc
-        ryj_origin = woken_doc["checkout"]["token"]
-        self.add_secret(ryj_origin)
+            ryj_origin = self.register_checkout_token(woken_doc)
+        assert woken_hdrs.get("x-rootyard-ci-state") == "ready", "scenario C: origin wake state header is not ready"
+        assert woken_doc.get("source") == "origin", "scenario C: origin wake selected an unexpected source"
         self.verify_git_checkout(
             f"{self.c2_base}/ci/{burst_oid2}/git/alice/forge2.git",
             self.root / "clone-c-origin", burst_oid2, ryj_origin,
@@ -1018,7 +1140,8 @@ class HaQualificationHarness:
                 for i, rid in enumerate(wq_runs.values())
             ]
             wq_res = [(st, json.loads(raw), hdrs) for st, raw, hdrs in (f.result(timeout=20) for f in wq_futs)]
-        assert any(st == 429 and h.get("x-rootyard-ci-state") == "overloaded" for st, _, h in wq_res), wq_res
+            self.register_checkout_tokens(wq_res)
+        assert any(st == 429 and h.get("x-rootyard-ci-state") == "overloaded" for st, _, h in wq_res), "scenario C: wait-queue burst did not report an overloaded response"
 
         assert observed_states == {"ready", "waiting", "denied", "missing", "overloaded"}, observed_states
 
@@ -1038,6 +1161,235 @@ class HaQualificationHarness:
             "source_token_zero_leak": True,
         }
 
+    def scenario_d_controlled_readiness_claim_transition(self) -> dict:
+        # Scenarios B/C leave every allowlisted mirror killed and inactive. This
+        # fresh unlisted mirror is therefore the only live mirror that can be
+        # made ready, and only by the explicit auto-fetch below.
+        self.git("checkout", "-b", "feat-e", "main", cwd=self.work1)
+        (self.work1 / "feat-e.txt").write_text("controlled readiness\n")
+        self.git("add", "feat-e.txt", cwd=self.work1)
+        self.git("commit", "-m", "commit feat-e", cwd=self.work1)
+        target_oid = self.git("rev-parse", "HEAD", cwd=self.work1).stdout.decode().strip()
+        self.git("push", "origin", "HEAD:refs/heads/feat-e", cwd=self.work1, token=self.alice)
+
+        self.start_daemon(
+            "mirror-4", "serve-mirror",
+            self.mirror_env(self.m4_id, self.m4_port, self.mirror4_data, self.c2_base), self.m4_base,
+        )
+        heartbeat = {
+            "audience": self.audience, "url": self.m4_base, "storage_generation": 1,
+            "ready_oids": [], "capacity": 4, "active": True,
+        }
+        self.document(
+            self.c2_base, f"/api/repos/alice/forge/ci-mirrors/{self.m4_id}/heartbeat", 200,
+            token=self.alice, method="POST", body=heartbeat,
+        )
+        st_m4, raw_m4, _ = self.http(self.m4_base, "/metrics")
+        assert st_m4 == 200, "scenario D: mirror metrics request failed"
+        assert b"rootyard_mirror_sync_total 0\n" in raw_m4, "scenario D: mirror synced before the explicit fetch"
+
+        pr4, _ = self.document(
+            self.c2_base, "/api/repos/alice/forge/pulls", 201,
+            token=self.alice, method="POST",
+            body={
+                "title": "Scenario D Controlled Readiness", "body": "pr4",
+                "head_ref": "refs/heads/feat-e", "base_ref": "refs/heads/main",
+            },
+        )
+        assert pr4.get("head_oid") == target_oid, "scenario D: PR head OID mismatch"
+        pr_number = pr4.get("number")
+        if not isinstance(pr_number, int):
+            raise AssertionError("scenario D: PR number is not an integer")
+        runs4 = self.wait_for_runs(
+            self.repo1["id"], pr_number, target_oid, ("ci/test", "ci/lint", "ci/b3")
+        )
+        prefix1 = f"/api/repos/alice/forge/integrations/{self.hook1_id}/runs/"
+        run_id = runs4.get("ci/test")
+        if not isinstance(run_id, str):
+            raise AssertionError("scenario D: ci/test run is absent")
+
+        # Refresh the only live mirror and prove it is alive but not ready.
+        self.document(
+            self.c2_base, f"/api/repos/alice/forge/ci-mirrors/{self.m4_id}/heartbeat", 200,
+            token=self.alice, method="POST", body=heartbeat,
+        )
+        before, _ = self.document(
+            self.c2_base, f"/api/repos/alice/forge/ci-mirrors?target_oid={target_oid}", 200, token=self.alice
+        )
+        before_mirrors = before.get("mirrors")
+        if not isinstance(before_mirrors, list):
+            raise AssertionError("scenario D: pre-claim mirror listing is not a list")
+        by_id = {m.get("mirror_id"): m for m in before_mirrors if isinstance(m, dict)}
+        mirror_before = by_id.get(self.m4_id)
+        if not isinstance(mirror_before, dict):
+            raise AssertionError("scenario D: mirror-4 is absent from the pre-claim listing")
+        assert mirror_before.get("alive") is True, "scenario D: mirror-4 is not alive before claim"
+        assert mirror_before.get("target_ready") is False, "scenario D: mirror-4 already serves the target"
+        assert all(
+            not (m.get("alive") and m.get("target_ready"))
+            for mid, m in by_id.items()
+            if mid != self.m4_id and isinstance(m, dict)
+        ), "scenario D: an unselected mirror already serves the target"
+        assert self.sql(
+            f"SELECT count(*) FROM ci_mirror_nodes WHERE repository_id='{self.repo1['id']}' "
+            f"AND mirror_id<>'{self.m4_id}' AND active=true"
+        ) == "0", "scenario D: an allowlisted mirror is still active"
+
+        # First real claim: the live target mirror cannot serve the target, so
+        # the only correct answer is a genuine 202 waiting with no lease/grant.
+        waiting_doc, waiting_hdrs = self.document(
+            self.c2_base, prefix1 + run_id + "/claim", 202,
+            bearer=self.hook_secret, method="POST",
+            body={"runner_id": "runner-d-wait", "prefer_mirror": True, "wait_for_ready_ms": 0},
+        )
+        assert waiting_hdrs.get("x-rootyard-ci-state") == "waiting", "scenario D: first claim state header is not waiting"
+        assert waiting_doc.get("classification") == "waiting", "scenario D: first claim classification is not waiting"
+        assert "checkout" not in waiting_doc and "source" not in waiting_doc, "scenario D: first claim published checkout data"
+        availability = waiting_doc.get("availability")
+        if not isinstance(availability, dict):
+            raise AssertionError("scenario D: first claim availability is not an object")
+        ready_available = availability.get("ready_available_mirrors")
+        if type(ready_available) is not int:
+            raise AssertionError("scenario D: first claim available count is not an integer")
+        assert ready_available == 0, "scenario D: an unavailable ready mirror was counted"
+        ready_total = availability.get("ready_total_mirrors")
+        if type(ready_total) is not int:
+            raise AssertionError("scenario D: first claim ready count is not an integer")
+        assert ready_total == 0, "scenario D: a ready mirror was counted before fetch"
+        healthy_unready = availability.get("healthy_unready_mirrors")
+        if type(healthy_unready) is not int:
+            raise AssertionError("scenario D: first claim unready count is not an integer")
+        assert healthy_unready >= 1, "scenario D: no healthy unready mirror was counted"
+        queued = self.sql(
+            f"SELECT state||','||attempt||','||lease_generation||','||coalesce(source_url,'')||','||coalesce(runner_id,'') "
+            f"FROM ci_runs WHERE id='{run_id}'"
+        )
+        assert queued == "queued,0,0,,", "scenario D: first claim published a lease or changed the queued run"
+        assert self.sql(
+            f"SELECT count(*) FROM ci_integration_checkout_jobs WHERE run_id='{run_id}'"
+        ) == "0", "scenario D: first claim published a checkout grant"
+        assert self.sql(
+            f"SELECT count(*) FROM ci_mirror_nodes WHERE repository_id='{self.repo1['id']}' "
+            f"AND active=true AND heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-30 "
+            f"AND ready_oids ? '{target_oid}'"
+        ) == "0", "scenario D: target became ready without the explicit auto-fetch"
+        st_m4, raw_m4, _ = self.http(self.m4_base, "/metrics")
+        assert st_m4 == 200, "scenario D: mirror metrics request failed after first claim"
+        assert b"rootyard_mirror_sync_total 0\n" in raw_m4, "scenario D: mirror synced before the explicit fetch"
+
+        # The explicit named-mirror auto-fetch is a real isolate mirror sync on
+        # the same controller/PostgreSQL/storage. Its response is returned only
+        # after publish_ready_oid commits the exact target OID.
+        fetched, fetch_hdrs = self.document(
+            self.m4_base, "/api/repos/alice/forge/mirror-auto-fetch", 200,
+            token=self.prewarm_pat, method="POST", timeout=30.0,
+            body={"target_oid": target_oid, "storage_generation": 1, "wait_ms": 5000, "mirror_id": self.m4_id},
+        )
+        assert fetch_hdrs.get("x-rootyard-ci-state") == "ready", "scenario D: auto-fetch state header is not ready"
+        assert fetched.get("target_oid") == target_oid, "scenario D: auto-fetch target OID mismatch"
+        assert fetched.get("classification") == "ready", "scenario D: auto-fetch classification is not ready"
+        assert fetched.get("cache_status") == "miss_fetched", "scenario D: auto-fetch did not perform a fresh fetch"
+        after, _ = self.document(
+            self.c2_base, f"/api/repos/alice/forge/ci-mirrors?target_oid={target_oid}", 200, token=self.alice
+        )
+        after_mirrors = after.get("mirrors")
+        if not isinstance(after_mirrors, list):
+            raise AssertionError("scenario D: post-fetch mirror listing is not a list")
+        after_by_id = {m.get("mirror_id"): m for m in after_mirrors if isinstance(m, dict)}
+        mirror_after = after_by_id.get(self.m4_id)
+        if not isinstance(mirror_after, dict):
+            raise AssertionError("scenario D: mirror-4 is absent from the post-fetch listing")
+        assert mirror_after.get("alive") is True, "scenario D: mirror-4 is not alive after fetch"
+        assert mirror_after.get("target_ready") is True, "scenario D: mirror-4 did not publish target readiness"
+        assert self.sql(
+            f"SELECT active::text||','||(ready_oids ? '{target_oid}')::text||','||"
+            f"(heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-30)::text "
+            f"FROM ci_mirror_nodes WHERE repository_id='{self.repo1['id']}' AND mirror_id='{self.m4_id}'"
+        ) == "true,true,true", "scenario D: explicit auto-fetch did not commit readiness"
+        st_m4, raw_m4, _ = self.http(self.m4_base, "/metrics")
+        assert st_m4 == 200, "scenario D: mirror metrics request failed after fetch"
+        assert b"rootyard_mirror_sync_total 0\n" not in raw_m4, "scenario D: mirror sync counter did not advance"
+
+        # The same durable queued run must now claim the exact ready mirror and
+        # persist attempt/lease/grant against this repository, target and generation.
+        claimed, claim_hdrs = self.document(
+            self.c2_base, prefix1 + run_id + "/claim", 200,
+            bearer=self.hook_secret, method="POST",
+            body={"runner_id": "runner-d-ready", "prefer_mirror": True, "wait_for_ready_ms": 0},
+        )
+        # Register the credential before any assertion can stringify the response.
+        checkout_token = self.register_checkout_token(claimed)
+        assert claim_hdrs.get("x-rootyard-ci-state") == "ready", "scenario D: claim state header is not ready"
+        assert claimed.get("run_id") == run_id, "scenario D: claim returned a different run"
+        assert claimed.get("source") == self.m4_base, "scenario D: claim selected an unexpected source"
+        assert claimed.get("head_oid") == target_oid, "scenario D: claim target OID mismatch"
+        assert claimed.get("storage_generation") == 1, "scenario D: claim storage generation mismatch"
+        assert claimed.get("attempt") == 1, "scenario D: claim attempt mismatch"
+        assert claimed.get("lease_generation") == 1, "scenario D: claim lease generation mismatch"
+        checkout = claimed.get("checkout")
+        if not isinstance(checkout, dict):
+            raise AssertionError("scenario D: claim checkout is not an object")
+        plan = checkout.get("plan")
+        if not isinstance(plan, dict):
+            raise AssertionError("scenario D: claim plan is not an object")
+        claimed_job_id = claimed.get("job_id")
+        if not isinstance(claimed_job_id, str):
+            raise AssertionError("scenario D: claim job id is not a string")
+        try:
+            uuid.UUID(claimed_job_id)
+        except ValueError:
+            raise AssertionError("scenario D: claim job id is not a UUID") from None
+        assert plan.get("repository_id") == self.repo1["id"], "scenario D: plan repository mismatch"
+        assert plan.get("job_id") == claimed_job_id, "scenario D: plan job mismatch"
+        assert plan.get("target_oid") == target_oid, "scenario D: plan target OID mismatch"
+        assert plan.get("storage_generation") == 1, "scenario D: plan storage generation mismatch"
+        persisted = self.sql(
+            f"SELECT state||','||attempt||','||lease_generation||','||source_url||','||runner_id||','||"
+            f"storage_generation||','||head_oid||','||repository_id::text||','||job_id::text "
+            f"FROM ci_runs WHERE id='{run_id}'"
+        )
+        assert persisted == (
+            f"leased,1,1,{self.m4_base},runner-d-ready,1,{target_oid},{self.repo1['id']},{claimed_job_id}"
+        ), "scenario D: persisted lease does not match the claimed run"
+        assert self.sql(
+            f"SELECT count(*) FROM ci_integration_checkout_jobs WHERE run_id='{run_id}'"
+        ) == "1", "scenario D: checkout grant count is not exactly one"
+        assert self.sql(
+            f"SELECT count(*) FROM ci_integration_checkout_jobs WHERE run_id='{run_id}' "
+            f"AND attempt=1 AND lease_generation=1 AND repository_id='{self.repo1['id']}' "
+            f"AND job_id='{claimed_job_id}' AND plan->>'target_oid'='{target_oid}' "
+            f"AND plan->>'storage_generation'='1'"
+        ) == "1", "scenario D: checkout grant is not bound to repo/target/generation"
+        assert self.sql(
+            f"SELECT encode(credential_digest,'hex') FROM ci_integration_checkout_jobs WHERE run_id='{run_id}'"
+        ) == hashlib.sha256(checkout_token.encode()).hexdigest(), "scenario D: grant token digest mismatch"
+        assert self.sql(
+            f"SELECT (r.lease_expires_unix>extract(epoch FROM clock_timestamp())::bigint)::text||','||"
+            f"(g.expires_unix>r.lease_expires_unix)::text||','||"
+            f"(g.expires_unix=(g.plan->>'expires_unix')::bigint)::text "
+            f"FROM ci_runs r JOIN ci_integration_checkout_jobs g ON g.run_id=r.id WHERE r.id='{run_id}'"
+        ) == "true,true,true", "scenario D: lease/grant expiry is not coherent"
+
+        self.verify_git_checkout(
+            f"{self.m4_base}/ci/{target_oid}/git/alice/forge.git",
+            self.root / "clone-d", target_oid, checkout_token,
+        )
+
+        return {
+            "first_claim_http": 202,
+            "first_claim_state": "waiting",
+            "lease_or_grant_before_ready": False,
+            "explicit_autofetch_cache_status": "miss_fetched",
+            "target_ready_via_controller": True,
+            "second_claim_http": 200,
+            "persisted_attempt": 1,
+            "persisted_lease_generation": 1,
+            "persisted_grant_bound_repo_target_generation": True,
+            "checkout_clone_fsck": "strict_passed",
+            "target_oid": target_oid,
+            "mirror_id": self.m4_id,
+        }
+
     def case(self, name: str, fn) -> None:
         t0 = time.monotonic()
         try:
@@ -1050,9 +1402,27 @@ class HaQualificationHarness:
             self.results.append({"name": name, "status": "failed", "seconds": round(time.monotonic() - t0, 4), "error": msg, "traceback": tb})
             raise
 
-    def cleanup(self) -> None:
+    def stop_all_daemons(self) -> None:
+        failed = False
         for name in list(self.procs):
-            self.stop_daemon(name, hard=False)
+            try:
+                self.stop_daemon(name, hard=False)
+            except Exception:
+                failed = True
+        if failed:
+            raise AssertionError("daemon shutdown failed")
+
+    def scan_source_token_logs(self) -> dict[str, object]:
+        paths = [entry["log_path"] for entry in self.procs.values() if entry.get("log_path")]
+        if not paths:
+            return {"state": "unavailable", "scanned": 0, "bytes": 0}
+        if live_pgid_processes(self.tracked_pgids):
+            return {"state": "live_writer", "scanned": 0, "bytes": 0}
+        return scan_token_in_logs(paths, self.source_pat.get("token", ""))
+
+    def cleanup(self, *, stop_daemons: bool = True) -> None:
+        if stop_daemons:
+            self.stop_all_daemons()
         leaked = live_pgid_processes(self.tracked_pgids)
         if leaked:
             for pid, _, _, _ in leaked:
@@ -1084,38 +1454,119 @@ def main(argv: list[str] | None = None) -> int:
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
         parser.error("ROOTYARD_TEST_DATABASE_URL is required; use a disposable dedicated database")
 
-    harness = HaQualificationHarness(args)
+    root: Path | None = None
+    harness: HaQualificationHarness | None = None
     success = False
+    failure_trace: str | None = None
+    leak_state = "unavailable"
+    leak_logs = 0
+    leak_bytes = 0
     try:
+        root = Path(tempfile.mkdtemp(prefix="rootyard-ci-mirror-ha-"))
+        harness = HaQualificationHarness(args, root)
         harness.case("setup_daemons", harness.setup_daemons)
         harness.case("scenario_a_pr_prewarm_and_live_mirror_checkout", harness.scenario_a_pr_prewarm_and_live_mirror_checkout)
         harness.case("scenario_b_sigkill_dual_crash_and_failover", harness.scenario_b_sigkill_dual_crash_and_failover)
         harness.case("scenario_c_coalesced_prewarm_and_origin_burst", harness.scenario_c_coalesced_prewarm_and_origin_burst)
+        harness.case("scenario_d_controlled_readiness_claim_transition", harness.scenario_d_controlled_readiness_claim_transition)
         success = True
     except Exception:
-        print(harness.redact(traceback.format_exc()), file=sys.stderr)
+        if harness is None:
+            if root is not None:
+                shutil.rmtree(root, ignore_errors=True)
+        else:
+            failure_trace = harness.redact(traceback.format_exc())
     finally:
-        try:
-            harness.cleanup()
-        except Exception as err:
-            harness.results.append({"name": "cleanup", "status": "failed", "error": harness.redact(err)})
+        if harness is None:
+            print("qualification harness initialization failed", file=sys.stderr)
+            payload = json.dumps({
+                "passed": False,
+                "cases": [{
+                    "name": "initialization",
+                    "status": "failed",
+                    "error": "qualification harness initialization failed",
+                }],
+            }, indent=2) + "\n"
+        else:
+            try:
+                harness.stop_all_daemons()
+            except Exception:
+                harness.results.append({
+                    "name": "stop_daemons",
+                    "status": "failed",
+                    "error": "daemon shutdown failed",
+                })
+                success = False
+            try:
+                leak_scan = harness.scan_source_token_logs()
+            except Exception:
+                leak_scan = {"state": "unreadable", "scanned": 0, "bytes": 0}
+            leak_state = str(leak_scan.get("state", "unreadable"))
+            if leak_state not in {
+                "clean", "leaked", "missing", "oversize", "unreadable", "unavailable", "live_writer",
+            }:
+                leak_state = "unreadable"
+            leak_logs = leak_scan.get("scanned", 0)
+            if type(leak_logs) is not int or leak_logs < 0:
+                leak_logs = 0
+            leak_bytes = leak_scan.get("bytes", 0)
+            if type(leak_bytes) is not int or leak_bytes < 0:
+                leak_bytes = 0
+            leak_clean = leak_state == "clean"
+            harness.results.append({
+                "name": "final_source_token_leak_scan",
+                "status": "passed" if leak_clean else "failed",
+                "detail": {"state": leak_state, "logs": leak_logs, "bytes": leak_bytes},
+            })
+            print(f"final source-token leak scan: {leak_state}", file=sys.stderr)
+            if not leak_clean:
+                success = False
+            try:
+                harness.cleanup(stop_daemons=False)
+            except Exception:
+                harness.results.append({
+                    "name": "cleanup",
+                    "status": "failed",
+                    "error": "cleanup failed",
+                })
+                success = False
+            if failure_trace:
+                print(failure_trace, file=sys.stderr)
+            report = {
+                "passed": success,
+                "cases": harness.results,
+                "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()
+                if Path(args.binary).is_file()
+                else None,
+                "limitations": [
+                    "Single-host loopback processes and isolated PostgreSQL 17 schema, not a multi-host network or power-loss test.",
+                    "Automatic lease expiry in Scenario B resets lease_expires_unix in the run-owned schema so expiry reconciliation finishes within the CI timeout budget.",
+                    "Scenario D commits target readiness only through an explicit named-mirror auto-fetch on an unlisted live mirror; it does not inject a production race or substitute scheduler authority.",
+                ],
+            }
+            report["passed"] = success
+            payload = json.dumps(report, indent=2) + "\n"
+            if any(secret and secret in payload for secret in harness.secrets):
+                report["passed"] = False
+                success = False
+                payload = harness.redact(json.dumps(report, indent=2) + "\n")
+        payload, within_limit = bounded_report_payload(payload)
+        if not within_limit:
             success = False
-        report = {
-            "passed": success,
-            "cases": harness.results,
-            "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()
-            if Path(args.binary).is_file()
-            else None,
-            "limitations": [
-                "Single-host loopback processes and isolated PostgreSQL 17 schema, not a multi-host network or power-loss test.",
-                "Automatic lease expiry in Scenario B resets lease_expires_unix in the run-owned schema so expiry reconciliation finishes within the CI timeout budget.",
-            ],
-        }
-        payload = json.dumps(report, indent=2) + "\n"
-        if harness.source_pat.get("token") and harness.source_pat["token"] in payload:
-            payload = harness.redact(payload)
-            report["passed"] = False
-            success = False
+            payload = json.dumps({
+                "passed": False,
+                "cases": [{
+                    "name": "report_size_limit",
+                    "status": "failed",
+                    "error": "qualification report exceeded the bounded size cap",
+                }],
+                "final_source_token_leak_scan": {
+                    "state": leak_state,
+                    "logs": leak_logs,
+                    "bytes": leak_bytes,
+                },
+            }, indent=2) + "\n"
+            print("qualification report exceeded the bounded size cap", file=sys.stderr)
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(payload, encoding="utf-8", newline="\n")
