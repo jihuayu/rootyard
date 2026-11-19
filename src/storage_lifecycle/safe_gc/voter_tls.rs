@@ -233,7 +233,7 @@ async fn handle_https_connection(
 }
 
 /// Serve bounded mTLS HTTPS/1.1 requests until shutdown, rejecting every unauthenticated peer.
-pub async fn serve_mtls_https_voter(
+pub(super) async fn serve_mtls_https_voter(
     listener: tokio::net::TcpListener,
     state: Arc<VoterState>,
     expected_token: Zeroizing<Vec<u8>>,
