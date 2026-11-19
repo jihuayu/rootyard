@@ -920,6 +920,22 @@ def project_busy_witness(records, *, helper_tag, writer_tag,
     return target, state
 
 
+def _receipt_file_matches(records, *, kind, role, tag):
+    """Require every record in one file to have that file's fixed role/identity."""
+    if not isinstance(records, list) or not records:
+        return False
+    if type(tag) is not int or tag <= 0:
+        return False
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        if (record.get("kind") != kind
+                or record.get("role") != role
+                or record.get("proc_tag") != tag):
+            return False
+    return True
+
+
 def project_busy_witness_receipts(witness_dir, *, helper_tag, writer_tag,
                                   expected_mounts, owned_mounts):
     """Read both bounded receipts and project them, defaulting to unknown."""
@@ -930,6 +946,12 @@ def project_busy_witness_receipts(witness_dir, *, helper_tag, writer_tag,
     except (OSError, TypeError, ValueError):
         return UNKNOWN, UNKNOWN
     if helper is None or writer is None:
+        return UNKNOWN, UNKNOWN
+    if not _receipt_file_matches(
+            helper, kind="umount", role="helper", tag=helper_tag):
+        return UNKNOWN, UNKNOWN
+    if not _receipt_file_matches(
+            writer, kind="close", role="writer", tag=writer_tag):
         return UNKNOWN, UNKNOWN
     return project_busy_witness(
         helper + writer,

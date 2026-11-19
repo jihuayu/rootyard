@@ -371,6 +371,45 @@ class BusyWitnessReceiptParserTest(unittest.TestCase):
         self.assertIn(state, WRITER_CLOSE_STATES)
         self.assertEqual((target, state), ("writer", "completed_before_unmount_entry"))
 
+    def test_swapped_valid_receipt_files_are_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            # Both records carry the expected tags, but the file roles are
+            # swapped; no merge may treat them as a coherent pair.
+            _write_private(Path(root) / "helper.receipt", _line(_close()))
+            _write_private(Path(root) / "writer.receipt", _line(_umount()))
+            self.assertEqual(project_busy_witness_receipts(
+                root,
+                helper_tag=HELPER_TAG,
+                writer_tag=WRITER_TAG,
+                expected_mounts=EXPECTED,
+                owned_mounts=OWNED,
+            ), (UNKNOWN, UNKNOWN))
+
+    def test_receipt_file_mixed_or_wrong_identity_is_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_private(
+                Path(root) / "helper.receipt",
+                _line(_umount()) + _line(_close()))
+            _write_private(Path(root) / "writer.receipt", _line(_close()))
+            self.assertEqual(project_busy_witness_receipts(
+                root,
+                helper_tag=HELPER_TAG,
+                writer_tag=WRITER_TAG,
+                expected_mounts=EXPECTED,
+                owned_mounts=OWNED,
+            ), (UNKNOWN, UNKNOWN))
+            _write_private(Path(root) / "helper.receipt", _line(_umount()))
+            _write_private(
+                Path(root) / "writer.receipt",
+                _line(_close(tag=HELPER_TAG)))
+            self.assertEqual(project_busy_witness_receipts(
+                root,
+                helper_tag=HELPER_TAG,
+                writer_tag=WRITER_TAG,
+                expected_mounts=EXPECTED,
+                owned_mounts=OWNED,
+            ), (UNKNOWN, UNKNOWN))
+
     def test_receipt_requires_private_regular_file(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "helper.receipt"
