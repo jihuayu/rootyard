@@ -286,11 +286,34 @@ fn reverse_git_diagnostic_labels_are_closed_and_bounded() {
     for (outcome, label) in outcomes {
         assert_eq!(outcome.as_str(), label);
     }
-    let line = reverse_diag::failure_line(
+    let mut line = Vec::new();
+    reverse_diag::write_failure_line(
+        &mut line,
         ReverseGitStage::CommitSynthesize,
         reverse_diag::ReverseGitChildOutcome::Signaled,
+    )
+    .unwrap();
+    assert_eq!(line, b"rootyard: S4 reverse Git child failed stage=commit_synthesize outcome=signaled\n");
+}
+
+#[test]
+fn reverse_git_diagnostic_write_failure_is_best_effort() {
+    struct Failing;
+    impl std::io::Write for Failing {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let result = reverse_diag::write_failure_line(
+        &mut Failing,
+        ReverseGitStage::CommitSynthesize,
+        reverse_diag::ReverseGitChildOutcome::NonzeroExit,
     );
-    assert_eq!(line, "rootyard: S4 reverse Git child failed stage=commit_synthesize outcome=signaled");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
 }
 
 #[cfg(unix)]

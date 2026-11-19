@@ -64,12 +64,16 @@ pub(crate) fn classify(status: ExitStatus) -> ReverseGitChildOutcome {
     }
 }
 
-pub(crate) fn failure_line(stage: ReverseGitStage, outcome: ReverseGitChildOutcome) -> String {
-    format!(
-        "rootyard: S4 reverse Git child failed stage={} outcome={}",
-        stage.as_str(),
-        outcome.as_str()
-    )
+pub(crate) fn write_failure_line<W: std::io::Write>(
+    writer: &mut W,
+    stage: ReverseGitStage,
+    outcome: ReverseGitChildOutcome,
+) -> std::io::Result<()> {
+    writer.write_all(b"rootyard: S4 reverse Git child failed stage=")?;
+    writer.write_all(stage.as_str().as_bytes())?;
+    writer.write_all(b" outcome=")?;
+    writer.write_all(outcome.as_str().as_bytes())?;
+    writer.write_all(b"\n")
 }
 
 #[cfg(test)]
@@ -89,7 +93,8 @@ pub(crate) fn take_for_test() -> Vec<(ReverseGitStage, ReverseGitChildOutcome)> 
 pub(crate) fn emit(stage: ReverseGitStage, outcome: ReverseGitChildOutcome) {
     #[cfg(test)]
     REVERSE_GIT_CHILD_DIAGNOSTICS.with(|records| records.borrow_mut().push((stage, outcome)));
-    // The S4 acceptance harness installs no tracing subscriber. `eprintln!` is
-    // deliberate: libtest prints a failing test's captured stderr.
-    eprintln!("{}", failure_line(stage, outcome));
+    // The S4 acceptance harness installs no tracing subscriber. This is a
+    // best-effort write to process stderr; a failed write is deliberately
+    // discarded so the caller still returns the original public error.
+    let _ = write_failure_line(&mut std::io::stderr().lock(), stage, outcome);
 }

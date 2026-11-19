@@ -165,7 +165,9 @@ pub(crate) async fn project_with_stage(
     let remotes =
         run_git(git_bin, work, &["for-each-ref", "--format=%(refname)", "refs/remotes"], deadline, stage).await?;
     for reference in remotes.lines().filter(|line| !line.is_empty()) {
-        let _ = run_git(git_bin, work, &["update-ref", "-d", reference], deadline, stage).await;
+        // Cleanup is deliberately discarded, so a failure here must not wear
+        // the propagated reverse-runner diagnostic label.
+        let _ = run_git(git_bin, work, &["update-ref", "-d", reference], deadline, None).await;
     }
     if !subdir.is_empty() {
         let path = format!("{base}^{{tree}}:{subdir}");
@@ -183,12 +185,14 @@ pub(crate) async fn project_with_stage(
             stage,
         )
         .await?;
+        // Cleanup is deliberately discarded, so a failure here must not wear
+        // the propagated reverse-runner diagnostic label.
         let _ = run_git(
             git_bin,
             work,
             &["update-ref", "-d", "refs/original/refs/heads/projected"],
             deadline,
-            stage,
+            None,
         )
         .await;
     }

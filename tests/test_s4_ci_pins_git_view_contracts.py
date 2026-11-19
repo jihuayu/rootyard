@@ -324,9 +324,15 @@ class SourceContracts(unittest.TestCase):
             self.assertIn(f'"{label}"', diag)
         self.assertIn("enum ReverseGitStage", diag)
         self.assertIn("enum ReverseGitChildOutcome", diag)
-        self.assertIn("rootyard: S4 reverse Git child failed stage=", diag)
-        self.assertIn('eprintln!("{}", failure_line(stage, outcome));', diag)
-        self.assertIn("rootyard: S4 reverse Git child failed stage={} outcome={}", diag)
+        self.assertIn("pub(crate) fn write_failure_line", diag)
+        self.assertIn('b"rootyard: S4 reverse Git child failed stage="', diag)
+        self.assertIn('b" outcome="', diag)
+        self.assertIn("let _ = write_failure_line(&mut std::io::stderr().lock(), stage, outcome);", diag)
+        self.assertNotIn("eprintln!", diag)
+        self.assertNotIn("fn failure_line", diag)
+        self.assertNotIn("format!", diag)
+        self.assertNotIn("unwrap", diag)
+        self.assertNotIn("panic!", diag)
         self.assertNotIn("{:?", diag, "no debug-formatted child value may enter the line")
         self.assertNotIn("tracing_subscriber", diag)
         self.assertNotIn("RUST_LOG", diag)
@@ -337,6 +343,9 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(len(failed), 2, "the diagnostic must sit at the child-status boundary")
         self.assertIn("reverse_diag::emit(stage, reverse_diag::classify(status))", failed[1])
         self.assertIn("return Err(fail_error);", failed[1])
+        capture = failed[1].split("return Err(fail_error);", 1)[0]
+        self.assertNotIn("unwrap", capture, "capture failure must not replace the public error")
+        self.assertNotIn("panic!", capture, "capture failure must not replace the public error")
 
         for variant in (
             "ReverseGitStage::SourceProjection",
@@ -354,6 +363,33 @@ class SourceContracts(unittest.TestCase):
         self.assertIn("failing_reverse_child_emits_closed_diagnostic_and_keeps_public_conflict", tests)
         self.assertIn("reverse_git_child_outcome_distinguishes_nonzero_signal_and_unknown", tests)
         self.assertIn("reverse_git_diagnostic_labels_are_closed_and_bounded", tests)
+        self.assertIn("reverse_git_diagnostic_write_failure_is_best_effort", tests)
+
+    def test_discarded_projection_cleanup_is_not_diagnosed(self) -> None:
+        view = text(SRC / "namespace_service" / "s4_git_view.rs")
+        self.assertIn(
+            'let _ = run_git(git_bin, work, &["update-ref", "-d", reference], deadline, None).await;',
+            view,
+        )
+        self.assertIn(
+            '&["update-ref", "-d", "refs/original/refs/heads/projected"],\n            deadline,\n            None,',
+            view,
+        )
+        self.assertNotIn('&["update-ref", "-d", reference], deadline, stage)', view)
+        self.assertNotIn(
+            '&["update-ref", "-d", "refs/original/refs/heads/projected"],\n            deadline,\n            stage,',
+            view,
+        )
+
+    def test_reverse_fixture_failure_output_is_bounded(self) -> None:
+        harness = text(TESTS / "s4_ci_pins_git_view_support" / "harness.rs")
+        reverse = harness.split("pub async fn reverse", 1)[1].split("pub async fn post_json", 1)[0]
+        self.assertIn("reverse_changeset failure http_status={}", reverse)
+        self.assertIn("status.as_u16()", reverse)
+        self.assertNotIn("post_json(", reverse)
+        self.assertNotIn("{url}", reverse)
+        self.assertNotIn("{value}", reverse)
+        self.assertIn("response.json().await.context", reverse)
 
     def test_hold_regressions_cover_the_two_review_items(self) -> None:
         body = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
