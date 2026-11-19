@@ -1,0 +1,481 @@
+//! Durable typed outcomes for Root Ref-CAS application commands.
+//!
+//! Expected business refusals are replicated application decisions, not storage errors. The
+//! reducer records one typed outcome per applied business command in its sealed application state,
+//! so a caller can recover the actual result after reply loss/restart without re-deriving it from a
+//! raw local snapshot.
+
+use rootyard_refcas_log::state_machine::ApplicationLogId;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::ref_store::CoreGateVersion;
+use crate::ref_store::contract::{OperationState, RefStoreError};
+use crate::ref_store::core::state_machine::{ApplyResponse, ScopeLifecycle, StateMachineError};
+use crate::ref_store::core::terminal::CommitTerminal;
+use crate::ref_store::core::types::GitObjectFormat;
+use crate::ref_store::raft_backend::scope_close::ScopeCloseDrainSummary;
+
+/// One result of applying a Root business command at an exact Raft coordinate.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RootRefCasOutcome {
+    Applied(RootRefCasApplied),
+    Refused(RootRefCasRefusal),
+}
+
+impl RootRefCasOutcome {
+    pub fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+
+    pub fn is_refused(&self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+}
+
+/// Successful typed application response. This is an explicit, bounded mirror of the core
+/// `ApplyResponse`; it carries the actual business fields without requiring a core serde change.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RootRefCasApplied {
+    Noop,
+    AlreadyApplied {
+        log_id: ApplicationLogId,
+    },
+    GateInitialized {
+        version: GateVersionSnapshot,
+        created: bool,
+    },
+    RepositoryLaneUpdated {
+        version: GateVersionSnapshot,
+        lifecycle: ScopeLifecycle,
+        authz_floor: i64,
+    },
+    OperationBegun {
+        operation_id: Uuid,
+        state: OperationStateSnapshot,
+        created: bool,
+    },
+    RefsCommitted {
+        operation_id: Uuid,
+        state: OperationStateSnapshot,
+        replayed: bool,
+        terminal: CommitTerminal,
+    },
+    OperationCancelled {
+        operation_id: Option<Uuid>,
+        state: Option<OperationStateSnapshot>,
+        tombstone_created: bool,
+        decision_cancelled: Option<Uuid>,
+    },
+    CancelCutoffAdvanced {
+        cutoff_sequence: i64,
+        pruned_tombstones: usize,
+    },
+    DecisionInstalled {
+        decision_id: Uuid,
+        replayed: bool,
+    },
+    /// Legacy full-vector close receipt. Retained for decoding old `/3` attempts and exact replay;
+    /// new applications never emit this variant.
+    AuthScopeClosed {
+        scope_kind: String,
+        scope_id: Uuid,
+        lifecycle: ScopeLifecycle,
+        authz_floor: i64,
+        replayed: bool,
+        open_decision_ids: Vec<Uuid>,
+        pending_operation_ids: Vec<Uuid>,
+    },
+    /// Compact at-close acknowledgment emitted for new applications. It commits to the exact
+    /// returned vectors but cannot reconstruct them; current drain comes from the committed query.
+    AuthScopeClosedV2 {
+        scope_kind: String,
+        scope_id: Uuid,
+        lifecycle: ScopeLifecycle,
+        authz_floor: i64,
+        replayed: bool,
+        drain_summary: ScopeCloseDrainSummary,
+    },
+    SnapshotPinCreated {
+        snapshot_id: Uuid,
+        pin_id: Uuid,
+        generation: i64,
+        gate_revision: i64,
+        expires_at_tick: u64,
+        replayed: bool,
+    },
+    PinRenewed {
+        pin_id: Uuid,
+        generation: i64,
+        expires_at_tick: u64,
+        replayed: bool,
+    },
+    PinReleased {
+        pin_id: Uuid,
+        generation: i64,
+        replayed: bool,
+    },
+    RootRegistered {
+        root_id: Uuid,
+        roots_revision: i64,
+        replayed: bool,
+    },
+    RootReleased {
+        root_id: Uuid,
+        tombstone_created: bool,
+        replayed: bool,
+    },
+    HoldBatchAcquired {
+        request_id: Uuid,
+        consume_request_id: Uuid,
+        hold_count: usize,
+        replayed: bool,
+    },
+    HoldsConsumed {
+        consume_request_id: Uuid,
+        hold_count: usize,
+        replayed: bool,
+    },
+    HoldsRetired {
+        retired_count: usize,
+    },
+}
+
+impl RootRefCasApplied {
+    /// Converts the actual core response without changing core types.
+    pub fn from_response(response: ApplyResponse) -> Self {
+        match response {
+            ApplyResponse::Noop => Self::Noop,
+            ApplyResponse::AlreadyApplied { log_id } => {
+                Self::AlreadyApplied { log_id: ApplicationLogId::new(log_id.term, log_id.index) }
+            }
+            ApplyResponse::GateInitialized { version, created } => {
+                Self::GateInitialized { version: GateVersionSnapshot::from_core(&version), created }
+            }
+            ApplyResponse::RepositoryLaneUpdated { version, lifecycle, authz_floor } => Self::RepositoryLaneUpdated {
+                version: GateVersionSnapshot::from_core(&version),
+                lifecycle,
+                authz_floor,
+            },
+            ApplyResponse::OperationBegun(receipt) => Self::OperationBegun {
+                operation_id: receipt.record.identity().operation_id(),
+                state: OperationStateSnapshot::from(receipt.record.state()),
+                created: receipt.created,
+            },
+            ApplyResponse::RefsCommitted(receipt) => Self::RefsCommitted {
+                operation_id: receipt.record.identity().operation_id(),
+                state: OperationStateSnapshot::from(receipt.record.state()),
+                replayed: receipt.replayed,
+                terminal: receipt.terminal,
+            },
+            ApplyResponse::OperationCancelled { receipt, decision_cancelled } => Self::OperationCancelled {
+                operation_id: receipt.record.as_ref().map(|record| record.identity().operation_id()),
+                state: receipt.record.as_ref().map(|record| OperationStateSnapshot::from(record.state())),
+                tombstone_created: receipt.tombstone_created,
+                decision_cancelled,
+            },
+            ApplyResponse::CancelCutoffAdvanced { cutoff_sequence, pruned_tombstones } => {
+                Self::CancelCutoffAdvanced { cutoff_sequence, pruned_tombstones }
+            }
+            ApplyResponse::DecisionInstalled { decision_id, replayed } => {
+                Self::DecisionInstalled { decision_id, replayed }
+            }
+            ApplyResponse::AuthScopeClosed {
+                scope_kind,
+                scope_id,
+                lifecycle,
+                authz_floor,
+                replayed,
+                open_decision_ids,
+                pending_operation_ids,
+            } => Self::AuthScopeClosedV2 {
+                drain_summary: ScopeCloseDrainSummary::from_vectors(
+                    &scope_kind,
+                    scope_id,
+                    lifecycle,
+                    authz_floor,
+                    &open_decision_ids,
+                    &pending_operation_ids,
+                ),
+                scope_kind,
+                scope_id,
+                lifecycle,
+                authz_floor,
+                replayed,
+            },
+            ApplyResponse::SnapshotPinCreated {
+                snapshot_id,
+                pin_id,
+                generation,
+                gate_revision,
+                expires_at_tick,
+                replayed,
+            } => Self::SnapshotPinCreated { snapshot_id, pin_id, generation, gate_revision, expires_at_tick, replayed },
+            ApplyResponse::PinRenewed { pin_id, generation, expires_at_tick, replayed } => {
+                Self::PinRenewed { pin_id, generation, expires_at_tick, replayed }
+            }
+            ApplyResponse::PinReleased { pin_id, generation, replayed } => {
+                Self::PinReleased { pin_id, generation, replayed }
+            }
+            ApplyResponse::RootRegistered { root_id, roots_revision, replayed } => {
+                Self::RootRegistered { root_id, roots_revision, replayed }
+            }
+            ApplyResponse::RootReleased { root_id, tombstone_created, replayed } => {
+                Self::RootReleased { root_id, tombstone_created, replayed }
+            }
+            ApplyResponse::HoldBatchAcquired { request_id, consume_request_id, hold_count, replayed } => {
+                Self::HoldBatchAcquired { request_id, consume_request_id, hold_count, replayed }
+            }
+            ApplyResponse::HoldsConsumed { consume_request_id, hold_count, replayed } => {
+                Self::HoldsConsumed { consume_request_id, hold_count, replayed }
+            }
+            ApplyResponse::HoldsRetired { retired_count } => Self::HoldsRetired { retired_count },
+        }
+    }
+}
+
+/// Serializable mirror of `CoreGateVersion` captured at the applied coordinate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateVersionSnapshot {
+    pub repository_id: Uuid,
+    pub tenant_id: Uuid,
+    pub object_format: GitObjectFormat,
+    pub history_incarnation: Uuid,
+    pub authority_epoch: i64,
+    pub group_epoch: i64,
+    pub head_ref: String,
+    pub revision: i64,
+    pub digest_hex: String,
+}
+
+impl GateVersionSnapshot {
+    pub fn from_core(version: &CoreGateVersion) -> Self {
+        Self {
+            repository_id: version.repository_id(),
+            tenant_id: version.tenant_id(),
+            object_format: version.object_format(),
+            history_incarnation: version.history_incarnation(),
+            authority_epoch: version.authority_epoch(),
+            group_epoch: version.group_epoch(),
+            head_ref: version.head_ref().as_str().to_owned(),
+            revision: version.revision(),
+            digest_hex: version.digest().as_hex(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStateSnapshot {
+    Pending,
+    Committed,
+    Rejected,
+    Cancelled,
+}
+
+impl From<OperationState> for OperationStateSnapshot {
+    fn from(state: OperationState) -> Self {
+        match state {
+            OperationState::Pending => Self::Pending,
+            OperationState::Committed => Self::Committed,
+            OperationState::Rejected => Self::Rejected,
+            OperationState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Typed deterministic business refusal. The `detail` is diagnostic only; classification is the
+/// explicit `kind`, never string matching.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootRefCasRefusal {
+    pub kind: RootRefCasRefusalKind,
+    pub detail: String,
+}
+
+impl RootRefCasRefusal {
+    /// Fixed, bounded detail. No caller/core string is copied into a receipt.
+    pub fn from_kind(kind: RootRefCasRefusalKind) -> Self {
+        Self { kind, detail: kind.fixed_detail().to_owned() }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootRefCasRefusalKind {
+    InvalidInput,
+    InvalidIdentity,
+    ProposalInvalid,
+    ProposalExpired,
+    ProposalConflict,
+    ProposalScopeMismatch,
+    GateTransitionRefused,
+    GateScopeRefused,
+    StateCapacity,
+    BelowCancelCutoff,
+    ScopeClosingOrClosed,
+    AuthzFloorViolation,
+    AuthzFloorRegression,
+    LifecycleRegression,
+    DecisionNotFound,
+    DecisionConflict,
+    DecisionExpired,
+    DecisionDigestMismatch,
+    HoldNotFound,
+    HoldNotActive,
+    HoldProtectedByRoot,
+    HoldScopeMismatch,
+    PinNotFound,
+    PinExpired,
+    PinReleased,
+    PinGenerationMismatch,
+    SnapshotNotFound,
+    RootConflict,
+    RootReleased,
+    RootDigestConflict,
+    QuotaExceeded,
+    RepositoryNotFound,
+    DigestConflict,
+    IdentityConflict,
+    CancellationConflict,
+    Cancelled,
+    UnknownOperation,
+    OperationPending,
+    GateConflict,
+    TerminalImmutable,
+    Unsupported,
+    MetadataSnapshotNotFound,
+    MetadataPinNotFound,
+    MetadataPinReleased,
+    MetadataPinExpired,
+    MetadataPinGenerationMismatch,
+    MetadataSnapshotTooLarge,
+    MetadataScopeMismatch,
+    MetadataCursorScopeMismatch,
+    MetadataQuotaExceeded,
+    MetadataGateVersionMismatch,
+}
+
+impl RootRefCasRefusalKind {
+    /// Explicit classification. `None` is fatal: malformed/corrupt input, log-coordinate
+    /// invariants, and uncertain storage/transaction state must never become business outcomes.
+    pub fn from_state_machine(error: &StateMachineError) -> Option<Self> {
+        match error {
+            StateMachineError::InvalidInput(_) => Some(Self::InvalidInput),
+            StateMachineError::BelowCancelCutoff { .. } => Some(Self::BelowCancelCutoff),
+            StateMachineError::ScopeClosingOrClosed { .. } => Some(Self::ScopeClosingOrClosed),
+            StateMachineError::AuthzFloorViolation { .. } => Some(Self::AuthzFloorViolation),
+            StateMachineError::AuthzFloorRegression { .. } => Some(Self::AuthzFloorRegression),
+            StateMachineError::LifecycleRegression { .. } => Some(Self::LifecycleRegression),
+            StateMachineError::DecisionNotFound { .. } => Some(Self::DecisionNotFound),
+            StateMachineError::DecisionConflict { .. } => Some(Self::DecisionConflict),
+            StateMachineError::DecisionExpired { .. } => Some(Self::DecisionExpired),
+            StateMachineError::DecisionDigestMismatch { .. } => Some(Self::DecisionDigestMismatch),
+            StateMachineError::HoldNotFound { .. } => Some(Self::HoldNotFound),
+            StateMachineError::HoldNotActive { .. } => Some(Self::HoldNotActive),
+            StateMachineError::HoldProtectedByRoot { .. } => Some(Self::HoldProtectedByRoot),
+            StateMachineError::HoldScopeMismatch { .. } => Some(Self::HoldScopeMismatch),
+            StateMachineError::PinNotFound { .. } => Some(Self::PinNotFound),
+            StateMachineError::PinExpired { .. } => Some(Self::PinExpired),
+            StateMachineError::PinReleased { .. } => Some(Self::PinReleased),
+            StateMachineError::PinGenerationMismatch { .. } => Some(Self::PinGenerationMismatch),
+            StateMachineError::SnapshotNotFound { .. } => Some(Self::SnapshotNotFound),
+            StateMachineError::RootConflict(_) => Some(Self::RootConflict),
+            StateMachineError::RootReleased { .. } => Some(Self::RootReleased),
+            StateMachineError::RootDigestConflict(_) => Some(Self::RootDigestConflict),
+            StateMachineError::QuotaExceeded(_) => Some(Self::QuotaExceeded),
+            StateMachineError::Store(error) => Self::from_store(error),
+            StateMachineError::SnapshotCorrupted(_) | StateMachineError::NonMonotonicLogIndex { .. } => None,
+        }
+    }
+
+    fn from_store(error: &RefStoreError) -> Option<Self> {
+        match error {
+            RefStoreError::InvalidIdentity(_) => Some(Self::InvalidIdentity),
+            RefStoreError::RepositoryNotFound => Some(Self::RepositoryNotFound),
+            RefStoreError::DigestConflict => Some(Self::DigestConflict),
+            RefStoreError::IdentityConflict => Some(Self::IdentityConflict),
+            RefStoreError::CancellationConflict => Some(Self::CancellationConflict),
+            RefStoreError::Cancelled { .. } => Some(Self::Cancelled),
+            RefStoreError::UnknownOperation { .. } => Some(Self::UnknownOperation),
+            RefStoreError::OperationPending { .. } => Some(Self::OperationPending),
+            RefStoreError::GateConflict => Some(Self::GateConflict),
+            RefStoreError::TerminalImmutable => Some(Self::TerminalImmutable),
+            RefStoreError::Unsupported(_) => Some(Self::Unsupported),
+            RefStoreError::MetadataSnapshotNotFound { .. } => Some(Self::MetadataSnapshotNotFound),
+            RefStoreError::MetadataPinNotFound { .. } => Some(Self::MetadataPinNotFound),
+            RefStoreError::MetadataPinReleased { .. } => Some(Self::MetadataPinReleased),
+            RefStoreError::MetadataPinExpired { .. } => Some(Self::MetadataPinExpired),
+            RefStoreError::MetadataPinGenerationMismatch { .. } => Some(Self::MetadataPinGenerationMismatch),
+            RefStoreError::MetadataSnapshotTooLarge { .. } => Some(Self::MetadataSnapshotTooLarge),
+            RefStoreError::MetadataScopeMismatch(_) => Some(Self::MetadataScopeMismatch),
+            RefStoreError::MetadataCursorScopeMismatch => Some(Self::MetadataCursorScopeMismatch),
+            RefStoreError::MetadataQuotaExceeded { .. } => Some(Self::MetadataQuotaExceeded),
+            RefStoreError::MetadataGateVersionMismatch => Some(Self::MetadataGateVersionMismatch),
+            RefStoreError::Timeout
+            | RefStoreError::CommitUnknown { .. }
+            | RefStoreError::MetadataCommitUnknown { .. }
+            | RefStoreError::Database(_) => None,
+        }
+    }
+
+    /// Fixed safe detail. Receipt bytes never include caller/core error strings.
+    pub fn fixed_detail(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "decoded command failed semantic validation",
+            Self::InvalidIdentity => "decoded command contains invalid identity fields",
+            Self::ProposalInvalid => "proposal identity is invalid or outside its fixed window",
+            Self::ProposalExpired => "proposal identity expired; historic outcome is unknown",
+            Self::ProposalConflict => "proposal identity is bound to a different command digest",
+            Self::ProposalScopeMismatch => "proposal identity does not match the bound scope",
+            Self::GateTransitionRefused => "live gate transition is not monotonic for this history/epoch target",
+            Self::GateScopeRefused => "proposal scope differs from the live Root gate at apply",
+            Self::StateCapacity => "bounded proposal receipt window cannot admit this decision",
+            Self::BelowCancelCutoff => "operation is below the durable cancel cutoff",
+            Self::ScopeClosingOrClosed => "repository scope is closing or closed",
+            Self::AuthzFloorViolation => "authorization epoch is below the monotonic floor",
+            Self::AuthzFloorRegression => "authorization floor regression refused",
+            Self::LifecycleRegression => "scope lifecycle regression refused",
+            Self::DecisionNotFound => "publication decision not found",
+            Self::DecisionConflict => "publication decision state conflict",
+            Self::DecisionExpired => "publication decision expired",
+            Self::DecisionDigestMismatch => "publication decision digest/scope mismatch",
+            Self::HoldNotFound => "artifact hold not found",
+            Self::HoldNotActive => "artifact hold is not active",
+            Self::HoldProtectedByRoot => "artifact hold is protected by an active root",
+            Self::HoldScopeMismatch => "artifact hold scope mismatch",
+            Self::PinNotFound => "snapshot pin not found",
+            Self::PinExpired => "snapshot pin expired",
+            Self::PinReleased => "snapshot pin is permanently released",
+            Self::PinGenerationMismatch => "snapshot pin generation mismatch",
+            Self::SnapshotNotFound => "metadata snapshot not found",
+            Self::RootConflict => "retention root conflict",
+            Self::RootReleased => "retention root already released",
+            Self::RootDigestConflict => "retention root digest conflict",
+            Self::QuotaExceeded => "bounded quota exceeded",
+            Self::RepositoryNotFound => "repository not found",
+            Self::DigestConflict => "operation identity conflicts with a durable digest",
+            Self::IdentityConflict => "operation identity conflicts with a durable record",
+            Self::CancellationConflict => "cancellation tombstone conflict",
+            Self::Cancelled => "operation is cancelled",
+            Self::UnknownOperation => "operation is not registered",
+            Self::OperationPending => "operation is durably pending with unknown outcome",
+            Self::GateConflict => "gate initialization conflicts with the durable gate",
+            Self::TerminalImmutable => "terminal operation result is immutable",
+            Self::Unsupported => "requested capability is unsupported",
+            Self::MetadataSnapshotNotFound => "metadata snapshot not found in scope",
+            Self::MetadataPinNotFound => "metadata pin not found in scope",
+            Self::MetadataPinReleased => "metadata pin is released",
+            Self::MetadataPinExpired => "metadata pin expired",
+            Self::MetadataPinGenerationMismatch => "metadata pin generation mismatch",
+            Self::MetadataSnapshotTooLarge => "metadata snapshot exceeds its bounded limit",
+            Self::MetadataScopeMismatch => "metadata scope mismatch",
+            Self::MetadataCursorScopeMismatch => "metadata cursor scope mismatch",
+            Self::MetadataQuotaExceeded => "metadata admission quota exhausted",
+            Self::MetadataGateVersionMismatch => "metadata gate version moved before capture",
+        }
+    }
+}
