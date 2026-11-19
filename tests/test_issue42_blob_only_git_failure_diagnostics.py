@@ -1,8 +1,8 @@
-"""Pure synthetic checks for the Blob-only Git failure diagnostic contract.
+"""Pure synthetic checks for the narrow Blob-only stock-push diagnostic.
 
-No Git process, service, database, network or Cargo is used. The diagnostics
-may inspect synthetic stdout/stderr internally, but must expose only an integer
-exit status, fixed class strings and fixed porcelain flags.
+No Git process, service, database, network or Cargo is used. The diagnostic may
+inspect synthetic stdout/stderr internally, but must expose only an integer exit
+status, a fixed porcelain flag/summary class, and fixed stderr signatures.
 """
 import json
 from pathlib import Path
@@ -18,6 +18,7 @@ import blob_only_service as blob  # noqa: E402
 SECRETS = (
     "secret-ref",
     "refs/heads/secret-ref",
+    "remote-rejected-ref",
     "secret.example",
     "user:token",
     "token-123",
@@ -37,88 +38,75 @@ class BlobOnlyGitFailureDiagnosticsTest(unittest.TestCase):
         for secret in SECRETS:
             self.assertNotIn(secret, encoded)
         self.assertIs(type(diagnostic["exit"]), int)
-        self.assertIs(type(diagnostic["unknown"]), bool)
-        self.assertIs(type(diagnostic["porcelain"]["entries"]), int)
-        for key in ("ok", "rejected"):
-            self.assertIs(type(diagnostic["porcelain"][key]), bool)
-        for key in ("unpack_ok", "unpack_failed", "ok", "ng"):
-            self.assertIs(type(diagnostic["report_status"][key]), bool)
-        self.assertTrue(all(type(value) is str for value in diagnostic["classes"]))
-        self.assertTrue(all(type(value) is str for value in diagnostic["markers"]))
-        self.assertTrue(all(value in blob._DIAGNOSTIC_PORCELAIN_FLAGS
-                            for value in diagnostic["porcelain"]["flags"]))
+        self.assertIs(type(diagnostic["flag"]), str)
+        self.assertIs(type(diagnostic["summary"]), str)
+        self.assertTrue(all(type(value) is str for value in diagnostic["stderr"]))
 
-    def test_porcelain_rejection_is_classified(self):
-        diagnostic = blob.git_failure(process(
-            stdout=(b"To https://user:token@secret.example/secret.git\n"
-                    b"!\trefs/heads/secret-ref:refs/heads/secret-ref "
-                    b"[remote rejected] (non-fast-forward)\n"
-                    b"Done\n"),
-            stderr=(b"error: failed to push some refs to "
-                    b"'https://user:token@secret.example/secret.git'\n"),
+    def test_fake_refspec_and_path_markers_cannot_forge_summary(self):
+        diagnostic = blob.push_failure(process(
+            stdout=(b"!\trefs/heads/remote-rejected-ref:/tmp/secret/remote-rejected-ref"
+                    b"\t[up to date]\n"),
+            stderr=b"error: failed to push some refs to https://user:token@secret.example/r.git\n",
         ))
-        self.assertEqual(diagnostic["exit"], 1)
-        self.assertEqual(diagnostic["porcelain"],
-                         {"entries": 1, "ok": False, "rejected": True, "flags": ["!"]})
-        self.assertIn("porcelain-rejected", diagnostic["classes"])
-        self.assertIn("porcelain-remote-rejected", diagnostic["classes"])
-        self.assertIn("porcelain-non-fast-forward", diagnostic["classes"])
-        self.assertIn("stderr-failed-to-push", diagnostic["classes"])
-        self.assertFalse(diagnostic["unknown"])
+        self.assertEqual(diagnostic["flag"], "!")
+        self.assertEqual(diagnostic["summary"], "up-to-date")
+        self.assertNotEqual(diagnostic["summary"], "remote-rejected")
+        self.assertIn("failed-to-push", diagnostic["stderr"])
         self.assert_closed(diagnostic)
 
-    def test_report_status_ng_and_unpack_failure_are_classified(self):
-        rejected = blob.git_failure(process(
-            stdout=b"unpack ok\nng refs/heads/secret-ref protected branch\n",
-            stderr=b"error: failed to push some refs\n",
-        ))
-        self.assertTrue(rejected["report_status"]["unpack_ok"])
-        self.assertTrue(rejected["report_status"]["ng"])
-        self.assertIn("report-status-ng", rejected["classes"])
-        self.assertIn("report-status-protected-branch", rejected["classes"])
-        self.assert_closed(rejected)
-
-        unpack_failed = blob.git_failure(process(
-            stdout=b"unpack index-pack failed\n",
-            stderr=b"",
-        ))
-        self.assertTrue(unpack_failed["report_status"]["unpack_failed"])
-        self.assertIn("report-status-unpack-failed", unpack_failed["classes"])
-        self.assert_closed(unpack_failed)
-
-    def test_transport_auth_and_http_classes_are_closed(self):
-        diagnostic = blob.git_failure(process(
-            stdout=b"",
+    def test_rejection_summary_and_http_signature_are_attributed(self):
+        diagnostic = blob.push_failure(process(
+            stdout=b"!\trefs/heads/secret-ref:/tmp/secret\t[remote rejected] (pre-receive hook declined)\n",
             stderr=(b"fatal: unable to access "
                     b"'https://user:token@secret.example/secret.git/': "
                     b"The requested URL returned error: 503\n"),
         ))
-        self.assertIn("stderr-unable-to-access", diagnostic["classes"])
-        self.assertIn("stderr-http-503", diagnostic["classes"])
+        self.assertEqual(diagnostic["flag"], "!")
+        self.assertEqual(diagnostic["summary"], "remote-rejected")
+        self.assertIn("unable to access", diagnostic["stderr"])
+        self.assertIn("http", diagnostic["stderr"])
         self.assert_closed(diagnostic)
 
-    def test_unknown_fallback_and_non_integer_exit_are_closed(self):
-        diagnostic = blob.git_failure(process(
-            stdout=b"raw stdout body /tmp/secret",
+    def test_ordinary_exit_rpc_disconnect_and_unknown_outcome(self):
+        rpc = blob.push_failure(process(
+            stdout=b"",
+            stderr=b"error: RPC failed; curl 56 Unexpected disconnect\n",
+        ))
+        self.assertEqual(rpc["exit"], 1)
+        self.assertEqual(rpc["flag"], "none")
+        self.assertEqual(rpc["summary"], "unclassified")
+        self.assertIn("rpc", rpc["stderr"])
+        self.assertIn("disconnect", rpc["stderr"])
+        self.assert_closed(rpc)
+
+        unknown = blob.push_failure(process(
+            stdout=b"raw stdout body",
             stderr=b"raw stderr body token-123",
             returncode=None,
         ))
-        self.assertEqual(diagnostic["exit"], -1)
-        self.assertTrue(diagnostic["unknown"])
-        self.assertEqual(diagnostic["classes"], ["unclassified"])
-        self.assert_closed(diagnostic)
+        self.assertEqual(unknown["exit"], -1)
+        self.assertEqual(unknown["flag"], "none")
+        self.assertEqual(unknown["summary"], "unclassified")
+        self.assertEqual(unknown["stderr"], ["unclassified"])
+        self.assert_closed(unknown)
 
-    def test_porcelain_success_flag_is_reported_without_refname(self):
-        diagnostic = blob.git_failure(process(
-            stdout=(b"To https://user:token@secret.example/secret.git\n"
-                    b" \trefs/heads/secret-ref:refs/heads/secret-ref [new branch]\n"
-                    b"Done\n"),
-            stderr=b"",
-        ))
-        self.assertTrue(diagnostic["porcelain"]["ok"])
-        self.assertEqual(diagnostic["porcelain"]["flags"], [" "])
-        self.assertIn("porcelain-ok", diagnostic["classes"])
-        self.assert_closed(diagnostic)
+    def test_original_git_failure_is_unchanged(self):
+        self.assertEqual(
+            blob.git_failure(process(
+                stdout=b"!\trefs/heads/secret-ref:/tmp/secret\t[remote rejected]\n",
+                stderr=b"non-fast-forward\n",
+                returncode=1,
+            )),
+            {"exit": 1, "markers": ["non-fast-forward"]},
+        )
+        self.assertEqual(
+            blob.git_failure(process(
+                stdout=b"!\trefs/heads/secret-ref:/tmp/secret\t[remote rejected]\n",
+                stderr=b"",
+                returncode=1,
+            )),
+            {"exit": 1, "markers": []},
+        )
 
 
 if __name__ == "__main__":

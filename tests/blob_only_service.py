@@ -456,142 +456,72 @@ esac
         assert len(oid) == (40 if fmt == "sha1" else 64), oid
         pushed = self.git("push", "--porcelain", "origin", "HEAD:refs/heads/main",
                           cwd=work, token=self.alice, check=False)
-        assert pushed.returncode == 0, json.dumps(git_failure(pushed))
+        assert pushed.returncode == 0, json.dumps(push_failure(pushed))
         assert push_success(parse_push(pushed.stdout.decode()), "refs/heads/main")
         self.assert_ref(remote, "refs/heads/main", oid)
         self.no_bare(repo, fmt + " push")
         self.exact_clone(remote, self.root / (name + "-clone"), oid, fmt, files, self.reader)
         return oid
-_DIAGNOSTIC_PORCELAIN_FLAGS = frozenset("*+=!- ")
-_DIAGNOSTIC_PORCELAIN_CLASSES = (
-    ("porcelain-remote-rejected", ("remote rejected",)),
-    ("porcelain-non-fast-forward", ("non-fast-forward",)),
-    ("porcelain-fetch-first", ("fetch first",)),
-    ("porcelain-stale-info", ("stale info",)),
-    ("porcelain-hook-declined", ("hook declined", "pre-receive hook declined")),
-    ("porcelain-protected-branch", ("protected branch",)),
-    ("porcelain-unpacker-error", ("unpacker error",)),
-    ("porcelain-remote-failure", ("remote failure",)),
-)
-_DIAGNOSTIC_REPORT_CLASSES = (
-    ("report-status-non-fast-forward", ("non-fast-forward",)),
-    ("report-status-remote-rejected", ("remote rejected", "rejected")),
-    ("report-status-fetch-first", ("fetch first",)),
-    ("report-status-stale-info", ("stale info",)),
-    ("report-status-hook-declined", ("hook declined",)),
-    ("report-status-protected-branch", ("protected branch",)),
-    ("report-status-unpacker-error", ("unpacker error",)),
-)
-_DIAGNOSTIC_STDERR_CLASSES = (
-    ("stderr-non-fast-forward", ("non-fast-forward",)),
-    ("stderr-rejected", ("[rejected]",)),
-    ("stderr-fetch-first", ("fetch first",)),
-    ("stderr-authentication-failed", ("authentication failed", "could not read username",
-                                      "terminal prompts disabled")),
-    ("stderr-not-found", ("not found", "repository not found")),
-    ("stderr-does-not-support", ("does not support",)),
-    ("stderr-could-not-resolve", ("could not resolve",)),
-    ("stderr-unable-to-access", ("unable to access",)),
-    ("stderr-rpc-failed", ("rpc failed",)),
-    ("stderr-remote-end-hung-up", ("remote end hung up", "unexpected disconnect")),
-    ("stderr-http-401", ("returned error: 401", "http 401")),
-    ("stderr-http-403", ("returned error: 403", "http 403")),
-    ("stderr-http-404", ("returned error: 404", "http 404")),
-    ("stderr-http-500", ("returned error: 500", "http 500")),
-    ("stderr-http-502", ("returned error: 502", "http 502")),
-    ("stderr-http-503", ("returned error: 503", "http 503")),
-    ("stderr-pre-receive-hook-declined", ("pre-receive hook declined",)),
-    ("stderr-unpacker-error", ("unpacker error",)),
-    ("stderr-bad-pack", ("bad pack", "pack has bad object")),
-    ("stderr-index-pack-failed", ("index-pack failed",)),
-    ("stderr-protocol-error", ("protocol error",)),
-    ("stderr-not-our-ref", ("not our ref",)),
-    ("stderr-failed-to-push", ("failed to push",)),
-    ("stderr-denied", ("denied",)),
-    ("stderr-refusing", ("refusing",)),
-)
-def _diagnostic_text(process, name):
-    value = getattr(process, name, None)
-    if isinstance(value, bytes):
-        return value.decode("utf-8", "replace")
-    if isinstance(value, str):
-        return value
-    return ""
-def _diagnostic_classes(text, mapping):
-    lower = text.lower()
-    return [name for name, needles in mapping if any(needle in lower for needle in needles)]
 def git_failure(process):
-    """Closed, credential-free attribution for a failed stock Git invocation.
-
-    Only integer exit status, fixed class strings and fixed porcelain flags are
-    returned. Raw stdout/stderr, refnames, URLs, tokens, environment values and
-    repository paths are never copied into the diagnostic object.
-    """
-    stdout = _diagnostic_text(process, "stdout")
-    stderr = _diagnostic_text(process, "stderr")
-    text = stderr.lower()
+    text = (process.stderr or b"").decode(errors="replace").lower()
     markers = [marker for marker in ("non-fast-forward", "[rejected]", "fetch first", "authentication failed",
                                      "not found", "does not support", "could not resolve", "unable to access",
                                      "repository not found") if marker in text]
-    classes = set(_diagnostic_classes(stderr, _DIAGNOSTIC_STDERR_CLASSES))
-    porcelain_entries = 0
-    porcelain_flags = set()
-    porcelain_ok = False
-    porcelain_rejected = False
-    for line in stdout.splitlines():
-        if len(line) < 3 or line[0] not in _DIAGNOSTIC_PORCELAIN_FLAGS or "\t" not in line:
+    return {"exit": process.returncode, "markers": markers}
+_PUSH_SUMMARY_CLASSES = {
+    "[rejected]": "rejected",
+    "[remote rejected]": "remote-rejected",
+    "[remote failure]": "remote-failure",
+    "[no match]": "no-match",
+    "[non-fast-forward]": "non-fast-forward",
+    "[fetch first]": "fetch-first",
+    "[stale info]": "stale-info",
+    "[up to date]": "up-to-date",
+}
+_PUSH_STDERR_SIGNATURES = (
+    ("returned error: 4", "http"),
+    ("returned error: 5", "http"),
+    ("the requested url returned error", "http"),
+    ("rpc failed", "rpc"),
+    ("remote end hung up", "disconnect"),
+    ("unexpected disconnect", "disconnect"),
+    ("failed to push", "failed-to-push"),
+)
+def _push_text(process, name):
+    value = getattr(process, name, b"") or b""
+    return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+def push_failure(process):
+    """Narrow attribution for the one failed stock `sha_roundtrip` push.
+
+    Only exact three-column porcelain lines are parsed. The refspec column is
+    never inspected, so a ref or path containing marker text cannot forge a
+    summary class.
+    """
+    flag = "none"
+    summary = "unclassified"
+    for line in _push_text(process, "stdout").splitlines():
+        columns = line.split("\t")
+        if len(columns) != 3 or not columns[0] or columns[0][0] not in "*+=!- ":
             continue
-        porcelain_entries += 1
-        porcelain_flags.add(line[0])
-        if line[0] == "!":
-            porcelain_rejected = True
-            classes.add("porcelain-rejected")
-        elif line[0] in "*+ ":
-            porcelain_ok = True
-            classes.add("porcelain-ok")
-        classes.update(_diagnostic_classes(line, _DIAGNOSTIC_PORCELAIN_CLASSES))
-    report_unpack_ok = False
-    report_unpack_failed = False
-    report_ok = False
-    report_ng = False
-    for line in stdout.splitlines():
-        lower = line.lower()
-        if lower.startswith("unpack "):
-            if lower.strip() == "unpack ok":
-                report_unpack_ok = True
-                classes.add("report-status-unpack-ok")
-            else:
-                report_unpack_failed = True
-                classes.add("report-status-unpack-failed")
-                classes.update(_diagnostic_classes(line, _DIAGNOSTIC_REPORT_CLASSES))
-        elif lower.startswith("ng "):
-            report_ng = True
-            classes.add("report-status-ng")
-            classes.update(_diagnostic_classes(line, _DIAGNOSTIC_REPORT_CLASSES))
-        elif lower.startswith("ok "):
-            report_ok = True
-            classes.add("report-status-ok")
-    classes_list = sorted(classes)
-    unknown = not classes_list
-    if unknown:
-        classes_list = ["unclassified"]
+        candidate = columns[0][0]
+        if flag == "none" or (candidate == "!" and flag != "!"):
+            flag = candidate
+            summary_column = columns[2].strip()
+            closing = summary_column.find("]")
+            token = summary_column[:closing + 1] if summary_column.startswith("[") and closing >= 0 else ""
+            summary = _PUSH_SUMMARY_CLASSES.get(token, "unclassified")
+        if flag == "!":
+            break
+    stderr = _push_text(process, "stderr").lower()
+    classes = list(git_failure(process)["markers"])
+    for signature, name in _PUSH_STDERR_SIGNATURES:
+        if signature in stderr and name not in classes:
+            classes.append(name)
     return {
         "exit": process.returncode if type(getattr(process, "returncode", None)) is int else -1,
-        "markers": markers,
-        "classes": classes_list,
-        "porcelain": {
-            "entries": porcelain_entries,
-            "ok": porcelain_ok,
-            "rejected": porcelain_rejected,
-            "flags": sorted(porcelain_flags),
-        },
-        "report_status": {
-            "unpack_ok": report_unpack_ok,
-            "unpack_failed": report_unpack_failed,
-            "ok": report_ok,
-            "ng": report_ng,
-        },
-        "unknown": unknown,
+        "flag": flag,
+        "summary": summary,
+        "stderr": classes or ["unclassified"],
     }
 def parse_push(text):
     entries = []
