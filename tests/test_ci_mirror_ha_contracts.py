@@ -289,6 +289,75 @@ class CiMirrorHaContractsTest(unittest.TestCase):
         self.assertIsNotNone(first_claimed_assert)
         self.assertLess(token_line, first_claimed_assert)
 
+    def test_scenario_d_pushes_to_live_controller2_same_repo(self) -> None:
+        tree = ast.parse(QUAL_SCRIPT.read_text(encoding="utf-8"))
+        cls = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "HaQualificationHarness"
+        )
+        scenario = next(
+            node for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "scenario_d_controlled_readiness_claim_transition"
+        )
+
+        def self_attr(node, name: str) -> bool:
+            return (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+                and node.attr == name
+            )
+
+        def repo1_clone_path(node) -> bool:
+            return (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "self"
+                and node.value.attr == "repo1"
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == "clone_path"
+            )
+
+        pushes = []
+        for node in ast.walk(scenario):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "git"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "push"
+            ):
+                pushes.append(node)
+            if isinstance(node, ast.Constant) and node.value == "origin":
+                self.fail(f"Scenario D references dead origin at line {node.lineno}")
+            if self_attr(node, "c1_base"):
+                self.fail(f"Scenario D references dead controller-1 at line {node.lineno}")
+        self.assertEqual(len(pushes), 1)
+        push = pushes[0]
+        self.assertEqual(len(push.args), 3)
+        destination = push.args[1]
+        self.assertIsInstance(destination, ast.BinOp)
+        self.assertIsInstance(destination.op, ast.Add)
+        self.assertTrue(self_attr(destination.left, "c2_base"))
+        self.assertTrue(repo1_clone_path(destination.right))
+        self.assertEqual(push.args[2].value, "HEAD:refs/heads/feat-e")
+        keywords = {keyword.arg: keyword.value for keyword in push.keywords}
+        self.assertTrue(self_attr(keywords.get("cwd"), "work1"))
+        self.assertTrue(self_attr(keywords.get("token"), "alice"))
+        for node in ast.walk(scenario):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"start_daemon", "git"}
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in {"controller-1", "remote", "config"}
+            ):
+                self.fail(f"Scenario D changes controller/auth/global state at line {node.lineno}")
+
     def test_all_checkout_tokens_register_before_assertions(self) -> None:
         tree = ast.parse(QUAL_SCRIPT.read_text(encoding="utf-8"))
         cls = next(

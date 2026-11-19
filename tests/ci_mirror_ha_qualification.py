@@ -1219,7 +1219,7 @@ class HaQualificationHarness:
         self.git("add", "feat-e.txt", cwd=self.work1)
         self.git("commit", "-m", "commit feat-e", cwd=self.work1)
         target_oid = self.git("rev-parse", "HEAD", cwd=self.work1).stdout.decode().strip()
-        self.git("push", "origin", "HEAD:refs/heads/feat-e", cwd=self.work1, token=self.alice)
+        self.git("push", self.c2_base + self.repo1["clone_path"], "HEAD:refs/heads/feat-e", cwd=self.work1, token=self.alice)
 
         self.start_daemon(
             "mirror-4", "serve-mirror",
