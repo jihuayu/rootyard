@@ -74,6 +74,24 @@ CASE_STAGES = (
     "denials",
     "final_assertions",
 )
+REPO_CREATE_CODES = (
+    "post_send",
+    "post_status_4xx",
+    "post_status_5xx",
+    "post_status_other",
+    "post_shape",
+    "get_send",
+    "get_status_4xx",
+    "get_status_5xx",
+    "get_status_other",
+    "get_shape",
+    "get_terminal_state",
+    "get_timeout",
+    "identity_mismatch",
+    "backend_mismatch",
+    "object_format_mismatch",
+    "clone_path_mismatch",
+)
 REPORT_KIND = "rootyard/a4-redis-wake-external-acceptance"
 WORKER_NAME = "rootyard_a4_redis_wake_worker"
 TARGET_KIND = "pg_refstore_core_commit_audit"
@@ -186,6 +204,7 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         self.channel = "rootyard:a4:test:" + self.schema
         self.redis_started = False
         self.case_stage = None
+        self.repo_create_code = None
 
     # ---- owned processes -------------------------------------------------
     def stop_workers(self):
@@ -713,9 +732,14 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         assert self.git("rev-parse", "HEAD", cwd=clone).stdout.decode().strip() == oid
         self.git("fsck", "--full", "--strict", cwd=clone)
 
+    def observe_repo_create(self, code):
+        if self.repo_create_code is None and code in REPO_CREATE_CODES:
+            self.repo_create_code = code
+
     def run_case(self):
         self.case_stage = "repo_create"
-        repo, _ = self.create("a4wake", self.alice)
+        self.repo_create_code = None
+        repo, _ = self.create("a4wake", self.alice, observer=self.observe_repo_create)
         remote = self.base + repo["clone_path"]
         work = self.root / "a4wake-work"
         self.case_stage = "empty_clone"
@@ -911,6 +935,9 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None, containment
             stage = getattr(harness, "case_stage", None)
             if isinstance(stage, str) and stage in CASE_STAGES:
                 case["stage"] = stage
+                if stage == "repo_create":
+                    code = getattr(harness, "repo_create_code", None)
+                    case["repo_create"] = code if isinstance(code, str) and code in REPO_CREATE_CODES else "unavailable"
         if cleanup_error is not None:
             case["cleanup_failed"] = True
         if primary is not None and cleanup_error is not None:

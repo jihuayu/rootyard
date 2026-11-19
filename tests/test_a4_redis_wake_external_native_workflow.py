@@ -50,6 +50,7 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         self.complete = namespace["installer_complete"]
         self.case_evidence = namespace["case_evidence"]
         self.case_stages = namespace["CASE_STAGES"]
+        self.repo_create_codes = namespace["REPO_CREATE_CODES"]
         self.phase_path = self.runner / "a4" / "native-tools-phase.json"
         self.wrapper_sha = hashlib.sha256(
             (self.workspace / "scripts" / "install_ci_native_tools.sh").read_bytes()
@@ -200,6 +201,39 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
     def test_evidence_payload_uses_case_evidence_projection(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('"case": case_evidence(case, observations)', text)
+
+
+    def test_repo_create_evidence_uses_only_whitelisted_codes(self):
+        self.assertEqual(self.repo_create_codes, set(a4.REPO_CREATE_CODES))
+        observations = {"owned_cleanup_completed": False}
+        failed = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "repo_create",
+             "repo_create": "post_status_5xx"}, observations
+        )
+        self.assertEqual(failed["stage"], "repo_create")
+        self.assertEqual(failed["repo_create"], "post_status_5xx")
+        missing = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "repo_create"}, observations
+        )
+        self.assertEqual(missing["repo_create"], "unavailable")
+        for bad_code in ("private/repo/url", "", 7, ["post_status_5xx"], {"code": "post_shape"}):
+            with self.subTest(code=bad_code):
+                rejected = self.case_evidence(
+                    {"name": a4.CASE, "status": "failed", "stage": "repo_create",
+                     "repo_create": bad_code}, observations
+                )
+                self.assertEqual(rejected["repo_create"], "unavailable")
+                self.assertNotIn("private", repr(rejected))
+        other_stage = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "healthy_push",
+             "repo_create": "post_status_5xx"}, observations
+        )
+        self.assertNotIn("repo_create", other_stage)
+        passed = self.case_evidence(
+            {"name": a4.CASE, "status": "passed", "stage": "repo_create",
+             "repo_create": "post_status_5xx"}, observations
+        )
+        self.assertNotIn("repo_create", passed)
 
 
 

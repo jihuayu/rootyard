@@ -221,6 +221,47 @@ class ReportTest(unittest.TestCase):
             detail={"healthy_wake_before_poll": True, "owned_cleanup_completed": True},
         )])
         self.assertNotIn("stage", repr(report["cases"]))
+        self.assertNotIn("repo_create", repr(report["cases"]))
+
+    def test_repo_create_failure_reports_fixed_code(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private repo id url oid")
+        harness.case_stage = "repo_create"
+        harness.repo_create_code = "post_status_5xx"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case",
+            stage="repo_create", repo_create="post_status_5xx",
+        )])
+        self.assertNotIn("private", repr(report))
+
+    def test_repo_create_failure_rejects_unknown_or_missing_code(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private repo id url oid")
+        harness.case_stage = "repo_create"
+        for code in (None, "private/repo/url", ["post_status_5xx"], 7):
+            with self.subTest(code=code):
+                harness.repo_create_code = code
+                report = a4.acceptance_report(self.args)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["cases"], [dict(
+                    name=a4.CASE, status="failed", error="case",
+                    stage="repo_create", repo_create="unavailable",
+                )])
+                self.assertNotIn("private", repr(report))
+
+    def test_repo_create_code_not_emitted_for_other_stage(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private repo id url oid")
+        harness.case_stage = "healthy_push"
+        harness.repo_create_code = "post_status_5xx"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case", stage="healthy_push",
+        )])
+        self.assertNotIn("repo_create", repr(report["cases"]))
 
     def test_primary_failure_precedes_cleanup_failure_but_records_it(self):
         harness = self.factory.return_value
@@ -279,6 +320,77 @@ class CaseStageTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "private detail"):
             harness.run_case()
         self.assertEqual(harness.case_stage, "healthy_push")
+
+    def test_real_run_case_tracks_repo_create_code(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.case_stage = None
+        harness.repo_create_code = None
+        harness.base = "http://fixture"
+        harness.root = Path("/tmp/a4-stage")
+        harness.alice = object()
+        def fail_create(*_args, **_kwargs):
+            harness.observe_repo_create("post_status_5xx")
+            raise RuntimeError("private detail")
+        harness.create = Mock(side_effect=fail_create)
+        with self.assertRaisesRegex(RuntimeError, "private detail"):
+            harness.run_case()
+        self.assertEqual(harness.case_stage, "repo_create")
+        self.assertEqual(harness.repo_create_code, "post_status_5xx")
+        harness.repo_create_code = None
+        harness.observe_repo_create("private/repo/url")
+        self.assertIsNone(harness.repo_create_code)
+
+
+class RepoCreateObserverTest(unittest.TestCase):
+    def test_post_status_class_and_shape_observers(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.repo_create_code = None
+        harness.http = Mock(return_value=(503, b"{}", {}))
+        with self.assertRaisesRegex(AssertionError, "POST /api/repos"):
+            harness.post_repo("repo", None, observer=harness.observe_repo_create)
+        self.assertEqual(harness.repo_create_code, "post_status_5xx")
+        harness.repo_create_code = None
+        harness.http = Mock(return_value=(201, b"not-json", {}))
+        with self.assertRaises(ValueError):
+            harness.post_repo("repo", None, observer=harness.observe_repo_create)
+        self.assertEqual(harness.repo_create_code, "post_shape")
+
+    def test_get_status_and_terminal_state_observers(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.repo_create_code = None
+        harness.http = Mock(return_value=(404, b"{}", {}))
+        with self.assertRaisesRegex(AssertionError, "GET "):
+            harness.await_ready("alice", "repo", None, observer=harness.observe_repo_create)
+        self.assertEqual(harness.repo_create_code, "get_status_4xx")
+        harness.repo_create_code = None
+        harness.http = Mock(return_value=(200, b'{"state":"failed"}', {}))
+        with self.assertRaisesRegex(AssertionError, "failed"):
+            harness.await_ready("alice", "repo", None, observer=harness.observe_repo_create)
+        self.assertEqual(harness.repo_create_code, "get_terminal_state")
+
+    def test_create_without_observer_keeps_existing_contract(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.post_repo = Mock(return_value=(201, {"id": "1", "owner": "alice", "name": "repo"}))
+        harness.await_ready = Mock(return_value={
+            "id": "1", "owner": "alice", "name": "repo", "storage_backend": "pg_refstore",
+            "object_format": "sha1", "clone_path": "/git/alice/repo.git",
+        })
+        repo, code = harness.create("repo", None)
+        self.assertEqual(code, 201)
+        self.assertEqual(repo["id"], "1")
+        self.assertEqual(repo["clone_path"], "/git/alice/repo.git")
+
+    def test_create_final_identity_observer(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.repo_create_code = None
+        harness.post_repo = Mock(return_value=(201, {"id": "1", "owner": "alice", "name": "repo"}))
+        harness.await_ready = Mock(return_value={
+            "id": "2", "owner": "alice", "name": "repo", "storage_backend": "pg_refstore",
+            "object_format": "sha1", "clone_path": "/git/alice/repo.git",
+        })
+        with self.assertRaises(AssertionError):
+            harness.create("repo", None, observer=harness.observe_repo_create)
+        self.assertEqual(harness.repo_create_code, "identity_mismatch")
 
 
 class PreflightTest(unittest.TestCase):

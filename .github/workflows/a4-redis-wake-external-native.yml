@@ -269,6 +269,12 @@ jobs:
               "worker_startup", "healthy_push", "invalid_hints", "redis_cut_pg_fallback",
               "healed_wake", "denials", "final_assertions",
           }
+          REPO_CREATE_CODES = {
+              "post_send", "post_status_4xx", "post_status_5xx", "post_status_other",
+              "post_shape", "get_send", "get_status_4xx", "get_status_5xx", "get_status_other",
+              "get_shape", "get_terminal_state", "get_timeout", "identity_mismatch",
+              "backend_mismatch", "object_format_mismatch", "clone_path_mismatch",
+          }
           HEX = re.compile(r"^[0-9a-f]{64}$")
           FAIL = {"preflight", "fixture", "case", "receipt_changed", "cleanup"}
           ROOT = pathlib.Path.cwd()
@@ -346,12 +352,22 @@ jobs:
               return stage if isinstance(stage, str) and stage in CASE_STAGES else "unavailable"
 
 
+          def failed_repo_create_code(case):
+              if not isinstance(case, dict) or case.get("status") != "failed" or case.get("stage") != "repo_create":
+                  return None
+              code = case.get("repo_create")
+              return code if isinstance(code, str) and code in REPO_CREATE_CODES else "unavailable"
+
+
           def case_evidence(case, observations):
               case = case if isinstance(case, dict) else {}
               view = {"name": case.get("name"), "status": case.get("status"), "observations": observations}
               stage = failed_case_stage(case)
               if stage is not None:
                   view["stage"] = stage
+              repo_create = failed_repo_create_code(case)
+              if repo_create is not None:
+                  view["repo_create"] = repo_create
               return view
 
 
