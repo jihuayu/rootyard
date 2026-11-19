@@ -240,6 +240,9 @@ pub(super) async fn rotate_slot_one(
 ) -> Result<SlotOneAdmission, GatewayError> {
     let public = handoff.public.clone();
     let repository_id = public.repository_id;
+    if !actor_matches(actor, &public) {
+        return Err(GatewayError::Internal("slot one actor differs from its public identity"));
+    }
     let mut client = state.pooled(deadline).await?;
     let mut tx = match timeout_at(deadline, client.transaction()).await {
         Ok(Ok(tx)) => tx,
@@ -298,7 +301,9 @@ pub(super) async fn rotate_slot_one(
     if receipt.replayed {
         // The primitive fully proved the stored slot-one/retired pair in this
         // read-only call. It must not have built a plan, allocated a lane or
-        // advanced a sequence. Discard the empty savepoint and outer owner.
+        // advanced a sequence. Discard the empty savepoint before the live
+        // lookup, then roll back the owning transaction once the original
+        // actor/realm/restore fence has been re-proved from current PG data.
         if built.is_some() {
             let _ = rollback_bounded(savepoint, deadline).await;
             let _ = rollback_deadpool_bounded(tx, deadline).await;
@@ -312,9 +317,40 @@ pub(super) async fn rotate_slot_one(
             let _ = rollback_deadpool_bounded(tx, deadline).await;
             return Err(GatewayError::Internal("slot one replay receipt differs from its public request"));
         }
-        rollback_bounded(savepoint, deadline).await?;
-        rollback_deadpool_bounded(tx, deadline).await?;
-        return Ok(SlotOneAdmission::Replayed(receipt));
+        // Release the empty gateway savepoint, not the outer transaction, so
+        // the live lookup runs while the replay primitive's advisory/restore
+        // locks are still held. The outer transaction is rolled back only after
+        // the current actor/realm/restore evidence is checked.
+        match super::commit_bounded(savepoint, deadline, repository_id, Some(public.public_id)).await {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = rollback_deadpool_bounded(tx, deadline).await;
+                return Err(GatewayError::from(error));
+            }
+        }
+        // Reuse the primitive's outer transaction. This is not an independent
+        // authorization transaction: the replay holds the public/attempt and
+        // restore locks. The added order is public/attempt -> cluster fence ->
+        // live auth -> current realm; it does not join or reorder the existing
+        // operation -> lane -> repository -> gate/protocol decision path, and
+        // the restore path takes the cluster fence before token rows in the
+        // same direction.
+        let replay_auth = live_serving_in_tx(&tx, state, serving, actor, deadline).await;
+        let cleanup = rollback_deadpool_bounded(tx, deadline).await;
+        match replay_auth {
+            Ok(fresh) if same_current_realm(&fresh, serving, &public) => {
+                cleanup?;
+                return Ok(SlotOneAdmission::Replayed(receipt));
+            }
+            Ok(_) => {
+                let _ = cleanup;
+                return Err(GatewayError::Conflict("repository authority changed; retry"));
+            }
+            Err(error) => {
+                let _ = cleanup;
+                return Err(error);
+            }
+        }
     }
 
     let Some(plan) = built else {
@@ -341,21 +377,11 @@ pub(super) async fn rotate_slot_one(
     // Same outer transaction, after the lane/repository/gate locks: prove the
     // live token/RBAC/membership, ready serving binding, opened backend,
     // restore incarnation and exact realm before allowing COMMIT.
-    let fresh = match crate::ref_store::serving::lookup_in_tx(
-        &tx,
-        actor,
-        &serving.repository.owner,
-        &serving.repository.name,
-        true,
-        state.store().backend_identity(),
-        deadline,
-    )
-    .await
-    {
+    let fresh = match live_serving_in_tx(&tx, state, serving, actor, deadline).await {
         Ok(fresh) => fresh,
         Err(error) => {
             let _ = rollback_deadpool_bounded(tx, deadline).await;
-            return Err(GatewayError::from(error));
+            return Err(error);
         }
     };
     if !same_locked_realm(&fresh, serving, &public, baseline) {
@@ -459,14 +485,41 @@ fn validate_fresh_receipt(
     Ok(())
 }
 
-/// The after-savepoint serving lookup must prove the same locked realm, cluster
-/// restoration and gate version captured before the rotation.
-fn same_locked_realm(
-    fresh: &ServingRepository,
+/// The live lookup is performed with the original authenticated actor. The
+/// handoff proof already binds that actor; keep the replay classification's
+/// original-actor check explicit as well.
+fn actor_matches(actor: &Identity, public: &PublicAttemptRequest) -> bool {
+    actor.id == public.issuer_id
+}
+
+/// Reuse the caller's exact outer transaction for the live writable serving
+/// lookup. Fresh and replay both take this path; neither opens a second
+/// connection or an independent authorization transaction.
+async fn live_serving_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    state: &BlobGitState,
     serving: &ServingRepository,
-    public: &PublicAttemptRequest,
-    baseline: &PackCommitBaseline,
-) -> bool {
+    actor: &Identity,
+    deadline: Instant,
+) -> Result<ServingRepository, GatewayError> {
+    crate::ref_store::serving::lookup_in_tx(
+        tx,
+        actor,
+        &serving.repository.owner,
+        &serving.repository.name,
+        true,
+        state.store().backend_identity(),
+        deadline,
+    )
+    .await
+    .map_err(GatewayError::from)
+}
+
+/// Current live realm/restore fence without the fresh-plan gate-revision
+/// equality. Exact replay is allowed after later gate revisions as long as the
+/// primitive already proved the stored rotation; the live serving lookup still
+/// has to prove the realm, backend binding and restore anchor.
+fn same_current_realm(fresh: &ServingRepository, serving: &ServingRepository, public: &PublicAttemptRequest) -> bool {
     let gate = &fresh.gate;
     fresh.repository.id == public.repository_id
         && gate.repository_id() == public.repository_id
@@ -476,8 +529,18 @@ fn same_locked_realm(
         && gate.authority_epoch() == public.authority_epoch
         && gate.group_epoch() == public.group_epoch
         && fresh.cluster_incarnation == public.restore_incarnation
-        && gate.version() == *baseline.gate()
         && RealmExpectation::from_gate(gate) == RealmExpectation::from_gate(&serving.gate)
+}
+
+/// The after-savepoint fresh lookup must prove the same locked realm, cluster
+/// restoration and gate version captured before the rotation.
+fn same_locked_realm(
+    fresh: &ServingRepository,
+    serving: &ServingRepository,
+    public: &PublicAttemptRequest,
+    baseline: &PackCommitBaseline,
+) -> bool {
+    same_current_realm(fresh, serving, public) && fresh.gate.version() == *baseline.gate()
 }
 
 struct Redacted;
@@ -687,6 +750,57 @@ mod tests {
             assert!(!format!("{error:?}").contains(&private_id.to_string()), "{label}");
             assert!(!format!("{error:?}").contains(&event_id.to_string()), "{label}");
         }
+    }
+
+    #[test]
+    fn replay_realm_allows_later_gate_revision_but_not_actor_or_restore_drift() {
+        let serving = serving();
+        let actor = actor();
+        let baseline = baseline(&serving);
+        let public = public_request(
+            &serving,
+            &actor,
+            Uuid::new_v4(),
+            RequestDigest::of("slot-one-replay-realm", &[b"wire"]),
+            &baseline,
+        );
+        let moved_gate = CoreGate::new(
+            serving.gate.repository_id(),
+            serving.gate.tenant_id(),
+            serving.gate.object_format(),
+            serving.gate.history_incarnation(),
+            serving.gate.authority_epoch(),
+            serving.gate.group_epoch(),
+            serving.gate.head_ref().clone(),
+            serving.gate.revision() + 2,
+        )
+        .unwrap();
+        let mut later = serving.clone();
+        later.gate = moved_gate;
+
+        assert!(actor_matches(&actor, &public));
+        assert!(same_current_realm(&later, &serving, &public));
+        let mut other_actor = actor.clone();
+        other_actor.id = Uuid::new_v4();
+        assert!(!actor_matches(&other_actor, &public));
+
+        let mut moved_restore = later.clone();
+        moved_restore.cluster_incarnation = Uuid::new_v4();
+        assert!(!same_current_realm(&moved_restore, &serving, &public));
+
+        let mut moved_realm = later.clone();
+        moved_realm.gate = CoreGate::new(
+            serving.gate.repository_id(),
+            serving.gate.tenant_id(),
+            serving.gate.object_format(),
+            Uuid::new_v4(),
+            serving.gate.authority_epoch(),
+            serving.gate.group_epoch(),
+            serving.gate.head_ref().clone(),
+            serving.gate.revision() + 2,
+        )
+        .unwrap();
+        assert!(!same_current_realm(&moved_realm, &serving, &public));
     }
 
     #[test]
