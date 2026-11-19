@@ -98,6 +98,7 @@ async fn materialize_projected_bare(
             &scratch.work(),
             &["--no-local", "--no-hardlinks", "--no-tags"],
             deadline,
+            None,
         )
         .await?;
         let projected = views::s4_git_view::project(git, &work, &view.source_oid, &view.subdir, deadline).await?;
@@ -111,6 +112,7 @@ async fn materialize_projected_bare(
             &bare,
             &["--bare", "--no-local", "--no-hardlinks", "--no-tags", "--single-branch", "--branch", "projected"],
             deadline,
+            None,
         )
         .await?;
         for args in [
@@ -118,7 +120,7 @@ async fn materialize_projected_bare(
             &["config", "uploadpack.allowAnySHA1InWant", "false"][..],
             &["config", "uploadpack.allowReachableSHA1InWant", "false"][..],
         ] {
-            let _ = git_bytes(&state.config.git, &bare, args, deadline, "Git view projection failed").await?;
+            let _ = git_bytes(&state.config.git, &bare, args, deadline, "Git view projection failed", None).await?;
         }
         Ok(bare)
     })
@@ -165,6 +167,7 @@ pub(super) async fn info_refs(
             META_OUTPUT_CAP.min(super::ADVERTISE_LIMIT),
             deadline,
             Error(StatusCode::SERVICE_UNAVAILABLE, "projected Git view unavailable"),
+            None,
         ),
     )
     .await?;
@@ -218,6 +221,7 @@ pub(super) async fn upload_pack(
             max_out,
             deadline,
             Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"),
+            None,
         ),
     )
     .await?;

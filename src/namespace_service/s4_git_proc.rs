@@ -6,6 +6,9 @@ use axum::http::StatusCode;
 use std::{io, path::Path as FsPath, process::{ExitStatus, Stdio}, time::Duration};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, process::{Child, Command}, time::Instant};
 
+#[path = "s4_git_reverse_diag.rs"]
+mod reverse_diag;
+
 pub(crate) const META_OUTPUT_CAP: usize = 4 * 1024 * 1024;
 const TIMEOUT_CLEANUP_BOUND: Duration = Duration::from_secs(2);
 const LEADER_REAP_BOUND: Duration = Duration::from_millis(100);
@@ -68,6 +71,8 @@ pub(crate) use super::s4_git_proc_reverse::{
 };
 
 pub(crate) enum GitStdin<'a> { Null, Bytes(&'a [u8]), File(std::fs::File) }
+
+pub(crate) use reverse_diag::ReverseGitStage;
 
 pub(crate) fn base_command(git_bin: &FsPath) -> Command {
     let mut command = Command::new(git_bin);
@@ -270,6 +275,7 @@ pub(crate) async fn run_git_bounded(
     max_stdout_bytes: usize,
     deadline: Instant,
     fail_error: Error,
+    stage: Option<ReverseGitStage>,
 ) -> Result<Vec<u8>, Error> {
     if Instant::now() >= deadline {
         return Err(Error::timeout());
@@ -356,6 +362,9 @@ pub(crate) async fn run_git_bounded(
     }
     let status = guard.finish(deadline).await?;
     if !status.success() {
+        if let Some(stage) = stage {
+            reverse_diag::emit(stage, reverse_diag::classify(status));
+        }
         return Err(fail_error);
     }
     Ok(output)
@@ -367,6 +376,7 @@ pub(crate) async fn git_bytes(
     args: &[&str],
     deadline: Instant,
     conflict_msg: &'static str,
+    stage: Option<ReverseGitStage>,
 ) -> Result<Vec<u8>, Error> {
     let mut cmd = base_command(git_bin);
     cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "-C"])
@@ -378,6 +388,7 @@ pub(crate) async fn git_bytes(
         META_OUTPUT_CAP,
         deadline,
         Error(StatusCode::CONFLICT, conflict_msg),
+        stage,
     )
     .await
 }
@@ -388,8 +399,10 @@ pub(crate) async fn git_text(
     args: &[&str],
     deadline: Instant,
     conflict_msg: &'static str,
+    stage: Option<ReverseGitStage>,
 ) -> Result<String, Error> {
-    String::from_utf8(git_bytes(git_bin, repo, args, deadline, conflict_msg).await?).map_err(Error::internal)
+    String::from_utf8(git_bytes(git_bin, repo, args, deadline, conflict_msg, stage).await?)
+        .map_err(Error::internal)
 }
 
 pub(crate) async fn git_oid(
@@ -397,8 +410,9 @@ pub(crate) async fn git_oid(
     repo: &FsPath,
     args: &[&str],
     deadline: Instant,
+    stage: Option<ReverseGitStage>,
 ) -> Result<String, Error> {
-    Ok(git_text(git_bin, repo, args, deadline, "Git View reverse mapping conflict")
+    Ok(git_text(git_bin, repo, args, deadline, "Git View reverse mapping conflict", stage)
         .await?
         .trim()
         .to_owned())
@@ -421,6 +435,7 @@ pub(crate) async fn git_init_bare(
         META_OUTPUT_CAP,
         deadline,
         Error(StatusCode::CONFLICT, "Git view repository could not be initialized"),
+        None,
     )
     .await?;
     Ok(())
@@ -432,6 +447,7 @@ pub(crate) async fn git_clone(
     dest: &FsPath,
     extra: &[&str],
     deadline: Instant,
+    stage: Option<ReverseGitStage>,
 ) -> Result<(), Error> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(Error::internal)?;
@@ -448,6 +464,7 @@ pub(crate) async fn git_clone(
         META_OUTPUT_CAP,
         deadline,
         Error(StatusCode::CONFLICT, "Git view clone failed"),
+        stage,
     )
     .await?;
     Ok(())

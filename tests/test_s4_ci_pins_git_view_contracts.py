@@ -42,7 +42,9 @@ TOUCHED = [
     SRC / "namespace_service" / "s4_git_proc.rs",
     SRC / "namespace_service" / "s4_git_proc_tests.rs",
     SRC / "namespace_service" / "s4_git_proc_reverse.rs",
+    SRC / "namespace_service" / "s4_git_reverse_diag.rs",
     SRC / "namespace_service" / "s4_git_view_reverse.rs",
+    SRC / "namespace_service" / "s4_git_view_reverse_binding.rs",
     SRC / "namespace_service" / "view_git_http.rs",
     SRC / "namespace_service" / "s4_git_view_http.rs",
     TESTS / "s4_ci_pins_git_view.rs",
@@ -109,12 +111,14 @@ class SourceContracts(unittest.TestCase):
     def test_every_s4_entrypoint_ensures_the_dedicated_schema(self) -> None:
         for rel in (
             SRC / "namespace_service" / "s4_git_view.rs",
-            SRC / "namespace_service" / "s4_git_view_reverse.rs",
+            SRC / "namespace_service" / "s4_git_view_reverse_binding.rs",
             SRC / "namespace_service" / "s4_git_view_http.rs",
             CI_PINS / "s4_authority.rs",
             CI_PINS / "s4_transport.rs",
         ):
             self.assertIn("ensure_s4_schema", text(rel), rel)
+        # The reverse entrypoint must load its active binding through that helper.
+        self.assertIn("load_binding(state, view)", text(SRC / "namespace_service" / "s4_git_view_reverse.rs"))
 
     def test_deserialize_requests_deny_unknown_fields(self) -> None:
         pattern = re.compile(
@@ -298,6 +302,58 @@ class SourceContracts(unittest.TestCase):
         hold = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
         self.assertIn("SET incarnation=$1, rotated_at=$2", hold)
         self.assertIn("GateEpochRestoreGuard", hold)
+
+    def test_reverse_git_child_failure_diagnostic_is_closed_and_visible(self) -> None:
+        proc = text(SRC / "namespace_service" / "s4_git_proc.rs")
+        diag = text(SRC / "namespace_service" / "s4_git_reverse_diag.rs")
+        reverse = text(SRC / "namespace_service" / "s4_git_proc_reverse.rs")
+        view_reverse = text(SRC / "namespace_service" / "s4_git_view_reverse.rs")
+        tests = text(SRC / "namespace_service" / "s4_git_proc_tests.rs")
+        product = proc.split('#[path = "s4_git_proc_tests.rs"]', 1)[0]
+
+        for label in (
+            "source_projection",
+            "proposal_verify_fetch",
+            "ancestry_integrity",
+            "subtree_graft",
+            "commit_synthesize",
+            "pack_write_index",
+        ):
+            self.assertIn(f'"{label}"', diag)
+        for label in ("nonzero_exit", "signaled", "unknown"):
+            self.assertIn(f'"{label}"', diag)
+        self.assertIn("enum ReverseGitStage", diag)
+        self.assertIn("enum ReverseGitChildOutcome", diag)
+        self.assertIn("rootyard: S4 reverse Git child failed stage=", diag)
+        self.assertIn('eprintln!("{}", failure_line(stage, outcome));', diag)
+        self.assertIn("rootyard: S4 reverse Git child failed stage={} outcome={}", diag)
+        self.assertNotIn("{:?", diag, "no debug-formatted child value may enter the line")
+        self.assertNotIn("tracing_subscriber", diag)
+        self.assertNotIn("RUST_LOG", diag)
+        self.assertNotIn("tracing_subscriber", product)
+        self.assertNotIn("RUST_LOG", product)
+
+        failed = product.split("if !status.success()", 1)
+        self.assertEqual(len(failed), 2, "the diagnostic must sit at the child-status boundary")
+        self.assertIn("reverse_diag::emit(stage, reverse_diag::classify(status))", failed[1])
+        self.assertIn("return Err(fail_error);", failed[1])
+
+        for variant in (
+            "ReverseGitStage::SourceProjection",
+            "ReverseGitStage::ProposalVerifyFetch",
+            "ReverseGitStage::AncestryIntegrity",
+            "ReverseGitStage::SubtreeGraft",
+            "ReverseGitStage::CommitSynthesize",
+        ):
+            self.assertIn(variant, view_reverse)
+        self.assertIn("ReverseGitStage::PackWriteIndex", reverse)
+        self.assertIn("Git View reverse mapping conflict", reverse)
+        self.assertIn("Git View reverse mapping conflict", view_reverse)
+
+        self.assertIn("reverse_diag::take_for_test", tests)
+        self.assertIn("failing_reverse_child_emits_closed_diagnostic_and_keeps_public_conflict", tests)
+        self.assertIn("reverse_git_child_outcome_distinguishes_nonzero_signal_and_unknown", tests)
+        self.assertIn("reverse_git_diagnostic_labels_are_closed_and_bounded", tests)
 
     def test_hold_regressions_cover_the_two_review_items(self) -> None:
         body = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
