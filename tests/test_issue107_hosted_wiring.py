@@ -17,6 +17,10 @@ import issue107_native11_inventory as native_inventory  # noqa: E402
 
 WORKFLOW = ROOT / ".github/workflows/refstore-protocol-acceptance.yml"
 STEP_NAME = "Build and run the fixed issue107 HTTP13 and native11 acceptance inventory"
+NATIVE_STEP_NAME = "Exercise roots, decisions, accepted subset and pack-read regressions"
+A4_CASE = (
+    "decision_subset_support::cases_f::"
+    "a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit")
 
 
 def workflow():
@@ -29,6 +33,13 @@ def inventory_step():
     marker = f'      - name: "{STEP_NAME}"\n'
     assert marker in text
     return text.split(marker, 1)[1].split('\n      - name: "', 1)[0]
+
+
+def native_step():
+    text = WORKFLOW.read_text()
+    marker = f'      - name: {NATIVE_STEP_NAME}\n'
+    assert marker in text
+    return text.split(marker, 1)[1].split('\n      - name: ', 1)[0]
 
 
 class HostedWiringTests(unittest.TestCase):
@@ -122,6 +133,22 @@ class HostedWiringTests(unittest.TestCase):
             self.assertIn(target, step)
         self.assertIn("runner.validate_report(report, sys.argv[1])", acceptance)
         self.assertIn("test-results/refstore/issue107-native11.json", acceptance)
+        self.assertEqual(acceptance.count("--allow-known-a4-extra"), 1)
+
+    def test_step11_requires_exact_a4_ok_row_and_bound_separate_report(self):
+        step = native_step()
+        row = f"test {A4_CASE} ... ok"
+        self.assertIn(row, step)
+        self.assertIn("assert log.count(a4_row) == 1", step)
+        self.assertIn("assert log.count(a4_prefix) == 1", step)
+        self.assertIn("assert a4_prefix + ' ignored' not in log", step)
+        self.assertIn("issue107-a4-native.json", step)
+        self.assertIn("'case': a4_name", step)
+        self.assertIn("'row': a4_row", step)
+        self.assertIn("'native_log_sha256': hashlib.sha256(raw_log).hexdigest()", step)
+        self.assertIn("native.json", step)
+        self.assertIn("'suite_counts': [int(row[1]) for row in rows]", step)
+        self.assertIn("assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 12, 23, 24]", step)
 
     def test_existing_unfiltered_sequence_still_has_all_legacy_reports(self):
         text = WORKFLOW.read_text()

@@ -16,6 +16,16 @@ TARGET_ORDER = (
     'ref_store_decision_subset',
 )
 
+# The hosted native workflow executes this reviewed A4 row in its separate
+# exact four-suite step. It is deliberately outside the fixed 167-case
+# inventory: only an explicit hosted listing opt-in may accept this one extra
+# row, while default listing and execution remain the original selectors.
+HOSTED_KNOWN_EXTRA_CASES = {
+    'ref_store_decision_subset': (
+        'decision_subset_support::cases_f::a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit',
+    ),
+}
+
 TARGETS = {
     'ref_store_operations': {
         "source": 'tests/ref_store_operations.rs',
@@ -362,7 +372,6 @@ TARGETS = {
             'decision_subset_support::cases_e::non_tenant_producer_collaborator_selects_with_producer_owner_different_from_tenant',
             'decision_subset_support::cases_e::plan_claiming_another_tenant_is_refused_by_begin_pending',
             'decision_subset_support::cases_e::unauthorized_actor_cannot_select_a_producers_plan',
-            'decision_subset_support::cases_f::a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit',
         ),
     },
 }

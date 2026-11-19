@@ -153,15 +153,31 @@ jobs:
             --test ref_store_packs --test ref_store_materialized_reads \
             -- --ignored --test-threads=1 2>&1 | tee test-results/refstore/native.log
           python3 - <<'PY'
-          import json, pathlib, re
-          log = pathlib.Path('test-results/refstore/native.log').read_text()
+          import hashlib, json, pathlib, re
+          log_path = pathlib.Path('test-results/refstore/native.log')
+          raw_log = log_path.read_bytes()
+          log = raw_log.decode()
           rows = re.findall(r'test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;', log)
           assert len(rows) == 4, rows
           assert all(state == 'ok' and failed == ignored == '0' for state, _, failed, ignored in rows), rows
           assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 12, 23, 24], rows
+          a4_name = 'decision_subset_support::cases_f::a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit'
+          a4_row = 'test decision_subset_support::cases_f::a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit ... ok'
+          a4_prefix = a4_row.removesuffix(' ok')
+          assert log.count(a4_row) == 1, 'A4 exact ok row missing or duplicated'
+          assert log.count(a4_prefix) == 1, 'A4 row is not unique'
+          assert a4_prefix + ' ignored' not in log, 'A4 was skipped'
           pathlib.Path('test-results/refstore/native.json').write_text(json.dumps({
               'passed': True, 'suite_counts': [int(row[1]) for row in rows],
               'ignored': 0, 'external_blob_backup': False, 'serving_cutover': False,
+          }, indent=2) + '\n')
+          pathlib.Path('test-results/refstore/issue107-a4-native.json').write_text(json.dumps({
+              'version': 1, 'issue': 318, 'suite': 'ref_store_decision_subset',
+              'case': a4_name, 'status': 'passed', 'row': a4_row,
+              'native_log': str(log_path),
+              'native_log_sha256': hashlib.sha256(raw_log).hexdigest(),
+              'suite_counts': sorted(int(row[1]) for _, passed, _, _ in rows),
+              'ignored': 0,
           }, indent=2) + '\n')
           PY
       - name: "Create the run-owned #174 foundation database"
@@ -556,6 +572,7 @@ jobs:
           done
           python3 scripts/issue107_native11_runner.py \
             --source-head "$GITHUB_SHA" --source-root "$GITHUB_WORKSPACE" \
+            --allow-known-a4-extra \
             "${target_args[@]}" "${receipt_args[@]}" \
             --report test-results/refstore/issue107-native11.json
           python3 - "$GITHUB_SHA" test-results/refstore/issue107-native11.json <<'PY'
