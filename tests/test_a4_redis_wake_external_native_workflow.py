@@ -43,6 +43,7 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         namespace = {}
         exec(compile(workflow_phase_prefix(), str(WORKFLOW), "exec"), namespace)
         self.phase = namespace["installer_phase"]
+        self.complete = namespace["installer_complete"]
         self.phase_path = self.runner / "a4" / "native-tools-phase.json"
         self.wrapper_sha = hashlib.sha256(
             (self.workspace / "scripts" / "install_ci_native_tools.sh").read_bytes()
@@ -121,6 +122,51 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         self.assertEqual(self.phase(), {"available": False})
         self._write_record(self._record(wrapper="0" * 64))
         self.assertEqual(self.phase(), {"available": False})
+
+    def test_acceptance_predicate_requires_complete_installer_phase(self):
+        self.phase_path.unlink(missing_ok=True)
+        absent = self.phase()
+        self.assertEqual(absent, {"available": False})
+        self.assertFalse(self.complete(absent))
+
+        self._write_record(self._record(wrapper="0" * 64))
+        forged = self.phase()
+        self.assertEqual(forged, {"available": False})
+        self.assertFalse(self.complete(forged))
+
+        wrapper = self.wrapper_sha
+        self.phase_path.write_text(
+            '{"mode":"invalid","mode":"install","phase":"provenance",'
+            f'"state":"complete","wrapper_sha256":"{wrapper}"}}',
+            encoding="utf-8",
+        )
+        malformed = self.phase()
+        self.assertEqual(malformed, {"available": False})
+        self.assertFalse(self.complete(malformed))
+
+        self._write_record(self._record(phase="git_build", state="entered"))
+        incomplete = self.phase()
+        self.assertTrue(incomplete["available"])
+        self.assertFalse(self.complete(incomplete))
+
+        self._write_record(self._record(mode="preflight"))
+        wrong_mode = self.phase()
+        self.assertTrue(wrong_mode["available"])
+        self.assertFalse(self.complete(wrong_mode))
+
+        self._write_record(self._record())
+        valid = self.phase()
+        self.assertTrue(valid["available"])
+        self.assertTrue(self.complete(valid))
+
+    def test_pass_predicate_uses_completed_installer_phase(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        status_lines = [line.strip() for line in text.splitlines() if 'status = "passed"' in line]
+        self.assertEqual(len(status_lines), 1)
+        self.assertIn("phase_complete", status_lines[0])
+        self.assertIn("phase_complete = installer_complete(phase)", text)
+        self.assertIn("elif phase_only:", text)
+        self.assertIn('stage = "installer_phase"', text)
 
 
 if __name__ == "__main__":

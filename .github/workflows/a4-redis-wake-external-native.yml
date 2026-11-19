@@ -325,6 +325,15 @@ jobs:
               return {"available": True, "mode": record["mode"], "phase": record["phase"], "state": record["state"], "wrapper_sha256": record["wrapper_sha256"]}
 
 
+          def installer_complete(phase):
+              return (
+                  phase.get("available") is True
+                  and phase.get("mode") == "install"
+                  and phase.get("phase") == "provenance"
+                  and phase.get("state") == "complete"
+              )
+
+
           def load(path):
               try:
                   raw = path.read_bytes()
@@ -365,12 +374,7 @@ jobs:
               detail = case.get("detail") if isinstance(case.get("detail"), dict) else {}
               observations = {key: value for key, value in detail.items() if isinstance(value, bool)}
               phase = installer_phase()
-              phase_complete = (
-                  phase.get("available") is True
-                  and phase.get("mode") == "install"
-                  and phase.get("phase") == "provenance"
-                  and phase.get("state") == "complete"
-              )
+              phase_complete = installer_complete(phase)
               binary_sha, receipt_sha, harness_sha = digest(BINARY), digest(RECEIPT), digest(HARNESS)
               source_inputs = report.get("source_inputs_sha256")
               kind, passed = report.get("kind"), report.get("passed") is True
@@ -401,9 +405,13 @@ jobs:
                   and receipt.get("features") == {"enabled": ["state-redis"], "no_default_features": False}
                   and receipt.get("working_tree") == {"tree": tree, "status": ""}
               )
-              status = "passed" if harness == "success" and garage_start == "success" and garage_outcome == "success" and report_state_ok and report_binding_ok and receipt_ok else "failed"
+              base_ok = harness == "success" and garage_start == "success" and garage_outcome == "success" and report_state_ok and report_binding_ok and receipt_ok
+              status = "passed" if base_ok and phase_complete else "failed"
+              phase_only = base_ok and not phase_complete
               if status == "passed":
                   stage = None
+              elif phase_only:
+                  stage = "installer_phase"
               elif report.get("cleanup_failed") is True or report.get("cleanup_error") is not None:
                   stage = "cleanup"
               elif garage_start == "failure":
