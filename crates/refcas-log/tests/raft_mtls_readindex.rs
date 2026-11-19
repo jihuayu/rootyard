@@ -319,15 +319,20 @@ fn three_voter_wal_snapshot_membership_restart_and_blob_rejection() {
 }
 
 #[test]
-fn standalone_crate_boundary_excludes_blob_pg_redis_and_root_links() {
+fn standalone_crate_boundary_excludes_blob_pg_redis_and_reverse_root_links() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let crate_lock = std::fs::read_to_string(manifest_dir.join("Cargo.lock")).unwrap();
     for forbidden in ["\"opendal\"", "\"sqlx\"", "\"redis\"", "\"rdkafka\"", "\"postgres\"", "\"rootyard\""] {
         assert!(!crate_lock.contains(forbidden), "refcas-log Cargo.lock must not pull {forbidden}");
     }
+    // Issue #175 authorizes the Root crate to depend on this isolated crate for the real Raft
+    // backend. The reverse edge remains forbidden: the crate must never depend on Root business
+    // code, PostgreSQL, Blob, Redis, or the root Cargo.lock.
+    let crate_toml = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+    assert!(!crate_toml.contains("rootyard ="), "refcas-log must not depend on the Root crate");
     let root_toml = std::fs::read_to_string(manifest_dir.join("../..").join("Cargo.toml")).unwrap();
     assert!(
-        !root_toml.contains("refcas-log"),
-        "root Cargo.toml must not link refcas-log into standalone serve/serve-blob binary"
+        root_toml.contains("rootyard-refcas-log = { path = \"crates/refcas-log\" }"),
+        "Root must link refcas-log only through the explicit path dependency used by #175"
     );
 }
