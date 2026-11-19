@@ -3,7 +3,7 @@
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -59,6 +59,30 @@ fn run_git(dir: Option<&Path>, args: &[&str]) -> String {
     let output = command.args(args).output().expect("run git");
     assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+struct GitHandshake {
+    release: PathBuf,
+    released: bool,
+}
+
+impl GitHandshake {
+    fn new(release: PathBuf) -> Self {
+        Self { release, released: false }
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            let _ = fs::write(&self.release, b"release");
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for GitHandshake {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 #[test]
@@ -155,7 +179,7 @@ fn fallback_boundary_releases_lease_before_stock_git_await() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_empty_fallback_does_not_hold_read_lease() {
+async fn actual_empty_fallback_parks_stock_git_until_gc_proof() {
     let serial = test_seam::serial();
     test_seam::reset();
     let td = TempDir::new().expect("tempdir");
@@ -190,16 +214,18 @@ async fn actual_empty_fallback_does_not_hold_read_lease() {
     fs::set_permissions(&views, std::fs::Permissions::from_mode(0o700)).expect("views mode");
     let view_root = DisposableViewRoot::open(&views, 32, 64 << 20, Duration::from_secs(300)).expect("view root");
 
-    let ready = td.path().join("fallback-git-started");
-    let wrapper = td.path().join("slow-git.sh");
+    let ready = td.path().join("fallback-git-ready");
+    let release = td.path().join("fallback-git-release");
+    let mut handshake = GitHandshake::new(release.clone());
+    let wrapper = td.path().join("parked-git.sh");
     let real_git = fixture::git_binary();
     let script = format!(
-        "#!/bin/sh\nif [ ! -e \"{}\" ]; then\n  : > \"{}\"\n  sleep 2\nfi\nexec \"{}\" \"$@\"\n",
-        ready.display(),
-        ready.display(),
-        real_git.display()
+        "#!/bin/sh\nif [ ! -e \"{ready}\" ]; then\n  : > \"{ready}\"\n  i=0\n  while [ ! -e \"{release}\" ]; do\n    i=$((i + 1))\n    if [ \"$i\" -ge 150 ]; then\n      exit 70\n    fi\n    sleep 0.1\n  done\nfi\nexec \"{real_git}\" \"$@\"\n",
+        ready = ready.display(),
+        release = release.display(),
+        real_git = real_git.display()
     );
-    fs::write(&wrapper, script).expect("slow git wrapper");
+    fs::write(&wrapper, script).expect("parked git wrapper");
     fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("wrapper mode");
 
     let now = 1_750_000_000i64;
@@ -237,16 +263,21 @@ async fn actual_empty_fallback_does_not_hold_read_lease() {
     };
     let authority: Arc<dyn CloneKitAuthorityOracle> = Arc::new(InMemoryAuthorityOracle::new());
 
+    let (gc_tx, gc_rx) = tokio::sync::oneshot::channel();
     let store_for_gc = store.clone();
-    let observer = std::thread::spawn(move || -> Result<bool, String> {
+    let ready_for_observer = ready.clone();
+    let observer = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !ready.exists() {
+        while !ready_for_observer.exists() {
             if Instant::now() >= deadline {
-                return Err("stock Git fallback did not start".into());
+                let _ = gc_tx.send(Err("stock Git fallback did not park".to_string()));
+                return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        store_for_gc.try_gc_generation(repository_id, 1, &RetentionPinLedger::new()).map_err(|err| err.to_string())
+        let result =
+            store_for_gc.try_gc_generation(repository_id, 1, &RetentionPinLedger::new()).map_err(|err| err.to_string());
+        let _ = gc_tx.send(result);
     });
 
     let origin_remote = origin.to_str().expect("origin utf8").to_owned();
@@ -276,17 +307,21 @@ async fn actual_empty_fallback_does_not_hold_read_lease() {
         };
         execute_ci_checkout(&request).await
     });
-    let checkout = tokio::time::timeout(Duration::from_secs(30), checkout)
+    let gc = tokio::time::timeout(Duration::from_secs(10), gc_rx)
         .await
-        .expect("checkout timeout")
-        .expect("checkout join");
-    let gc = observer.join().expect("observer join");
+        .expect("gc handshake timed out")
+        .expect("gc observer dropped");
+    // Keep Stock Git parked until the read-lease GC proof has been observed.
+    handshake.release();
+    let checkout = tokio::time::timeout(Duration::from_secs(30), checkout).await;
+    observer.join().expect("observer join");
+    let checkout = checkout.expect("checkout timeout").expect("checkout join");
     let outcome = checkout.expect("checkout");
+    assert!(matches!(gc, Ok(true)), "gc during actual empty fallback: {gc:?}");
     assert!(matches!(
         outcome.telemetry.strategy,
         CheckoutStrategy::StockGitFallback { reason: FallbackReason::EmptyRepository }
     ));
-    assert!(matches!(gc, Ok(true)), "gc during actual empty fallback: {gc:?}");
     assert!(!store.version_dir(repository_id, 1).exists());
     let _serial = test_seam::serial();
     test_seam::reset();
