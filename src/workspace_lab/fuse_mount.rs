@@ -93,7 +93,9 @@ pub(crate) use teardown::{MountTeardownClass, MountTeardownError};
 
 pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
 pub use spawn::{mount, spawn, spawn_helper};
-pub(crate) use spawn::{mount_options, spawn_legacy};
+pub(crate) use spawn::spawn_legacy;
+#[cfg(test)]
+use spawn::mount_options;
 
 /// Live kernel mount. Dropping the session unmounts and drops the shim, which
 /// stops the actor and drains every queued reply.

@@ -2,7 +2,6 @@
 
 use super::read_pool::ReadPool;
 use super::*;
-use fuser::ReplyData;
 
 pub(super) struct Actor {
     pub(super) overlay: Overlay,

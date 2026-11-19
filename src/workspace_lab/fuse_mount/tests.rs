@@ -2,6 +2,7 @@ use super::*;
 // The owned teardown helpers live in `ownership` with their original
 // privacy; tests reach them through the module, never a production re-export.
 use super::ownership::{mount_id_in, owns_current_mount};
+use fuser::MountOption;
 
 struct NotManaged;
 
