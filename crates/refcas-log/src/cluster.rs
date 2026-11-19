@@ -189,11 +189,17 @@ impl MtlsPeerClient {
         }
         let addr = self.peers.get(self.target).unwrap_or_else(|| self.fallback_addr.clone());
         let deadline_fut = async {
-            if let Some(stream) = self.stream.as_mut() {
-                if let Ok(resp) = roundtrip_async(stream, &req).await {
-                    return Ok(resp);
+            if let Some(mut cached) = self.stream.take() {
+                match roundtrip_async(&mut cached, &req).await {
+                    Ok(resp) => {
+                        self.stream = Some(cached);
+                        return Ok(resp);
+                    }
+                    Err(_) => {
+                        // `cached` is dropped here; the existing single fresh-connection
+                        // fallback below is preserved without an extra retry.
+                    }
                 }
-                self.stream = None;
             }
             let mut fresh = self.client.connect_peer(&addr, self.target).await?;
             let resp = roundtrip_async(&mut fresh, &req).await?;
@@ -394,3 +400,6 @@ pub fn rpc_expect_ok(resp: RpcResponse) -> Res<()> {
         other => Err(E::Refused(format!("unexpected RPC response: {other:?}"))),
     }
 }
+
+#[cfg(test)]
+mod cancellation_tests;

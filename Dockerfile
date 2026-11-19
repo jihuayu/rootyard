@@ -20,6 +20,7 @@ RUN /usr/local/bin/install_ci_cargo_fork.sh verify \
       --record /build/ci-cargo-fork.json
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY vendor ./vendor
+COPY crates/refcas-log ./crates/refcas-log
 COPY src ./src
 COPY migrations ./migrations
 COPY schema ./schema

@@ -249,59 +249,76 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIsNone(_step(PANDO_CLI_STEP)["timeout-minutes"])
         self.assertEqual(_step(PANDO_PITR_STEP)["timeout-minutes"], "10")
 
-    def test_python_suite_report_is_source_bound_for_258_and_283_only(self):
+    def test_python_suite_report_is_source_bound_for_258_277_283_only(self):
         suite = _step("Run all Python unit and Tier-5 adversarial contract suites")
         env = suite["env"]
-        pitr_selector = (
+        pitr_283_selector = (
+            "${{ github.event.pull_request.number == 283 && "
+            "'test-results/python-ci-result.json' || '' }}"
+        )
+        pitr_258_selector = (
             "${{ github.event.pull_request.number == 258 && "
             "'test-results/python-ci-result.json' || '' }}"
         )
         suite_selector = (
             "${{ (github.event.pull_request.number == 258 || "
+            "github.event.pull_request.number == 277 || "
             "github.event.pull_request.number == 283) && "
             "'test-results/python-ci-result.json' || '' }}"
         )
-        # The PITR failure checkpoint keeps its old #258-only switch, while the
-        # full-suite report accepts both source-bound PR heads that used to
-        # select the same old report target.
-        self.assertEqual(env["ROOTYARD_PYTHON_CI_REPORT"], pitr_selector)
+        # Main's #283 PITR checkpoint keeps its exact env/name.  PR258's
+        # previous own report scope is preserved separately, while the
+        # full-suite watchdog report is the additive 258/277/283 union.
+        self.assertEqual(env["ROOTYARD_PYTHON_CI_REPORT"], pitr_283_selector)
+        self.assertEqual(env["ROOTYARD_PYTHON_CI_REPORT_258"], pitr_258_selector)
         self.assertEqual(env["ROOTYARD_PYTHON_SUITE_REPORT"], suite_selector)
-        self.assertIn(
-            "== 258 || github.event.pull_request.number == 283",
-            suite_selector,
-        )
-        self.assertTrue(suite_selector.endswith("|| '' }}"))
         run = suite["run"]
         self.assertIn(
             'if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then', run
         )
         self.assertIn('--report-out "$ROOTYARD_PYTHON_SUITE_REPORT"', run)
         self.assertIn('--expected-commit="${GITHUB_SHA:-}"', run)
+        self.assertIn(
+            'python3 scripts/run_python_ci_tests.py "${report_args[@]}"', run
+        )
         self.assertNotIn('--report-out "$ROOTYARD_PYTHON_CI_REPORT"', run)
-        # The empty fallback plus the non-empty guard gives the exact truth
-        # table: 258 and 283 report; no PR and every other PR do not.
+        self.assertNotIn(
+            '--report-out "$ROOTYARD_PYTHON_CI_REPORT_258"', run
+        )
         selector = re.fullmatch(
             r"\$\{\{ \(github\.event\.pull_request\.number == (\d+) \|\| "
+            r"github\.event\.pull_request\.number == (\d+) \|\| "
             r"github\.event\.pull_request\.number == (\d+)\) && "
             r"'([^']+)' \|\| '' \}\}",
             suite_selector,
         )
         self.assertIsNotNone(selector)
-        first, second, target = selector.groups()
+        first, second, third, target = selector.groups()
+        self.assertEqual((int(first), int(second), int(third)), (258, 277, 283))
         for number, expected in (
             (258, target),
+            (277, target),
             (283, target),
             (257, ""),
+            (276, ""),
+            (284, ""),
             (None, ""),
         ):
             with self.subTest(pull_request=number):
                 selected = (
                     target
                     if number is not None
-                    and number in (int(first), int(second))
+                    and number in (int(first), int(second), int(third))
                     else ""
                 )
                 self.assertEqual(selected, expected)
+        upload = _step(UPLOAD_STEP)
+        self.assertEqual(upload.get("if"), "always()")
+        paths = [line.strip() for line in upload["with"]["path"].splitlines()
+                 if line.strip()]
+        # The old always-on e2e artifact already collects the exact bounded
+        # file; no new artifact, path or raw log is introduced.
+        self.assertIn("test-results/*.json", paths)
 
     def test_single_native_batch_exports_the_pando_receipt(self):
         steps = _steps()

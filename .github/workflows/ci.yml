@@ -290,8 +290,9 @@ jobs:
         # Full discovery stays unfiltered; the runner adds per-test progress and
         # periodic stderr thread stacks without changing exit semantics.
         env:
-          ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 258 && 'test-results/python-ci-result.json' || '' }}
-          ROOTYARD_PYTHON_SUITE_REPORT: ${{ (github.event.pull_request.number == 258 || github.event.pull_request.number == 283) && 'test-results/python-ci-result.json' || '' }}
+          ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 283 && 'test-results/python-ci-result.json' || '' }}
+          ROOTYARD_PYTHON_CI_REPORT_258: ${{ github.event.pull_request.number == 258 && 'test-results/python-ci-result.json' || '' }}
+          ROOTYARD_PYTHON_SUITE_REPORT: ${{ (github.event.pull_request.number == 258 || github.event.pull_request.number == 277 || github.event.pull_request.number == 283) && 'test-results/python-ci-result.json' || '' }}
         run: |
           report_args=()
           if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then

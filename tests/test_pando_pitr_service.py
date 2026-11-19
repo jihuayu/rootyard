@@ -21,9 +21,11 @@ from test_native_build_receipt_v2 import ReceiptFixture  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = "a" * 40
 
-# The hosted PR 258 Python suite step is the only place the workflow sets this
-# exact opt-in.  The value is an authorization signal, never a write path.
+# The hosted PR 283 Python suite step is the mandatory PITR opt-in name.  PR
+# 258 keeps its exact previous report scope through a separate variable; the
+# value is an authorization signal, never a write path.
 FAILURE_CHECKPOINT_ENV = "ROOTYARD_PYTHON_CI_REPORT"
+PR258_FAILURE_CHECKPOINT_ENV = "ROOTYARD_PYTHON_CI_REPORT_258"
 FAILURE_CHECKPOINT_OPT_IN = "test-results/python-ci-result.json"
 FAILURE_CHECKPOINT_NAME = "pando-pitr-failure.json"
 _FAILURE_CHECKPOINT_STAGES = frozenset({"preflight", "suite", "postflight", "report"})
@@ -44,10 +46,13 @@ _FULL_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _pitr_failure_checkpoint_enabled(environ=None) -> bool:
-    """Return true only for the exact hosted PR 258 opt-in."""
+    """Return true only for the exact hosted PR 258 or PR 283 opt-in."""
     values = os.environ if environ is None else environ
     try:
-        return values.get(FAILURE_CHECKPOINT_ENV) == FAILURE_CHECKPOINT_OPT_IN
+        return any(
+            values.get(name) == FAILURE_CHECKPOINT_OPT_IN
+            for name in (FAILURE_CHECKPOINT_ENV, PR258_FAILURE_CHECKPOINT_ENV)
+        )
     except Exception:
         return False
 
@@ -495,7 +500,7 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         self.assertIn("--harness tests/pando_pitr_service.py", manifest)
         self.assertIn("--harness tests/test_pando_pitr_service.py", manifest)
 
-    def test_ci_pitr_failure_checkpoint_remains_pr_258_only(self) -> None:
+    def test_ci_pitr_failure_checkpoint_preserves_258_and_283_scopes(self) -> None:
         text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         start = text.index(
             "      - name: Run all Python unit and Tier-5 adversarial contract suites"
@@ -504,6 +509,12 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         step = text[start:end]
         self.assertIn(
             "ROOTYARD_PYTHON_CI_REPORT: ${{ "
+            "github.event.pull_request.number == 283 && "
+            "'test-results/python-ci-result.json' || '' }}",
+            step,
+        )
+        self.assertIn(
+            "ROOTYARD_PYTHON_CI_REPORT_258: ${{ "
             "github.event.pull_request.number == 258 && "
             "'test-results/python-ci-result.json' || '' }}",
             step,
@@ -511,6 +522,7 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         self.assertIn(
             "ROOTYARD_PYTHON_SUITE_REPORT: ${{ "
             "(github.event.pull_request.number == 258 || "
+            "github.event.pull_request.number == 277 || "
             "github.event.pull_request.number == 283) && "
             "'test-results/python-ci-result.json' || '' }}",
             step,
@@ -521,12 +533,19 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         self.assertIn('--report-out "$ROOTYARD_PYTHON_SUITE_REPORT"', step)
         self.assertIn('--expected-commit="${GITHUB_SHA:-}"', step)
         self.assertNotIn('--report-out "$ROOTYARD_PYTHON_CI_REPORT"', step)
+        self.assertNotIn(
+            '--report-out "$ROOTYARD_PYTHON_CI_REPORT_258"', step
+        )
         self.assertTrue(_pitr_failure_checkpoint_enabled(
             {FAILURE_CHECKPOINT_ENV: FAILURE_CHECKPOINT_OPT_IN}
+        ))
+        self.assertTrue(_pitr_failure_checkpoint_enabled(
+            {PR258_FAILURE_CHECKPOINT_ENV: FAILURE_CHECKPOINT_OPT_IN}
         ))
         for environ in (
             {},
             {FAILURE_CHECKPOINT_ENV: ""},
+            {PR258_FAILURE_CHECKPOINT_ENV: ""},
             {"ROOTYARD_PYTHON_SUITE_REPORT": FAILURE_CHECKPOINT_OPT_IN},
         ):
             with self.subTest(environ=environ):

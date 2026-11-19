@@ -2,6 +2,7 @@ use openraft::{EntryPayload, LogId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::state_machine::app::{ApplicationCommand, is_application_wire};
 use crate::{E, Res, checksum, je};
 
 pub(crate) const MAX_KV_KEY_BYTES: usize = 4096;
@@ -36,26 +37,54 @@ pub(crate) struct DecodedPayload {
     pub(crate) kind: &'static str,
     pub(crate) payload_bytes: Vec<u8>,
     pub(crate) kv_cmd: Option<SmCommand>,
+    pub(crate) app_cmd: Option<ApplicationCommand>,
     pub(crate) membership: Option<openraft::Membership<u64, openraft::BasicNode>>,
 }
 
 pub(crate) fn decode_entry_payload(payload: &EntryPayload<crate::LogTypeConfig>) -> Res<DecodedPayload> {
     match payload {
-        EntryPayload::Blank => {
-            Ok(DecodedPayload { kind: "blank", payload_bytes: Vec::new(), kv_cmd: None, membership: None })
+        EntryPayload::Blank => Ok(DecodedPayload {
+            kind: "blank",
+            payload_bytes: Vec::new(),
+            kv_cmd: None,
+            app_cmd: None,
+            membership: None,
+        }),
+        EntryPayload::Normal(bytes) if is_application_wire(bytes) => {
+            let cmd = ApplicationCommand::decode(bytes)?;
+            Ok(DecodedPayload {
+                kind: "application",
+                payload_bytes: bytes.clone(),
+                kv_cmd: None,
+                app_cmd: Some(cmd),
+                membership: None,
+            })
         }
         EntryPayload::Normal(bytes) => {
             if let Ok(cmd) = serde_json::from_slice::<SmCommand>(bytes) {
                 validate_kv_cmd(&cmd)?;
-                Ok(DecodedPayload { kind: "kv", payload_bytes: cmd.encode()?, kv_cmd: Some(cmd), membership: None })
+                Ok(DecodedPayload {
+                    kind: "kv",
+                    payload_bytes: cmd.encode()?,
+                    kv_cmd: Some(cmd),
+                    app_cmd: None,
+                    membership: None,
+                })
             } else {
-                Ok(DecodedPayload { kind: "normal", payload_bytes: bytes.clone(), kv_cmd: None, membership: None })
+                Ok(DecodedPayload {
+                    kind: "normal",
+                    payload_bytes: bytes.clone(),
+                    kv_cmd: None,
+                    app_cmd: None,
+                    membership: None,
+                })
             }
         }
         EntryPayload::Membership(mem) => Ok(DecodedPayload {
             kind: "membership",
             payload_bytes: je(mem)?.into_bytes(),
             kv_cmd: None,
+            app_cmd: None,
             membership: Some(mem.clone()),
         }),
     }
@@ -137,4 +166,26 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
+}
+
+pub(crate) fn hex_decode(value: &str) -> Res<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return Err(E::Codec("hex value has odd length".into()));
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    for index in (0..bytes.len()).step_by(2) {
+        let hi = hex_nibble(bytes[index])?;
+        let lo = hex_nibble(bytes[index + 1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Res<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(E::Codec("hex value contains a non-lowercase-hex byte".into())),
+    }
 }
