@@ -373,7 +373,7 @@ pub(super) fn verify_generation(
         .map_err(|err| CloneKitError::CorruptArtifact(format!("selected clonekit generation vanished: {err}")))?;
     if after.file_type().is_symlink()
         || !after.is_dir()
-        || (after.dev(), after.ino()) != (generation.dev, generation.ino())
+        || (after.dev(), after.ino()) != (generation.dev, generation.ino)
     {
         return Err(CloneKitError::CorruptArtifact("selected clonekit generation changed during verification".into()));
     }
