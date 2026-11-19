@@ -174,16 +174,20 @@ impl PackDeliveryLeaseRegistry {
             .is_some_and(|rec| !rec.revoked && rec.durable_hold.is_active() && self.durable_pins.is_pin_active(pin_id))
     }
 
-    /// Returns `false` while ANY active pin/grace window or live inflight reader protects `pack_oid`.
+    /// Returns `false` while ANY live inflight reader or active pin/grace window protects `pack_oid`.
+    ///
+    /// A reader that began before revocation keeps its verified pack protected until its exact guard drains;
+    /// revoked zero-inflight issuance references remain sweepable as before.
     pub fn can_sweep_pack(&self, tenant_id: Uuid, repository_id: Uuid, pack_oid: &str, now_unix: u64) -> bool {
         let guard = self.leases.lock().unwrap_or_else(|p| p.into_inner());
         !guard.values().any(|rec| {
             rec.tenant_id == tenant_id
                 && rec.repository_id == repository_id
                 && rec.pack_oid == pack_oid
-                && !rec.revoked
-                && rec.durable_hold.is_active()
-                && (rec.inflight_downloads > 0 || rec.guard_refs > 0 || now_unix <= rec.grace_until_unix)
+                && (rec.inflight_downloads > 0
+                    || (!rec.revoked
+                        && rec.durable_hold.is_active()
+                        && (rec.guard_refs > 0 || now_unix <= rec.grace_until_unix)))
         })
     }
 
