@@ -6,7 +6,6 @@
 //! derives the expected positive identities from it.
 use anyhow::{Result, ensure};
 use deadpool_postgres::Pool;
-use rootyard::ref_store::RequestDigest;
 use serde_json::{Value, json};
 use std::path::Path;
 use uuid::Uuid;
@@ -40,14 +39,4 @@ pub fn write(path: &Path, marker: &Value) -> Result<()> {
     }
     std::fs::write(path, text)?;
     Ok(())
-}
-
-/// Deterministic but distinct release intent digest for one release request
-/// (the release digest is caller-supplied intent, never a stored proof).
-pub fn release_digest(label: &str) -> String {
-    let mut seed = [0x5a; 32];
-    for (index, byte) in label.as_bytes().iter().enumerate() {
-        seed[index % 32] ^= *byte;
-    }
-    RequestDigest::from_bytes(seed).as_hex()
 }
