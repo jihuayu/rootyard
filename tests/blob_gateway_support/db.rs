@@ -166,15 +166,18 @@ impl RunEnvironment {
     }
 }
 
-static RUN: OnceLock<RunEnvironment> = OnceLock::new();
+const PREPARE_ERROR: &str = "blob_git_gateway fixture environment cannot be prepared";
 
-/// Pin the run environment (idempotent) and return its schema.
+static RUN: OnceLock<std::result::Result<RunEnvironment, &'static str>> = OnceLock::new();
+
+/// Pin the run environment exactly once (idempotent) and return its schema.
+/// A failed preparation is stored as one fixed error: no panic hook can observe
+/// the underlying URL/parser error and no later call retries setup.
 pub fn prepare() -> Result<&'static str> {
-    let environment = RUN.get_or_init(|| {
-        RunEnvironment::prepare()
-            .unwrap_or_else(|error| panic!("blob_git_gateway fixture environment cannot be prepared: {error:#}"))
-    });
-    Ok(&environment.schema)
+    match RUN.get_or_init(|| RunEnvironment::prepare().map_err(|_| PREPARE_ERROR)) {
+        Ok(environment) => Ok(environment.schema.as_str()),
+        Err(_) => Err(anyhow::Error::msg(PREPARE_ERROR)),
+    }
 }
 
 pub struct Db {
