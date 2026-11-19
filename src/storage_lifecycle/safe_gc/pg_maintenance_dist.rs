@@ -1,8 +1,9 @@
 //! Production DistributedRefCas cutpoint capture for the scheduled `storage_lifecycle` worker (#122).
 //!
-//! The scheduled worker must mint a fresh [`RefCasReconciledCut`] from an authoritative
-//! `RefCasStateMachine` on every maintenance pass; a PostgreSQL `ref_store_core_refs.revision`
-//! sequence or a stale journal-embedded cut can never authorize `DistributedRefCas` deletion.
+//! The scheduled worker must mint a fresh [`RefCasReconciledCut`] from independently attested
+//! quorum-committed `RefCasStateMachine` state on every maintenance pass; a PostgreSQL
+//! `ref_store_core_refs.revision` sequence, a stale journal-embedded cut or a sealed on-volume
+//! envelope can never authorize `DistributedRefCas` deletion.
 
 use std::{
     collections::BTreeMap,
@@ -15,24 +16,22 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
-use crate::ref_store::core::artifact_hold::reconcile_proof::{
-    AttestedGroupSnapshotDto, GROUP_KEYRING_ENV, GroupVoterSignatureDto,
-};
 use crate::ref_store::core::state_machine::{RefCasLogEntry, RefCasSnapshot, RefCasStateMachine};
 
 use super::{
     SafeGcError,
     dist_auth::{
         QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcRepoTrustConfig, compute_holds_digest,
-        restore_attested_state_machine, sign_snapshot_with_keyring_dir, verify_attested_snapshot_with_keyring,
+        fetch_quorum_cutpoint_from_voters,
     },
     model::{AuthorityLane, GcMode, SafeGcArmReceipt, SourceFreshness},
     refcas_cut::{RefCasReconciledCut, reconcile_refcas_cut_with_pg},
     store::{DurableSafeGcAuthority, SafeGcRepoSnapshot},
 };
 
-/// Sealed on-volume Ref-CAS quorum state-machine envelope consumed by the
-/// scheduled maintenance worker (`<storage_root>/safe-gc/refcas/<repo_id>.json`).
+/// Sealed on-volume Ref-CAS quorum state-machine envelope (`<storage_root>/safe-gc/refcas/<repo_id>.json`).
+///
+/// The envelope is audit metadata only: `DistributedRefCas` never treats it as a cutpoint source.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedRefCasCutpointEnvelope {
@@ -40,8 +39,6 @@ pub struct PersistedRefCasCutpointEnvelope {
     pub snapshot: RefCasSnapshot,
     #[serde(default)]
     pub wal_tail: Vec<RefCasLogEntry>,
-    #[serde(default)]
-    pub quorum_attestation: Option<AttestedGroupSnapshotDto>,
 }
 
 /// Canonical on-volume path of the sealed Ref-CAS cutpoint envelope for one repository.
@@ -49,41 +46,7 @@ pub fn safe_gc_refcas_cutpoint_path(storage_root: &Path, repo_id: Uuid) -> PathB
     storage_root.join("safe-gc").join("refcas").join(format!("{repo_id}.json"))
 }
 
-fn resolve_keyring_dir(storage_root: &Path, repo_id: Uuid) -> Option<PathBuf> {
-    SafeGcRepoTrustConfig::load(storage_root, repo_id)
-        .ok()
-        .and_then(|trust| trust.refcas_keyring_dir.map(PathBuf::from))
-        .or_else(|| std::env::var_os(GROUP_KEYRING_ENV).map(PathBuf::from))
-        .filter(|dir| dir.is_dir())
-}
-
-fn mint_cutpoint_attestation(
-    storage_root: &Path,
-    repo_id: Uuid,
-    group_id: i64,
-    snapshot: &RefCasSnapshot,
-) -> Result<Option<AttestedGroupSnapshotDto>, SafeGcError> {
-    let Some(keyring_dir) = resolve_keyring_dir(storage_root, repo_id) else {
-        return Ok(None);
-    };
-    let Some(gate) = snapshot.body.gates.iter().find(|gate| gate.repository_id == repo_id) else {
-        return Ok(None);
-    };
-    if snapshot.body.last_applied.is_none() {
-        return Ok(None);
-    }
-    let attested = sign_snapshot_with_keyring_dir(
-        &keyring_dir,
-        group_id,
-        gate.history_incarnation,
-        gate.group_epoch,
-        gate.authority_epoch,
-        snapshot,
-    )?;
-    Ok(Some(attested))
-}
-
-/// Atomically persist a sealed `RefCasSnapshot` plus any WAL tail for worker cutpoint capture.
+/// Atomically persist a sealed `RefCasSnapshot` plus any WAL tail for worker cutpoint audit.
 pub fn persist_refcas_cutpoint_snapshot(
     storage_root: &Path,
     repo_id: Uuid,
@@ -100,13 +63,11 @@ pub fn persist_refcas_cutpoint_snapshot(
     if snapshot.verify_integrity().is_err() {
         return Err(SafeGcError::IncompleteProof("failed verifying RefCasSnapshot"));
     }
-    let quorum_attestation = mint_cutpoint_attestation(storage_root, repo_id, group_id, &snapshot)?;
     let path = safe_gc_refcas_cutpoint_path(storage_root, repo_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SafeGcError::Io(e.to_string()))?;
     }
-    let envelope =
-        PersistedRefCasCutpointEnvelope { group_id, snapshot, wal_tail: wal_tail.to_vec(), quorum_attestation };
+    let envelope = PersistedRefCasCutpointEnvelope { group_id, snapshot, wal_tail: wal_tail.to_vec() };
     let bytes = serde_json::to_vec_pretty(&envelope).map_err(|e| SafeGcError::Serialization(e.to_string()))?;
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     std::fs::write(&tmp, &bytes).map_err(|e| SafeGcError::Io(e.to_string()))?;
@@ -129,7 +90,7 @@ pub trait RefCasCutpointSource: Send + Sync {
     }
 }
 
-/// Volume-sealed default production source backed by [`persist_refcas_cutpoint_snapshot`].
+/// Volume-sealed default production source for NON-distributed lanes only.
 pub struct FsSealedRefCasCutpointSource {
     storage_root: PathBuf,
 }
@@ -272,67 +233,18 @@ impl RefCasCutpointSource for ProductionRefCasAuthoritySource {
     }
 }
 
-/// Capture and `#151`-authenticate a cutpoint, refusing unattested on-volume JSON.
-pub(super) fn capture_verified_dist_cutpoint(
+/// Fetch and threshold-verify the independent voter quorum cutpoint; sealed files are never used.
+pub(super) async fn capture_verified_dist_cutpoint(
     storage_root: &Path,
     repo_id: Uuid,
-) -> Result<Option<(i64, RefCasStateMachine, Option<Vec<GroupVoterSignatureDto>>)>, SafeGcError> {
+) -> Result<(i64, RefCasStateMachine, QuorumCommitEvidence), SafeGcError> {
     let trust = SafeGcRepoTrustConfig::load(storage_root, repo_id)?;
-    let keyring_dir = trust
-        .refcas_keyring_dir
-        .as_deref()
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os(GROUP_KEYRING_ENV).map(PathBuf::from))
-        .ok_or(SafeGcError::DistributedPrereqsMissing(
-            "DistributedRefCas cutpoint requires a #151 keyring directory",
-        ))?;
-    if let Some(source) = lookup_production_refcas_source(storage_root, repo_id)
-        && let Some((group_id, sm)) = source.capture_state_machine(repo_id)?
-    {
-        let snapshot =
-            sm.snapshot().map_err(|_| SafeGcError::IncompleteProof("failed sealing live Ref-CAS snapshot"))?;
-        let gate = snapshot
-            .body
-            .gates
-            .iter()
-            .find(|gate| gate.repository_id == repo_id)
-            .ok_or(SafeGcError::DistributedPrereqsMissing("live Ref-CAS snapshot missing repository gate"))?;
-        let attested = sign_snapshot_with_keyring_dir(
-            &keyring_dir,
-            group_id,
-            gate.history_incarnation,
-            gate.group_epoch,
-            gate.authority_epoch,
-            &snapshot,
-        )?;
-        let verified = verify_attested_snapshot_with_keyring(&keyring_dir, repo_id, trust.tenant_id, &attested)?;
-        let verified_sm = restore_attested_state_machine(&verified)?;
-        return Ok(Some((group_id, verified_sm, Some(attested.voter_signatures))));
-    }
-    let path = safe_gc_refcas_cutpoint_path(storage_root, repo_id);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let raw = std::fs::read(&path).map_err(|e| SafeGcError::Io(e.to_string()))?;
-    let env: PersistedRefCasCutpointEnvelope = serde_json::from_slice(&raw)
-        .map_err(|_| SafeGcError::IncompleteProof("corrupted Ref-CAS cutpoint snapshot"))?;
-    let attested = env.quorum_attestation.as_ref().ok_or(SafeGcError::DistributedPrereqsMissing(
-        "DistributedRefCas cutpoint envelope missing #151 quorum voter attestation",
-    ))?;
-    let verified_snap = verify_attested_snapshot_with_keyring(&keyring_dir, repo_id, trust.tenant_id, attested)?;
-    if verified_snap != env.snapshot {
+    if trust.quorum_threshold.is_none() || trust.trusted_consensus_voters.is_empty() {
         return Err(SafeGcError::DistributedPrereqsMissing(
-            "attested Ref-CAS quorum snapshot disagrees with sealed cutpoint envelope",
+            "DistributedRefCas cutpoint requires pinned independent consensus voters",
         ));
     }
-    if !env.wal_tail.is_empty() {
-        return Err(SafeGcError::DistributedPrereqsMissing(
-            "Ref-CAS cutpoint WAL tail is not covered by the #151 quorum attestation",
-        ));
-    }
-    let voters = attested.voter_signatures.clone();
-    let sm = restore_attested_state_machine(&verified_snap)?;
-    Ok(Some((env.group_id, sm, Some(voters))))
+    fetch_quorum_cutpoint_from_voters(&trust, repo_id).await
 }
 
 /// Mint a fresh cut for the current pass; `DistributedRefCas` fails closed without one.
@@ -343,7 +255,7 @@ pub(super) async fn reconcile_worker_refcas_cut_if_needed<C: GenericClient + Syn
     explicit_source: Option<&dyn RefCasCutpointSource>,
     authority: &DurableSafeGcAuthority,
     destructive_env: bool,
-) -> Result<(Option<RefCasReconciledCut>, Option<Vec<GroupVoterSignatureDto>>), anyhow::Error> {
+) -> Result<(Option<RefCasReconciledCut>, Option<QuorumCommitEvidence>), anyhow::Error> {
     let snap = authority.snapshot();
     let is_armed_dist = matches!(
         &snap.gc_mode,
@@ -354,16 +266,13 @@ pub(super) async fn reconcile_worker_refcas_cut_if_needed<C: GenericClient + Syn
     if is_armed_dist && !uses_production_authority {
         bail!("DistributedRefCas destructive GC requires the production Ref-CAS authority source");
     }
-    let mut verified_voters = None;
+    let mut verified_quorum = None;
     let captured = if is_armed_dist {
-        let verified = capture_verified_dist_cutpoint(storage_root, repo_id)
+        let (group_id, sm, quorum) = capture_verified_dist_cutpoint(storage_root, repo_id)
+            .await
             .map_err(|e| anyhow::anyhow!("capture verified Ref-CAS cutpoint: {e}"))?;
-        if let Some((group_id, sm, voters)) = verified {
-            verified_voters = voters;
-            Some((group_id, sm))
-        } else {
-            None
-        }
+        verified_quorum = Some(quorum);
+        Some((group_id, sm))
     } else {
         let fs_default = FsSealedRefCasCutpointSource::new(storage_root);
         let source: &dyn RefCasCutpointSource = explicit_source.unwrap_or(&fs_default);
@@ -380,10 +289,10 @@ pub(super) async fn reconcile_worker_refcas_cut_if_needed<C: GenericClient + Syn
             let cut = reconcile_refcas_cut_with_pg(pg_client, &sm, repo_id, group_id, authority)
                 .await
                 .map_err(|e| anyhow::anyhow!("reconcile_refcas_cut_with_pg: {e}"))?;
-            Ok((Some(cut), verified_voters))
+            Ok((Some(cut), verified_quorum))
         }
         (false, Some((group_id, sm))) => {
-            Ok((reconcile_refcas_cut_with_pg(pg_client, &sm, repo_id, group_id, authority).await.ok(), verified_voters))
+            Ok((reconcile_refcas_cut_with_pg(pg_client, &sm, repo_id, group_id, authority).await.ok(), verified_quorum))
         }
         (false, None) => Ok((None, None)),
     }
@@ -397,7 +306,7 @@ pub(super) fn reseal_worker_arm_receipt(
     gate_revision: u64,
     fence_epoch: u64,
     fresh_cut: Option<&RefCasReconciledCut>,
-    verified_voters: Option<Vec<GroupVoterSignatureDto>>,
+    verified_quorum: Option<QuorumCommitEvidence>,
 ) -> Result<SafeGcArmReceipt> {
     let repo_id = snap.authority.repo_id;
     let trust = SafeGcRepoTrustConfig::load(storage_root, repo_id)?;
@@ -438,23 +347,33 @@ pub(super) fn reseal_worker_arm_receipt(
                     && cut.sm_applied_log_term > 0,
                 "RefCasReconciledCut log coordinate is behind or invalid"
             );
-            let voters = verified_voters
-                .ok_or_else(|| anyhow::anyhow!("DistributedRefCas requires #151 verified voter signatures"))?;
-            let quorum_signer = SafeGcEd25519Signer::load_seed_file(&SafeGcRepoTrustConfig::seed_path(
-                storage_root,
-                repo_id,
-                "quorum",
-            ))?;
-            let quorum = QuorumCommitEvidence::sign(
-                &quorum_signer,
+            let quorum = verified_quorum.ok_or_else(|| {
+                anyhow::anyhow!("DistributedRefCas requires independently verified voter quorum evidence")
+            })?;
+            let threshold = trust
+                .quorum_threshold
+                .ok_or_else(|| anyhow::anyhow!("repository trust has no independent voter quorum threshold"))?;
+            quorum.verify_against_trusted_voters(
                 *ref_cas_authority_id,
                 *quorum_epoch,
-                cut.group_id,
-                cut.sm_applied_log_term,
-                cut.sm_applied_log_index,
-                cut.sm_snapshot_checksum.clone(),
-                voters,
+                snap.authority.history_id,
+                &trust.trusted_consensus_voters,
+                threshold,
             )?;
+            ensure!(quorum.group_id == cut.group_id, "quorum group_id disagrees with RefCasReconciledCut");
+            ensure!(quorum.raft_term == cut.sm_applied_log_term, "quorum raft_term disagrees with RefCasReconciledCut");
+            ensure!(
+                quorum.committed_log_index == cut.sm_applied_log_index,
+                "quorum committed_log_index disagrees with RefCasReconciledCut"
+            );
+            ensure!(
+                quorum.snapshot_checksum == cut.sm_snapshot_checksum,
+                "quorum snapshot_checksum disagrees with RefCasReconciledCut"
+            );
+            ensure!(
+                quorum.history_incarnation == snap.authority.history_id,
+                "quorum history incarnation disagrees with the armed history"
+            );
             hold_bridge_evidence.verify(*ref_cas_authority_id, *quorum_epoch)?;
             ensure!(
                 trust.trusted_hold_bridge_pubkey_hex.as_deref()

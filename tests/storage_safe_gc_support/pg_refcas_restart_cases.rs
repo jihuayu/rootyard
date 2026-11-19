@@ -1,4 +1,4 @@
-//! Real PG17 `DistributedRefCas` `pending_delete` interruption + multi-process restart fence proof (#122).
+//! Real PG17 `DistributedRefCas` `pending_delete` `SIGKILL` recovery + fresh PG fence proof (#122).
 
 use std::{
     sync::{Arc, atomic::Ordering},
@@ -29,18 +29,16 @@ use rootyard::{
     },
 };
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use uuid::Uuid;
 
 use super::{
     PG_SAFE_GC_TEST_LOCK, app_config,
-    dist_auth_harness::{
-        provision_distributed_trust, seal_test_lane_arm, test_arm_signer, test_dist_lane,
-        write_refcas_group_keyring_dir,
-    },
+    dist_auth_harness::{provision_distributed_trust, seal_test_lane_arm, test_arm_signer, test_dist_lane},
     isolated_pg_pool_with_schema, pg_child_worker,
-    pg_refcas_merge_fixture::{force_scan_and_schedule, production_refcas_pr_merge},
+    pg_refcas_merge_fixture::{build_refcas_merge_rig, force_scan_and_schedule, production_refcas_pr_merge},
     provision_pg_refstore_repo,
+    raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin},
     s3_harness::{LoopbackS3, build_pack_via_opendal, build_snapshot, git_cmd, make_serving_record},
     test_policy,
 };
@@ -71,27 +69,33 @@ pub(super) async fn project_all_refcas_events(
     Ok(())
 }
 
-/// Pass #1 crash helper executed inside the spawned child OS process.
-pub(super) async fn execute_pass1_crash_after_one_delete(
+/// Pass #1 body executed inside the spawned child OS process: delete exactly one locator, then
+/// wait in a durable pause until the parent terminates the whole process with `SIGKILL`.
+pub(super) async fn execute_pass1_pause_for_sigkill_after_one_delete(
     state: &Arc<AppState>,
     pool: &deadpool_postgres::Pool,
     policy: &Policy,
     repo_id: Uuid,
+    ready_marker_path: &std::path::Path,
 ) -> Result<JobOutcome> {
     force_scan_and_schedule(state, pool, policy, repo_id).await?;
+    let leased = Policy { lease_seconds: 5, ..(*policy).clone() };
     run_claimed_safe_gc_once_with_fault(
         state,
-        policy,
+        &leased,
         Uuid::new_v4(),
         None,
-        DeleteFaultHook::SimulateCrashAfterDeletes(1),
+        DeleteFaultHook::PauseAfterDeletesForExternalKill {
+            after_deletes: 1,
+            ready_marker_path: ready_marker_path.to_path_buf(),
+        },
     )
     .await?
-    .context("pass1 interrupted sweep")
+    .context("pass1 SIGKILL sweep")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fence_and_resumes() -> Result<()> {
+async fn pg17_distributed_refcas_sigkill_recovery_requires_new_pg_fence_and_resumes() -> Result<()> {
     let _serial = PG_SAFE_GC_TEST_LOCK.lock().await;
     let Some(db_url) = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok() else {
         ensure!(
@@ -100,6 +104,7 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
         );
         return Ok(());
     };
+    let Some(node_bin) = resolve_raft_node_bin()? else { return Ok(()) };
 
     let s3 = LoopbackS3::shared();
     let (blob_store, provider) = s3.open_store_and_provider()?;
@@ -117,6 +122,12 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
         transfer_metrics: Arc::new(metrics::TransferCounters::default()),
         git_slots: Arc::new(Semaphore::new(2)),
     });
+    let cluster = Arc::new(AsyncMutex::new(LiveRaftVoterCluster::start(node_bin).await?));
+    let trusted_voters = cluster.lock().await.trusted_voters();
+    provision_distributed_trust(&state.storage.root, tenant_id, repo_id, history_id, 2, trusted_voters)?;
+    cluster.lock().await.set_voter_enabled(1, true);
+    cluster.lock().await.set_voter_enabled(2, true);
+
     let journal = safe_gc_journal_path(&state.storage.root, repo_id);
     let dl = Instant::now() + Duration::from_secs(60);
 
@@ -144,16 +155,7 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
         build_pack_via_opendal(&provider, &git_repo, &dir.path().join("so"), "HEAD", (tenant_id, repo_id, 1), dl)
             .await?;
 
-    let keyring_dir = dir.path().join("refcas-keyring");
-    std::fs::create_dir_all(&keyring_dir)?;
-    write_refcas_group_keyring_dir(
-        &keyring_dir,
-        0,
-        history_id,
-        2,
-        &[(1, 0, [0x11; 32]), (2, 0, [0x12; 32]), (3, 0, [0x13; 32])],
-    )?;
-    provision_distributed_trust(&state.storage.root, tenant_id, repo_id, history_id, &keyring_dir)?;
+    let rig = build_refcas_merge_rig(Arc::clone(&cluster), tenant_id, repo_id, history_id, &base_oid).await?;
 
     let auth_rec = AuthorityRecord {
         tenant_id,
@@ -214,18 +216,18 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     let rep_idx_loc = snap_off.active_packs[0].idx_locator.to_locator()?;
     drop(reloaded);
 
-    // The production PR-merge Ref-CAS commit path publishes the sealed cutpoint snapshot.
-    let sm = production_refcas_pr_merge(&state, tenant_id, repo_id, history_id, &base_oid, &main_oid).await?;
+    let sm = production_refcas_pr_merge(&rig, &base_oid, &main_oid).await?;
     project_all_refcas_events(&pool, tenant_id, repo_id, ProjectionRealm::new(history_id, 0, 1)?, &sm).await?;
 
     let armed = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
+    let armed_snap = armed.snapshot();
     let lane_arm = seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
-        test_dist_lane(repo_id, 1, 4, &[], SafeGcObjectFormat::Sha1),
+        test_dist_lane(tenant_id, repo_id, history_id, 1, 1, &armed_snap.global_holds, SafeGcObjectFormat::Sha1),
     )?;
     armed.set_gc_mode(GcMode::ArmedDestructive(Box::new(lane_arm)))?;
     drop(armed);
@@ -235,8 +237,9 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     // Child #1 must reopen the volume itself: release the parent's exclusive writer lock first.
     drop(state);
 
-    // Child #1 (separate OS process, exact isolated PG schema): crash after one provider delete.
-    let c1 = pg_child_worker::spawn_pass1_crash_child(dir.path(), &db_url, &schema, repo_id, &s3.env_pairs())?;
+    // Child #1 (separate OS process, exact isolated PG schema): SIGKILL while holding the fence.
+    let c1 = pg_child_worker::spawn_pass1_sigkill_child(dir.path(), &db_url, &schema, repo_id, &s3.env_pairs(), &pool)
+        .await?;
     assert_ne!(c1.pid, std::process::id(), "pass1 must run in a separate OS process");
     let retired = [p_main.clone(), i_main.clone(), p_orph.clone(), i_orph.clone()];
     assert_eq!(retired.iter().filter(|l| !s3.has_key(l)).count(), 1, "exactly one retired locator deleted");
@@ -268,7 +271,8 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     assert_eq!(retired.iter().filter(|l| s3.has_key(l)).count(), 3, "un-rebound restart must not delete");
     drop(cold_reopened);
 
-    // Child #2 (separate OS process): the scheduled runtime acquires a fresh PG fence and resumes.
+    // Child #2 (separate OS process): the scheduled runtime reaps the expired lease, acquires a
+    // fresh PG fence with zero manual SQL, and resumes the batch.
     let c2 = pg_child_worker::spawn_pass2_scheduled_runtime_child(
         dir.path(),
         &db_url,
@@ -276,9 +280,11 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
         repo_id,
         c1.job_id,
         &s3.env_pairs(),
-    )?;
+    )
+    .await?;
     assert_ne!(c2.pid, std::process::id(), "pass2 must run in a separate OS process");
     assert_ne!(c2.pid, c1.pid, "each pass must run in its own OS process");
+    assert_ne!(c2.job_id, c1.job_id, "the recovery pass must claim a brand-new maintenance job");
     assert_eq!(c2.result["authority_lane"], "distributed_refcas");
     let epoch_2 = c2.result["gc_epoch"].as_u64().context("pass2 gc_epoch")?;
     assert!(epoch_2 > epoch_1, "restart must acquire a strictly newer PG gc_epoch fence");

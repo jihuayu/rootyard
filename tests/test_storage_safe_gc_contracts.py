@@ -24,6 +24,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_auth.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_evidence.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_keyring.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_trust_migration.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "domain.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "error.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "executor.rs",
@@ -46,6 +47,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_concurrency.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_auth.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_migration.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_reconcile.rs",
     ROOT / "tests" / "storage_safe_gc.rs",
     ROOT / "tests" / "storage_safe_gc_maintenance.rs",
@@ -55,6 +57,8 @@ RUST_FILES = [
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_merge_fixture.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_restart_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_lifecycle_cases.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "raft_voter_cluster.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "raft_merge_backend.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "s3_harness.rs",
     ROOT / "src" / "pulls" / "remote_merge_finalizer" / "coordinator_outcome.rs",
 ]
@@ -93,6 +97,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             "dist_auth.rs",
             "dist_evidence.rs",
             "dist_keyring.rs",
+            "dist_trust_migration.rs",
         ):
             src = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / name).read_text(encoding="utf-8")
             for m in re.finditer(r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*pub struct (\w+)", src):
@@ -145,13 +150,57 @@ class StorageSafeGcContractsTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("set_abort_after_install_once", lifecycle)
         self.assertIn("isolated_pg_pool_with_schema", lifecycle)
-        self.assertIn("with_safe_gc_cutpoint_publisher", merge_fixture)
+        self.assertIn("LiveRaft3MergeBackend", merge_fixture)
+        self.assertIn("LiveRaftVoterCluster", merge_fixture)
+        self.assertIn("build_refcas_merge_rig", merge_fixture)
+        self.assertNotIn("with_safe_gc_cutpoint_publisher", merge_fixture)
         self.assertIn("production_refcas_pr_merge", cases)
         self.assertIn("production_refcas_pr_merge", restart)
         self.assertIn("run_claimed_safe_gc_once_with_fault", restart)
         self.assertIn("reconcile_pending_delete_after_restart_fenced", restart)
-        for support in (merge_fixture, cases, restart):
+        self.assertIn("SIGKILL", restart)
+        self.assertIn("PauseAfterDeletesForExternalKill", restart)
+        self.assertIn("spawn_pass1_sigkill_child", restart)
+        for support in (merge_fixture, restart):
             self.assertNotIn("persist_refcas_cutpoint_snapshot", support)
+        self.assertIn("persist_refcas_cutpoint_snapshot", cases)
+
+        keyring = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_keyring.rs").read_text(
+            encoding="utf-8"
+        )
+        evidence = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_evidence.rs").read_text(
+            encoding="utf-8"
+        )
+        auth = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_auth.rs").read_text(
+            encoding="utf-8"
+        )
+        migration = (
+            ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_trust_migration.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("migrate_legacy_trust_file", migration)
+        executor = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "executor.rs").read_text(
+            encoding="utf-8"
+        )
+        maintenance = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "pg_maintenance.rs").read_text(
+            encoding="utf-8"
+        )
+        worker = (ROOT / "src" / "storage_lifecycle" / "worker.rs").read_text(encoding="utf-8")
+        for text in (auth, dist):
+            self.assertNotIn("mint_cutpoint_attestation", text)
+            self.assertNotIn("sign_snapshot_with_keyring_dir", text)
+            self.assertNotIn(".quorum.seed", text)
+            self.assertNotIn(".bridge.seed", text)
+            self.assertNotIn(".backup.seed", text)
+        self.assertIn("VOTER_CUTPOINT_DOMAIN", keyring)
+        self.assertIn("voter_cutpoint_transcript", evidence)
+        self.assertIn("PauseAfterDeletesForExternalKill", executor)
+        self.assertIn("reap_expired_pg_refstore_jobs", maintenance)
+        self.assertIn("reap_expired_pg_refstore_jobs", worker)
+        capture = dist.split("pub(super) async fn capture_verified_dist_cutpoint", 1)[1].split(
+            "pub(super) async fn reconcile_worker_refcas_cut_if_needed", 1
+        )[0]
+        self.assertNotIn("FsSealedRefCasCutpointSource", capture)
+        self.assertIn("fetch_quorum_cutpoint_from_voters", capture)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf_raw = WORKFLOW.read_bytes()
@@ -185,6 +234,9 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             "cargo test --locked --no-default-features --lib storage_lifecycle::safe_gc",
             "cargo test --locked --no-default-features --test storage_safe_gc",
             "cargo test --locked --no-default-features --test storage_safe_gc_maintenance",
+            "ROOTYARD_REFCAS_NODE_BIN",
+            "crates/refcas-log/Cargo.toml",
+            "--bin raft-node",
             "scripts/eval_storage_safe_gc.py",
         ):
             self.assertIn(token, wf_text)

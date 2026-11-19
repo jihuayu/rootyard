@@ -1,18 +1,17 @@
-//! Production Ref-CAS PR-merge fixture: forced scans + sealed cutpoint publication (#122).
+//! Production Ref-CAS PR-merge fixture over a live 3-node Raft cluster: forced scans (#122).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
     sync::Arc,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rootyard::{
     AppState,
     pulls::remote_merge_finalizer::{
-        CheckRunSnapshot, InMemoryMergeStore, InProcessRefCasBackend, LiveAuthzScopeState, MergeAttemptOutcome,
-        MergeAttemptSpec, MergeBindingInputs, MergeFaultInjection, MergePullSnapshot, MergeStrategy,
-        ProjectedPullRecord, PullRemoteMergeProducer, compute_merge_binding_digest,
+        CheckRunSnapshot, InMemoryMergeStore, LiveAuthzScopeState, MergeAttemptOutcome, MergeAttemptSpec,
+        MergeBindingInputs, MergeFaultInjection, MergePullSnapshot, MergeStrategy, ProjectedPullRecord,
+        PullRemoteMergeProducer, compute_merge_binding_digest,
     },
     ref_store::{
         CommitRefsRequest, IssuerLane,
@@ -27,10 +26,13 @@ use rootyard::{
         },
         projector::{DecisionGrantKeyring, GrantExpectedRealm, SignedDecisionGrantPayload},
     },
-    storage_lifecycle::{models::Policy, safe_gc::safe_gc_refcas_cutpoint_path, scheduler},
+    storage_lifecycle::{models::Policy, scheduler},
 };
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+use super::raft_voter_cluster::{LiveRaft3MergeBackend, LiveRaftVoterCluster};
 
 pub(super) async fn force_scan_and_schedule(
     state: &Arc<AppState>,
@@ -46,20 +48,19 @@ pub(super) async fn force_scan_and_schedule(
     Ok(())
 }
 
-/// Reusable live authority for a production Ref-CAS merge test: a seeded gate,
-/// the production cutpoint publisher, decision keyring and token scope id.
+/// Reusable live Raft authority for a production Ref-CAS merge test.
 pub(super) struct RefCasMergeRig {
     pub tenant_id: Uuid,
     pub repo_id: Uuid,
     pub history_id: Uuid,
-    pub backend: InProcessRefCasBackend,
+    pub backend: LiveRaft3MergeBackend,
     pub keyring: DecisionGrantKeyring,
     pub token_scope_id: Uuid,
 }
 
-/// Seed `refs/heads/main` (`base_oid -> main_oid`) and return the publisher-backed backend.
-pub(super) fn build_refcas_merge_rig(
-    storage_root: &Path,
+/// Seed the Ref-CAS gate and `refs/heads/main = base_oid` through the live Raft log.
+pub(super) async fn build_refcas_merge_rig(
+    cluster: Arc<AsyncMutex<LiveRaftVoterCluster>>,
     tenant_id: Uuid,
     repo_id: Uuid,
     history_id: Uuid,
@@ -68,9 +69,7 @@ pub(super) fn build_refcas_merge_rig(
     let fmt = GitObjectFormat::Sha1;
     let token_scope_id = Uuid::new_v4();
     let keyring = DecisionGrantKeyring::new([(1, Zeroizing::new([0x5a; 32]))], 1, BTreeSet::new()).unwrap();
-
-    // Seed the Ref-CAS gate and base ref inline: mounting `pulls_remote_merge_support/ctx.rs`
-    // would introduce unused helpers and fail this binary's `-D warnings` build.
+    let backend = LiveRaft3MergeBackend::new(cluster);
     let init = RefCasCommand::InitializeGate(InitializeGateCommand {
         gate: WireGateInit {
             repository_id: repo_id,
@@ -113,15 +112,20 @@ pub(super) fn build_refcas_merge_rig(
         policy_rejects: BTreeMap::new(),
         logical_tick: 1,
     });
-    let mut sm = RefCasStateMachine::new();
-    sm.apply(AppliedLogId { term: 1, index: 1 }, init)?;
-    sm.apply(AppliedLogId { term: 1, index: 2 }, seed)?;
-    let backend = InProcessRefCasBackend::new(sm).with_safe_gc_cutpoint_publisher(storage_root.to_path_buf(), 0)?;
+    backend.apply_repo_command(init).await.map_err(|err| anyhow::anyhow!("seed Ref-CAS gate through Raft: {err}"))?;
+    backend
+        .apply_repo_command(seed)
+        .await
+        .map_err(|err| anyhow::anyhow!("seed refs/heads/main through Raft: {err}"))?;
+    ensure!(
+        backend.state_machine().await?.read_refs(repo_id).get("refs/heads/main").map(String::as_str) == Some(base_oid),
+        "Raft Ref-CAS state machine did not seed refs/heads/main"
+    );
     Ok(RefCasMergeRig { tenant_id, repo_id, history_id, backend, keyring, token_scope_id })
 }
 
 /// Build the production attempt spec + pull snapshot for a fast-forward `base_oid -> head_oid`.
-pub(super) fn build_refcas_merge_attempt(
+pub(super) async fn build_refcas_merge_attempt(
     rig: &RefCasMergeRig,
     base_oid: &str,
     head_oid: &str,
@@ -142,7 +146,9 @@ pub(super) fn build_refcas_merge_attempt(
         history_incarnation: history_id,
         authority_epoch: 1,
     };
-    let gv = rig.backend.state_machine().read_gate_version(repo_id)?.context("seeded Ref-CAS gate version")?;
+    let gv = rig.backend.state_machine().await?.read_gate_version(repo_id)?.ok_or_else(|| {
+        anyhow::anyhow!("seeded Ref-CAS gate has no version; rebuild the merge rig after seeding the gate")
+    })?;
     let checks = vec!["ci/verify".to_owned()];
     let pull = MergePullSnapshot {
         tenant_id,
@@ -296,22 +302,16 @@ pub(super) fn build_refcas_merge_attempt(
 }
 
 /// Commit `refs/heads/main` (`base_oid -> main_oid`) through the production
-/// `InProcessRefCasBackend::with_safe_gc_cutpoint_publisher` +
-/// `PullRemoteMergeProducer::execute_merge` path so the sealed cutpoint snapshot
-/// is published exclusively by the production Ref-CAS commit path.
+/// `PullRemoteMergeProducer::execute_merge` path, with the OpenRaft log as the sole commit point.
 pub(super) async fn production_refcas_pr_merge(
-    state: &Arc<AppState>,
-    tenant_id: Uuid,
-    repo_id: Uuid,
-    history_id: Uuid,
+    rig: &RefCasMergeRig,
     base_oid: &str,
     main_oid: &str,
 ) -> Result<RefCasStateMachine> {
-    let rig = build_refcas_merge_rig(&state.storage.root, tenant_id, repo_id, history_id, base_oid)?;
     let merge_store = InMemoryMergeStore::new();
     merge_store.seed_pull(ProjectedPullRecord {
-        tenant_id,
-        repository_id: repo_id,
+        tenant_id: rig.tenant_id,
+        repository_id: rig.repo_id,
         pull_number: 1,
         state: "open".into(),
         head_oid: main_oid.into(),
@@ -320,14 +320,15 @@ pub(super) async fn production_refcas_pr_merge(
         merged_storage_generation: None,
         version: 1,
     });
-    let (spec, pull) = build_refcas_merge_attempt(&rig, base_oid, main_oid, main_oid, 1, 1, rig.token_scope_id)?;
+    let (spec, pull) = build_refcas_merge_attempt(rig, base_oid, main_oid, main_oid, 1, 1, rig.token_scope_id).await?;
     let merge_out = PullRemoteMergeProducer::new(&rig.backend, &merge_store, &rig.keyring)
         .execute_merge(&spec, &pull, true, MergeFaultInjection::None)
         .await?;
     ensure!(matches!(merge_out, MergeAttemptOutcome::Committed(_)), "production Ref-CAS PR merge was not committed");
+    let sm = rig.backend.state_machine().await?;
     ensure!(
-        safe_gc_refcas_cutpoint_path(&state.storage.root, repo_id).is_file(),
-        "production Ref-CAS commit path did not publish the sealed cutpoint snapshot"
+        sm.read_refs(rig.repo_id).get("refs/heads/main").map(String::as_str) == Some(main_oid),
+        "Raft Ref-CAS state machine did not commit refs/heads/main"
     );
-    Ok(rig.backend.state_machine())
+    Ok(sm)
 }

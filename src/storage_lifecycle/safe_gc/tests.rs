@@ -257,7 +257,7 @@ pub(super) fn seed_fixture(
     })
     .unwrap();
     let lane = if distributed {
-        make_test_dist_lane(Uuid::new_v4(), 1, 10, &[], fmt)
+        make_test_dist_lane(&auth, 10, &[], fmt)
     } else {
         AuthorityLane::SingleNodePg {
             pg_authority_id: auth.repo_id,

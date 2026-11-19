@@ -54,7 +54,33 @@ pub fn safe_gc_journal_path(storage_root: &Path, repo_id: Uuid) -> PathBuf {
     storage_root.join("safe-gc").join(format!("{repo_id}.json"))
 }
 
+/// Hard-process-death recovery: fail every expired `pg_refstore` job so the next
+/// scheduler/worker tick can re-queue the repository without manual SQL.
+///
+/// A `SIGKILL` leaves one `running` row behind with a 5s lease and a stale
+/// `repositories.gc_owner`; reaping it here (plus the `NOT EXISTS` guard on the
+/// repository claim) lets a cold worker resume with a strict epoch increase.
+pub async fn reap_expired_pg_refstore_jobs(pool: &deadpool_postgres::Pool) -> Result<u64> {
+    let client = pool.get().await?;
+    let reaped = client
+        .execute(
+            "UPDATE storage_maintenance_jobs j \
+             SET state='failed', lease_owner=NULL, lease_until=NULL, \
+                 last_error=COALESCE(j.last_error, \
+                   'pg_refstore worker lease expired after hard process termination'), \
+                 completed_at=clock_timestamp(), updated_at=clock_timestamp() \
+             FROM repositories r \
+             WHERE j.repository_id=r.id AND r.storage_backend='pg_refstore' \
+               AND (j.state='queued' OR (j.state='running' \
+                    AND (j.lease_until IS NULL OR j.lease_until < clock_timestamp())))",
+            &[],
+        )
+        .await?;
+    Ok(reaped)
+}
+
 pub async fn schedule_pg_refstore(state: &AppState, policy: &Policy) -> Result<usize> {
+    let _ = reap_expired_pg_refstore_jobs(&state.pool).await?;
     let destructive_env = safe_gc_destructive_env_enabled()?;
     let safe_gc_dir = state.storage.root.join("safe-gc");
     if !safe_gc_dir.is_dir() {
@@ -148,6 +174,7 @@ pub async fn run_claimed_safe_gc_once_with_fault(
     if !safe_gc_dir.is_dir() {
         return Ok(None);
     }
+    reap_expired_pg_refstore_jobs(&state.pool).await?;
     let client = state.pool.get().await?;
     let Some(claimed_row) = client
         .query_opt(
@@ -157,6 +184,10 @@ pub async fn run_claimed_safe_gc_once_with_fault(
              WHERE s.repository_id = r.id AND s.tenant_id = r.owner_id \
                AND r.state = 'ready' AND r.storage_backend = 'pg_refstore' \
                AND COALESCE((s.last_scan->>'safe_gc_queued')::boolean, false) = true \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM storage_maintenance_jobs j \
+                 WHERE j.repository_id = r.id AND j.state IN ('queued','running') \
+                   AND (j.lease_until IS NULL OR j.lease_until >= clock_timestamp())) \
              RETURNING r.id, r.owner_id, r.storage_generation, s.last_scan",
             &[],
         )
@@ -302,7 +333,7 @@ async fn run_safe_gc_phases(
         reconcile_pg_refstore_authority(&**pg_client, job.repository_id, &blob_store, &authority, Some(fence_epoch))
             .await
             .map_err(|e| anyhow::anyhow!("reconcile_pg_refstore_authority: {e}"))?;
-    let (fresh_cut, verified_voters) = super::pg_maintenance_dist::reconcile_worker_refcas_cut_if_needed(
+    let (fresh_cut, verified_quorum) = super::pg_maintenance_dist::reconcile_worker_refcas_cut_if_needed(
         &**pg_client,
         job.repository_id,
         &state.storage.root,
@@ -378,7 +409,7 @@ async fn run_safe_gc_phases(
         reconciled.gate_revision,
         fence_epoch,
         fresh_cut.as_ref(),
-        verified_voters,
+        verified_quorum,
     )
     .map_err(|e| anyhow::anyhow!("re-seal live PG arm: {e}"))?;
     authority

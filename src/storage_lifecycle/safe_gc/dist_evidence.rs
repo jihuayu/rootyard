@@ -6,12 +6,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::ref_store::core::artifact_hold::reconcile_proof::GroupVoterSignatureDto;
-
 use super::super::model::{GlobalHoldEntry, GlobalHoldState, encode_len_bytes, validate_sha256_hex};
-use super::{SafeGcEd25519Signer, is_lower_hex, verify_ed25519_domain};
+use super::keyring::{VOTER_CUTPOINT_DOMAIN, VoterCutpointSignature, voter_cutpoint_transcript};
+use super::{SafeGcEd25519Signer, is_lower_hex, validate_ed25519_pubkey_hex, verify_ed25519_domain};
 
-const QUORUM_DOMAIN: &[u8] = b"rootyard/safe-gc-quorum-evidence/v1";
 const HOLD_BRIDGE_DOMAIN: &[u8] = b"rootyard/safe-gc-hold-bridge-evidence/v1";
 const BACKUP_ROOT_DOMAIN: &[u8] = b"rootyard/safe-gc-backup-root-evidence/v1";
 const HOLDS_DIGEST_DOMAIN: &[u8] = b"rootyard/safe-gc-holds-set/v1|";
@@ -31,89 +29,181 @@ fn evidence_digest(
     hasher.finalize().into()
 }
 
-/// Ed25519-signed Ref-CAS quorum commit evidence bound to one authority epoch.
+fn missing(reason: &'static str) -> super::SafeGcError {
+    super::SafeGcError::DistributedPrereqsMissing(reason)
+}
+
+/// Independent multi-voter Ed25519 quorum commit evidence anchored to committed Raft state.
+///
+/// `snapshot_sha256` is `hex(SHA-256(SnapshotBytes))` and is part of every voter transcript;
+/// `snapshot_checksum` is the sealed `RefCasSnapshot::checksum` that PG cut reconciliation binds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuorumCommitEvidence {
     pub group_id: i64,
+    pub history_incarnation: Uuid,
+    pub authority_epoch: i64,
     pub raft_term: u64,
     pub committed_log_index: u64,
+    pub raft_commit_digest_hex: String,
+    pub snapshot_sha256: String,
     pub snapshot_checksum: String,
-    pub voter_signatures: Vec<GroupVoterSignatureDto>,
-    pub quorum_pubkey_hex: String,
-    pub quorum_signature_hex: String,
+    pub quorum_threshold: usize,
+    pub voter_signatures: Vec<VoterCutpointSignature>,
+}
+
+/// Verified coordinate set used to seal one [`QuorumCommitEvidence`].
+#[derive(Clone, Debug)]
+pub struct QuorumCommitSeal {
+    pub group_id: i64,
+    pub history_incarnation: Uuid,
+    pub authority_epoch: i64,
+    pub raft_term: u64,
+    pub committed_log_index: u64,
+    pub raft_commit_digest_hex: String,
+    pub snapshot_sha256: String,
+    pub snapshot_checksum: String,
+    pub quorum_threshold: usize,
+    pub voter_signatures: Vec<VoterCutpointSignature>,
 }
 
 impl QuorumCommitEvidence {
-    pub fn sign(
-        signer: &SafeGcEd25519Signer,
+    /// Seal evidence from independently verified voter signatures and re-verify it immediately.
+    pub fn from_verified_voters(
         ref_cas_authority_id: Uuid,
         quorum_epoch: u64,
-        group_id: i64,
-        raft_term: u64,
-        committed_log_index: u64,
-        snapshot_checksum: String,
-        voter_signatures: Vec<GroupVoterSignatureDto>,
+        seal: QuorumCommitSeal,
     ) -> Result<Self, super::SafeGcError> {
-        let mut evidence = Self {
-            group_id,
-            raft_term,
-            committed_log_index,
-            snapshot_checksum,
-            voter_signatures,
-            quorum_pubkey_hex: signer.pubkey_hex().to_owned(),
-            quorum_signature_hex: String::new(),
+        let evidence = Self {
+            group_id: seal.group_id,
+            history_incarnation: seal.history_incarnation,
+            authority_epoch: seal.authority_epoch,
+            raft_term: seal.raft_term,
+            committed_log_index: seal.committed_log_index,
+            raft_commit_digest_hex: seal.raft_commit_digest_hex,
+            snapshot_sha256: seal.snapshot_sha256,
+            snapshot_checksum: seal.snapshot_checksum,
+            quorum_threshold: seal.quorum_threshold,
+            voter_signatures: seal.voter_signatures,
         };
-        let digest =
-            evidence_digest(QUORUM_DOMAIN, ref_cas_authority_id, quorum_epoch, |h| evidence.encode_canonical(h));
-        evidence.quorum_signature_hex = signer.sign_domain(QUORUM_DOMAIN, &digest);
         evidence.verify(ref_cas_authority_id, quorum_epoch)?;
         Ok(evidence)
     }
 
+    /// Verify identity bounds, canonical digests and every Ed25519 voter transcript signature.
     pub fn verify(&self, ref_cas_authority_id: Uuid, quorum_epoch: u64) -> Result<(), super::SafeGcError> {
         if ref_cas_authority_id.is_nil()
             || quorum_epoch == 0
             || self.group_id < 0
+            || self.history_incarnation.is_nil()
+            || self.authority_epoch <= 0
             || self.raft_term == 0
             || self.committed_log_index == 0
         {
-            return Err(super::SafeGcError::DistributedPrereqsMissing("Ref-CAS quorum evidence identity invalid"));
+            return Err(missing("Ref-CAS quorum evidence identity invalid"));
         }
+        validate_sha256_hex(&self.raft_commit_digest_hex)
+            .map_err(|_| missing("Ref-CAS quorum commit digest invalid"))?;
+        validate_sha256_hex(&self.snapshot_sha256).map_err(|_| missing("Ref-CAS quorum snapshot digest invalid"))?;
         validate_sha256_hex(&self.snapshot_checksum)
-            .map_err(|_| super::SafeGcError::DistributedPrereqsMissing("Ref-CAS quorum evidence checksum invalid"))?;
-        if self.voter_signatures.is_empty() || self.voter_signatures.len() > 32 {
-            return Err(super::SafeGcError::DistributedPrereqsMissing(
-                "Ref-CAS quorum voter signature set out of bounds",
-            ));
+            .map_err(|_| missing("Ref-CAS quorum evidence checksum invalid"))?;
+        if self.quorum_threshold < 2 || self.quorum_threshold > 32 {
+            return Err(missing("Ref-CAS quorum threshold must be at least two of at most 32 voters"));
         }
+        if self.voter_signatures.len() < self.quorum_threshold || self.voter_signatures.len() > 32 {
+            return Err(missing("Ref-CAS quorum voter signature set out of bounds"));
+        }
+        let group_epoch =
+            i64::try_from(quorum_epoch).map_err(|_| missing("Ref-CAS quorum epoch exceeds the signed i64 range"))?;
         let mut voters = BTreeSet::new();
+        let mut keys = BTreeSet::new();
         for signature in &self.voter_signatures {
-            if signature.voter_id == 0
-                || !voters.insert(signature.voter_id)
-                || validate_sha256_hex(&signature.mac_hex).is_err()
-            {
-                return Err(super::SafeGcError::DistributedPrereqsMissing("Ref-CAS quorum voter signature invalid"));
+            if signature.voter_id == 0 || !voters.insert(signature.voter_id) {
+                return Err(missing("Ref-CAS quorum voter identity invalid or duplicated"));
             }
+            validate_ed25519_pubkey_hex(&signature.voter_pubkey_hex)
+                .map_err(|_| missing("Ref-CAS quorum voter public key invalid"))?;
+            if !keys.insert(signature.voter_pubkey_hex.as_str()) {
+                return Err(missing("Ref-CAS quorum voter public key duplicated"));
+            }
+            let transcript = voter_cutpoint_transcript(
+                self.group_id,
+                self.history_incarnation,
+                group_epoch,
+                self.authority_epoch,
+                self.raft_term,
+                self.committed_log_index,
+                signature.voter_id,
+                signature.key_id,
+                &self.raft_commit_digest_hex,
+                &self.snapshot_sha256,
+            );
+            verify_ed25519_domain(
+                &signature.voter_pubkey_hex,
+                VOTER_CUTPOINT_DOMAIN,
+                &transcript,
+                &signature.signature_hex,
+            )
+            .map_err(|_| missing("Ref-CAS quorum voter Ed25519 signature rejected"))?;
         }
-        let digest = evidence_digest(QUORUM_DOMAIN, ref_cas_authority_id, quorum_epoch, |h| self.encode_canonical(h));
-        verify_ed25519_domain(&self.quorum_pubkey_hex, QUORUM_DOMAIN, &digest, &self.quorum_signature_hex).map_err(
-            |_| super::SafeGcError::DistributedPrereqsMissing("Ref-CAS quorum evidence Ed25519 signature rejected"),
-        )
+        Ok(())
+    }
+
+    /// Verify against the repository's pinned independent voter set and expected threshold.
+    pub fn verify_against_trusted_voters(
+        &self,
+        ref_cas_authority_id: Uuid,
+        quorum_epoch: u64,
+        history_id: Uuid,
+        trusted_voters: &[super::TrustedConsensusVoter],
+        expected_threshold: usize,
+    ) -> Result<(), super::SafeGcError> {
+        self.verify(ref_cas_authority_id, quorum_epoch)?;
+        if self.history_incarnation != history_id {
+            return Err(missing("Ref-CAS quorum history incarnation not trusted by repository authority"));
+        }
+        if expected_threshold < 2
+            || expected_threshold > trusted_voters.len()
+            || self.quorum_threshold != expected_threshold
+        {
+            return Err(missing("Ref-CAS quorum threshold disagrees with repository trust"));
+        }
+        let mut counted = BTreeSet::new();
+        for signature in &self.voter_signatures {
+            let Some(trusted) = trusted_voters
+                .iter()
+                .find(|voter| voter.voter_id == signature.voter_id && voter.key_id == signature.key_id)
+            else {
+                return Err(missing("Ref-CAS quorum voter is not a trusted consensus voter"));
+            };
+            if trusted.ed25519_pubkey_hex != signature.voter_pubkey_hex {
+                return Err(missing("Ref-CAS quorum voter public key is not trusted by repository authority"));
+            }
+            counted.insert(signature.voter_id);
+        }
+        if counted.len() < expected_threshold {
+            return Err(missing("Ref-CAS quorum does not reach the trusted voter threshold"));
+        }
+        Ok(())
     }
 
     pub(crate) fn encode_canonical(&self, h: &mut Sha256) {
         h.update(self.group_id.to_be_bytes());
+        h.update(self.history_incarnation.as_bytes());
+        h.update(self.authority_epoch.to_be_bytes());
         h.update(self.raft_term.to_be_bytes());
         h.update(self.committed_log_index.to_be_bytes());
+        encode_len_bytes(h, self.raft_commit_digest_hex.as_bytes());
+        encode_len_bytes(h, self.snapshot_sha256.as_bytes());
         encode_len_bytes(h, self.snapshot_checksum.as_bytes());
+        h.update((self.quorum_threshold as u64).to_be_bytes());
         h.update((self.voter_signatures.len() as u64).to_be_bytes());
         for signature in &self.voter_signatures {
             h.update(signature.voter_id.to_be_bytes());
             h.update([signature.key_id]);
-            encode_len_bytes(h, signature.mac_hex.as_bytes());
+            encode_len_bytes(h, signature.voter_pubkey_hex.as_bytes());
+            encode_len_bytes(h, signature.signature_hex.as_bytes());
         }
-        encode_len_bytes(h, self.quorum_pubkey_hex.as_bytes());
     }
 }
 

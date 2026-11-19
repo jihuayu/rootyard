@@ -1,16 +1,23 @@
-//! Distributed-authority Ed25519, #151 quorum and keyring fail-closed tests (#122).
+//! Independent multi-voter Ed25519 quorum cutpoint fail-closed tests (#122).
 
 use tempfile::tempdir;
 use uuid::Uuid;
 
-use crate::ref_store::core::artifact_hold::reconcile_proof::GroupVoterSignatureDto;
+use crate::ref_store::core::state_machine::{
+    AppliedLogId, InitializeGateCommand, NoopCommand, RefCasCommand, RefCasSnapshot, RefCasStateMachine,
+    RepositoryLane, SmPackMode, WireGateInit,
+};
+use crate::ref_store::core::types::GitObjectFormat;
 
 use super::super::domain::AuthorityRecord;
 use super::super::model::{AuthorityLane, GlobalHoldEntry, GlobalHoldState, SafeGcArmReceipt, SafeGcObjectFormat};
 use super::{
-    BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcRepoTrustConfig,
-    write_refcas_group_keyring_dir,
+    BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, QuorumCommitSeal, SafeGcEd25519Signer,
+    SafeGcRepoTrustConfig, TrustedConsensusVoter, VoterCutpointAttestation, VoterCutpointClaims, compute_holds_digest,
+    sign_single_voter_cutpoint_attestation, verify_quorum_voter_attestations, verify_single_voter_cutpoint_attestation,
 };
+
+pub(crate) const TEST_VOTER_SEEDS: [[u8; 32]; 3] = [[0x71; 32], [0x72; 32], [0x73; 32]];
 
 pub(crate) fn test_arm_signer() -> SafeGcEd25519Signer {
     SafeGcEd25519Signer::from_seed([0x41; 32]).unwrap()
@@ -29,45 +36,132 @@ fn sha(tag: &str) -> String {
     hex::encode(Sha256::digest(tag.as_bytes()))
 }
 
+fn voter_signer(voter_id: u64) -> SafeGcEd25519Signer {
+    SafeGcEd25519Signer::from_seed(TEST_VOTER_SEEDS[(voter_id - 1) as usize]).unwrap()
+}
+
+pub(crate) fn test_trusted_voters() -> Vec<TrustedConsensusVoter> {
+    (1..=3_u64)
+        .map(|voter_id| TrustedConsensusVoter {
+            voter_id,
+            key_id: 1,
+            ed25519_pubkey_hex: voter_signer(voter_id).pubkey_hex().to_owned(),
+            endpoint_url: format!("http://127.0.0.1:{}/", 18_100 + voter_id),
+        })
+        .collect()
+}
+
+pub(crate) fn test_trust_config(auth: &AuthorityRecord) -> SafeGcRepoTrustConfig {
+    SafeGcRepoTrustConfig {
+        repo_id: auth.repo_id,
+        tenant_id: auth.tenant_id,
+        history_id: auth.history_id,
+        trusted_arm_pubkey_hex: test_arm_signer().pubkey_hex().to_owned(),
+        quorum_threshold: Some(2),
+        trusted_hold_bridge_pubkey_hex: Some(test_hold_bridge_signer().pubkey_hex().to_owned()),
+        trusted_backup_pubkey_hex: Some(test_backup_signer().pubkey_hex().to_owned()),
+        trusted_consensus_voters: test_trusted_voters(),
+    }
+}
+
+fn seeded_snapshot(auth: &AuthorityRecord, committed_log_index: u64, logical_tick: Option<u64>) -> RefCasSnapshot {
+    assert!(committed_log_index >= 1);
+    let mut sm = RefCasStateMachine::new();
+    let gate = WireGateInit {
+        repository_id: auth.repo_id,
+        tenant_id: auth.tenant_id,
+        object_format: GitObjectFormat::Sha1,
+        history_incarnation: auth.history_id,
+        authority_epoch: 1,
+        group_epoch: 1,
+        head_ref: "refs/heads/main".into(),
+    };
+    sm.apply(
+        AppliedLogId { term: 1, index: 1 },
+        RefCasCommand::InitializeGate(InitializeGateCommand {
+            gate,
+            lane: RepositoryLane::ServingRefStore,
+            pack_mode: SmPackMode::MetadataOnly,
+            authz_floor: 1,
+        }),
+    )
+    .unwrap();
+    for index in 2..=committed_log_index {
+        let tick = (index == committed_log_index).then_some(logical_tick).flatten();
+        sm.apply(AppliedLogId { term: 1, index }, RefCasCommand::Noop(NoopCommand { logical_tick: tick })).unwrap();
+    }
+    sm.snapshot().unwrap()
+}
+
+fn voter_claims(voter_id: u64, auth: &AuthorityRecord, committed_log_index: u64) -> VoterCutpointClaims {
+    VoterCutpointClaims {
+        voter_id,
+        key_id: 1,
+        group_id: 0,
+        history_incarnation: auth.history_id,
+        group_epoch: 1,
+        authority_epoch: 1,
+        raft_term: 1,
+        committed_log_index,
+        raft_commit_digest_hex: sha("raft-commit"),
+    }
+}
+
+fn attestation(
+    voter_id: u64,
+    auth: &AuthorityRecord,
+    committed_log_index: u64,
+    snapshot: &RefCasSnapshot,
+) -> VoterCutpointAttestation {
+    sign_single_voter_cutpoint_attestation(
+        &voter_signer(voter_id),
+        &voter_claims(voter_id, auth, committed_log_index),
+        snapshot,
+    )
+    .unwrap()
+}
+
+fn quorum_seal(snapshot: &RefCasSnapshot, auth: &AuthorityRecord, committed_log_index: u64) -> QuorumCommitSeal {
+    let one = attestation(1, auth, committed_log_index, snapshot);
+    let two = attestation(2, auth, committed_log_index, snapshot);
+    QuorumCommitSeal {
+        group_id: 0,
+        history_incarnation: auth.history_id,
+        authority_epoch: 1,
+        raft_term: 1,
+        committed_log_index,
+        raft_commit_digest_hex: sha("raft-commit"),
+        snapshot_sha256: one.snapshot_sha256.clone(),
+        snapshot_checksum: sha("sm-snapshot"),
+        quorum_threshold: 2,
+        voter_signatures: vec![one.signature, two.signature],
+    }
+}
+
 pub(crate) fn make_test_dist_lane(
-    ref_cas_authority_id: Uuid,
-    quorum_epoch: u64,
+    auth: &AuthorityRecord,
     raft_commit_index: u64,
     holds: &[GlobalHoldEntry],
     format: SafeGcObjectFormat,
 ) -> AuthorityLane {
-    let signer = test_arm_signer();
-    let quorum = QuorumCommitEvidence::sign(
-        &signer,
-        ref_cas_authority_id,
-        quorum_epoch,
-        0,
-        1,
-        raft_commit_index,
-        sha("sm-snapshot"),
-        vec![GroupVoterSignatureDto { voter_id: 1, key_id: 0, mac_hex: hex::encode([0x33_u8; 32]) }],
-    )
-    .unwrap();
-    let bridge = HoldBridgeEvidence::sign(
-        &test_hold_bridge_signer(),
-        ref_cas_authority_id,
-        quorum_epoch,
-        raft_commit_index.max(1),
-        holds,
-    )
-    .unwrap();
+    let snapshot = seeded_snapshot(auth, raft_commit_index, None);
+    let quorum =
+        QuorumCommitEvidence::from_verified_voters(auth.repo_id, 1, quorum_seal(&snapshot, auth, raft_commit_index))
+            .unwrap();
+    let bridge =
+        HoldBridgeEvidence::sign(&test_hold_bridge_signer(), auth.repo_id, 1, raft_commit_index.max(1), holds).unwrap();
     let backup = BackupRootEvidence::sign(
         &test_backup_signer(),
-        ref_cas_authority_id,
-        quorum_epoch,
+        auth.repo_id,
+        1,
         1,
         hex::encode([0x44_u8; 32]),
         vec!["a".repeat(format.oid_hex_len())],
     )
     .unwrap();
     AuthorityLane::DistributedRefCas {
-        ref_cas_authority_id,
-        quorum_epoch,
+        ref_cas_authority_id: auth.repo_id,
+        quorum_epoch: 1,
         raft_commit_index,
         quorum_evidence: Box::new(quorum),
         hold_bridge_evidence: Box::new(bridge),
@@ -107,7 +201,8 @@ fn sample_holds() -> Vec<GlobalHoldEntry> {
 #[test]
 fn arm_receipt_signature_and_ttl_arming_fail_closed() {
     let auth = authority_record();
-    let lane = make_test_dist_lane(Uuid::new_v4(), 1, 10, &[], SafeGcObjectFormat::Sha1);
+    let lane = make_test_dist_lane(&auth, 10, &[], SafeGcObjectFormat::Sha1);
+    lane.validate_for_destructive_gc().unwrap();
     let arm = SafeGcArmReceipt::seal(
         &test_arm_signer(),
         auth.tenant_id,
@@ -116,7 +211,7 @@ fn arm_receipt_signature_and_ttl_arming_fail_closed() {
         auth.incarnation_id,
         auth.incarnation_epoch,
         true,
-        lane.clone(),
+        lane,
     )
     .unwrap();
     arm.validate().unwrap();
@@ -132,29 +227,192 @@ fn arm_receipt_signature_and_ttl_arming_fail_closed() {
 }
 
 #[test]
-fn quorum_and_hold_bridge_evidence_reject_tampering_and_wrong_holds() {
-    let signer = test_arm_signer();
-    let authority_id = Uuid::new_v4();
-    let holds = sample_holds();
-    let voter = GroupVoterSignatureDto { voter_id: 1, key_id: 0, mac_hex: sha("voter") };
-    let quorum =
-        QuorumCommitEvidence::sign(&signer, authority_id, 1, 0, 1, 10, sha("snapshot"), vec![voter.clone()]).unwrap();
-    quorum.verify(authority_id, 1).unwrap();
+fn independent_voters_reject_minority_tampering_and_forged_signatures() {
+    let auth = authority_record();
+    let snapshot = seeded_snapshot(&auth, 10, None);
+    let one = attestation(1, &auth, 10, &snapshot);
+    let two = attestation(2, &auth, 10, &snapshot);
+    let trust = test_trust_config(&auth);
 
-    let mut bad_sig = quorum.clone();
-    bad_sig.quorum_signature_hex = hex::encode([0x66_u8; 64]);
-    assert!(bad_sig.verify(authority_id, 1).is_err());
+    let mut minority = two.clone();
+    minority.signature = one.signature.clone();
+    assert!(verify_quorum_voter_attestations(&trust, auth.repo_id, &[minority]).is_err());
 
+    let mut forged = two.clone();
+    forged.signature.signature_hex = hex::encode([0x66_u8; 64]);
+    assert!(verify_quorum_voter_attestations(&trust, auth.repo_id, &[one.clone(), forged]).is_err());
+
+    let mut duplicate_voter = two.clone();
+    duplicate_voter.signature.voter_id = 1;
+    assert!(verify_quorum_voter_attestations(&trust, auth.repo_id, &[one.clone(), duplicate_voter]).is_err());
+
+    let mut duplicate_key = two;
+    duplicate_key.signature.voter_pubkey_hex = one.signature.voter_pubkey_hex.clone();
+    assert!(verify_quorum_voter_attestations(&trust, auth.repo_id, &[one, duplicate_key]).is_err());
+}
+
+#[test]
+fn conflicting_snapshots_cannot_reach_a_quorum() {
+    let auth = authority_record();
+    let a = seeded_snapshot(&auth, 10, None);
+    let b = seeded_snapshot(&auth, 10, Some(7));
+    assert_ne!(a.checksum, b.checksum);
+    let trust = test_trust_config(&auth);
+    let split = [attestation(1, &auth, 10, &a), attestation(2, &auth, 10, &b)];
+    assert!(verify_quorum_voter_attestations(&trust, auth.repo_id, &split).is_err());
+    let consistent = [attestation(1, &auth, 10, &a), attestation(2, &auth, 10, &a)];
+    let (group_id, sm, quorum) = verify_quorum_voter_attestations(&trust, auth.repo_id, &consistent).unwrap();
+    assert_eq!(group_id, 0);
+    assert_eq!(sm.last_applied(), Some(AppliedLogId { term: 1, index: 10 }));
+    assert_eq!(quorum.quorum_threshold, 2);
+    assert_eq!(quorum.snapshot_checksum, a.checksum);
+    quorum.verify(auth.repo_id, 1).unwrap();
+}
+
+#[test]
+fn untrusted_voters_and_history_mismatch_are_rejected() {
+    let auth = authority_record();
+    let snapshot = seeded_snapshot(&auth, 10, None);
+    let mut trust = test_trust_config(&auth);
+    let good = [attestation(1, &auth, 10, &snapshot), attestation(2, &auth, 10, &snapshot)];
+    let (_, _, quorum) = verify_quorum_voter_attestations(&trust, auth.repo_id, &good).unwrap();
+    quorum.verify_against_trusted_voters(auth.repo_id, 1, auth.history_id, &trust.trusted_consensus_voters, 2).unwrap();
+
+    trust.trusted_consensus_voters[1].ed25519_pubkey_hex = voter_signer(3).pubkey_hex().to_owned();
     assert!(
-        QuorumCommitEvidence::sign(&signer, authority_id, 1, 0, 1, 10, sha("snapshot"), vec![voter.clone(), voter])
+        quorum
+            .verify_against_trusted_voters(auth.repo_id, 1, auth.history_id, &trust.trusted_consensus_voters, 2)
+            .is_err()
+    );
+    trust.trusted_consensus_voters = test_trusted_voters();
+    assert!(
+        quorum
+            .verify_against_trusted_voters(auth.repo_id, 1, Uuid::new_v4(), &trust.trusted_consensus_voters, 2)
+            .is_err()
+    );
+    assert!(
+        quorum
+            .verify_against_trusted_voters(auth.repo_id, 1, auth.history_id, &trust.trusted_consensus_voters, 3)
             .is_err()
     );
 
+    let stranger = SafeGcEd25519Signer::from_seed([0x74; 32]).unwrap();
+    let foreign = sign_single_voter_cutpoint_attestation(
+        &stranger,
+        &VoterCutpointClaims {
+            voter_id: 2,
+            key_id: 1,
+            group_id: 0,
+            history_incarnation: auth.history_id,
+            group_epoch: 1,
+            authority_epoch: 1,
+            raft_term: 1,
+            committed_log_index: 10,
+            raft_commit_digest_hex: sha("raft-commit"),
+        },
+        &snapshot,
+    )
+    .unwrap();
+    assert!(
+        verify_single_voter_cutpoint_attestation(
+            &trust.trusted_consensus_voters[1],
+            auth.repo_id,
+            auth.tenant_id,
+            auth.history_id,
+            &foreign
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn trust_bundle_provisioning_keeps_only_the_arm_seed_on_the_worker_volume() {
+    let dir = tempdir().unwrap();
+    let auth = authority_record();
+    let trust = SafeGcRepoTrustConfig::provision_distributed(
+        dir.path(),
+        auth.tenant_id,
+        auth.repo_id,
+        auth.history_id,
+        &test_arm_signer(),
+        2,
+        test_trusted_voters(),
+        (test_hold_bridge_signer().pubkey_hex(), test_backup_signer().pubkey_hex()),
+    )
+    .unwrap();
+    assert_eq!(SafeGcRepoTrustConfig::load(dir.path(), auth.repo_id).unwrap(), trust);
+    assert!(SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "arm").is_file());
+    for kind in ["quorum", "bridge", "backup", "voter"] {
+        assert!(!SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, kind).exists());
+    }
+
+    let lane = make_test_dist_lane(&auth, 10, &sample_holds(), SafeGcObjectFormat::Sha1);
+    let arm = SafeGcArmReceipt::seal(
+        &test_arm_signer(),
+        auth.tenant_id,
+        auth.repo_id,
+        auth.history_id,
+        auth.incarnation_id,
+        1,
+        true,
+        lane,
+    )
+    .unwrap();
+    trust.verify_arm_against_trust(&arm).unwrap();
+
+    let mut wrong_repo = arm;
+    wrong_repo.repo_id = Uuid::new_v4();
+    assert!(trust.verify_arm_against_trust(&wrong_repo).is_err());
+
+    let bad_threshold = SafeGcRepoTrustConfig::provision_distributed(
+        dir.path(),
+        auth.tenant_id,
+        auth.repo_id,
+        auth.history_id,
+        &test_arm_signer(),
+        1,
+        test_trusted_voters(),
+        (test_hold_bridge_signer().pubkey_hex(), test_backup_signer().pubkey_hex()),
+    );
+    assert!(matches!(bad_threshold, Err(super::super::SafeGcError::ArmingRejected(_))));
+
+    let mut duplicate = test_trusted_voters();
+    duplicate[1].voter_id = duplicate[0].voter_id;
+    let dup = SafeGcRepoTrustConfig::provision_distributed(
+        dir.path(),
+        auth.tenant_id,
+        auth.repo_id,
+        auth.history_id,
+        &test_arm_signer(),
+        2,
+        duplicate,
+        (test_hold_bridge_signer().pubkey_hex(), test_backup_signer().pubkey_hex()),
+    );
+    assert!(matches!(dup, Err(super::super::SafeGcError::ArmingRejected(_))));
+
+    let reuse_arm_key = SafeGcRepoTrustConfig::provision_distributed(
+        dir.path(),
+        auth.tenant_id,
+        auth.repo_id,
+        auth.history_id,
+        &test_arm_signer(),
+        2,
+        test_trusted_voters(),
+        (test_arm_signer().pubkey_hex(), test_backup_signer().pubkey_hex()),
+    );
+    assert!(matches!(reuse_arm_key, Err(super::super::SafeGcError::ArmingRejected(_))));
+}
+
+#[test]
+fn hold_bridge_evidence_rejects_wrong_holds_and_zero_sequence() {
+    let signer = test_hold_bridge_signer();
+    let authority_id = Uuid::new_v4();
+    let holds = sample_holds();
     let bridge = HoldBridgeEvidence::sign(&signer, authority_id, 1, 10, &holds).unwrap();
     bridge.verify(authority_id, 1).unwrap();
     let mut different_holds = holds.clone();
     different_holds[0].registered_seq = 2;
-    assert_ne!(super::compute_holds_digest(&holds), super::compute_holds_digest(&different_holds));
+    assert_ne!(compute_holds_digest(&holds), compute_holds_digest(&different_holds));
     assert!(matches!(
         HoldBridgeEvidence::sign(&signer, authority_id, 1, 0, &holds),
         Err(super::super::SafeGcError::DistributedPrereqsMissing(_))
@@ -163,7 +421,7 @@ fn quorum_and_hold_bridge_evidence_reject_tampering_and_wrong_holds() {
 
 #[test]
 fn backup_root_evidence_rejects_forged_oids_and_epochs() {
-    let signer = test_arm_signer();
+    let signer = test_backup_signer();
     let authority_id = Uuid::new_v4();
     let evidence =
         BackupRootEvidence::sign(&signer, authority_id, 1, 1, sha("backup"), vec!["a".repeat(40), "b".repeat(40)])
@@ -179,130 +437,6 @@ fn backup_root_evidence_rejects_forged_oids_and_epochs() {
     assert!(wrong_epoch.verify(authority_id, 1).is_err());
 }
 
-#[test]
-fn distributed_lane_rejects_async_projection_and_missing_evidence() {
-    let authority_id = Uuid::new_v4();
-    let lane = make_test_dist_lane(authority_id, 1, 10, &[], SafeGcObjectFormat::Sha1);
-    lane.validate_for_destructive_gc().unwrap();
-
-    let AuthorityLane::DistributedRefCas {
-        ref_cas_authority_id,
-        quorum_epoch,
-        quorum_evidence,
-        hold_bridge_evidence,
-        backup_root_evidence,
-        ..
-    } = lane
-    else {
-        unreachable!()
-    };
-    let mut no_backup = backup_root_evidence;
-    no_backup.protected_root_oids.clear();
-    let bad = AuthorityLane::DistributedRefCas {
-        ref_cas_authority_id,
-        quorum_epoch,
-        raft_commit_index: 10,
-        quorum_evidence: quorum_evidence.clone(),
-        hold_bridge_evidence: hold_bridge_evidence.clone(),
-        backup_root_evidence: no_backup,
-        async_projection_only: false,
-    };
-    assert!(matches!(bad.validate_for_destructive_gc(), Err(super::super::SafeGcError::DistributedPrereqsMissing(_))));
-    let async_only = AuthorityLane::DistributedRefCas {
-        ref_cas_authority_id,
-        quorum_epoch,
-        raft_commit_index: 10,
-        quorum_evidence,
-        hold_bridge_evidence,
-        backup_root_evidence: Box::new(
-            BackupRootEvidence::sign(&test_backup_signer(), authority_id, 1, 1, sha("backup"), vec!["a".repeat(40)])
-                .unwrap(),
-        ),
-        async_projection_only: true,
-    };
-    assert!(async_only.validate_for_destructive_gc().is_err());
-}
-
-#[test]
-fn trust_bundle_and_keyring_provisioning_reject_mismatched_identity() {
-    let dir = tempdir().unwrap();
-    let auth = authority_record();
-    let trust = SafeGcRepoTrustConfig::provision_single_node(
-        dir.path(),
-        auth.tenant_id,
-        auth.repo_id,
-        auth.history_id,
-        &test_arm_signer(),
-    )
-    .unwrap();
-    assert_eq!(SafeGcRepoTrustConfig::load(dir.path(), auth.repo_id).unwrap(), trust);
-
-    let lane = AuthorityLane::SingleNodePg {
-        pg_authority_id: auth.repo_id,
-        pg_tx_seq: 1,
-        pg_gc_fence_epoch: 1,
-        reader_barrier_epoch: 1,
-    };
-    let arm = SafeGcArmReceipt::seal(
-        &test_arm_signer(),
-        auth.tenant_id,
-        auth.repo_id,
-        auth.history_id,
-        auth.incarnation_id,
-        1,
-        true,
-        lane,
-    )
-    .unwrap();
-    trust.verify_arm_against_trust(&arm).unwrap();
-    let mut wrong_repo = arm;
-    wrong_repo.repo_id = Uuid::new_v4();
-    assert!(trust.verify_arm_against_trust(&wrong_repo).is_err());
-
-    let keyring = dir.path().join("keyring");
-    std::fs::create_dir_all(&keyring).unwrap();
-    write_refcas_group_keyring_dir(
-        &keyring,
-        1,
-        auth.history_id,
-        2,
-        &[(1, 0, [0x11; 32]), (2, 0, [0x12; 32]), (3, 0, [0x13; 32])],
-    )
-    .unwrap();
-    let bridge = test_hold_bridge_signer();
-    let backup = test_backup_signer();
-    let dist_trust = SafeGcRepoTrustConfig::provision_distributed(
-        dir.path(),
-        auth.tenant_id,
-        auth.repo_id,
-        auth.history_id,
-        (&test_arm_signer(), &test_arm_signer()),
-        (bridge.pubkey_hex(), backup.pubkey_hex()),
-        &keyring,
-    )
-    .unwrap();
-    assert!(SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "arm").is_file());
-    assert!(SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "quorum").is_file());
-    assert!(!SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "bridge").exists());
-    assert!(!SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "backup").exists());
-    let dist_arm = SafeGcArmReceipt::seal(
-        &test_arm_signer(),
-        auth.tenant_id,
-        auth.repo_id,
-        auth.history_id,
-        auth.incarnation_id,
-        1,
-        true,
-        make_test_dist_lane(auth.repo_id, 1, 10, &sample_holds(), SafeGcObjectFormat::Sha1),
-    )
-    .unwrap();
-    dist_trust.verify_arm_against_trust(&dist_arm).unwrap();
-    let verifier =
-        crate::ref_store::core::artifact_hold::reconcile_proof::GroupConsensusVerifier::from_keyring_dir(&keyring)
-            .unwrap();
-    assert_eq!(verifier.group_count(), 1);
-}
-
 #[tokio::test]
 async fn install_to_commit_abort_leaves_pending_decision_and_publishes_cutpoint() {
     use crate::pulls::remote_merge_finalizer::unit_tests::{build_spec_and_pull, setup_fixture};
@@ -310,7 +444,6 @@ async fn install_to_commit_abort_leaves_pending_decision_and_publishes_cutpoint(
         AuthorityCommitOutcome, MergeAuthorityBackend, verify_pull_remote_authz_grant,
     };
     use crate::ref_store::core::state_machine::SmDecisionState;
-    use crate::ref_store::core::types::GitObjectFormat;
     use crate::storage_lifecycle::safe_gc::safe_gc_refcas_cutpoint_path;
 
     let dir = tempdir().unwrap();

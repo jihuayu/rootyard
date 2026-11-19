@@ -1,6 +1,6 @@
 //! Fenced physical delete executor, staging cleanup & crash-restart reconciliation (#122).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -34,6 +34,12 @@ pub enum DeleteFaultHook {
     MutateAfterTicketBeforeProviderDelete(PostTicketDriftFault),
     BumpLeaseEpochAfterProviderDeleteBeforeCommit,
     SimulateCrashAfterDeletes(usize),
+    /// Publish a readiness marker after N confirmed deletes, then block until an
+    /// external watchdog `SIGKILL`s this process (hard process-death recovery test).
+    PauseAfterDeletesForExternalKill {
+        after_deletes: usize,
+        ready_marker_path: std::path::PathBuf,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +252,19 @@ async fn drive_pending_batch_ctx(
         }
         apply_pre_ticket_fault(ctx.authority, &mut fault, deleted_this_pass)?;
 
+        if let DeleteFaultHook::PauseAfterDeletesForExternalKill { after_deletes, ready_marker_path } = &fault
+            && deleted_this_pass >= *after_deletes
+        {
+            let marker = serde_json::json!({
+                "pid": std::process::id(),
+                "batch_id": batch.batch_id,
+                "deleted_this_pass": deleted_this_pass,
+            });
+            write_ready_marker(ready_marker_path, &marker)?;
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            return Err(SafeGcError::Io("external kill after deletes never arrived".into()));
+        }
+
         if let DeleteFaultHook::SimulateCrashAfterDeletes(limit) = fault
             && deleted_this_pass >= limit
         {
@@ -338,6 +357,13 @@ fn find_retired_locator_for_key(
         }
     }
     None
+}
+
+fn write_ready_marker(path: &std::path::Path, marker: &serde_json::Value) -> Result<(), SafeGcError> {
+    let bytes = serde_json::to_vec(marker).map_err(|e| SafeGcError::Serialization(e.to_string()))?;
+    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    std::fs::write(&tmp, &bytes).map_err(|e| SafeGcError::Io(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| SafeGcError::Io(e.to_string()))
 }
 
 fn apply_post_ticket_fault(authority: &DurableSafeGcAuthority, fault: PostTicketDriftFault) -> Result<(), SafeGcError> {

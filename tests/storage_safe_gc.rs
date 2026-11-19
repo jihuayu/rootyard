@@ -235,7 +235,7 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
         let live_snap = authority.snapshot();
         let cur_seq = live_snap.authority.live_ref_seq;
         let lane = if distributed {
-            test_dist_lane(auth.repo_id, 1, cur_seq, &live_snap.global_holds, fmt)
+            test_dist_lane(auth.tenant_id, auth.repo_id, auth.history_id, 1, cur_seq, &live_snap.global_holds, fmt)
         } else {
             AuthorityLane::SingleNodePg {
                 pg_authority_id: auth.repo_id,

@@ -1,4 +1,4 @@
-//! Real PG17 + `RefCasStateMachine` + migration-149 `ref_cas_projection_cursors` cut acceptance (#122).
+//! Real PG17 + live Raft Ref-CAS + migration-149 `ref_cas_projection_cursors` cut acceptance (#122).
 
 use std::{
     sync::{Arc, atomic::Ordering},
@@ -21,28 +21,28 @@ use rootyard::{
             domain::AuthorityRecord,
             model::{GcMode, SafeGcObjectFormat, SourceFreshness},
             pg_maintenance::safe_gc_journal_path,
-            pg_maintenance_dist::InMemoryRefCasCutpointSource,
+            pg_maintenance_dist::{InMemoryRefCasCutpointSource, persist_refcas_cutpoint_snapshot},
             pg_reconcile::reconcile_pg_refstore_authority,
             refcas_cut::reconcile_refcas_cut_with_pg,
-            safe_gc_refcas_cutpoint_path,
             store::DurableSafeGcAuthority,
         },
         scheduler, worker,
     },
 };
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use uuid::Uuid;
 
 use super::{
     PG_SAFE_GC_TEST_LOCK, app_config,
     dist_auth_harness::{
-        provision_distributed_trust, seal_test_lane_arm, test_arm_signer, test_dist_lane,
-        write_refcas_group_keyring_dir,
+        assert_worker_volume_has_no_external_signing_keys, provision_distributed_trust, seal_test_lane_arm,
+        test_arm_signer, test_dist_lane, test_trusted_voters,
     },
     isolated_pg_pool,
-    pg_refcas_merge_fixture::{force_scan_and_schedule, production_refcas_pr_merge},
+    pg_refcas_merge_fixture::{build_refcas_merge_rig, force_scan_and_schedule, production_refcas_pr_merge},
     provision_pg_refstore_repo,
+    raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin},
     s3_harness::{LoopbackS3, build_pack_via_opendal, build_snapshot, git_cmd, make_serving_record},
     test_policy,
 };
@@ -71,6 +71,7 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         );
         return Ok(());
     };
+    let Some(node_bin) = resolve_raft_node_bin()? else { return Ok(()) };
 
     let s3 = LoopbackS3::shared();
     let (blob_store, provider) = s3.open_store_and_provider()?;
@@ -88,6 +89,20 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         transfer_metrics: Arc::new(metrics::TransferCounters::default()),
         git_slots: Arc::new(Semaphore::new(2)),
     });
+    let cluster = Arc::new(AsyncMutex::new(LiveRaftVoterCluster::start(node_bin).await?));
+    let trusted_voters = cluster.lock().await.trusted_voters();
+    let pinned = test_trusted_voters();
+    assert_eq!(trusted_voters.len(), pinned.len());
+    for (live, expected) in trusted_voters.iter().zip(&pinned) {
+        assert_eq!(
+            (live.voter_id, &live.ed25519_pubkey_hex),
+            (expected.voter_id, &expected.ed25519_pubkey_hex),
+            "the live voters must match the keys used to seal the initial test arm"
+        );
+    }
+    provision_distributed_trust(&state.storage.root, tenant_id, repo_id, history_id, 2, trusted_voters)?;
+    assert_worker_volume_has_no_external_signing_keys(&state.storage.root, repo_id);
+
     let journal = safe_gc_journal_path(&state.storage.root, repo_id);
     let dl = Instant::now() + Duration::from_secs(60);
 
@@ -117,16 +132,7 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         build_pack_via_opendal(&provider, &git_repo, &dir.path().join("so"), "HEAD", (tenant_id, repo_id, 1), dl)
             .await?;
 
-    let keyring_dir = dir.path().join("refcas-keyring");
-    std::fs::create_dir_all(&keyring_dir)?;
-    write_refcas_group_keyring_dir(
-        &keyring_dir,
-        0,
-        history_id,
-        2,
-        &[(1, 0, [0x11; 32]), (2, 0, [0x12; 32]), (3, 0, [0x13; 32])],
-    )?;
-    provision_distributed_trust(&state.storage.root, tenant_id, repo_id, history_id, &keyring_dir)?;
+    let rig = build_refcas_merge_rig(Arc::clone(&cluster), tenant_id, repo_id, history_id, &base_oid).await?;
 
     let auth_rec = AuthorityRecord {
         tenant_id,
@@ -198,13 +204,14 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         .execute("UPDATE ref_store_core_refs SET revision = 50 WHERE repository_id = $1", &[&repo_id])
         .await?;
     let armed = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
+    let armed_snap = armed.snapshot();
     let lane_arm = seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
-        test_dist_lane(repo_id, 1, 4, &[], SafeGcObjectFormat::Sha1),
+        test_dist_lane(tenant_id, repo_id, history_id, 1, 1, &armed_snap.global_holds, SafeGcObjectFormat::Sha1),
     )?;
     armed.set_gc_mode(GcMode::ArmedDestructive(Box::new(lane_arm)))?;
     drop(armed);
@@ -212,23 +219,38 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");
     }
 
-    // Gate A: armed DistributedRefCas with no authoritative RefCasCutpointSource fails closed.
-    gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate A").await?;
-    assert!(!safe_gc_refcas_cutpoint_path(&state.storage.root, repo_id).is_file());
-    assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
+    // Gate A: a sealed on-volume cutpoint exists, but zero voters answer: fail closed, no fallback.
+    let sm_seed = cluster.lock().await.state_machine().await?;
+    let sealed = persist_refcas_cutpoint_snapshot(&state.storage.root, repo_id, 0, &sm_seed, &[])?;
+    assert!(sealed.is_file());
+    gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate A (0-of-3)").await?;
+    assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph), "gate A deleted objects");
+    assert!(sealed.is_file(), "the sealed audit file must never be promoted to a cutpoint");
 
-    // The production PR-merge Ref-CAS commit path publishes the sealed cutpoint snapshot.
-    let sm = production_refcas_pr_merge(&state, tenant_id, repo_id, history_id, &base_oid, &main_oid).await?;
-    assert!(safe_gc_refcas_cutpoint_path(&state.storage.root, repo_id).is_file());
-    assert_eq!(sm.last_applied().context("Ref-CAS last_applied")?.index, 4);
+    // Gate A2: only one of three independent voters accepts: 1-of-3 can never reach the threshold.
+    cluster.lock().await.set_voter_enabled(1, true);
+    gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate A2 (1-of-3)").await?;
+    assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph), "gate A2 deleted objects");
+
+    // The production PR-merge Ref-CAS commit path writes the OpenRaft log (no sealed file fallback).
+    let sm = production_refcas_pr_merge(&rig, &base_oid, &main_oid).await?;
     let events: Vec<(u64, u64)> = sm.snapshot()?.body.events.iter().map(|ev| (ev.event_seq, ev.log_index)).collect();
-    assert_eq!(events, vec![(1, 2), (2, 4)]);
+    ensure!(events.len() == 2, "expected the seed and PR-merge Ref-CAS events, got {events:?}");
+    let (seed_seq, seed_idx) = events[0];
+    let (merge_seq, merge_idx) = events[1];
+    assert_eq!((seed_seq, merge_seq), (1, 2));
+    assert_eq!(sm.last_applied().context("Ref-CAS last_applied")?.index, merge_idx);
+    assert!(seed_idx < merge_idx);
 
-    // Gate B: sealed cutpoint exists but PG `ref_cas_projection_cursors` row is missing.
+    // Two of three independent voters now answer, and voter 3 stays disabled.
+    cluster.lock().await.set_voter_enabled(2, true);
+    assert_eq!(cluster.lock().await.enabled_voter_ids(), vec![1, 2]);
+
+    // Gate B: the live quorum cutpoint exists but PG `ref_cas_projection_cursors` is missing.
     gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate B").await?;
     assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
 
-    // Gate C: genesis cursor event_seq=0 vs Ref-CAS event_seq=2 must fail closed.
+    // Gate C: genesis cursor event_seq=0 vs the quorum Ref-CAS event_seq=2 must fail closed.
     let realm = ProjectionRealm::new(history_id, 0, 1)?;
     let mut tx_conn = pool.get().await?;
     let tx = tx_conn.transaction().await?;
@@ -242,6 +264,7 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         Err(SafeGcError::IncompleteProof(_))
     ));
     drop(pgc);
+    drop(auth);
     gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate C").await?;
     assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
 
@@ -275,7 +298,7 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     assert_eq!(gate_d_mem.state, "failed");
     assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
 
-    // Gate E: resolve projection jobs; the production FsSealed source path authorizes the sweep.
+    // Gate E: resolve projection jobs; the independent 2-of-3 voter quorum authorizes the sweep.
     pool.get()
         .await?
         .execute(
@@ -291,8 +314,8 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     let res_json: serde_json::Value =
         pgc.query_one("SELECT result FROM storage_maintenance_jobs WHERE id = $1", &[&sweep_out.job_id]).await?.get(0);
     assert_eq!(res_json["authority_lane"], "distributed_refcas");
-    assert_eq!(res_json["refcas_cut_event_seq"], 2);
-    assert_eq!(res_json["refcas_cut_log_index"], 4);
+    assert_eq!(res_json["refcas_cut_event_seq"].as_u64(), Some(2));
+    assert_eq!(res_json["refcas_cut_log_index"].as_u64(), Some(merge_idx));
     drop(pgc);
 
     // A second pass with a caller-supplied (non-production) cutpoint source must not
@@ -308,6 +331,7 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     let reloaded = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
     let cut = reloaded.snapshot().paired_cursors.refcas_cut.expect("persisted RefCasReconciledCut");
     assert_eq!(cut.sm_applied_event_seq, 2);
+    assert_eq!(cut.sm_applied_log_index, merge_idx);
 
     // A later pass with projected cursors must never carry this cut forward as Reconciled.
     let pgc_reset = pool.get().await?;

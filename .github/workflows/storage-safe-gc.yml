@@ -11,6 +11,7 @@ on:
       - 'src/storage_lifecycle/worker.rs'
       - 'src/storage_lifecycle/safe_gc.rs'
       - 'src/storage_lifecycle/safe_gc/**'
+      - 'crates/refcas-log/**'
       - 'tests/storage_safe_gc.rs'
       - 'tests/storage_safe_gc_maintenance.rs'
       - 'tests/storage_safe_gc_support/**'
@@ -53,6 +54,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_safegc122
       ROOTYARD_SAFE_GC_REQUIRE_PG: '1'
+      ROOTYARD_REFCAS_NODE_BIN: ${{ github.workspace }}/crates/refcas-log/target/debug/raft-node
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,6 +106,10 @@ jobs:
           cargo fmt --all -- --check
           python3 scripts/check_design_docs.py
           python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_storage_safe_gc_contracts.py
+      - name: Build the pinned raft-node test binary
+        run: |
+          cargo build --locked --manifest-path crates/refcas-log/Cargo.toml --bin raft-node
+          test -x "$ROOTYARD_REFCAS_NODE_BIN"
       - name: Run Clippy, unit tests, and stock-Git PG17 OpenDAL Safe GC integration tests
         run: |
           cargo clippy --locked --no-default-features --lib --test storage_safe_gc --test storage_safe_gc_maintenance -- -D warnings

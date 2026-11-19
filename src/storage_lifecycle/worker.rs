@@ -64,6 +64,9 @@ async fn run_once_scoped_with_refcas(
     };
     let fallback = production_source.as_ref().map(|source| source as &dyn super::safe_gc::RefCasCutpointSource);
     let refcas_source = refcas_source.or(fallback);
+    // A hard `SIGKILL` leaves an expired `running` row and a stale `gc_owner`
+    // behind; reap before claiming so a cold worker resumes without manual SQL.
+    super::safe_gc::pg_maintenance::reap_expired_pg_refstore_jobs(&state.pool).await?;
     // Observe a claim failure inside the Claim scope before `?` drops it, so
     // the event keeps the worker, the fixed phase and any SQLSTATE.
     let Some(job) = observability::worker::run(operation, Phase::Claim, async {

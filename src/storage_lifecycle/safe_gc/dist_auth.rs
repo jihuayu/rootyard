@@ -1,9 +1,9 @@
 //! Ed25519-authenticated distributed authority for Safe GC (#122/#151/#153).
 //!
-//! `DistributedRefCas` arming binds non-deserializable Ed25519 signers, `#151`
-//! `GroupConsensusVerifier`-authenticated quorum snapshots, hold-bridge evidence and `#153`
-//! backup-root evidence. Seeds are raw 32-byte `0600` files; keyrings are absolute `0700`
-//! directories with a `0600` manifest and `0600` voter keys.
+//! `DistributedRefCas` arming binds a non-deserializable Ed25519 arm signer, independently
+//! operated voter public keys, `#151` hold-bridge evidence and `#153` backup-root evidence.
+//! The worker volume holds exactly one arm seed: voter, quorum, bridge and backup signers are
+//! external, so no local directory can mint a quorum cutpoint.
 
 use std::{
     fmt,
@@ -17,30 +17,38 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::ref_store::core::state_machine::{RefCasSnapshot, RefCasStateMachine};
-
-use super::{
-    SafeGcError,
-    model::{AuthorityLane, PairedCursorReconciliation, SafeGcArmReceipt, SourceFreshness},
-};
+use super::SafeGcError;
+use super::model::{AuthorityLane, PairedCursorReconciliation, SafeGcArmReceipt, SourceFreshness};
 
 #[path = "dist_evidence.rs"]
 mod evidence;
 #[path = "dist_keyring.rs"]
 mod keyring;
+#[path = "dist_trust_migration.rs"]
+mod migration;
 
-pub use evidence::{BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, compute_holds_digest};
+pub use evidence::{
+    BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, QuorumCommitSeal, compute_holds_digest,
+};
 pub use keyring::{
-    sign_snapshot_with_keyring_dir, verify_attested_snapshot_with_keyring, write_refcas_group_keyring_dir,
+    TrustedConsensusVoter, VoterCutpointAttestation, VoterCutpointClaims, VoterCutpointSignature,
+    fetch_quorum_cutpoint_from_voters, sign_single_voter_cutpoint_attestation, verify_quorum_voter_attestations,
+    verify_single_voter_cutpoint_attestation,
 };
 
 const SEED_BYTES: usize = 32;
+/// Hard ceiling for the repository trust document stored on the worker volume.
+const MAX_TRUST_DOCUMENT_BYTES: usize = 64 * 1024;
 
 fn io_error(err: std::io::Error) -> SafeGcError {
     SafeGcError::Io(err.to_string())
 }
 
-fn is_lower_hex(value: &str, len: usize) -> bool {
+fn invalid_pubkey() -> SafeGcError {
+    SafeGcError::ArmingRejected("invalid Ed25519 public key hex")
+}
+
+pub(crate) fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
@@ -51,21 +59,6 @@ fn ensure_private_dir(dir: &Path) -> Result<(), SafeGcError> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
         if fs::metadata(dir).map_err(io_error)?.mode() & 0o777 != 0o700 {
-            return Err(SafeGcError::ArmingRejected("safe-gc trust directory must be 0700"));
-        }
-    }
-    Ok(())
-}
-
-fn verify_private_dir(dir: &Path) -> Result<(), SafeGcError> {
-    let meta = fs::metadata(dir).map_err(io_error)?;
-    if !meta.is_dir() {
-        return Err(SafeGcError::ArmingRejected("safe-gc trust path must be a directory"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.mode() & 0o777 != 0o700 {
             return Err(SafeGcError::ArmingRejected("safe-gc trust directory must be 0700"));
         }
     }
@@ -99,6 +92,9 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), SafeGcError> {
 
 fn read_private_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, SafeGcError> {
     let meta = fs::metadata(path).map_err(io_error)?;
+    if !meta.is_file() || meta.len() > max_bytes as u64 {
+        return Err(SafeGcError::ArmingRejected("safe-gc private file missing or over its size bound"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -106,18 +102,13 @@ fn read_private_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, SafeGcErr
             return Err(SafeGcError::ArmingRejected("safe-gc secret file must be 0600"));
         }
     }
-    if meta.len() as usize > max_bytes {
-        return Err(SafeGcError::ArmingRejected("safe-gc secret file exceeds size bound"));
+    let mut bytes = Vec::new();
+    let read_limit = max_bytes as u64 + 1;
+    fs::File::open(path).map_err(io_error)?.take(read_limit).read_to_end(&mut bytes).map_err(io_error)?;
+    if bytes.len() > max_bytes {
+        return Err(SafeGcError::ArmingRejected("safe-gc private file exceeds its size bound"));
     }
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    OpenOptions::new().read(true).open(path).map_err(io_error)?.read_to_end(&mut bytes).map_err(io_error)?;
     Ok(bytes)
-}
-
-fn read_private_json<T: for<'de> Deserialize<'de>>(path: &Path, max_bytes: usize) -> Result<T, SafeGcError> {
-    let bytes = read_private_file(path, max_bytes)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| SafeGcError::Serialization("invalid safe-gc private JSON document".into()))
 }
 
 /// Ed25519 signer whose raw seed is zeroized on drop and never printed by `Debug`.
@@ -172,16 +163,11 @@ impl SafeGcEd25519Signer {
 }
 
 pub fn validate_ed25519_pubkey_hex(pubkey_hex: &str) -> Result<[u8; SEED_BYTES], SafeGcError> {
-    if !is_lower_hex(pubkey_hex, 64) {
-        return Err(SafeGcError::ArmingRejected("invalid Ed25519 public key hex"));
+    if !is_lower_hex(pubkey_hex, 64) || pubkey_hex.bytes().all(|b| b == b'0') {
+        return Err(invalid_pubkey());
     }
-    let decoded = hex::decode(pubkey_hex).map_err(|_| SafeGcError::ArmingRejected("invalid Ed25519 public key hex"))?;
-    let key: [u8; SEED_BYTES] =
-        decoded.try_into().map_err(|_| SafeGcError::ArmingRejected("invalid Ed25519 public key hex"))?;
-    if key.iter().all(|&byte| byte == 0) {
-        return Err(SafeGcError::ArmingRejected("invalid Ed25519 public key hex"));
-    }
-    Ok(key)
+    let decoded = hex::decode(pubkey_hex).map_err(|_| invalid_pubkey())?;
+    decoded.try_into().map_err(|_| invalid_pubkey())
 }
 
 pub fn verify_ed25519_domain(
@@ -212,10 +198,11 @@ pub struct SafeGcRepoTrustConfig {
     pub tenant_id: Uuid,
     pub history_id: Uuid,
     pub trusted_arm_pubkey_hex: String,
-    pub trusted_quorum_pubkey_hex: Option<String>,
+    pub quorum_threshold: Option<usize>,
     pub trusted_hold_bridge_pubkey_hex: Option<String>,
     pub trusted_backup_pubkey_hex: Option<String>,
-    pub refcas_keyring_dir: Option<String>,
+    #[serde(default)]
+    pub trusted_consensus_voters: Vec<TrustedConsensusVoter>,
 }
 
 impl SafeGcRepoTrustConfig {
@@ -233,7 +220,11 @@ impl SafeGcRepoTrustConfig {
 
     fn write_config(storage_root: &Path, config: &Self) -> Result<(), SafeGcError> {
         let bytes = serde_json::to_vec_pretty(config).map_err(|e| SafeGcError::Serialization(e.to_string()))?;
-        write_private_file(&Self::config_path(storage_root, config.repo_id), &bytes)
+        let dir = Self::trust_dir(storage_root);
+        ensure_private_dir(&dir)?;
+        let tmp = dir.join(format!("{}.tmp-{}", config.repo_id, Uuid::new_v4()));
+        write_private_file(&tmp, &bytes)?;
+        fs::rename(&tmp, Self::config_path(storage_root, config.repo_id)).map_err(io_error)
     }
 
     pub fn provision_single_node(
@@ -248,10 +239,10 @@ impl SafeGcRepoTrustConfig {
             tenant_id,
             history_id,
             trusted_arm_pubkey_hex: arm_signer.pubkey_hex().to_owned(),
-            trusted_quorum_pubkey_hex: None,
+            quorum_threshold: None,
             trusted_hold_bridge_pubkey_hex: None,
             trusted_backup_pubkey_hex: None,
-            refcas_keyring_dir: None,
+            trusted_consensus_voters: Vec::new(),
         };
         config.validate_identity()?;
         arm_signer.write_seed_file(&Self::seed_path(storage_root, repo_id, "arm"))?;
@@ -259,34 +250,32 @@ impl SafeGcRepoTrustConfig {
         Ok(config)
     }
 
+    /// Provision independent voter trust; the worker volume receives ONLY `{repo_id}.arm.seed`.
     pub fn provision_distributed(
         storage_root: &Path,
         tenant_id: Uuid,
         repo_id: Uuid,
         history_id: Uuid,
-        signers: (&SafeGcEd25519Signer, &SafeGcEd25519Signer),
+        arm_signer: &SafeGcEd25519Signer,
+        quorum_threshold: usize,
+        trusted_consensus_voters: Vec<TrustedConsensusVoter>,
         external_pubkeys: (&str, &str),
-        keyring_dir: &Path,
     ) -> Result<Self, SafeGcError> {
-        validate_ed25519_pubkey_hex(external_pubkeys.0)?;
-        validate_ed25519_pubkey_hex(external_pubkeys.1)?;
-        if !keyring_dir.is_absolute() {
-            return Err(SafeGcError::ArmingRejected("Ref-CAS keyring directory must be absolute"));
-        }
-        verify_private_dir(keyring_dir)?;
         let config = Self {
             repo_id,
             tenant_id,
             history_id,
-            trusted_arm_pubkey_hex: signers.0.pubkey_hex().to_owned(),
-            trusted_quorum_pubkey_hex: Some(signers.1.pubkey_hex().to_owned()),
+            trusted_arm_pubkey_hex: arm_signer.pubkey_hex().to_owned(),
+            quorum_threshold: Some(quorum_threshold),
             trusted_hold_bridge_pubkey_hex: Some(external_pubkeys.0.to_owned()),
             trusted_backup_pubkey_hex: Some(external_pubkeys.1.to_owned()),
-            refcas_keyring_dir: Some(keyring_dir.display().to_string()),
+            trusted_consensus_voters,
         };
         config.validate_identity()?;
-        signers.0.write_seed_file(&Self::seed_path(storage_root, repo_id, "arm"))?;
-        signers.1.write_seed_file(&Self::seed_path(storage_root, repo_id, "quorum"))?;
+        for kind in ["quorum", "bridge", "backup"] {
+            let _ = fs::remove_file(Self::seed_path(storage_root, repo_id, kind));
+        }
+        arm_signer.write_seed_file(&Self::seed_path(storage_root, repo_id, "arm"))?;
         Self::write_config(storage_root, &config)?;
         Ok(config)
     }
@@ -296,24 +285,61 @@ impl SafeGcRepoTrustConfig {
             return Err(SafeGcError::ArmingRejected("safe-gc trust identity must be non-nil"));
         }
         validate_ed25519_pubkey_hex(&self.trusted_arm_pubkey_hex)?;
-        for key in
-            [&self.trusted_quorum_pubkey_hex, &self.trusted_hold_bridge_pubkey_hex, &self.trusted_backup_pubkey_hex]
-                .into_iter()
-                .flatten()
-        {
+        let external = [self.trusted_hold_bridge_pubkey_hex.as_deref(), self.trusted_backup_pubkey_hex.as_deref()];
+        for key in external.into_iter().flatten() {
             validate_ed25519_pubkey_hex(key)?;
+            if key == self.trusted_arm_pubkey_hex {
+                return Err(SafeGcError::ArmingRejected("external evidence key must differ from the arm signer"));
+            }
+        }
+        if let (Some(bridge), Some(backup)) = (external[0], external[1])
+            && bridge == backup
+        {
+            return Err(SafeGcError::ArmingRejected("hold-bridge and backup evidence keys must be distinct"));
+        }
+        let Some(threshold) = self.quorum_threshold else {
+            return if self.trusted_consensus_voters.is_empty() {
+                Ok(())
+            } else {
+                Err(SafeGcError::ArmingRejected("trust pins independent voters without a quorum threshold"))
+            };
+        };
+        let voters = &self.trusted_consensus_voters;
+        if threshold < 2 || voters.len() < 2 || voters.len() > 32 {
+            return Err(SafeGcError::ArmingRejected("independent voter quorum requires two to 32 voters"));
+        }
+        if threshold < (voters.len() / 2) + 1 || threshold > voters.len() {
+            return Err(SafeGcError::ArmingRejected("quorum_threshold must be a strict majority <= voter count"));
+        }
+        if external[0].is_none() || external[1].is_none() {
+            return Err(SafeGcError::ArmingRejected("distributed trust requires external #151/#153 evidence keys"));
+        }
+        let mut voter_ids = std::collections::BTreeSet::new();
+        let mut pubkeys = std::collections::BTreeSet::new();
+        for voter in voters {
+            keyring::validate_trusted_voter(voter, &self.trusted_arm_pubkey_hex)?;
+            if !voter_ids.insert(voter.voter_id) || !pubkeys.insert(voter.ed25519_pubkey_hex.as_str()) {
+                return Err(SafeGcError::ArmingRejected("duplicate independent voter identity or public key"));
+            }
         }
         Ok(())
     }
 
     pub fn load(storage_root: &Path, repo_id: Uuid) -> Result<Self, SafeGcError> {
-        verify_private_dir(&Self::trust_dir(storage_root))?;
-        let config: Self = read_private_json(&Self::config_path(storage_root, repo_id), 64 * 1024)?;
-        if config.repo_id != repo_id {
-            return Err(SafeGcError::ArmingRejected("safe-gc trust bundle repository mismatch"));
+        let dir = Self::trust_dir(storage_root);
+        let meta = fs::metadata(&dir).map_err(io_error)?;
+        if !meta.is_dir() {
+            return Err(SafeGcError::ArmingRejected("safe-gc trust path must be a directory"));
         }
-        config.validate_identity()?;
-        Ok(config)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.mode() & 0o777 != 0o700 {
+                return Err(SafeGcError::ArmingRejected("safe-gc trust directory must be 0700"));
+            }
+        }
+        let bytes = read_private_file(&Self::config_path(storage_root, repo_id), MAX_TRUST_DOCUMENT_BYTES)?;
+        migration::parse_trust_or_reject_legacy(&bytes, repo_id)
     }
 
     pub fn verify_arm_against_trust(&self, arm: &SafeGcArmReceipt) -> Result<(), SafeGcError> {
@@ -326,16 +352,36 @@ impl SafeGcRepoTrustConfig {
                 "arm receipt Ed25519 public key not trusted by repository authority",
             ));
         }
-        if let AuthorityLane::DistributedRefCas { quorum_evidence, hold_bridge_evidence, backup_root_evidence, .. } =
-            &arm.lane
-            && (self.trusted_quorum_pubkey_hex.as_deref() != Some(quorum_evidence.quorum_pubkey_hex.as_str())
-                || self.trusted_hold_bridge_pubkey_hex.as_deref()
-                    != Some(hold_bridge_evidence.bridge_pubkey_hex.as_str())
-                || self.trusted_backup_pubkey_hex.as_deref() != Some(backup_root_evidence.backup_pubkey_hex.as_str()))
+        if let AuthorityLane::DistributedRefCas {
+            ref_cas_authority_id,
+            quorum_epoch,
+            quorum_evidence,
+            hold_bridge_evidence,
+            backup_root_evidence,
+            ..
+        } = &arm.lane
         {
-            return Err(SafeGcError::ArmingRejected(
-                "distributed arm evidence public keys not trusted by repository authority",
-            ));
+            let threshold = self.quorum_threshold.ok_or_else(|| {
+                SafeGcError::ArmingRejected("repository trust has no independent voter quorum threshold")
+            })?;
+            quorum_evidence
+                .verify_against_trusted_voters(
+                    *ref_cas_authority_id,
+                    *quorum_epoch,
+                    self.history_id,
+                    &self.trusted_consensus_voters,
+                    threshold,
+                )
+                .map_err(|_| {
+                    SafeGcError::ArmingRejected("independent voter quorum evidence is not authorized by pinned voters")
+                })?;
+            if self.trusted_hold_bridge_pubkey_hex.as_deref() != Some(hold_bridge_evidence.bridge_pubkey_hex.as_str())
+                || self.trusted_backup_pubkey_hex.as_deref() != Some(backup_root_evidence.backup_pubkey_hex.as_str())
+            {
+                return Err(SafeGcError::ArmingRejected(
+                    "distributed arm evidence public keys not trusted by repository authority",
+                ));
+            }
         }
         Ok(())
     }
@@ -387,15 +433,19 @@ pub(super) fn verify_distributed_cursor_coverage(
         ));
     };
     cut.verify_reconciled(history_id, refcas_floor, quorum_epoch)?;
-    if cut.group_id != quorum_evidence.group_id {
-        return Err(SafeGcError::IncompleteProof("RefCasReconciledCut disagrees with signed QuorumCommitEvidence"));
+    if quorum_evidence.history_incarnation != history_id {
+        return Err(SafeGcError::IncompleteProof(
+            "signed QuorumCommitEvidence history incarnation disagrees with the armed history",
+        ));
     }
-    if cut.sm_applied_log_index < quorum_evidence.committed_log_index {
+    if cut.group_id != quorum_evidence.group_id
+        || cut.sm_snapshot_checksum != quorum_evidence.snapshot_checksum
+        || cut.sm_applied_log_index < quorum_evidence.committed_log_index
+    {
         return Err(SafeGcError::IncompleteProof("RefCasReconciledCut disagrees with signed QuorumCommitEvidence"));
     }
     if cut.sm_applied_log_index == quorum_evidence.committed_log_index
-        && (cut.sm_applied_log_term != quorum_evidence.raft_term
-            || cut.sm_snapshot_checksum != quorum_evidence.snapshot_checksum)
+        && cut.sm_applied_log_term != quorum_evidence.raft_term
     {
         return Err(SafeGcError::IncompleteProof("RefCasReconciledCut disagrees with signed QuorumCommitEvidence"));
     }
@@ -416,12 +466,10 @@ pub(super) fn verify_distributed_cursor_coverage(
     Ok(())
 }
 
-/// Rebuild a state machine from an attested snapshot for live-authority cut capture.
-pub(super) fn restore_attested_state_machine(snapshot: &RefCasSnapshot) -> Result<RefCasStateMachine, SafeGcError> {
-    RefCasStateMachine::restore(snapshot)
-        .map_err(|_| SafeGcError::DistributedPrereqsMissing("attested RefCasSnapshot failed state-machine restore"))
-}
-
 #[cfg(test)]
 #[path = "tests_dist_auth.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "tests_dist_migration.rs"]
+mod migration_tests;

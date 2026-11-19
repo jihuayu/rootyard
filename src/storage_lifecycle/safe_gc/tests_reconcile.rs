@@ -479,7 +479,7 @@ fn distributed_arm(auth: &AuthorityRecord) -> SafeGcArmReceipt {
         auth.incarnation_id,
         auth.incarnation_epoch,
         true,
-        make_test_dist_lane(auth.repo_id, 1, 10, &[], SafeGcObjectFormat::Sha1),
+        make_test_dist_lane(auth, 10, &[], SafeGcObjectFormat::Sha1),
     )
     .unwrap()
 }

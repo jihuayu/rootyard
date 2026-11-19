@@ -62,6 +62,9 @@ pub use anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey};
 pub use compaction::{SafeGcCompactionRequest, SafeGcCompactionResult, execute_two_phase_compaction};
 pub use dist_auth::{
     BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcRepoTrustConfig,
+    TrustedConsensusVoter, VoterCutpointAttestation, VoterCutpointClaims, VoterCutpointSignature,
+    fetch_quorum_cutpoint_from_voters, sign_single_voter_cutpoint_attestation, verify_quorum_voter_attestations,
+    verify_single_voter_cutpoint_attestation,
 };
 pub use domain::{
     ActiveDeleteFence, AuthorityRecord, BlobStoreReadbackBackend, CasCompactionPublish, CompactionPublishResult,

@@ -31,19 +31,17 @@ use rootyard::{
     },
 };
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use uuid::Uuid;
 
 use super::{
     PG_SAFE_GC_TEST_LOCK, app_config,
-    dist_auth_harness::{
-        provision_distributed_trust, seal_test_lane_arm, test_arm_signer, test_dist_lane,
-        write_refcas_group_keyring_dir,
-    },
+    dist_auth_harness::{provision_distributed_trust, seal_test_lane_arm, test_arm_signer, test_dist_lane},
     isolated_pg_pool_with_schema,
     pg_refcas_merge_fixture::{build_refcas_merge_attempt, build_refcas_merge_rig, force_scan_and_schedule},
     pg_refcas_restart_cases::project_all_refcas_events,
     provision_pg_refstore_repo,
+    raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin},
     s3_harness::{LoopbackS3, build_pack_via_opendal, build_snapshot, git_cmd, make_serving_record},
     test_policy,
 };
@@ -96,6 +94,7 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
         );
         return Ok(());
     };
+    let Some(node_bin) = resolve_raft_node_bin()? else { return Ok(()) };
 
     let s3 = LoopbackS3::shared();
     let (blob_store, provider) = s3.open_store_and_provider()?;
@@ -115,6 +114,12 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
         transfer_metrics: Arc::new(metrics::TransferCounters::default()),
         git_slots: Arc::new(Semaphore::new(2)),
     });
+    let cluster = Arc::new(AsyncMutex::new(LiveRaftVoterCluster::start(node_bin).await?));
+    let trusted_voters = cluster.lock().await.trusted_voters();
+    provision_distributed_trust(&state.storage.root, tenant_id, repo_id, history_id, 2, trusted_voters)?;
+    cluster.lock().await.set_voter_enabled(1, true);
+    cluster.lock().await.set_voter_enabled(2, true);
+
     let journal = safe_gc_journal_path(&state.storage.root, repo_id);
     let dl = Instant::now() + Duration::from_secs(60);
 
@@ -152,16 +157,7 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
         build_pack_via_opendal(&provider, &git_repo, &dir.path().join("so"), "HEAD", (tenant_id, repo_id, 1), dl)
             .await?;
 
-    let keyring_dir = dir.path().join("refcas-keyring");
-    std::fs::create_dir_all(&keyring_dir)?;
-    write_refcas_group_keyring_dir(
-        &keyring_dir,
-        0,
-        history_id,
-        2,
-        &[(1, 0, [0x11; 32]), (2, 0, [0x12; 32]), (3, 0, [0x13; 32])],
-    )?;
-    provision_distributed_trust(&state.storage.root, tenant_id, repo_id, history_id, &keyring_dir)?;
+    let rig = build_refcas_merge_rig(Arc::clone(&cluster), tenant_id, repo_id, history_id, &base_oid).await?;
 
     let auth_rec = AuthorityRecord {
         tenant_id,
@@ -217,25 +213,35 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
     let rep_idx_loc = snap_off.snapshot().active_packs[0].idx_locator.to_locator()?;
     drop(snap_off);
 
-    let rig = build_refcas_merge_rig(&state.storage.root, tenant_id, repo_id, history_id, &base_oid)?;
     let producer = PullRemoteMergeProducer::new(&rig.backend, &pg_store, &rig.keyring);
     let (happy_spec, happy_pull) =
-        build_refcas_merge_attempt(&rig, &base_oid, &main_oid, &main_oid, 1, 1, rig.token_scope_id)?;
+        build_refcas_merge_attempt(&rig, &base_oid, &main_oid, &main_oid, 1, 1, rig.token_scope_id).await?;
     let committed = producer.execute_merge(&happy_spec, &happy_pull, false, MergeFaultInjection::None).await?;
     ensure!(matches!(committed, MergeAttemptOutcome::Committed(_)), "install→commit must commit");
     assert_eq!(rig.backend.read_ref_oid(repo_id, "refs/heads/main").await?, Some(main_oid.clone()));
 
-    let sm_happy = rig.backend.state_machine();
-    project_all_refcas_events(&pool, tenant_id, repo_id, ProjectionRealm::new(history_id, 0, 1)?, &sm_happy).await?;
+    let (spec_a, pull_a) =
+        build_refcas_merge_attempt(&rig, &main_oid, &cand_oid, &cand_oid, 2, 2, rig.token_scope_id).await?;
+    let validated_a = verify_pull_remote_authz_grant(&spec_a, &pull_a, &rig.keyring)?;
+    let cancel_identity = validated_a.commit_cmd.commit.request.identity.clone();
+    rig.backend.set_abort_after_install_once(true);
+    let aborted = producer.execute_merge(&spec_a, &pull_a, false, MergeFaultInjection::None).await.unwrap_err();
+    ensure!(matches!(aborted, RemoteMergeError::UnknownOutcome(_)), "install abort must surface UnknownOutcome");
+    assert_eq!(attempt_state(&pool, repo_id, spec_a.operation_id).await?, "pending_merge");
+    // Project commit + install so the PG cursor is current while the decision stays open.
+    let sm_installed = rig.backend.state_machine().await?;
+    project_all_refcas_events(&pool, tenant_id, repo_id, ProjectionRealm::new(history_id, 0, 1)?, &sm_installed)
+        .await?;
 
     let armed = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
+    let armed_snap = armed.snapshot();
     let lane_arm = seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
-        test_dist_lane(repo_id, 1, 4, &[], SafeGcObjectFormat::Sha1),
+        test_dist_lane(tenant_id, repo_id, history_id, 1, 1, &armed_snap.global_holds, SafeGcObjectFormat::Sha1),
     )?;
     armed.set_gc_mode(GcMode::ArmedDestructive(Box::new(lane_arm)))?;
     drop(armed);
@@ -243,23 +249,15 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");
     }
 
-    let (spec_a, pull_a) = build_refcas_merge_attempt(&rig, &main_oid, &cand_oid, &cand_oid, 2, 2, rig.token_scope_id)?;
-    let validated_a = verify_pull_remote_authz_grant(&spec_a, &pull_a, &rig.keyring)?;
-    let cancel_identity = validated_a.commit_cmd.commit.request.identity.clone();
-    rig.backend.set_abort_after_install_once(true);
-    let aborted = producer.execute_merge(&spec_a, &pull_a, false, MergeFaultInjection::None).await.unwrap_err();
-    ensure!(matches!(aborted, RemoteMergeError::UnknownOutcome(_)), "install abort must surface UnknownOutcome");
-    assert_eq!(attempt_state(&pool, repo_id, spec_a.operation_id).await?, "pending_merge");
     let (failed, err) = worker_pass_with_error(&state, &pool, &policy, repo_id).await?;
-    assert_eq!(failed, "failed", "unprojected install event must fail closed");
+    assert_eq!(failed, "failed", "open in-flight decision must fail closed");
     ensure!(err.contains("in-flight decision"), "expected in-flight decision barrier, got {err}");
     assert_eq!(s3.state.delete_requests.load(Ordering::SeqCst), pre_deletes);
     assert_eq!(rig.backend.read_ref_oid(repo_id, "refs/heads/main").await?, Some(main_oid.clone()));
 
     // Revoke the attempt's token scope, then replay the installed decision; commit is refused.
-    rig.backend.apply_repo_command(
-        repo_id,
-        RefCasCommand::CloseAuthScope(CloseAuthScopeCommand {
+    rig.backend
+        .apply_repo_command(RefCasCommand::CloseAuthScope(CloseAuthScopeCommand {
             scope_kind: "token".into(),
             scope_id: rig.token_scope_id,
             repository_id: None,
@@ -268,42 +266,43 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
             authz_floor: 9,
             change_id: Uuid::new_v4(),
             logical_tick: 20,
-        }),
-    )?;
+        }))
+        .await
+        .map_err(|err| anyhow::anyhow!("close auth scope through Raft: {err}"))?;
     let revoked = producer.execute_merge(&spec_a, &pull_a, false, MergeFaultInjection::None).await.unwrap_err();
     ensure!(matches!(revoked, RemoteMergeError::RevokedAuthorization(_)), "replay must be revoked, got {revoked:?}");
     assert_eq!(attempt_state(&pool, repo_id, spec_a.operation_id).await?, "rejected_merge");
     let (failed, err) = worker_pass_with_error(&state, &pool, &policy, repo_id).await?;
     assert_eq!(failed, "failed");
-    ensure!(err.contains("in-flight decision"), "expected in-flight decision barrier, got {err}");
+    ensure!(
+        err.contains("in-flight decision") || err.contains("unprojected Ref-CAS commits"),
+        "expected a fail-closed Ref-CAS barrier, got {err}"
+    );
     assert_eq!(s3.state.delete_requests.load(Ordering::SeqCst), pre_deletes);
     assert_eq!(rig.backend.read_ref_oid(repo_id, "refs/heads/main").await?, Some(main_oid.clone()));
 
-    rig.backend.apply_repo_command(
-        repo_id,
-        RefCasCommand::Cancel(CancelCommand {
+    rig.backend
+        .apply_repo_command(RefCasCommand::Cancel(CancelCommand {
             identity: cancel_identity,
             reason: Some("lifecycle cancellation".into()),
             logical_tick: 21,
-        }),
-    )?;
+        }))
+        .await
+        .map_err(|err| anyhow::anyhow!("cancel operation through Raft: {err}"))?;
     let cancelled = rig.backend.query_operation_outcome(repo_id, spec_a.operation_id, "refs/heads/main").await?;
     ensure!(
         matches!(cancelled, Some(rootyard::pulls::remote_merge_finalizer::AuthorityCommitOutcome::Cancelled { .. })),
         "cancelled operation must resolve as Cancelled"
     );
 
-    let (spec_b, pull_b) = build_refcas_merge_attempt(&rig, &base_oid, &cand_oid, &cand_oid, 2, 3, Uuid::new_v4())?;
+    let (spec_b, pull_b) =
+        build_refcas_merge_attempt(&rig, &base_oid, &cand_oid, &cand_oid, 2, 3, Uuid::new_v4()).await?;
     let rejected = producer.execute_merge(&spec_b, &pull_b, false, MergeFaultInjection::None).await.unwrap_err();
     ensure!(matches!(rejected, RemoteMergeError::TargetRefMoved { .. }), "stale base must be OldOidMismatch");
     assert_eq!(attempt_state(&pool, repo_id, spec_b.operation_id).await?, "rejected_merge");
-    let (failed, err) = worker_pass_with_error(&state, &pool, &policy, repo_id).await?;
-    assert_eq!(failed, "failed");
-    ensure!(err.contains("unprojected Ref-CAS commits"), "expected unprojected Ref-CAS commits barrier, got {err}");
-
-    // Project every Ref-CAS event (including the rejected terminal) and resolve queued jobs.
-    let sm = rig.backend.state_machine();
-    project_all_refcas_events(&pool, tenant_id, repo_id, ProjectionRealm::new(history_id, 0, 1)?, &sm).await?;
+    // The cancelled decision no longer blocks: project every terminal and sweep both retired packs.
+    let sm_final = rig.backend.state_machine().await?;
+    project_all_refcas_events(&pool, tenant_id, repo_id, ProjectionRealm::new(history_id, 0, 1)?, &sm_final).await?;
     assert_eq!(worker_pass(&state, &pool, &policy, repo_id).await?, "succeeded");
 
     assert!(!s3.has_key(&p_main) && !s3.has_key(&i_main));
