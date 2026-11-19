@@ -107,11 +107,11 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
         {
             let c = pool.get().await?;
             let refs =
-                repo_count(&**c, "SELECT count(*) FROM public.ref_store_core_refs WHERE repository_id = $1", repo_id)
+                repo_count(&c, "SELECT count(*) FROM public.ref_store_core_refs WHERE repository_id = $1", repo_id)
                     .await?;
             ensure!(refs == 0i64, "the ephemeral branch must be gone again");
             let memberships = repo_count(
-                &**c,
+                &c,
                 "SELECT count(*) FROM public.ref_store_core_pack_memberships WHERE repository_id = $1",
                 repo_id,
             )
@@ -224,11 +224,11 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
         {
             let c = published_pool.get().await?;
             let refs =
-                repo_count(&**c, "SELECT count(*) FROM public.ref_store_core_refs WHERE repository_id = $1", repo_id)
+                repo_count(&c, "SELECT count(*) FROM public.ref_store_core_refs WHERE repository_id = $1", repo_id)
                     .await?;
             ensure!(refs == 0i64, "the ephemeral rebind tag must be deleted again");
             let memberships = repo_count(
-                &**c,
+                &c,
                 "SELECT count(*) FROM public.ref_store_core_pack_memberships WHERE repository_id = $1",
                 repo_id,
             )
