@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::fault::{FaultController, FaultPoint};
 use crate::fixture::verify_same_device;
+use crate::state_machine::app::{ApplicationLogId, ApplicationStateMachine};
+use crate::state_machine::app_store::{
+    ApplicationSummary, SM_APP_SCHEMA, read_app_row, read_application_summary, validate_application_open, write_app_row,
+};
 use crate::state_machine::codec::{
     SmCommand, advance_state_digest, compute_entry_digest, decode_entry_payload, hex_encode, sm_entry_checksum,
     sm_kv_checksum, validate_digest_and_boundary,
@@ -54,10 +58,17 @@ pub(crate) struct SmInner {
     pub(crate) node_id: u64,
     pub(crate) conn: Connection,
     pub(crate) fault: Arc<FaultController>,
+    pub(crate) app: Option<Box<dyn ApplicationStateMachine>>,
 }
 
 impl SmInner {
-    pub(crate) fn open(dir: &Path, node_id: u64, check_on_open: bool, fault: Arc<FaultController>) -> Res<Self> {
+    pub(crate) fn open(
+        dir: &Path,
+        node_id: u64,
+        check_on_open: bool,
+        fault: Arc<FaultController>,
+        app: Option<Box<dyn ApplicationStateMachine>>,
+    ) -> Res<Self> {
         let lock = lock_named_dir(dir, SM_LOCK_FILE, "state machine directory")?;
         let canonical_dir = dir.canonicalize()?;
         let db_path = canonical_dir.join(SM_DB_FILE);
@@ -82,6 +93,7 @@ impl SmInner {
             tx.execute_batch(META_SCHEMA)?;
             tx.execute_batch(SM_ENTRIES_SCHEMA)?;
             tx.execute_batch(SM_KV_SCHEMA)?;
+            tx.execute_batch(SM_APP_SCHEMA)?;
             set_meta(&tx, "format", Some(SM_FORMAT_VERSION))?;
             set_meta(&tx, "node", Some(&node_id.to_string()))?;
             let empty_mem: StoredMembership<u64, BasicNode> = StoredMembership::default();
@@ -100,6 +112,9 @@ impl SmInner {
                     return Err(E::Refused(format!("state machine db missing {table}; refusing to reset")));
                 }
             }
+            // Forward-compatible addition: old KV databases gain the optional application row table
+            // without rewriting existing metadata, rows, or snapshot files.
+            conn.execute_batch(SM_APP_SCHEMA)?;
         }
 
         validate_identity(&conn, node_id)?;
@@ -110,9 +125,11 @@ impl SmInner {
             }
         }
         validate_persisted_state(&conn)?;
-        snapshot::verify_on_open(&conn, &canonical_dir, node_id)?;
+        let last_applied: Option<LogId<u64>> = meta(&conn, K_LAST_APPLIED)?;
+        let app = validate_application_open(&conn, app, last_applied)?;
+        snapshot::verify_on_open(&conn, &canonical_dir, node_id, app.as_deref())?;
 
-        Ok(SmInner { _lock: lock, dir: canonical_dir, node_id, conn, fault })
+        Ok(SmInner { _lock: lock, dir: canonical_dir, node_id, conn, fault, app })
     }
 
     pub(crate) fn tx(&mut self) -> Res<rusqlite::Transaction<'_>> {
@@ -262,6 +279,35 @@ pub(crate) fn read_summary(inner: &SmInner) -> Res<StateMachineSummary> {
     })
 }
 
+/// Clone of the live reducer plus the persisted consensus coordinate it materializes.
+pub(crate) struct ApplicationRuntimeSnapshot {
+    pub(crate) reducer: Box<dyn ApplicationStateMachine>,
+    pub(crate) applied: Option<LogId<u64>>,
+    pub(crate) summary: ApplicationSummary,
+}
+
+pub(crate) fn read_application_summary_row(inner: &SmInner) -> Res<Option<ApplicationSummary>> {
+    read_application_summary(&inner.conn)
+}
+
+pub(crate) fn read_application_runtime_snapshot(inner: &SmInner) -> Res<Option<ApplicationRuntimeSnapshot>> {
+    let Some(app) = inner.app.as_ref() else { return Ok(None) };
+    let (last_applied, _) = read_applied_state(&inner.conn)?;
+    let expected = last_applied.map(ApplicationLogId::from_log_id);
+    let row = read_app_row(&inner.conn)?
+        .ok_or_else(|| E::Refused("application mode lacks its persisted state row".into()))?;
+    if row.last_applied != expected || app.last_applied() != expected {
+        return Err(E::Refused("application runtime/disk coordinate mismatch".into()));
+    }
+    let digest = app.state_digest_hex().map_err(|e| E::Refused(format!("application digest refused: {e}")))?;
+    if digest != row.state_digest_hex {
+        return Err(E::Refused("application runtime/disk digest mismatch".into()));
+    }
+    let summary = read_application_summary(&inner.conn)?
+        .ok_or_else(|| E::Refused("application summary row disappeared".into()))?;
+    Ok(Some(ApplicationRuntimeSnapshot { reducer: app.clone_box(), applied: last_applied, summary }))
+}
+
 pub(crate) fn apply_entries(inner: &mut SmInner, entries: Vec<EntryOf>) -> Res<Vec<()>> {
     if entries.is_empty() {
         return Ok(Vec::new());
@@ -276,6 +322,9 @@ pub(crate) fn apply_entries(inner: &mut SmInner, entries: Vec<EntryOf>) -> Res<V
     }
 
     let fault = inner.fault.clone();
+    // Copy-on-write: the live reducer advances only after the SQLite commit returns Ok. A failed,
+    // partial, or ambiguous storage commit therefore never reports successful in-memory progress.
+    let mut app_staged: Option<Box<dyn ApplicationStateMachine>> = inner.app.as_ref().map(|app| app.clone_box());
     let tx = inner.tx()?;
     let (mut cur_last, mut last_membership) = read_applied_state(&tx)?;
     let mut state_digest = get_meta(&tx, K_STATE_DIGEST)?.ok_or_else(|| E::Refused("missing state_digest".into()))?;
@@ -299,6 +348,39 @@ pub(crate) fn apply_entries(inner: &mut SmInner, entries: Vec<EntryOf>) -> Res<V
             continue;
         }
 
+        if let Some(app) = app_staged.as_mut() {
+            let coord = ApplicationLogId::from_log_id(lid);
+            match decoded.app_cmd.as_ref() {
+                Some(cmd) => {
+                    if cmd.domain() != app.domain() || cmd.version() != app.version() {
+                        return Err(E::Refused(format!(
+                            "application command domain/version {}/{} mismatches reducer {}/{}",
+                            cmd.domain(),
+                            cmd.version(),
+                            app.domain(),
+                            app.version()
+                        )));
+                    }
+                    app.apply(coord, cmd.payload())
+                        .map_err(|e| E::Refused(format!("application reducer refused apply: {e}")))?;
+                }
+                None if matches!(decoded.kind, "blank" | "membership") => {
+                    app.advance_applied(coord)
+                        .map_err(|e| E::Refused(format!("application reducer refused coordinate advance: {e}")))?;
+                }
+                None => {
+                    return Err(E::Refused("application state machine refuses non-application normal payload".into()));
+                }
+            }
+            if app.last_applied() != Some(coord) {
+                return Err(E::Refused(format!(
+                    "application reducer did not advance to committed coordinate {coord:?}"
+                )));
+            }
+        } else if decoded.app_cmd.is_some() {
+            return Err(E::Refused("KV state machine refuses application command payload".into()));
+        }
+
         let row_csum = sm_entry_checksum(idx, &lid_json, decoded.kind, &decoded.payload_bytes, &digest);
         tx.execute(
             "INSERT INTO sm_entries(idx,log_id,kind,payload,entry_digest,checksum) VALUES(?1,?2,?3,?4,?5,?6)",
@@ -318,6 +400,9 @@ pub(crate) fn apply_entries(inner: &mut SmInner, entries: Vec<EntryOf>) -> Res<V
     }
 
     if mutated {
+        if let Some(app) = app_staged.as_ref() {
+            write_app_row(&tx, app.as_ref(), cur_last)?;
+        }
         set_meta(&tx, K_LAST_APPLIED, cur_last.as_ref().map(je).transpose()?.as_deref())?;
         set_meta(&tx, K_LAST_MEMBERSHIP, Some(&je(&last_membership)?))?;
         set_meta(&tx, K_STATE_DIGEST, Some(&state_digest))?;
@@ -325,6 +410,9 @@ pub(crate) fn apply_entries(inner: &mut SmInner, entries: Vec<EntryOf>) -> Res<V
         fault.check(FaultPoint::SmApplyEnospc)?;
         fault.check(FaultPoint::SmApplySync)?;
         tx.commit()?;
+        if let Some(app) = app_staged {
+            inner.app = Some(app);
+        }
     }
     Ok(responses)
 }
