@@ -210,6 +210,24 @@ async fn verify_external_runtime_schema(client: &mut tokio_postgres::Client) -> 
     Ok(())
 }
 
+async fn verify_mirror_client(client: &mut tokio_postgres::Client) -> Result<()> {
+    let tx = client.transaction().await?;
+    let granted: bool = tx.query_one("SELECT pg_try_advisory_xact_lock_shared(738390103)", &[]).await?.get(0);
+    if !granted {
+        return Err(crate::backup::BarrierBusy::Serving.into());
+    }
+    crate::backup::ensure_database_available(&tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Read mirrors never run migrations, so verify the database-global lifecycle
+/// lock and `rootyard.restore_in_progress` marker before opening mirror state.
+pub async fn verify_mirror_database_available(pool: &Pool) -> Result<()> {
+    let mut client = pool.get().await?;
+    verify_mirror_client(&mut client).await
+}
+
 pub async fn prepare_runtime_schema(pool: &Pool) -> Result<()> {
     match std::env::var("ROOTYARD_SCHEMA_MODE").as_deref() {
         Ok("external") => {

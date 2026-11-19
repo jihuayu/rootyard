@@ -22,10 +22,11 @@ LIMITS = {
     "src/bin/rootyard-w8a-backup.rs": 95,
     "src/db.rs": 440,
     "src/events.rs": 470,
-    "tests/w8a_pg_blob_paired_restore.rs": 460,
+    "src/mirror.rs": 139,
+    "tests/w8a_pg_blob_paired_restore.rs": 465,
     "tests/w8a_pg_blob_support/s3.rs": 330,
     "tests/w8a_pg_blob_support/seed.rs": 420,
-    "tests/w8a_pg_blob_support/lifecycle_guards.rs": 320,
+    "tests/w8a_pg_blob_support/lifecycle_guards.rs": 340,
     "tests/test_w8a_pg_blob_paired_contracts.py": 260,
     "docs/w8a-pg-blob-paired-restore.md": 300,
     ".github/workflows/w8a-pg-blob-restore.yml": 150,
@@ -127,6 +128,8 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
         runtime = files["src/db.rs"]
         self.assertIn("prepare_runtime_schema", runtime, "db.rs lost the runtime schema entry point")
         self.assertIn("ensure_database_available", runtime, "db.rs does not enforce the database restore marker")
+        self.assertIn("verify_mirror_database_available", runtime, "db.rs lost the mirror startup guard")
+        self.assertIn("verify_mirror_database_available", files["src/mirror.rs"], "mirror.rs skips the DB restore guard")
         self.assertIn("ref_store_serving_repositories", files["src/events.rs"])
 
         integration = files["tests/w8a_pg_blob_paired_restore.rs"]
@@ -186,7 +189,7 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
         self.assertIn("contents: read", workflow)
         for token in ["'src/backup/**'", "'src/blob_store/**'"]:
             self.assertIn(token, workflow, f"workflow paths missing {token}")
-        for token in ["'src/db.rs'", "'src/events.rs'"]:
+        for token in ["'src/db.rs'", "'src/events.rs'", "'src/mirror.rs'"]:
             self.assertIn(token, workflow, f"workflow paths missing {token}")
 
 

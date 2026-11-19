@@ -78,11 +78,19 @@ fn tampered_epoch_archive(archive: &Path, target: &Path) -> Result<PathBuf> {
 async fn assert_runtime_startup_refused_with_other_data_dir(
     env: &mut EnvGuard,
     url: &str,
-    other_data_dir: &Path,
+    temp: &Path,
+    git: &Path,
+    label: &str,
 ) -> Result<()> {
+    let other_data_dir = temp.join(format!("other-serve-{label}"));
+    let other_mirror_dir = temp.join(format!("other-mirror-{label}"));
     ensure!(
-        rootyard::backup::ensure_not_restoring(other_data_dir).is_ok(),
+        rootyard::backup::ensure_not_restoring(&other_data_dir).is_ok(),
         "separate data_dir unexpectedly had a local guard"
+    );
+    ensure!(
+        rootyard::backup::ensure_not_restoring(&other_mirror_dir).is_ok(),
+        "separate mirror data_dir unexpectedly had a local guard"
     );
     let pool = seed::pool_for(url)?;
     env.set_opt("ROOTYARD_SCHEMA_MODE", None);
@@ -96,6 +104,15 @@ async fn assert_runtime_startup_refused_with_other_data_dir(
         "external prepare_runtime_schema succeeded against fenced/restoring DB"
     );
     env.set_opt("ROOTYARD_SCHEMA_MODE", None);
+    env.set_opt("ROOTYARD_PRIMARY_URL", Some("http://127.0.0.1:18080"));
+    let mirror_cfg = seed::build_config(url.to_owned(), other_mirror_dir.clone(), git.to_path_buf());
+    let mirror_res = rootyard::mirror::open(mirror_cfg, pool).await;
+    env.set_opt("ROOTYARD_PRIMARY_URL", None);
+    ensure!(mirror_res.is_err(), "mirror::open succeeded against fenced/restoring DB with a separate data_dir");
+    ensure!(
+        !other_mirror_dir.exists(),
+        "refused mirror::open created its separate data_dir before checking DB restore state"
+    );
     Ok(())
 }
 
@@ -105,6 +122,7 @@ async fn assert_runtime_startup_refused_with_other_data_dir(
 pub async fn verify_post_restore_startup_and_projection(
     env: &mut EnvGuard,
     pool: &Pool,
+    clean_mirror_cfg: rootyard::config::Config,
     owner_id: Uuid,
     token_id: Uuid,
     actor_name: &str,
@@ -121,6 +139,15 @@ pub async fn verify_post_restore_startup_and_projection(
         "external prepare_runtime_schema refused the cleanly restored database"
     );
     env.set_opt("ROOTYARD_SCHEMA_MODE", None);
+    env.set_opt("ROOTYARD_PRIMARY_URL", Some("http://127.0.0.1:18080"));
+    let mirror_res = rootyard::mirror::open(clean_mirror_cfg, pool.clone()).await;
+    env.set_opt("ROOTYARD_PRIMARY_URL", None);
+    let mirror_state = mirror_res?;
+    ensure!(
+        mirror_state.storage.root.join(".rootyard-mirror").is_file(),
+        "cleanly restored database did not initialize a separate mirror volume"
+    );
+    drop(mirror_state);
     let client = pool.get().await?;
     let audit: i64 = client.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
     ensure!(audit == 1, "restored pg_refstore event was not audited exactly once: {audit}");
@@ -211,7 +238,7 @@ pub async fn run_lifecycle_guard_drills(
     ensure!(!config.data_dir.exists(), "failed restore published its target");
     ensure!(!compute.exists(), "failed restore kept the compute directory");
     ensure!(!has_partial_staging(temp)?, "failed restore kept a partial staging directory");
-    assert_runtime_startup_refused_with_other_data_dir(env, &url, &temp.join("other-serve-a")).await?;
+    assert_runtime_startup_refused_with_other_data_dir(env, &url, temp, git, "a").await?;
     let _ = seed::drop_database(admin, &database).await;
 
     let (database, url) = fresh_database(admin).await?;
@@ -229,7 +256,7 @@ pub async fn run_lifecycle_guard_drills(
     ensure!(startup_guard(&config.data_dir).exists(), "corrupt restore cleared its startup guard");
     ensure!(!config.data_dir.exists() && !compute.exists(), "corrupt restore published or kept local state");
     ensure!(!has_partial_staging(temp)?, "corrupt restore kept a partial staging directory");
-    assert_runtime_startup_refused_with_other_data_dir(env, &url, &temp.join("other-serve-b")).await?;
+    assert_runtime_startup_refused_with_other_data_dir(env, &url, temp, git, "b").await?;
     server.clear_intercepts();
     let _ = seed::drop_database(admin, &database).await;
 
@@ -269,7 +296,7 @@ pub async fn run_lifecycle_guard_drills(
     ensure!(fenced, "fresh-incarnation fence did not run before the guarded fsck");
     drop(probe);
     drop(pool);
-    assert_runtime_startup_refused_with_other_data_dir(env, &url, &temp.join("other-serve-c-live")).await?;
+    assert_runtime_startup_refused_with_other_data_dir(env, &url, temp, git, "c-live").await?;
     drop(restoring);
     paused.release.notify_one();
     server.clear_intercepts();
@@ -278,7 +305,7 @@ pub async fn run_lifecycle_guard_drills(
     ensure!(startup_guard(&config.data_dir).exists(), "cancelled restore cleared its startup guard");
     ensure!(!config.data_dir.exists() && !compute.exists(), "cancelled restore published or kept local state");
     ensure!(!has_partial_staging(temp)?, "cancelled restore kept a partial staging directory");
-    assert_runtime_startup_refused_with_other_data_dir(env, &url, &temp.join("other-serve-c-cancelled")).await?;
+    assert_runtime_startup_refused_with_other_data_dir(env, &url, temp, git, "c-cancelled").await?;
     let _ = seed::drop_database(admin, &database).await;
     Ok(())
 }

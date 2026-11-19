@@ -384,6 +384,7 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
     lifecycle_guards::verify_post_restore_startup_and_projection(
         &mut env,
         &destination_pool,
+        config(destination_url.clone(), temp.path(), "other-mirror-clean", &git),
         seeded.owner.identity.id,
         seeded.owner.identity.token_id,
         &seeded.owner.identity.username,
