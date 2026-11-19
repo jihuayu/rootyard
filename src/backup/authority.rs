@@ -4,6 +4,7 @@ use serde::Serialize;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
+const RESET_DELIVERIES: &str = "UPDATE public.event_deliveries SET state='pending', lease_owner=NULL, lease_until=NULL, next_attempt_at=clock_timestamp() WHERE state='leased'";
 const FENCED_WORKSPACES: &str = "UPDATE public.workspaces SET lease_epoch=lease_epoch+1, lease_until=clock_timestamp()-interval '1 second' WHERE state='ready'";
 const CANCELLED_DECISIONS: &str = "UPDATE public.ref_store_publication_decisions SET state='CANCELLED', cancelled_at=clock_timestamp(), closed_code='restored_incarnation', cancel_change_id=gen_random_uuid() WHERE state='OPEN'";
 const RELEASED_PINS: &str = "UPDATE public.ref_store_core_pins SET state='released', released_at=GREATEST(clock_timestamp(), created_at), updated_at=GREATEST(clock_timestamp(), updated_at), release_request_id=gen_random_uuid(), release_reason='operator_request' WHERE state='active'";
@@ -44,8 +45,6 @@ pub(super) async fn fence(client: &Client) -> Result<()> {
          UPDATE public.ref_cas_projection_jobs SET state='queued',claim_generation=claim_generation+1,
              lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp()
              WHERE state='running';
-         UPDATE public.event_deliveries SET state='pending',lease_owner=NULL,lease_until=NULL,
-             next_attempt_at=clock_timestamp() WHERE state='leased';
          UPDATE public.workspaces SET lease_epoch=lease_epoch+1,
              lease_until=clock_timestamp()-interval '1 second' WHERE state='ready';
          UPDATE public.sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp()
@@ -69,6 +68,7 @@ pub async fn fence_w8a_fresh_incarnation(
     tx.execute("UPDATE public.tokens SET revoked=true WHERE NOT revoked", &[]).await?;
     tx.execute("UPDATE public.web_sessions SET revoked=true WHERE NOT revoked", &[]).await?;
     tx.execute("UPDATE public.ci_checkout_jobs SET revoked=true WHERE plan IS NOT NULL AND NOT revoked", &[]).await?;
+    tx.execute(RESET_DELIVERIES, &[]).await?;
     let counts = tx
         .query_one(
             "SELECT (SELECT count(*) FROM public.tokens WHERE revoked),
