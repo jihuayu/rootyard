@@ -12,21 +12,22 @@
 use super::protocol::{
     ABORT_DEADLINE, AbortFreeze, AbortMount, Body, ErrorReply, FREEZE_DEADLINE, FenceIfUnchanged, Frame, FreezeBegin,
     FreezeFinish, HEARTBEAT_INTERVAL, Handoff, Heartbeat, Hello, MAX_INFLIGHT, MOUNT_DEADLINE, MountRequest, Observe,
-    PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, PrewarmReply, REQUEST_DEADLINE, StateReply, read_frame, write_frame,
+    PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, PrewarmReply, REQUEST_DEADLINE, StateReply, encode_frame, read_frame,
+    write_frame,
 };
 use crate::workspace_lab::fuse_mount::FreezeDecision;
 use std::{
     collections::HashMap,
-    io,
+    io::{self, Write},
     net::Shutdown,
     os::{
-        fd::OwnedFd,
+        fd::{AsRawFd, OwnedFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::Path,
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, TrySendError},
     },
@@ -37,13 +38,24 @@ use uuid::Uuid;
 
 #[path = "client_child.rs"]
 mod child_lifecycle;
-use child_lifecycle::{ChildSlot, ExitObservation, ExitView};
+use child_lifecycle::{ChildSlot, ExitKind, ExitObservation, ExitView, ReapFailure};
 
 /// Bound on queued cancel frames. One worker sends them, so a caller that
 /// abandons a begin/mount can never spawn an unbounded number of threads.
 const ABORT_QUEUE: usize = 64;
 /// How often the reaper checks the dead flag without relying on the channel.
 const REAPER_TICK: Duration = Duration::from_millis(50);
+/// Bounded poll granularity for control-mutex admission. The absolute call or
+/// teardown deadline is re-read on every iteration.
+const CONTROL_POLL: Duration = Duration::from_millis(10);
+/// Bounded poll granularity for socket writability. The absolute call or
+/// teardown deadline is re-read on every iteration.
+const WRITE_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const CONTROL_SEND_FLAGS: i32 = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const CONTROL_SEND_FLAGS: i32 = libc::MSG_DONTWAIT;
 
 /// Failure while talking to the helper. The code is an errno value when one is
 /// meaningful, so callers can distinguish `EBUSY`/`ESTALE`/timeouts.
@@ -56,6 +68,22 @@ pub struct HelperError {
 impl HelperError {
     pub fn new(code: i32, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
+    }
+
+    fn child_exited(status: &ExitView) -> Self {
+        Self::new(libc::ECHILD, format!("workspace FUSE helper exited with {}", status.description))
+    }
+
+    fn child_missing() -> Self {
+        Self::new(libc::ECHILD, "workspace FUSE helper child handle disappeared before an exit was observed")
+    }
+
+    fn child_reap_deadline() -> Self {
+        Self::new(libc::ECHILD, "workspace FUSE helper was killed but did not reap within the shutdown deadline")
+    }
+
+    fn child_reap_error(message: String) -> Self {
+        Self::new(libc::ECHILD, message)
     }
 
     pub fn disconnected() -> Self {
@@ -78,6 +106,67 @@ impl HelperError {
 impl std::fmt::Display for HelperError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} (errno {})", self.message, self.code)
+    }
+}
+
+/// Sealed exact child-status label. It records only the numeric exit code or
+/// terminating signal; a label selects an investigation family, never a cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildExitClass {
+    /// Exact nonzero exit code 101. This is the helper's existing panic-family
+    /// fail-stop entry, but the label does not assert a particular cause.
+    ExitCode101,
+    /// Exact nonzero exit code 102: normal-shutdown identity/probe refusal.
+    ExitCode102,
+    /// Exact nonzero exit code 103: matched-ID unmount syscall returned EBUSY.
+    ExitCode103,
+    /// Exact nonzero exit code 104: matched-ID unmount returned another error.
+    ExitCode104,
+    /// Exact nonzero exit code 105: actor/session join or owner-state failure.
+    ExitCode105,
+    /// Exact nonzero exit code 1 (the helper's generic fail-stop entry).
+    ExitCode1,
+    /// Exact SIGKILL. The parent's bounded reaper is the only current sender;
+    /// this label directs control-reaper investigation.
+    SignalKill,
+    /// Exact SIGTERM.
+    SignalTerm,
+    /// Any other nonzero exit code or terminating signal.
+    Other,
+}
+
+/// Closed private reason a normal-shutdown teardown failed. It is carried
+/// beside [`HelperError`] only inside the crate; the public error keeps its
+/// original errno/message shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperShutdownOutcome {
+    Other,
+    ChildExited(ChildExitClass),
+    ChildMissing,
+    ChildReapDeadline,
+    ChildReapError,
+    Timeout,
+}
+
+/// Crate-private shutdown result. `error` is exactly the value the original
+/// public shutdown call returned; `outcome` is the finite diagnostic class.
+#[derive(Debug)]
+pub(crate) struct HelperShutdownError {
+    pub(crate) error: HelperError,
+    pub(crate) outcome: HelperShutdownOutcome,
+}
+
+impl HelperShutdownError {
+    fn new(error: HelperError, outcome: HelperShutdownOutcome) -> Self {
+        Self { error, outcome }
+    }
+
+    fn other(error: HelperError) -> Self {
+        Self::new(error, HelperShutdownOutcome::Other)
+    }
+
+    fn timeout(error: HelperError) -> Self {
+        Self::new(error, HelperShutdownOutcome::Timeout)
     }
 }
 
@@ -117,11 +206,186 @@ struct Inner {
     dead: AtomicBool,
     stop: AtomicBool,
     death: Mutex<Option<HelperError>>,
+    /// One absolute teardown deadline, once shutdown starts. Every later
+    /// shutdown/reap phase may only tighten or reuse it.
+    teardown_deadline: Mutex<Option<Instant>>,
     child: Mutex<ChildSlot>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn control_deadline_error() -> HelperError {
+    HelperError::new(libc::ETIMEDOUT, "workspace FUSE helper control deadline expired")
+}
+
+/// Admit one control writer without blocking past the caller's absolute
+/// deadline. The deadline closure re-reads the current teardown cap on every
+/// iteration, so a deadline published while this writer waits for the mutex
+/// immediately tightens the wait.
+fn lock_until<'a, T, F>(mutex: &'a Mutex<T>, mut deadline: F) -> Result<MutexGuard<'a, T>, HelperError>
+where
+    F: FnMut() -> Instant,
+{
+    loop {
+        let limit = deadline();
+        let now = Instant::now();
+        if now >= limit {
+            return Err(control_deadline_error());
+        }
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                thread::sleep(limit.saturating_duration_since(now).min(CONTROL_POLL));
+            }
+        }
+    }
+}
+
+/// Wait until the exact control socket is writable or `wait` expires. The
+/// duration is deliberately short; the writer re-reads its absolute deadline
+/// after every poll instead of treating this as a fresh write grace.
+fn poll_writable(fd: RawFd, wait: Duration) -> Result<(), HelperError> {
+    let timeout = wait.min(WRITE_POLL).as_millis() as i32;
+    let mut pollfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    // SAFETY: one valid pollfd is supplied and the timeout is bounded.
+    let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+    if ready >= 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EINTR) {
+        // Return to the writer so it re-reads the absolute deadline instead of
+        // restarting this poll window.
+        return Ok(());
+    }
+    Err(HelperError::new(
+        error.raw_os_error().unwrap_or(libc::EIO),
+        format!("workspace FUSE helper control poll failed: {error}"),
+    ))
+}
+
+/// One complete-frame nonblocking send attempt. A short or failed attempt runs
+/// `terminal` before this function returns, so a caller that holds the control
+/// guard still marks the exact generation dead before releasing that guard.
+/// It never retries EINTR/short writes or restarts a grace.
+fn send_complete_or_terminal<F, M>(bytes: &[u8], send: F, terminal: M) -> bool
+where
+    F: FnOnce(*const u8, usize) -> io::Result<usize>,
+    M: FnOnce(i32),
+{
+    match send(bytes.as_ptr(), bytes.len()) {
+        Ok(sent) if sent == bytes.len() => true,
+        Ok(_) => {
+            terminal(libc::EIO);
+            false
+        }
+        Err(error) => {
+            terminal(error.raw_os_error().unwrap_or(libc::EIO));
+            false
+        }
+    }
+}
+
+/// Write one already-serialized control frame without blocking past the
+/// absolute deadline. The deadline closure re-reads the current teardown cap
+/// on every send/poll iteration. A partial frame is never followed by another
+/// frame: the caller fail-closes the generation on any error.
+fn write_bytes_until<F>(stream: &mut UnixStream, mut bytes: &[u8], mut deadline: F) -> Result<(), HelperError>
+where
+    F: FnMut() -> Instant,
+{
+    let fd = stream.as_raw_fd();
+    while !bytes.is_empty() {
+        let limit = deadline();
+        let now = Instant::now();
+        if now >= limit {
+            return Err(control_deadline_error());
+        }
+        // SAFETY: the socket fd is owned by `stream`; the pointer covers the
+        // remaining bytes and `MSG_DONTWAIT` keeps every call nonblocking.
+        let sent = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), CONTROL_SEND_FLAGS) };
+        if sent > 0 {
+            bytes = &bytes[sent as usize..];
+            continue;
+        }
+        if sent == 0 {
+            return Err(HelperError::new(libc::EPIPE, "workspace FUSE helper control write closed"));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                let remaining = limit.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(control_deadline_error());
+                }
+                poll_writable(fd, remaining)?;
+            }
+            _ => {
+                return Err(HelperError::new(
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                    format!("workspace FUSE helper control write failed: {error}"),
+                ));
+            }
+        }
+    }
+    stream.flush().map_err(|error| {
+        HelperError::new(
+            error.raw_os_error().unwrap_or(libc::EIO),
+            format!("workspace FUSE helper control flush failed: {error}"),
+        )
+    })
+}
+
+/// Classify only the exact allowlisted child-status shapes. The label carries
+/// no cause and no arbitrary value; every unlisted shape remains `Other`.
+fn child_exit_class(kind: ExitKind) -> ChildExitClass {
+    match kind {
+        ExitKind::Code(101) => ChildExitClass::ExitCode101,
+        ExitKind::Code(102) => ChildExitClass::ExitCode102,
+        ExitKind::Code(103) => ChildExitClass::ExitCode103,
+        ExitKind::Code(104) => ChildExitClass::ExitCode104,
+        ExitKind::Code(105) => ChildExitClass::ExitCode105,
+        ExitKind::Code(1) => ChildExitClass::ExitCode1,
+        ExitKind::Signal(libc::SIGKILL) => ChildExitClass::SignalKill,
+        ExitKind::Signal(libc::SIGTERM) => ChildExitClass::SignalTerm,
+        ExitKind::Code(_) | ExitKind::Signal(_) => ChildExitClass::Other,
+    }
+}
+
+/// Map one non-sleeping child observation to the shared shutdown outcome.
+/// `None` means the child is still running/reaping and the caller must apply
+/// its existing absolute deadline; it is never success.
+fn terminal_exit(observation: ExitObservation) -> Option<Result<(), HelperShutdownError>> {
+    match observation {
+        ExitObservation::Exited(Ok(status)) if status.success => Some(Ok(())),
+        ExitObservation::Exited(Ok(status)) => Some(Err(HelperShutdownError::new(
+            HelperError::child_exited(&status),
+            HelperShutdownOutcome::ChildExited(child_exit_class(status.kind)),
+        ))),
+        ExitObservation::Exited(Err(ReapFailure::Deadline)) => Some(Err(HelperShutdownError::new(
+            HelperError::child_reap_deadline(),
+            HelperShutdownOutcome::ChildReapDeadline,
+        ))),
+        ExitObservation::Exited(Err(ReapFailure::WaitError(message))) => Some(Err(HelperShutdownError::new(
+            HelperError::child_reap_error(message),
+            HelperShutdownOutcome::ChildReapError,
+        ))),
+        ExitObservation::Missing => {
+            Some(Err(HelperShutdownError::new(HelperError::child_missing(), HelperShutdownOutcome::ChildMissing)))
+        }
+        ExitObservation::Running | ExitObservation::Reaping => None,
+    }
+}
+
+/// A returned request error keeps its original `HelperError`; only a retained
+/// `ETIMEDOUT` errno selects the timeout class. Protocol/generic errors remain
+/// `Other` because the public error does not retain a typed protocol cause.
+fn shutdown_error_for(error: HelperError) -> HelperShutdownError {
+    if error.code == libc::ETIMEDOUT { HelperShutdownError::timeout(error) } else { HelperShutdownError::other(error) }
 }
 
 impl Inner {
@@ -155,6 +419,88 @@ impl Inner {
 
     fn failure(&self) -> HelperError {
         lock(&self.death).clone().unwrap_or_else(HelperError::disconnected)
+    }
+
+    /// Publish the one absolute teardown deadline. Repeated calls only tighten
+    /// it, so the RPC wait, child-exit wait, reaper and last-resort drop never
+    /// reset a fresh grace after the shared shutdown budget is exhausted.
+    fn begin_teardown_deadline(&self, deadline: Instant) -> Instant {
+        let mut current = lock(&self.teardown_deadline);
+        let effective = match *current {
+            Some(existing) => existing.min(deadline),
+            None => deadline,
+        };
+        *current = Some(effective);
+        effective
+    }
+
+    fn teardown_deadline(&self) -> Option<Instant> {
+        *lock(&self.teardown_deadline)
+    }
+
+    /// Tighten one call deadline with any already-published teardown cap.
+    fn effective_deadline(&self, deadline: Instant) -> Instant {
+        self.teardown_deadline().map_or(deadline, |limit| deadline.min(limit))
+    }
+
+    fn lock_control_until(&self, deadline: Instant) -> Result<MutexGuard<'_, UnixStream>, HelperError> {
+        lock_until(&self.control, || self.effective_deadline(deadline))
+    }
+
+    /// Best-effort canonical shutdown frame when no budget remains. It never
+    /// waits for the mutex or socket: if it cannot write the whole frame, the
+    /// caller fail-closes the generation and the deadline-capped reaper kills
+    /// and reaps the exact child. It is not evidence of a clean unmount.
+    fn try_send_shutdown_frame(&self) -> bool {
+        if self.dead.load(Ordering::Acquire) {
+            return false;
+        }
+        let frame = match Frame::request(self.generation, self.next_request(), None, 0, &Body::Shutdown) {
+            Ok(frame) => frame,
+            Err(_) => return false,
+        };
+        let bytes = match encode_frame(&frame) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        let mut control = match self.control.try_lock() {
+            Ok(control) => control,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        if self.dead.load(Ordering::Acquire) {
+            return false;
+        }
+        let fd = control.as_raw_fd();
+        // Exactly one nonblocking attempt: no retry loop and no grace reset.
+        // EINTR, EAGAIN, a short write or any other error is an unproved
+        // best-effort attempt. Mark the exact generation terminal while this
+        // guard is still held so a concurrent shutdown sender that acquires the
+        // control mutex afterwards rechecks `dead` and cannot append a frame to
+        // a corrupted stream.
+        // SAFETY: the socket fd is owned by `control`; the pointer covers the
+        // canonical frame bytes and `MSG_DONTWAIT` never blocks.
+        if !send_complete_or_terminal(
+            &bytes,
+            |pointer, length| {
+                // Capture the syscall errno immediately on failure, before any
+                // intervening call can overwrite it; positive results are the
+                // completed byte count.
+                let sent = unsafe { libc::send(fd, pointer.cast(), length, CONTROL_SEND_FLAGS) };
+                if sent < 0 { Err(io::Error::last_os_error()) } else { Ok(sent as usize) }
+            },
+            |code| {
+                self.fail_generation(code, "workspace FUSE helper shutdown frame was not sent completely");
+            },
+        ) {
+            return false;
+        }
+        if let Err(error) = control.flush() {
+            let code = error.raw_os_error().unwrap_or(libc::EIO);
+            self.fail_generation(code, "workspace FUSE helper shutdown flush failed");
+            return false;
+        }
+        true
     }
 
     fn deliver(&self, frame: Frame) {
@@ -221,10 +567,26 @@ impl Inner {
         workspace: Option<Uuid>,
         db_epoch: i64,
         body: Body,
-        deadline: Duration,
+        grace: Duration,
+    ) -> (u64, Result<Body, HelperError>) {
+        self.call_full_until(workspace, db_epoch, body, Instant::now() + grace)
+    }
+
+    /// Send one request and wait for the matching reply without extending the
+    /// caller's absolute deadline.
+    fn call_full_until(
+        &self,
+        workspace: Option<Uuid>,
+        db_epoch: i64,
+        body: Body,
+        deadline: Instant,
     ) -> (u64, Result<Body, HelperError>) {
         if self.dead.load(Ordering::Acquire) {
             return (0, Err(self.failure()));
+        }
+        let deadline = self.effective_deadline(deadline);
+        if Instant::now() >= deadline {
+            return (0, Err(control_deadline_error()));
         }
         let request_id = self.next_request();
         let (sender, receiver) = mpsc::channel();
@@ -245,19 +607,43 @@ impl Inner {
                 return (request_id, Err(HelperError::protocol(error.to_string())));
             }
         };
-        let written = {
-            // Only the write of this frame is under the mutex; the reply is
-            // awaited with the lock released so one slow operation cannot
-            // serialize every other mount's control traffic.
-            let mut control = lock(&self.control);
-            write_frame(&mut *control, &frame)
+        let bytes = match encode_frame(&frame) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                lock(&self.pending).remove(&request_id);
+                return (request_id, Err(HelperError::protocol(error.to_string())));
+            }
         };
-        if let Err(error) = written {
+        let mut control = match self.lock_control_until(deadline) {
+            Ok(control) => control,
+            Err(error) => {
+                lock(&self.pending).remove(&request_id);
+                return (request_id, Err(error));
+            }
+        };
+        if self.dead.load(Ordering::Acquire) {
             lock(&self.pending).remove(&request_id);
-            self.fail_generation(libc::ECONNRESET, format!("helper control write failed: {error}"));
             return (request_id, Err(self.failure()));
         }
-        match receiver.recv_timeout(deadline) {
+        // A teardown deadline may have been published while this caller waited
+        // for the control mutex. Re-read it immediately before touching the
+        // stream so the write itself consumes the tightened absolute budget.
+        let deadline = self.effective_deadline(deadline);
+        if Instant::now() >= deadline {
+            lock(&self.pending).remove(&request_id);
+            return (request_id, Err(control_deadline_error()));
+        }
+        // Only the write of this frame is under the mutex; the reply is
+        // awaited with the lock released so one slow operation cannot
+        // serialize every other mount's control traffic. A partial write is
+        // fail-closed here and never reused as another frame.
+        if let Err(error) = write_bytes_until(&mut control, &bytes, || self.effective_deadline(deadline)) {
+            lock(&self.pending).remove(&request_id);
+            self.fail_generation(error.code, error.message.clone());
+            return (request_id, Err(error));
+        }
+        let remaining = self.effective_deadline(deadline).saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
             Ok(result) => (request_id, result),
             Err(RecvTimeoutError::Timeout) => {
                 lock(&self.pending).remove(&request_id);
@@ -277,45 +663,44 @@ impl Inner {
         self.call_full(workspace, db_epoch, body, deadline).1
     }
 
-    fn wait_exit(&self, grace: Duration) -> Result<(), HelperError> {
-        let deadline = Instant::now() + grace;
+    fn call_until(
+        &self,
+        workspace: Option<Uuid>,
+        db_epoch: i64,
+        body: Body,
+        deadline: Instant,
+    ) -> Result<Body, HelperError> {
+        self.call_full_until(workspace, db_epoch, body, deadline).1
+    }
+
+    fn wait_exit_until(&self, deadline: Instant) -> Result<(), HelperShutdownError> {
         loop {
             // One short observation under the lock; sleep never happens here.
             let observation = {
                 let mut slot = lock(&self.child);
                 slot.observe()
             };
-            match observation {
-                ExitObservation::Exited(Ok(status)) if status.success => return Ok(()),
-                ExitObservation::Exited(Ok(status)) => {
-                    return Err(HelperError::new(
-                        libc::ECHILD,
-                        format!("workspace FUSE helper exited with {}", status.description),
-                    ));
-                }
-                ExitObservation::Exited(Err(error)) => return Err(HelperError::new(libc::ECHILD, error)),
-                ExitObservation::Missing => {
-                    return Err(HelperError::new(
-                        libc::ECHILD,
-                        "workspace FUSE helper child handle disappeared before an exit was observed",
-                    ));
-                }
-                ExitObservation::Running | ExitObservation::Reaping if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                ExitObservation::Running | ExitObservation::Reaping => {
-                    return Err(HelperError::new(
-                        libc::ETIMEDOUT,
-                        "workspace FUSE helper did not exit within the shutdown grace",
-                    ));
-                }
+            if let Some(result) = terminal_exit(observation) {
+                return result;
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(HelperShutdownError::timeout(HelperError::new(
+                    libc::ETIMEDOUT,
+                    "workspace FUSE helper did not exit within the shutdown deadline",
+                )));
+            }
+            thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
         }
     }
 
     /// The one fixed reaper keeps polling until `Child::try_wait` reports a
     /// real exit. A SIGKILLed process stuck in D-state is not dropped
-    /// unreaped; this dedicated thread may outlive a bounded caller.
+    /// unreaped. When shutdown published an absolute deadline, the reaper
+    /// stops waiting at that same deadline and records a failure instead of
+    /// starting a fresh grace. Without a shutdown deadline (for example a
+    /// crash-triggered generation death), this dedicated thread may outlive a
+    /// bounded caller as before.
     fn reap_child_until_exit(&self) {
         let child = {
             let mut slot = lock(&self.child);
@@ -329,9 +714,21 @@ impl Inner {
                     lock(&self.child).record_exit(Ok(ExitView::from(status)));
                     return;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    let now = Instant::now();
+                    let Some(limit) = self.teardown_deadline() else {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    if now >= limit {
+                        lock(&self.child).record_exit(Err(ReapFailure::Deadline));
+                        std::mem::forget(child);
+                        return;
+                    }
+                    thread::sleep(limit.saturating_duration_since(now).min(Duration::from_millis(10)));
+                }
                 Err(error) => {
-                    lock(&self.child).record_exit(Err(error.to_string()));
+                    lock(&self.child).record_exit(Err(ReapFailure::WaitError(error.to_string())));
                     return;
                 }
             }
@@ -340,7 +737,9 @@ impl Inner {
 
     /// Last-resort teardown when the last `Arc` is gone and no reaper can own
     /// the handle. Bounded; if the child still has not exited, forget the
-    /// handle instead of dropping an unreaped `Child`.
+    /// handle instead of dropping an unreaped `Child`. A published shutdown
+    /// deadline is a hard cap, so Drop never starts a fresh grace after the
+    /// shared budget is exhausted.
     fn reap_for_drop(&self, grace: Duration) {
         let child = {
             let mut slot = lock(&self.child);
@@ -348,20 +747,25 @@ impl Inner {
         };
         let Some(mut child) = child else { return };
         let _ = child.kill();
-        let deadline = Instant::now() + grace;
+        let proposed = Instant::now() + grace;
+        let deadline = self.teardown_deadline().map_or(proposed, |limit| limit.min(proposed));
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     lock(&self.child).record_exit(Ok(ExitView::from(status)));
                     return;
                 }
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 Ok(None) => {
-                    std::mem::forget(child);
-                    return;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        lock(&self.child).record_exit(Err(ReapFailure::Deadline));
+                        std::mem::forget(child);
+                        return;
+                    }
+                    thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
                 }
                 Err(error) => {
-                    lock(&self.child).record_exit(Err(error.to_string()));
+                    lock(&self.child).record_exit(Err(ReapFailure::WaitError(error.to_string())));
                     return;
                 }
             }
@@ -458,6 +862,7 @@ impl HelperClient {
             dead: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             death: Mutex::new(None),
+            teardown_deadline: Mutex::new(None),
             child: Mutex::new(ChildSlot::running(child)),
         });
 
@@ -485,6 +890,21 @@ impl HelperClient {
     /// False after control EOF, a failed write or a completed shutdown.
     pub fn alive(&self) -> bool {
         !self.inner.dead.load(Ordering::Acquire)
+    }
+
+    /// True only after the exact helper child was actually reaped. A dead
+    /// control generation with a still-running or unreaped child is not
+    /// quiescent and remains shutdown-visible.
+    pub fn child_reaped(&self) -> bool {
+        lock(&self.inner.child).reaped()
+    }
+
+    /// Publish the one absolute helper teardown deadline before scheduling the
+    /// blocking shutdown. This also caps a last-`Arc` drop/reaper that runs
+    /// before the blocking closure is dispatched, so it cannot start a fresh
+    /// grace after the shared shutdown budget is exhausted.
+    pub fn publish_teardown_deadline(&self, deadline: Instant) -> Instant {
+        self.inner.begin_teardown_deadline(deadline)
     }
 
     /// Send one request and wait for the matching reply with a deadline.
@@ -608,21 +1028,61 @@ impl HelperClient {
     /// Ask the child to fence, unmount and exit, then reap it within `grace`.
     ///
     /// A helper that does not exit is killed and reported as an error: shutdown
-    /// either observes a real exit or fails, it never claims success.
+    /// either observes a real exit or fails, it never claims success. The
+    /// grace is converted once to an absolute deadline shared by the RPC and
+    /// the exit wait; the old caller-visible method is preserved.
     pub fn shutdown(&self, grace: Duration) -> Result<(), HelperError> {
-        let request = self.call(None, 0, Body::Shutdown, grace.min(REQUEST_DEADLINE));
+        self.shutdown_until(Instant::now() + grace)
+    }
+
+    /// Deadline-aware shutdown used by the normal signal path. The RPC wait,
+    /// child-exit wait, reaper and last-resort drop all consume the same
+    /// absolute deadline and may only tighten it. No fresh grace is started
+    /// after the caller's remaining normal-shutdown budget is exhausted.
+    pub fn shutdown_until(&self, deadline: Instant) -> Result<(), HelperError> {
+        self.shutdown_until_observed(deadline).map_err(|error| error.error)
+    }
+
+    /// Crate-private typed shutdown used only by the normal-shutdown diagnostic.
+    /// The public `shutdown`/`shutdown_until` calls keep returning exactly the
+    /// original `HelperError` errno/message.
+    pub(crate) fn shutdown_until_observed(&self, deadline: Instant) -> Result<(), HelperShutdownError> {
+        let deadline = self.inner.begin_teardown_deadline(deadline);
+        if Instant::now() >= deadline {
+            // No remaining budget: still make one nonblocking, canonical
+            // shutdown/fence attempt, then fail-closed the exact generation so
+            // the deadline-capped reaper performs the owned kill/reap. This
+            // path never reports success without an observed child exit.
+            let attempted = self.inner.try_send_shutdown_frame();
+            self.inner.stop.store(true, Ordering::Release);
+            return match self.inner.wait_exit_until(deadline) {
+                Ok(()) => {
+                    self.inner.mark_dead();
+                    Ok(())
+                }
+                Err(error) => {
+                    self.inner.fail_generation(error.error.code, error.error.message.clone());
+                    if attempted { Err(error) } else { Err(HelperShutdownError::timeout(control_deadline_error())) }
+                }
+            };
+        }
+        let request_deadline = deadline.min(Instant::now() + REQUEST_DEADLINE);
+        let request = self.inner.call_until(None, 0, Body::Shutdown, request_deadline);
         self.inner.stop.store(true, Ordering::Release);
-        match self.inner.wait_exit(grace) {
+        match self.inner.wait_exit_until(deadline) {
             Ok(()) => {
                 self.inner.mark_dead();
                 match request {
                     Ok(Body::ShuttingDown) | Err(HelperError { code: libc::ECONNRESET, .. }) => Ok(()),
-                    Ok(other) => Err(HelperError::protocol(format!("unexpected shutdown reply `{}`", other.op()))),
-                    Err(error) => Err(error),
+                    Ok(other) => Err(HelperShutdownError::other(HelperError::protocol(format!(
+                        "unexpected shutdown reply `{}`",
+                        other.op()
+                    )))),
+                    Err(error) => Err(shutdown_error_for(error)),
                 }
             }
             Err(error) => {
-                self.inner.fail_generation(error.code, error.message.clone());
+                self.inner.fail_generation(error.error.code, error.error.message.clone());
                 Err(error)
             }
         }
@@ -850,5 +1310,181 @@ impl Drop for RemoteFreezeToken {
             epoch: self.epoch,
             op_id: self.op_id,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill_socket_until_blocked(stream: &mut UnixStream) {
+        let fd = stream.as_raw_fd();
+        let chunk = [0u8; 4096];
+        loop {
+            // SAFETY: the test owns both ends of the socket pair and keeps the
+            // peer alive for the whole test.
+            let sent = unsafe { libc::send(fd, chunk.as_ptr().cast(), chunk.len(), libc::MSG_DONTWAIT) };
+            if sent > 0 {
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK),
+                "unexpected socket fill error: {error}"
+            );
+            return;
+        }
+    }
+
+    #[test]
+    fn control_mutex_admission_is_bounded_by_the_absolute_deadline() {
+        let mutex = Mutex::new(0u8);
+        let _held = mutex.lock().expect("hold test mutex");
+        let started = Instant::now();
+        let error = match lock_until(&mutex, || started + Duration::from_millis(50)) {
+            Ok(_) => panic!("a held control mutex must not admit another writer after the deadline"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, libc::ETIMEDOUT);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn short_zero_budget_send_marks_terminal_before_releasing_the_control_guard() {
+        struct Guard(Arc<AtomicBool>);
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let guard_alive = Arc::new(AtomicBool::new(true));
+        let guard = Guard(guard_alive.clone());
+        let mut attempts = 0;
+        let mut terminal_calls = 0;
+        let complete = send_complete_or_terminal(
+            &[1u8, 2, 3],
+            |_, _| {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            },
+            |code| {
+                terminal_calls += 1;
+                assert!(guard_alive.load(Ordering::SeqCst), "terminal marking must precede guard release");
+                assert_eq!(code, libc::EINTR);
+            },
+        );
+        assert!(!complete);
+        assert_eq!(attempts, 1, "the zero-budget send must not retry EINTR or a short write");
+        assert_eq!(terminal_calls, 1);
+        drop(guard);
+        assert!(!guard_alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn short_positive_zero_budget_send_terminalizes_with_eio() {
+        let mut attempts = 0;
+        let mut terminal_calls = 0;
+        let complete = send_complete_or_terminal(
+            &[1u8, 2, 3],
+            |_, _| {
+                attempts += 1;
+                Ok(2)
+            },
+            |code| {
+                terminal_calls += 1;
+                assert_eq!(code, libc::EIO);
+            },
+        );
+        assert!(!complete);
+        assert_eq!(attempts, 1, "a short positive send must not be retried");
+        assert_eq!(terminal_calls, 1);
+    }
+
+    #[test]
+    fn stalled_control_write_observes_a_teardown_deadline_published_during_the_write() {
+        let (mut writer, _reader) = UnixStream::pair().expect("socket pair");
+        fill_socket_until_blocked(&mut writer);
+
+        let published = Arc::new(Mutex::new(None));
+        let publisher = published.clone();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            *publisher.lock().expect("publish teardown deadline") = Some(Instant::now() + Duration::from_millis(30));
+        });
+
+        let call_deadline = Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        let bytes = [0u8; 4096];
+        let error = match write_bytes_until(&mut writer, &bytes, || match *published.lock().expect("read deadline") {
+            Some(teardown) => call_deadline.min(teardown),
+            None => call_deadline,
+        }) {
+            Ok(()) => panic!("a full send buffer with no reader must not report a clean write"),
+            Err(error) => error,
+        };
+        release.join().expect("publisher thread");
+
+        assert_eq!(error.code, libc::ETIMEDOUT);
+        assert!(started.elapsed() >= Duration::from_millis(15), "teardown publication was not exercised");
+        assert!(started.elapsed() < Duration::from_secs(2), "write ignored the published teardown cap");
+    }
+
+    #[test]
+    fn child_exit_class_is_sealed_to_the_known_status_shapes() {
+        assert_eq!(child_exit_class(ExitKind::Code(101)), ChildExitClass::ExitCode101);
+        assert_eq!(child_exit_class(ExitKind::Code(102)), ChildExitClass::ExitCode102);
+        assert_eq!(child_exit_class(ExitKind::Code(103)), ChildExitClass::ExitCode103);
+        assert_eq!(child_exit_class(ExitKind::Code(104)), ChildExitClass::ExitCode104);
+        assert_eq!(child_exit_class(ExitKind::Code(105)), ChildExitClass::ExitCode105);
+        assert_eq!(child_exit_class(ExitKind::Code(1)), ChildExitClass::ExitCode1);
+        assert_eq!(child_exit_class(ExitKind::Signal(libc::SIGKILL)), ChildExitClass::SignalKill);
+        assert_eq!(child_exit_class(ExitKind::Signal(libc::SIGTERM)), ChildExitClass::SignalTerm);
+        assert_eq!(child_exit_class(ExitKind::Signal(libc::SIGINT)), ChildExitClass::Other);
+        assert_eq!(child_exit_class(ExitKind::Code(9)), ChildExitClass::Other);
+        assert_eq!(child_exit_class(ExitKind::Code(0)), ChildExitClass::Other);
+    }
+
+    #[test]
+    fn public_shutdown_error_messages_are_reconstructed_from_private_observations() {
+        let deadline = terminal_exit(ExitObservation::Exited(Err(ReapFailure::Deadline)))
+            .expect("a recorded reap failure is terminal")
+            .expect_err("a reap failure is never success");
+        assert_eq!(deadline.outcome, HelperShutdownOutcome::ChildReapDeadline);
+        assert_eq!(deadline.error.code, libc::ECHILD);
+        assert_eq!(
+            deadline.error.message,
+            "workspace FUSE helper was killed but did not reap within the shutdown deadline"
+        );
+
+        let wait = terminal_exit(ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))))
+            .expect("a recorded wait failure is terminal")
+            .expect_err("a wait failure is never success");
+        assert_eq!(wait.outcome, HelperShutdownOutcome::ChildReapError);
+        assert_eq!(wait.error.code, libc::ECHILD);
+        assert_eq!(wait.error.message, "wait failed");
+
+        let exited = terminal_exit(ExitObservation::Exited(Ok(ExitView {
+            success: false,
+            description: "exit status: 9".into(),
+            kind: ExitKind::Code(9),
+        })))
+        .expect("a recorded exit is terminal")
+        .expect_err("a nonzero exit is never success");
+        assert_eq!(exited.outcome, HelperShutdownOutcome::ChildExited(ChildExitClass::Other));
+        assert_eq!(exited.error.code, libc::ECHILD);
+        assert_eq!(exited.error.message, "workspace FUSE helper exited with exit status: 9");
+    }
+
+    #[test]
+    fn request_error_class_uses_only_the_retained_errno_and_preserves_public_error() {
+        let timeout = shutdown_error_for(HelperError::new(libc::ETIMEDOUT, "deadline"));
+        assert_eq!(timeout.outcome, HelperShutdownOutcome::Timeout);
+        assert_eq!((timeout.error.code, timeout.error.message.as_str()), (libc::ETIMEDOUT, "deadline"));
+
+        let generic = shutdown_error_for(HelperError::new(libc::EBUSY, "busy"));
+        assert_eq!(generic.outcome, HelperShutdownOutcome::Other);
+        assert_eq!((generic.error.code, generic.error.message.as_str()), (libc::EBUSY, "busy"));
     }
 }
