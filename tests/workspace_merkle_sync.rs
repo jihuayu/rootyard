@@ -169,6 +169,50 @@ fn seed_git_repo(repo: &Path, fmt: &str, files: &[(&str, &[u8])]) -> Result<()> 
     Ok(())
 }
 
+// Closed evidence checkpoint for the named SHA256 watcher case. Only the fixed
+// stage and a typed error class are printed, and only when the operation fails.
+const MERKLE_CHECKPOINT_PREFIX: &str = "rootyard-merkle-checkpoint";
+
+fn checkpoint_class(err: &anyhow::Error) -> &'static str {
+    use ms::MerkleSyncError as E;
+    // A live `.git` lock is only an unqualified `NotQuiescent` observation here.
+    // It does not prove the canonical `.git/objects/maintenance.lock`, so do not
+    // derive a maintenance class from it or from a generic I/O/NotFound error.
+    if let Some(err) = err.downcast_ref::<E>() {
+        return match err {
+            E::InvalidInput(_) => "invalid_input",
+            E::InvalidManifest(_) => "invalid_manifest",
+            E::UnsupportedGitState(_) => "unsupported_git_state",
+            E::NotQuiescent(_) => "not_quiescent",
+            E::ConcurrentEdit(_) => "concurrent_edit",
+            E::AccessDenied(_) => "access_denied",
+            E::TenantScopeMismatch(_) => "tenant_scope_mismatch",
+            E::StaleHistoryFenced(_) => "stale_history_fenced",
+            E::ForeignBackend => "foreign_backend",
+            E::MissingArtifact(_) => "missing_artifact",
+            E::IntegrityMismatch(_) => "integrity_mismatch",
+            E::GitFailed(_) => "git_failed",
+            E::Blob(_) => "blob",
+            E::Closure(_) => "closure",
+            E::DisposableView(_) => "disposable_view",
+            E::Io(_) => "io",
+        };
+    }
+    if err.downcast_ref::<std::io::Error>().is_some() { "io" } else { "unknown" }
+}
+
+fn checkpoint<T, E: Into<anyhow::Error>>(stage: &'static str, result: std::result::Result<T, E>) -> Result<T> {
+    result.map_err(|err| {
+        let err: anyhow::Error = err.into();
+        eprintln!("{MERKLE_CHECKPOINT_PREFIX} stage={stage} class={}", checkpoint_class(&err));
+        err
+    })
+}
+
+fn checkpoint_assert(stage: &'static str, condition: bool, message: &'static str) -> Result<()> {
+    if condition { Ok(()) } else { checkpoint(stage, Err::<(), _>(anyhow::anyhow!(message))) }
+}
+
 struct SyncEnv {
     s3: LoopbackS3,
     root_prefix: String,
@@ -321,17 +365,24 @@ impl SyncEnv {
 
 #[tokio::test]
 async fn sha256_watcher_converge_incremental_sync_and_cross_node_restore() -> Result<()> {
-    let h = SyncEnv::new("merkle-sha256")?;
-    let (ctx, pol) = (h.grant_ctx()?, EmptyDirPolicy::RetainNonIgnoredEmptyDirs);
+    let h = checkpoint("setup", SyncEnv::new("merkle-sha256"))?;
+    let (ctx, pol) = (checkpoint("setup", h.grant_ctx())?, EmptyDirPolicy::RetainNonIgnoredEmptyDirs);
     let repo = h.dir.path().join("src256");
-    seed_git_repo(&repo, "sha256", &[(".gitignore", b"*.log\n"), ("a/keep.txt", b"keep\n"), ("b/mut.txt", b"v1\n")])?;
-    let (base, _) = h.up(&ctx, &repo, pol, None).await?;
+    checkpoint(
+        "seed",
+        seed_git_repo(
+            &repo,
+            "sha256",
+            &[(".gitignore", b"*.log\n"), ("a/keep.txt", b"keep\n"), ("b/mut.txt", b"v1\n")],
+        ),
+    )?;
+    let (base, _) = checkpoint("base_capture", h.up(&ctx, &repo, pol, None).await)?;
 
     let non_utf = std::ffi::OsString::from_vec(b"raw-\xff\xfe.bin".to_vec());
-    fs::write(repo.join(&non_utf), b"nonutf-bytes\n")?;
-    fs::write(repo.join("b/mut.txt"), b"v2-converged\n")?;
-    fs::write(repo.join("skip.log"), b"ignored\n")?;
-    fs::create_dir_all(repo.join("retained_dir"))?;
+    checkpoint("incremental_fixture", fs::write(repo.join(&non_utf), b"nonutf-bytes\n"))?;
+    checkpoint("incremental_fixture", fs::write(repo.join("b/mut.txt"), b"v2-converged\n"))?;
+    checkpoint("incremental_fixture", fs::write(repo.join("skip.log"), b"ignored\n"))?;
+    checkpoint("incremental_fixture", fs::create_dir_all(repo.join("retained_dir")))?;
     let mut co = ms::WatcherCoalescer::new();
     let evs = vec![
         WE::Modify(b"b/mut.txt".into()),
@@ -340,20 +391,31 @@ async fn sha256_watcher_converge_incremental_sync_and_cross_node_restore() -> Re
     ];
     co.ingest(ms::WatcherBatch { seq_start: 1, seq_end: 2, events: evs });
     let (dirty, stats) = co.into_dirty_scope();
-    let sb = h.scan_only(&ctx, &repo, pol, Some(&base.manifest), dirty)?;
-    h.upload_scan(&ctx, &repo, &sb, &h.ledger, None).await?;
-    ensure!(!stats.used_full_rescan && sb.0.metrics.reused_nodes > 0 && sb.0.metrics.retained_empty_dirs == 1);
-    fs::remove_dir_all(&repo)?;
+    let sb = checkpoint("incremental_scan", h.scan_only(&ctx, &repo, pol, Some(&base.manifest), dirty))?;
+    checkpoint("incremental_upload", h.upload_scan(&ctx, &repo, &sb, &h.ledger, None).await)?;
+    checkpoint_assert(
+        "incremental_metrics",
+        !stats.used_full_rescan && sb.0.metrics.reused_nodes > 0 && sb.0.metrics.retained_empty_dirs == 1,
+        "incremental scan did not reuse nodes or retain the empty directory",
+    )?;
+    checkpoint("remove", fs::remove_dir_all(&repo))?;
 
     let restored = h.dir.path().join("dst256");
-    let rep = h.restore(&ctx, sb.0.manifest.checkpoint_id, &restored, "node-sha256").await?;
-    ensure!(rep.merkle_root_digest == sb.0.manifest.merkle_root_digest);
-    ensure!(
-        fs::read(restored.join(&non_utf))? == b"nonutf-bytes\n"
+    let rep = checkpoint("restore_root", h.restore(&ctx, sb.0.manifest.checkpoint_id, &restored, "node-sha256").await)?;
+    checkpoint_assert(
+        "restore_root",
+        rep.merkle_root_digest == sb.0.manifest.merkle_root_digest,
+        "restored Merkle root does not match the captured manifest",
+    )?;
+    let non_utf_body = checkpoint("restore_files", fs::read(restored.join(&non_utf)))?;
+    checkpoint_assert(
+        "restore_files",
+        non_utf_body == b"nonutf-bytes\n"
             && restored.join("retained_dir").is_dir()
-            && !restored.join("skip.log").exists()
-    );
-    git_ok(&restored, &["fsck", "--full", "--strict"])?;
+            && !restored.join("skip.log").exists(),
+        "restored files do not match the captured workspace",
+    )?;
+    checkpoint("fsck", git_ok(&restored, &["fsck", "--full", "--strict"]))?;
     Ok(())
 }
 

@@ -23,7 +23,9 @@ KNOWN_TESTS = (
     "forwarded_and_authorization_headers_never_change_the_peer",
     "missing_peer_is_refused_on_the_new_auth_route",
     "aborting_a_spawned_request_releases_the_permit",
+    "sha256_watcher_converge_incremental_sync_and_cross_node_restore",
 )
+MERKLE_TEST = KNOWN_TESTS[-1]
 
 
 class PandoLabCargoTest(unittest.TestCase):
@@ -79,7 +81,10 @@ class PandoLabCargoTest(unittest.TestCase):
             )
             return result, invoked.exists()
 
-    def run_gate(self, code, status, phase=None, *, names=(), truncated=False, bound=True, **invocation):
+    def run_gate(
+        self, code, status, phase=None, *, names=(), truncated=False,
+        checkpoint=None, bound=True, **invocation,
+    ):
         self.receipt.unlink(missing_ok=True)
         result, invoked = self.invoke_gate(code, **invocation)
         self.assertEqual(invoked, bound and code is not None)
@@ -99,6 +104,8 @@ class PandoLabCargoTest(unittest.TestCase):
         if phase == "test":
             expected["failed_tests"] = sorted(names)
             expected["failed_tests_truncated"] = truncated
+            if checkpoint is not None:
+                expected["failure_checkpoint"] = {"stage": checkpoint[0], "class": checkpoint[1]}
         self.assertEqual(json.loads(self.receipt.read_text()), expected)
 
     def test_success_preserves_argv_environment_and_working_directory(self):
@@ -137,6 +144,59 @@ class PandoLabCargoTest(unittest.TestCase):
             print("error: test failed, to rerun pass `--lib`", file=sys.stderr)
             sys.exit(101)
         """, 101, "test", names=KNOWN_TESTS[:8], truncated=True)
+
+    def test_named_merkle_case_projects_only_allowlisted_checkpoint(self):
+        self.run_gate(f"""
+            import sys
+            print("running 2 tests")
+            print("test workspace_merkle_sync::{MERKLE_TEST} ... FAILED")
+            print("---- workspace_merkle_sync::{MERKLE_TEST} stdout ----")
+            print("rootyard-merkle-checkpoint stage=base_capture class=not_quiescent")
+            print("credential=private /private/path")
+            print("failures:")
+            print("    {MERKLE_TEST}")
+            print("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
+                  "0 measured; 0 filtered out; finished in 0.01s")
+            sys.exit(101)
+        """, 101, "test", names=(MERKLE_TEST,), checkpoint=("base_capture", "not_quiescent"))
+
+    def test_named_merkle_case_ignores_unbounded_or_ambiguous_checkpoints(self):
+        marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
+        cases = {
+            "unknown stage": "rootyard-merkle-checkpoint stage=private_stage class=unknown",
+            "unknown class": "rootyard-merkle-checkpoint stage=base_capture class=private_class",
+            "trailing text": marker + " /private/path",
+            "oversized line": "x" * 4097 + marker,
+            "conflicting checkpoints": marker + "\n" + "rootyard-merkle-checkpoint stage=remove class=io",
+        }
+        for context, output in cases.items():
+            with self.subTest(context=context):
+                self.run_gate(f"""
+                    import sys
+                    print("running 2 tests")
+                    print("test workspace_merkle_sync::{MERKLE_TEST} ... FAILED")
+                    print({output!r})
+                    print("failures:")
+                    print("    {MERKLE_TEST}")
+                    print("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
+                          "0 measured; 0 filtered out; finished in 0.01s")
+                    sys.exit(101)
+                """, 101, "test", names=(MERKLE_TEST,))
+
+    def test_named_merkle_case_requires_a_sole_failure(self):
+        self.run_gate(f"""
+            import sys
+            print("running 3 tests")
+            print("test workspace_merkle_sync::{MERKLE_TEST} ... FAILED")
+            print("test valid_source::{KNOWN_TESTS[0]} ... FAILED")
+            print("rootyard-merkle-checkpoint stage=base_capture class=not_quiescent")
+            print("failures:")
+            print("    {MERKLE_TEST}")
+            print("    {KNOWN_TESTS[0]}")
+            print("test result: FAILED. 0 passed; 2 failed; 0 ignored; "
+                  "0 measured; 0 filtered out; finished in 0.01s")
+            sys.exit(101)
+        """, 101, "test", names=(KNOWN_TESTS[0], MERKLE_TEST))
 
     def test_compile_marker_is_projected_without_diagnostic_text(self):
         self.run_gate("""
