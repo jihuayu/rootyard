@@ -69,6 +69,7 @@ enum A4Phase {
     SubscriberDecoy,
     SubscriberPoll,
     SubscriberEffects,
+    Cleanup,
 }
 
 impl A4Phase {
@@ -105,6 +106,7 @@ impl A4Phase {
             Self::SubscriberDecoy => "subscriber.decoy",
             Self::SubscriberPoll => "subscriber.poll",
             Self::SubscriberEffects => "subscriber.effects",
+            Self::Cleanup => "cleanup",
         }
     }
 }
@@ -627,7 +629,11 @@ async fn a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit()
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    // `finish` rethrows the body outcome unchanged on failure; wrapping it
-    // here would replace a closed phase label with the cleanup boundary.
-    db.finish(outcome).await
+    match outcome {
+        // Real cleanup runs first; only its failure is mapped to the fixed phase.
+        Ok(()) => db.finish(Ok(())).await.phase(A4Phase::Cleanup),
+        // `finish` discards teardown detail and returns this original fixed body
+        // failure unchanged, so it is never appended with raw cleanup text.
+        Err(error) => db.finish(Err(error)).await,
+    }
 }
