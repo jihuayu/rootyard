@@ -23,9 +23,9 @@ jobs:
     # 95 minutes baseline, 12 for the #304 cold tenant LFS gate on owned Garage,
     # 28 for the full Redis qualification (13 build, 5 restore/flush, 3
     # partition, 4 failover, 3 cleanup and manifest binding), 40 for the Pando
-    # package gates, and 18 for the #29 bounded owned-Garage named witness:
-    # 95 + 12 + 28 + 40 + 18 = 193 minutes.
-    timeout-minutes: 193
+    # package gates, and 22 for the #29 bounded owned-Garage named witness:
+    # 95 + 12 + 28 + 40 + 22 = 197 minutes.
+    timeout-minutes: 197
     services:
       postgres:
         image: postgres:17
@@ -268,16 +268,19 @@ jobs:
       # Separate #29-owned Garage/bucket/scratch scope. Do not reuse the live
       # #85 fixture, keys, environment file or cleanup trap.
       - name: "Prove #29 tenant-scoped remote checkpoint restore/fork refusal on owned Garage"
-        # Worst-case bounded components: two 120s pulls plus 10s kill-after and a
-        # 2s retry pause (262s), a shared 60s startup budget plus a 5s kill-after
-        # and a 1s pause (66s), the independent S3 readiness probe's 60s budget
-        # plus a 5s attempt overrun and 0.5s pause (66s), and the 480s named test
-        # plus 15s kill-after (495s): 889s, or 14m49s.  The 18-minute allowance
-        # leaves ~3m11s for owned-container cleanup and normal Docker/Garage
-        # setup overhead.
-        timeout-minutes: 18
+        # Opt-in finite lifecycle: every Docker/Garage call in start shares a
+        # 540s deadline and every one in stop shares a 90s deadline, with a 5s
+        # kill-after per call. Reserving both possible stop windows (failed-start
+        # self cleanup and the repeated finalizer stop), the 480s named test with
+        # its 15s kill-after, and 30s of final shell/file checks:
+        # 545 + 495 + 95 + 95 + 30 = 1260s (21m). The 22-minute allowance keeps
+        # one minute of headroom. The start deadline includes the existing pull,
+        # startup and independent S3-probe budgets.
+        timeout-minutes: 22
         env:
           ROOTYARD_WORKSPACE_MOUNT_MODE: direct
+          ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT: "540"
+          ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT: "90"
         run: |
           set -euo pipefail
           umask 077

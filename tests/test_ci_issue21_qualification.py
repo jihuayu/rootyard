@@ -41,10 +41,13 @@ UPLOAD_ALLOWED_LOG = "test-results/ci-webhook-regressions.log"
 # The 163-minute verify/lifecycle budget already contains the 28-minute owned
 # Redis step, so it is not added again.  #304 contributes an independent
 # 12-minute cold tenant LFS gate on owned Garage, and #29 contributes an
-# independent 18-minute bounded owned-Garage named witness: 163 + 12 + 18 = 193.
+# independent 22-minute bounded owned-Garage named witness:
+# 163 + 12 + 22 = 197.
 VERIFY_BASE_BUDGET_MINUTES = 163
 COLD_LFS_BUDGET_MINUTES = 12
-REMOTE_CAS_BUDGET_MINUTES = 18
+REMOTE_CAS_BUDGET_MINUTES = 22
+REMOTE_CAS_START_LIFECYCLE_SECONDS = 540
+REMOTE_CAS_STOP_LIFECYCLE_SECONDS = 90
 
 
 def _lines():
@@ -219,9 +222,21 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertEqual(
             cold_lfs["timeout-minutes"], str(COLD_LFS_BUDGET_MINUTES)
         )
+        self.assertNotIn("ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT",
+                         cold_lfs["env"])
+        self.assertNotIn("ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT",
+                         cold_lfs["env"])
         remote_cas = _step(REMOTE_CAS_STEP)
         self.assertEqual(
             remote_cas["timeout-minutes"], str(REMOTE_CAS_BUDGET_MINUTES)
+        )
+        self.assertEqual(
+            remote_cas["env"].get("ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT"),
+            str(REMOTE_CAS_START_LIFECYCLE_SECONDS),
+        )
+        self.assertEqual(
+            remote_cas["env"].get("ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT"),
+            str(REMOTE_CAS_STOP_LIFECYCLE_SECONDS),
         )
         pg = _step(PG_STEP)
         self.assertEqual(pg["timeout-minutes"], "10")
