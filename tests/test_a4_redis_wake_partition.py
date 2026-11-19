@@ -368,6 +368,40 @@ class RepoCreateObserverTest(unittest.TestCase):
             harness.await_ready("alice", "repo", None, observer=harness.observe_repo_create)
         self.assertEqual(harness.repo_create_code, "get_terminal_state")
 
+    def test_create_owner_name_present_missing_id_calls_get_and_old_failure(self):
+        for use_observer in (False, True):
+            with self.subTest(observer=use_observer):
+                harness = object.__new__(a4.A4RedisWakeHarness)
+                harness.repo_create_code = None
+                harness.http = Mock(return_value=(201, b'{"owner":"alice","name":"repo"}', {}))
+                harness.await_ready = Mock(return_value={
+                    "id": "1", "owner": "alice", "name": "repo", "storage_backend": "pg_refstore",
+                    "object_format": "sha1", "clone_path": "/git/alice/repo.git",
+                })
+                observer = harness.observe_repo_create if use_observer else None
+                with self.assertRaises(KeyError):
+                    harness.create("repo", None, observer=observer)
+                harness.await_ready.assert_called_once()
+                if use_observer:
+                    self.assertEqual(harness.repo_create_code, "post_shape")
+
+    def test_create_malformed_owner_name_does_not_coerce_clone_path(self):
+        for use_observer in (False, True):
+            with self.subTest(observer=use_observer):
+                harness = object.__new__(a4.A4RedisWakeHarness)
+                harness.repo_create_code = None
+                harness.post_repo = Mock(return_value=(201, {"id": "1", "owner": "alice", "name": "repo"}))
+                harness.await_ready = Mock(return_value={
+                    "id": "1", "owner": 123, "name": 456, "storage_backend": "pg_refstore",
+                    "object_format": "sha1", "clone_path": "/git/123/456.git",
+                })
+                observer = harness.observe_repo_create if use_observer else None
+                with self.assertRaises(TypeError):
+                    harness.create("repo", None, observer=observer)
+                harness.await_ready.assert_called_once()
+                if use_observer:
+                    self.assertEqual(harness.repo_create_code, "get_shape")
+
     def test_create_without_observer_keeps_existing_contract(self):
         harness = object.__new__(a4.A4RedisWakeHarness)
         harness.post_repo = Mock(return_value=(201, {"id": "1", "owner": "alice", "name": "repo"}))

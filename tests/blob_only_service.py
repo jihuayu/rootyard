@@ -411,23 +411,37 @@ esac
         raise AssertionError("repository did not become ready within 30s")
     def create(self, name, token, object_format="sha1", observer=None):
         code, created = self.post_repo(name, token, object_format, observer=observer)
-        if not (isinstance(created, dict) and all(
+        if observer and not (isinstance(created, dict) and all(
                 isinstance(created.get(field), str) and created.get(field) for field in ("id", "owner", "name"))):
-            if observer: observer("post_shape")
-            raise AssertionError("POST /api/repos: response identity is incomplete")
+            observer("post_shape")
         repo = self.await_ready(created["owner"], created["name"], token, observer=observer)
-        if repo.get("id") != created.get("id"):
-            if observer: observer("identity_mismatch")
-        if repo.get("storage_backend") != "pg_refstore":
-            if observer: observer("backend_mismatch")
+        if observer and not (
+                isinstance(repo, dict)
+                and isinstance(repo.get("id"), str) and repo.get("id")
+                and isinstance(repo.get("owner"), str) and repo.get("owner")
+                and isinstance(repo.get("name"), str) and repo.get("name")
+                and isinstance(repo.get("storage_backend"), str) and repo.get("storage_backend")
+                and isinstance(repo.get("object_format"), str) and repo.get("object_format")
+                and isinstance(repo.get("clone_path"), str) and repo.get("clone_path")):
+            observer("get_shape")
+        if isinstance(repo, dict) and isinstance(created, dict):
+            if repo.get("id") != created.get("id"):
+                if observer: observer("identity_mismatch")
+            if repo.get("storage_backend") != "pg_refstore":
+                if observer: observer("backend_mismatch")
         assert repo["id"] == created["id"] and repo["storage_backend"] == "pg_refstore"
-        if repo.get("object_format") != object_format:
+        if isinstance(repo, dict) and repo.get("object_format") != object_format:
             if observer: observer("object_format_mismatch")
         assert repo["object_format"] == object_format, repo.get("object_format")
-        expected_clone = "/git/" + str(repo.get("owner", "")) + "/" + str(repo.get("name", "")) + ".git"
-        if repo.get("clone_path") != expected_clone:
-            if observer: observer("clone_path_mismatch")
-        assert repo["clone_path"] == expected_clone
+        if observer:
+            try:
+                expected_clone = "/git/" + repo["owner"] + "/" + repo["name"] + ".git"
+            except (KeyError, TypeError):
+                pass
+            else:
+                if repo.get("clone_path") != expected_clone:
+                    observer("clone_path_mismatch")
+        assert repo["clone_path"] == "/git/" + repo["owner"] + "/" + repo["name"] + ".git"
         return repo, code
     def db_repo(self, repo_id):
         value = str(uuid.UUID(repo_id))
