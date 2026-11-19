@@ -12,6 +12,7 @@ use tokio::{
 const GIT_DIR_CAP: usize = 64 * 1024 * 1024;
 const TIMEOUT_CLEANUP_BOUND: Duration = Duration::from_secs(2);
 const LEADER_REAP_BOUND: Duration = Duration::from_millis(100);
+const FALLBACK_ASYNC_BUDGET: Duration = Duration::from_millis(250);
 
 /// One refcounted scratch owner that must outlive a child process group.
 pub(crate) type ScratchHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
@@ -238,40 +239,130 @@ fn signal_group(child: &mut Child, pid: i32) {
     let _ = child.start_kill();
 }
 
-type ReaperTask = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type ReaperTask = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type GroupProbe = fn(i32) -> std::io::Result<bool>;
 
 fn spawn_reaper_thread(child: Child, pid: i32, hold: Option<ScratchHold>) {
-    spawn_reaper_with(child, pid, hold, |task| {
+    let holds: Vec<ScratchHold> = hold.into_iter().collect();
+    spawn_reaper_with(child, pid, holds, |task| {
         std::thread::Builder::new().name("s4-git-reap".into()).spawn(task).map(|_| ())
     });
 }
 
-pub(super) fn spawn_reaper_with<F>(child: Child, pid: i32, hold: Option<ScratchHold>, spawn_fn: F)
+pub(crate) fn spawn_reaper_with<F>(child: Child, pid: i32, holds: Vec<ScratchHold>, spawn_fn: F)
 where
     F: FnOnce(ReaperTask) -> std::io::Result<()>,
 {
-    let mut fallback = SpawnFallback { state: Some((child, pid, hold)) };
+    #[cfg(unix)]
+    let probe: GroupProbe = group_quiescent;
+    #[cfg(not(unix))]
+    let probe: GroupProbe = |_| Ok(true);
+    spawn_reaper_with_probe(child, pid, holds, spawn_fn, probe);
+}
+
+pub(crate) fn spawn_reaper_with_probe<F>(
+    child: Child,
+    pid: i32,
+    holds: Vec<ScratchHold>,
+    spawn_fn: F,
+    probe: GroupProbe,
+) where
+    F: FnOnce(ReaperTask) -> std::io::Result<()>,
+{
+    let mut fallback = SpawnFallback { state: Some((child, pid, holds, probe)) };
     let spawned = spawn_fn(Box::new(move || {
-        if let Some((child, pid, hold)) = fallback.state.take() {
-            reap_until_confirmed(child, pid, hold);
+        if let Some((child, pid, holds, probe)) = fallback.state.take() {
+            reap_until_confirmed(child, pid, holds, probe);
         }
     }));
     drop(spawned);
 }
 
 struct SpawnFallback {
-    state: Option<(Child, i32, Option<ScratchHold>)>,
+    state: Option<(Child, i32, Vec<ScratchHold>, GroupProbe)>,
 }
 
 impl Drop for SpawnFallback {
     fn drop(&mut self) {
-        if let Some((mut child, pid, hold)) = self.state.take() {
-            signal_group(&mut child, pid);
-            eprintln!("rootyard: failed to spawn Git reaper thread; retaining unverified scratch hold");
-            std::mem::forget(hold);
-            std::mem::forget(child);
+        let Some((mut child, pid, holds, probe)) = self.state.take() else {
+            return;
+        };
+        signal_group(&mut child, pid);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(reap_fallback_bounded(child, pid, holds, probe));
+            return;
+        }
+        #[cfg(unix)]
+        let quiescent = pid <= 1 || matches!(probe(pid), Ok(true));
+        #[cfg(not(unix))]
+        let quiescent = {
+            let _ = probe;
+            true
+        };
+        if quiescent && child_gone(&mut child) {
+            drop(child);
+            drop(holds);
+            return;
+        }
+        eprintln!("rootyard: Git reaper fallback timed out or group probe failed; preserving unverified scratch");
+        std::mem::forget(holds);
+        drop(child);
+    }
+}
+
+async fn reap_fallback_bounded(mut child: Child, pid: i32, holds: Vec<ScratchHold>, probe: GroupProbe) {
+    #[cfg(unix)]
+    let confirmed = if pid > 1 && child.id().is_some() {
+        tokio::time::timeout(FALLBACK_ASYNC_BUDGET, async {
+            while !matches!(probe(pid), Ok(true)) {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    } else {
+        let _ = probe;
+        true
+    };
+    #[cfg(not(unix))]
+    let confirmed = {
+        let _ = (pid, probe);
+        true
+    };
+    let reaped = confirmed
+        && (tokio::time::timeout(Duration::from_secs(1), child.wait()).await.is_ok() || child_gone(&mut child));
+    if !reaped {
+        eprintln!("rootyard: Git reaper fallback timed out or group probe failed; preserving unverified scratch");
+        std::mem::forget(holds);
+        let _ = tokio::time::timeout(LEADER_REAP_BOUND, child.wait()).await;
+        drop(child);
+        return;
+    }
+    drop(child);
+    drop(holds);
+}
+
+fn reap_until_confirmed(mut child: Child, pid: i32, holds: Vec<ScratchHold>, probe: GroupProbe) {
+    #[cfg(unix)]
+    if pid > 1 {
+        let started = std::time::Instant::now();
+        let mut reported = false;
+        while !matches!(probe(pid), Ok(true)) {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            if !reported && started.elapsed() > Duration::from_secs(5) {
+                eprintln!("rootyard: cancelled Git process group cleanup blocked; retaining scratch hold");
+                reported = true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
+    #[cfg(not(unix))]
+    let _ = (pid, probe);
+    while !child_gone(&mut child) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(holds);
 }
 
 fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
@@ -296,28 +387,6 @@ fn child_gone(child: &mut Child) -> bool {
         Err(_) => true,
         Ok(None) => false,
     }
-}
-
-fn reap_until_confirmed(mut child: Child, pid: i32, hold: Option<ScratchHold>) {
-    #[cfg(unix)]
-    if pid > 1 {
-        let started = std::time::Instant::now();
-        let mut reported = false;
-        while !matches!(group_quiescent(pid), Ok(true)) {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            if !reported && started.elapsed() > Duration::from_secs(5) {
-                eprintln!("rootyard: cancelled Git process group cleanup blocked; retaining scratch hold");
-                reported = true;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-    while !child_gone(&mut child) {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    drop(hold);
 }
 
 pub(crate) async fn run_git_dir_bounded(

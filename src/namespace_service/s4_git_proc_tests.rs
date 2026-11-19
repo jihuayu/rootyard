@@ -144,10 +144,10 @@ async fn expired_timeout_cleanup_hands_scratch_to_reaper_until_group_exits() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn spawn_reaper_failure_bounds_caller_and_retains_scratch() {
-    let scratch = ScratchDir::create("rootyard-s4-proc-spawn-fail").unwrap();
+async fn spawn_reaper_failure_bounds_caller_and_reaps_without_zombies() {
+    let scratch = ScratchDir::create("rootyard-s4-proc-spawn-ok").unwrap();
     let root = scratch.root().to_path_buf();
-    let pidfile = root.join("spawn-fail.pid");
+    let pidfile = root.join("spawn-ok.pid");
     let mut cmd = command(&pidfile);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
     let child = cmd.spawn().unwrap();
@@ -157,19 +157,57 @@ async fn spawn_reaper_failure_bounds_caller_and_retains_scratch() {
     drop(scratch);
     let started = std::time::Instant::now();
     spawn_reaper_with(child, pid, holds, |_| Err(io::Error::other("simulated thread limit")));
-    assert!(started.elapsed() < Duration::from_millis(500), "spawn failure blocked caller");
-    assert!(root.exists(), "unverified scratch vanished when reaper thread spawn failed");
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    for _ in 0..200 {
+    assert!(started.elapsed() < Duration::from_millis(200), "spawn failure blocked caller");
+    for _ in 0..300 {
+        if !root.exists()
+            && !PathBuf::from(format!("/proc/{leader}")).exists()
+            && !PathBuf::from(format!("/proc/{grandchild}")).exists()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
+    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
+    assert!(!root.exists(), "confirmed-quiescent scratch was not removed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_child() {
+    fn unknown_group(_pid: i32) -> io::Result<bool> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "simulated procfs error"))
+    }
+    let scratch = ScratchDir::create("rootyard-s4-proc-spawn-unk").unwrap();
+    let root = scratch.root().to_path_buf();
+    let pidfile = root.join("spawn-unk.pid");
+    let mut cmd = command(&pidfile);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
+    let child = cmd.spawn().unwrap();
+    let pid = i32::try_from(child.id().unwrap()).unwrap();
+    let (leader, grandchild) = wait_pids(&pidfile).await;
+    let holds = vec![scratch.hold()];
+    drop(scratch);
+    let started = std::time::Instant::now();
+    crate::ci_pins::s4_git_runner::spawn_reaper_with_probe(
+        child,
+        pid,
+        holds,
+        |_| Err(io::Error::other("simulated thread limit")),
+        unknown_group,
+    );
+    assert!(started.elapsed() < Duration::from_millis(200), "spawn failure blocked caller");
+    for _ in 0..300 {
         if !PathBuf::from(format!("/proc/{leader}")).exists()
             && !PathBuf::from(format!("/proc/{grandchild}")).exists()
         {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(root.exists(), "retained scratch hold was not preserved across process exit");
+    assert!(!PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
+    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(root.exists(), "uncertain scratch was deleted despite unknown group outcome");
     std::fs::remove_dir_all(&root).unwrap();
 }

@@ -59,7 +59,7 @@ pub(crate) mod s4_release;
 #[path = "ci_pins/s4_authority.rs"]
 pub(crate) mod s4_authority;
 #[path = "ci_pins/s4_git_runner.rs"]
-mod s4_git_runner;
+pub(crate) mod s4_git_runner;
 #[path = "ci_pins/s4_checkout.rs"]
 pub(crate) mod s4_checkout;
 #[path = "ci_pins/s4_transport.rs"]

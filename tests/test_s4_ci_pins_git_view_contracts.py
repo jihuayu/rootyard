@@ -267,8 +267,12 @@ class SourceContracts(unittest.TestCase):
             self.assertIn("TIMEOUT_CLEANUP_BOUND", body)
             self.assertIn("spawn_reaper_thread", body)
             self.assertIn("spawn_reaper_with", body)
-            self.assertIn("std::mem::forget", body)
             self.assertNotIn("kill_group_child", body)
+            self.assertNotIn("forget(child)", body)
+        self.assertIn("std::mem::forget(holds)", runner)
+        self.assertIn("reap_fallback_bounded", runner)
+        self.assertNotIn("waitpid", text(CI_PINS / "s4_tests.rs"))
+        self.assertNotIn("waitpid", text(SRC / "namespace_service" / "s4_git_proc_tests.rs"))
         for body in (runner, transport):
             self.assertIn("finish(deadline)", body)
         hold = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")

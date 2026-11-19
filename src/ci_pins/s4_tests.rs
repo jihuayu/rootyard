@@ -323,7 +323,7 @@ async fn upload_pack_advertise_and_spawn_pass_positional_directory() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn spawn_reaper_failure_bounds_caller_and_retains_scratch() {
+async fn spawn_reaper_failure_bounds_caller_and_reaps_without_zombies() {
     use super::s4_authority::DisposableCiView;
     use std::{os::unix::fs::PermissionsExt, process::Stdio};
     let view = DisposableCiView::create().expect("disposable view");
@@ -336,25 +336,67 @@ async fn spawn_reaper_failure_bounds_caller_and_retains_scratch() {
     let child = cmd.spawn().expect("spawn wrapper");
     let pid = child.id().and_then(|id| i32::try_from(id).ok()).expect("wrapper pid");
     let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
-    let hold = view.hold();
+    let holds = vec![view.hold()];
     drop(view);
     let started = std::time::Instant::now();
-    super::s4_git_runner::spawn_reaper_with(child, pid, Some(hold), |_| {
+    super::s4_git_runner::spawn_reaper_with(child, pid, holds, |_| {
         Err(std::io::Error::other("simulated thread limit"))
     });
-    assert!(started.elapsed() < std::time::Duration::from_millis(500), "spawn failure blocked caller");
-    assert!(root.exists(), "unverified disposable view vanished when reaper thread spawn failed");
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    for _ in 0..200 {
+    assert!(started.elapsed() < std::time::Duration::from_millis(200), "spawn failure blocked caller");
+    for _ in 0..300 {
+        if !root.exists()
+            && !std::path::PathBuf::from(format!("/proc/{leader}")).exists()
+            && !std::path::PathBuf::from(format!("/proc/{grandchild}")).exists()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
+    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
+    assert!(!root.exists(), "confirmed-quiescent disposable view was not removed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_child() {
+    use super::s4_authority::DisposableCiView;
+    use std::{os::unix::fs::PermissionsExt, process::Stdio};
+    fn unknown_group(_pid: i32) -> std::io::Result<bool> {
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "simulated procfs error"))
+    }
+    let view = DisposableCiView::create().expect("disposable view");
+    let root = view.path().to_path_buf();
+    let wrapper = root.join("git");
+    std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
+    let mut cmd = tokio::process::Command::new(&wrapper);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
+    let child = cmd.spawn().expect("spawn wrapper");
+    let pid = child.id().and_then(|id| i32::try_from(id).ok()).expect("wrapper pid");
+    let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
+    let holds = vec![view.hold()];
+    drop(view);
+    let started = std::time::Instant::now();
+    super::s4_git_runner::spawn_reaper_with_probe(
+        child,
+        pid,
+        holds,
+        |_| Err(std::io::Error::other("simulated thread limit")),
+        unknown_group,
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(200), "spawn failure blocked caller");
+    for _ in 0..300 {
         if !std::path::PathBuf::from(format!("/proc/{leader}")).exists()
             && !std::path::PathBuf::from(format!("/proc/{grandchild}")).exists()
         {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert!(root.exists(), "retained scratch hold was not preserved across process exit");
-    std::fs::remove_dir_all(&root).expect("cleanup retained disposable view");
+    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
+    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(root.exists(), "uncertain disposable view was deleted despite unknown group outcome");
+    std::fs::remove_dir_all(&root).expect("cleanup preserved disposable view");
 }
