@@ -212,6 +212,15 @@ async fn a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit()
             ),
             "A4_CAPTURE_FENCE phase=mismatch.commit unexpected refusal"
         );
+        // A `VerifiedAuthorizedPublication` owns its native facts workspace and
+        // therefore one process-wide materialized-view permit until dropped. The
+        // failed mismatch capture is only checked for its typed refusal and its
+        // durable rollback, while the matched capture is deliberately retained
+        // for the later exact replay. Release the failed capture here so the
+        // generic fact pass below stays within the bounded view budget instead
+        // of waiting on a third permit; the generic call itself remains the real
+        // prepare/select/verify/commit pipeline.
+        drop(mismatch_verified);
 
         // The whole final transaction rolled back before auth/terminal writes.
         let operation = facts::operation(&db.pool, repo, mismatch_op).await.phase(A4Phase::MismatchRollback)?;
