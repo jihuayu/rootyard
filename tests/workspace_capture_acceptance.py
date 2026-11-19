@@ -7,9 +7,12 @@ uses real workspaces, real Git clones and real filesystem inventories:
   an earlier workspace is permanently bad and another is deliberately slow;
 * a large inventory does not block the sole Tokio worker for health requests;
 * a scan in progress does not hold the workspace row lock, and a revision or
-  lease-epoch change during that scan is never overwritten by the stale result.
+  lease-epoch change during that scan is never overwritten by the stale result;
+* SSE reconnect honors the native Last-Event-ID cursor and retention gaps
+  terminate at the live durable revision without replaying unseen events.
 """
 import argparse
+import base64
 from collections import Counter
 import hashlib
 import io
@@ -113,6 +116,109 @@ def events(h, workspace, after=0):
         h.expect(f"/api/workspaces/{workspace['id']}/events?after_revision={after}", 200, token=h.alice)
     )
     return body.get("events", [])
+
+
+def write_event(h, workspace, index):
+    """Create one real durable workspace event through the write API."""
+    path = f"/api/workspaces/{workspace['id']}/files?path=event-{index}.txt"
+    for _ in range(10):
+        current = json.loads(h.expect(f"/api/workspaces/{workspace['id']}", 200, token=h.alice))
+        body = {
+            "content_base64": base64.b64encode(f"event {index}\n".encode()).decode(),
+            "expected_entry_version": 0,
+            "expected_workspace_revision": current["revision"],
+            "lease_epoch": current["lease_epoch"],
+        }
+        status, raw, _ = h.http(
+            path,
+            token=h.alice,
+            method="PUT",
+            body=body,
+            extra_headers={"Idempotency-Key": f"sse-event-{index}"},
+        )
+        if status == 200:
+            return json.loads(raw)
+        if status != 409:
+            raise AssertionError(f"workspace event write failed: {status}: {raw[:300]!r}")
+        time.sleep(0.05)
+    raise AssertionError(f"workspace event write for event-{index}.txt kept conflicting")
+
+
+def sse_frames(h, workspace, after=None, last_event_id=None, max_frames=1, timeout=8.0):
+    """Read a bounded number of real SSE frames from one response and close it."""
+    suffix = "" if after is None else f"?after_revision={after}"
+    headers = {
+        "Authorization": "Bearer " + h.alice["token"],
+        "Accept": "text/event-stream",
+    }
+    if last_event_id is not None:
+        headers["Last-Event-ID"] = str(last_event_id)
+    request = urllib.request.Request(
+        f"{h.base}/api/workspaces/{workspace['id']}/events/stream{suffix}",
+        headers=headers,
+    )
+    frames = []
+    frame = {"event": None, "id": None, "data": []}
+    line = b""
+    consumed = 0
+
+    def finish():
+        if frame["event"] is not None or frame["id"] is not None or frame["data"]:
+            frames.append(
+                {
+                    "event": frame["event"] or "message",
+                    "id": frame["id"],
+                    "data": "\n".join(frame["data"]),
+                }
+            )
+        frame.update(event=None, id=None, data=[])
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        try:
+            while len(frames) < max_frames and consumed < 65536:
+                try:
+                    chunk = response.read(1)
+                except TimeoutError:
+                    break
+                if not chunk:
+                    break
+                consumed += 1
+                if chunk != b"\n":
+                    line += chunk
+                    continue
+                text = line.rstrip(b"\r").decode("utf-8")
+                line = b""
+                if not text:
+                    finish()
+                    continue
+                if text.startswith(":"):
+                    continue
+                field, _, value = text.partition(":")
+                if value.startswith(" "):
+                    value = value[1:]
+                if field == "event":
+                    frame["event"] = value
+                elif field == "id":
+                    frame["id"] = value
+                elif field == "data":
+                    frame["data"].append(value)
+            if line:
+                text = line.rstrip(b"\r").decode("utf-8")
+                if text and not text.startswith(":"):
+                    field, _, value = text.partition(":")
+                    if value.startswith(" "):
+                        value = value[1:]
+                    if field == "data":
+                        frame["data"].append(value)
+                    elif field == "event":
+                        frame["event"] = value
+                    elif field == "id":
+                        frame["id"] = value
+            if len(frames) < max_frames:
+                finish()
+        finally:
+            response.close()
+    return frames
 
 
 def wait_event(h, workspace, timeout=30.0, after=0, kind="external_capture"):
@@ -463,6 +569,107 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
                 1.0,
                 f"health/live was blocked for {slowest:.3f}s by inventory scanning",
             )
+        finally:
+            h.cleanup()
+
+    def test_sse_reconnect_and_retention_gap_uses_live_revision(self):
+        h = harness()
+        try:
+            h.setup()
+            h.api()
+            h.roundtrip()
+            workspace = create(h, "sse")
+            for index in range(4):
+                write_event(h, workspace, index)
+
+            replay = json.loads(
+                h.expect(f"/api/workspaces/{workspace['id']}/events?after_revision=0", 200, token=h.alice)
+            )
+            replayed = replay["events"]
+            self.assertGreaterEqual(len(replayed), 4, replayed)
+            latest = replay["snapshot_revision"]
+            self.assertEqual(latest, replayed[-1]["revision"])
+            first, second = replayed[0], replayed[1]
+
+            # A native EventSource keeps the original query string on reconnect
+            # and sends Last-Event-ID. The header must not replay first again.
+            frames = sse_frames(h, workspace, after=0, last_event_id=first["revision"], max_frames=1)
+            self.assertEqual(len(frames), 1, frames)
+            self.assertEqual(frames[0]["event"], "workspace")
+            self.assertEqual(frames[0]["id"], str(second["revision"]))
+            self.assertEqual(json.loads(frames[0]["data"])["revision"], second["revision"])
+            self.assertNotEqual(json.loads(frames[0]["data"])["revision"], first["revision"])
+
+            # A malformed/overflowing header falls back to the query cursor.
+            frames = sse_frames(
+                h, workspace, after=first["revision"], last_event_id="9" * 40, max_frames=1
+            )
+            self.assertEqual(len(frames), 1, frames)
+            self.assertEqual(json.loads(frames[0]["data"])["revision"], second["revision"])
+
+            # Deleting this workspace's own third event models durable
+            # retention. The page starts contiguous after the cursor and has an
+            # internal discontinuity before later events.
+            cursor = first["revision"]
+            h.sql(
+                "DELETE FROM workspace_events WHERE workspace_id='%s' AND revision=%d"
+                % (workspace["id"], replayed[2]["revision"])
+            )
+            self.assertEqual(
+                h.sql("SELECT revision FROM workspaces WHERE id='%s'" % workspace["id"]),
+                str(latest),
+            )
+            resync = json.loads(
+                h.expect(
+                    f"/api/workspaces/{workspace['id']}/events?after_revision={cursor}",
+                    200,
+                    token=h.alice,
+                )
+            )
+            self.assertEqual(resync.get("kind"), "RESYNC_REQUIRED")
+            self.assertEqual(resync.get("snapshot_revision"), latest)
+            self.assertNotIn("events", resync)
+
+            frames = sse_frames(h, workspace, after=cursor, max_frames=4)
+            self.assertEqual(len(frames), 1, frames)
+            self.assertEqual(frames[0]["event"], "RESYNC_REQUIRED")
+            self.assertIsNone(frames[0]["id"], "resync must not acknowledge an unseen mutation")
+            self.assertEqual(json.loads(frames[0]["data"]), {"snapshot_revision": latest})
+            self.assertFalse(any(frame["event"] == "workspace" for frame in frames))
+
+            # Retaining nothing after the cursor while the durable revision is
+            # ahead is also a gap, not an idle stream.
+            h.sql(
+                "DELETE FROM workspace_events WHERE workspace_id='%s' AND revision>%d"
+                % (workspace["id"], cursor)
+            )
+            resync = json.loads(
+                h.expect(
+                    f"/api/workspaces/{workspace['id']}/events?after_revision={cursor}",
+                    200,
+                    token=h.alice,
+                )
+            )
+            self.assertEqual(resync.get("kind"), "RESYNC_REQUIRED")
+            self.assertEqual(resync.get("snapshot_revision"), latest)
+
+            frames = sse_frames(h, workspace, after=cursor, max_frames=4)
+            self.assertEqual(len(frames), 1, frames)
+            self.assertEqual(frames[0]["event"], "RESYNC_REQUIRED")
+            self.assertEqual(json.loads(frames[0]["data"]), {"snapshot_revision": latest})
+            self.assertFalse(any(frame["event"] == "workspace" for frame in frames))
+
+            # At the live revision, empty retention is just an idle stream.
+            idle = json.loads(
+                h.expect(
+                    f"/api/workspaces/{workspace['id']}/events?after_revision={latest}",
+                    200,
+                    token=h.alice,
+                )
+            )
+            self.assertEqual(idle.get("events"), [])
+            self.assertEqual(idle.get("snapshot_revision"), latest)
+            self.assertNotEqual(idle.get("kind"), "RESYNC_REQUIRED")
         finally:
             h.cleanup()
 
