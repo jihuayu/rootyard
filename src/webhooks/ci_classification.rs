@@ -51,6 +51,25 @@ pub struct CheckoutTarget<'a> {
     pub excluded: &'a [String],
 }
 
+/// Emit a selected mirror route only when the same snapshot counted it as
+/// available. A missing route with positive availability, or a route with zero
+/// availability, is an impossible snapshot and must fail closed rather than
+/// become a contradictory "ready" rejection.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SnapshotRoute {
+    Selected(String),
+    Unavailable(AvailabilitySummary),
+    Inconsistent,
+}
+
+pub fn route_from_snapshot(source: Option<String>, availability: AvailabilitySummary) -> SnapshotRoute {
+    match (source, availability.ready_available_mirrors) {
+        (Some(source), ready) if ready > 0 => SnapshotRoute::Selected(source),
+        (None, 0) => SnapshotRoute::Unavailable(availability),
+        _ => SnapshotRoute::Inconsistent,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckoutStateClass {
@@ -231,5 +250,33 @@ mod tests {
             classify_checkout_state(ClassificationInput { allow_origin: false, ..base }),
             CheckoutStateClass::Missing
         );
+    }
+
+    #[test]
+    fn checkout_route_requires_a_ready_source_in_the_same_snapshot() {
+        let base = AvailabilitySummary {
+            ready_available_mirrors: 1,
+            ready_total_mirrors: 1,
+            healthy_unready_mirrors: 0,
+            origin_budget: OriginBudgetStatus {
+                global_active: 0,
+                global_limit: 4,
+                per_repo_active: 0,
+                per_repo_limit: 2,
+            },
+        };
+        assert_eq!(
+            route_from_snapshot(Some("https://mirror.example".into()), base.clone()),
+            SnapshotRoute::Selected("https://mirror.example".into())
+        );
+        assert_eq!(route_from_snapshot(None, base.clone()), SnapshotRoute::Inconsistent);
+        let blocked = AvailabilitySummary {
+            ready_available_mirrors: 0,
+            ready_total_mirrors: 0,
+            healthy_unready_mirrors: 1,
+            ..base
+        };
+        assert_eq!(route_from_snapshot(None, blocked.clone()), SnapshotRoute::Unavailable(blocked.clone()));
+        assert_eq!(route_from_snapshot(Some("https://mirror.example".into()), blocked), SnapshotRoute::Inconsistent);
     }
 }
