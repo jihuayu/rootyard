@@ -233,7 +233,42 @@ fn wait_pids(path: &std::path::Path) -> (i32, i32) {
     panic!("the Git wrapper did not publish its process group");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcState {
+    /// No `/proc` entry: the PID was reaped (or the process exited before inspection).
+    Gone,
+    /// The PID is still listed, but only as `Z` (zombie) or `X` (dead/exiting).
+    Exited,
+    /// The PID can still run, so it is a live descendant for this contract.
+    Live,
+}
+
+#[cfg(target_os = "linux")]
+fn proc_state(pid: i32) -> ProcState {
+    let path = format!("/proc/{pid}/stat");
+    match std::fs::read_to_string(&path) {
+        Ok(stat) => {
+            let (_, rest) = stat
+                .rsplit_once(") ")
+                .unwrap_or_else(|| panic!("unparseable {path}: missing command terminator"));
+            let state = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("unparseable {path}: missing process state"));
+            match state {
+                "Z" | "X" => ProcState::Exited,
+                _ => ProcState::Live,
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => {
+            ProcState::Gone
+        }
+        Err(error) => panic!("cannot inspect {path}: {error}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes() {
     use super::s4_authority::{DisposableCiView, run_git_dir_bounded};
@@ -257,8 +292,12 @@ async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes
     assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
     let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
     assert!(root.exists(), "the disposable view vanished before the final wait was confirmed");
-    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists());
-    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists());
+    // The direct leader is our child, so cleanup must reap it rather than leave a zombie.
+    assert_eq!(proc_state(leader), ProcState::Gone, "the direct leader was not reaped");
+    // A descendant killed during cleanup can remain visible as Z/X until its new parent
+    // reaps it. The production contract is quiescence (dead or exiting), not disappearance:
+    // a process that can still run after the timeout is the failure this test must catch.
+    assert_ne!(proc_state(grandchild), ProcState::Live, "a live original descendant survived the timeout");
     drop(view);
     assert!(!root.exists());
 }
