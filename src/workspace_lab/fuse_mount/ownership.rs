@@ -7,6 +7,37 @@ use std::{ffi::CString, fs, io, os::unix::ffi::OsStrExt, path::Path};
 
 use super::MountId;
 
+/// Exact private reason an owned unmount did not complete.
+///
+/// The two `EBUSY` sources are deliberately distinct: a mount-identity refusal
+/// happened before any syscall, while `Busy` means the captured ID still
+/// matched at the check and `umount2(flags = 0)` itself returned `EBUSY`.
+#[derive(Debug)]
+pub(crate) enum UnmountOwnedError {
+    /// Mount table read/parse or mountpoint conversion refused before the syscall.
+    Probe(io::Error),
+    /// The captured mount is no longer the single mount at the path.
+    Identity,
+    /// The captured ID matched, and the syscall returned exactly `EBUSY`.
+    Busy(io::Error),
+    /// The captured ID matched, and the syscall returned another error.
+    Other(io::Error),
+}
+
+impl UnmountOwnedError {
+    fn from_syscall(error: io::Error) -> Self {
+        if error.raw_os_error() == Some(libc::EBUSY) { Self::Busy(error) } else { Self::Other(error) }
+    }
+
+    /// Preserve the historical `io::Error` boundary for every existing caller.
+    pub(crate) fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Probe(error) | Self::Busy(error) | Self::Other(error) => error,
+            Self::Identity => io::Error::from_raw_os_error(libc::EBUSY),
+        }
+    }
+}
+
 /// Normal (non-lazy) unmount of exactly the mount this handle captured.
 ///
 /// Fails closed in every other case: an unreadable mount table and a path that
@@ -15,19 +46,33 @@ use super::MountId;
 /// and a `fusermount -u` fallback are deliberately not used: a lazy detach
 /// leaves the session thread parked on its descriptor, and a blind path unmount
 /// could remove a mount this handle does not own.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn unmount_owned(mountpoint: &Path, mount_id: MountId) -> io::Result<()> {
-    match mount_id_at_path(mountpoint)? {
+    unmount_owned_typed(mountpoint, mount_id).map_err(UnmountOwnedError::into_io_error)
+}
+
+/// Typed ownership check used only by the normal-shutdown diagnostic path.
+///
+/// The mount-table identity check, the matched-ID normal unmount and every
+/// refusal remain the same operations and order as [`unmount_owned`]; only the
+/// private failure class is retained.
+pub(crate) fn unmount_owned_typed(mountpoint: &Path, mount_id: MountId) -> Result<(), UnmountOwnedError> {
+    match mount_id_at_path(mountpoint).map_err(UnmountOwnedError::Probe)? {
         Some(current) if owns_current_mount(mount_id, Some(current)) => {
             let path = CString::new(mountpoint.as_os_str().as_bytes())
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+                .map_err(|_| UnmountOwnedError::Probe(io::Error::from_raw_os_error(libc::EINVAL)))?;
             // SAFETY: `path` is NUL-terminated, and flags 0 request a normal,
             // non-lazy unmount of the identity verified above.
-            if unsafe { libc::umount2(path.as_ptr(), 0) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+            if unsafe { libc::umount2(path.as_ptr(), 0) } == 0 {
+                Ok(())
+            } else {
+                Err(UnmountOwnedError::from_syscall(io::Error::last_os_error()))
+            }
         }
         // Already unmounted: nothing to remove, `join` still reaps the session.
         None => Ok(()),
         // A different mount owns the path now; never unmount a foreign mount.
-        Some(_) => Err(io::Error::from_raw_os_error(libc::EBUSY)),
+        Some(_) => Err(UnmountOwnedError::Identity),
     }
 }
 
@@ -96,4 +141,31 @@ fn unescape_mountinfo(field: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_matched_syscall_busy_share_errno_but_not_class() {
+        let identity = UnmountOwnedError::Identity;
+        let busy = UnmountOwnedError::from_syscall(io::Error::from_raw_os_error(libc::EBUSY));
+        assert!(matches!(&identity, UnmountOwnedError::Identity));
+        assert!(matches!(&busy, UnmountOwnedError::Busy(_)));
+        assert_eq!(identity.into_io_error().raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(busy.into_io_error().raw_os_error(), Some(libc::EBUSY));
+    }
+
+    #[test]
+    fn unknown_syscall_status_stays_other_and_preserves_its_exact_errno() {
+        let other = UnmountOwnedError::from_syscall(io::Error::from_raw_os_error(libc::EACCES));
+        assert!(matches!(&other, UnmountOwnedError::Other(_)));
+        assert_eq!(other.into_io_error().raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn compatibility_wrapper_keeps_the_io_result_boundary() {
+        let _: fn(&Path, MountId) -> io::Result<()> = unmount_owned;
+    }
 }
