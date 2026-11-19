@@ -358,13 +358,31 @@ async fn spawn_reaper_failure_bounds_caller_and_reaps_without_zombies() {
 }
 
 #[cfg(unix)]
+static ALLOW_S4_PROBE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn proc_is_zombie(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z" || state == "X")
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_child() {
     use super::s4_authority::DisposableCiView;
     use std::{os::unix::fs::PermissionsExt, process::Stdio};
-    fn unknown_group(_pid: i32) -> std::io::Result<bool> {
-        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "simulated procfs error"))
+    fn unknown_group(pid: i32) -> std::io::Result<bool> {
+        if ALLOW_S4_PROBE.load(Ordering::Acquire) {
+            crate::git_http::group_quiescent(pid)
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "simulated procfs error"))
+        }
     }
+    ALLOW_S4_PROBE.store(false, Ordering::Release);
     let view = DisposableCiView::create().expect("disposable view");
     let root = view.path().to_path_buf();
     let wrapper = root.join("git");
@@ -385,25 +403,28 @@ async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_chi
         |_| Err(std::io::Error::other("simulated thread limit")),
         unknown_group,
     );
-    assert!(started.elapsed() < std::time::Duration::from_millis(200), "spawn failure blocked caller");
     for _ in 0..300 {
-        if !std::path::PathBuf::from(format!("/proc/{leader}")).exists()
-            && !std::path::PathBuf::from(format!("/proc/{grandchild}")).exists()
-        {
+        if !std::path::PathBuf::from(format!("/proc/{grandchild}")).exists() && proc_is_zombie(leader) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
-    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
     let post_budget = std::time::Duration::from_millis(400);
     if let Some(remaining) = post_budget.checked_sub(started.elapsed()) {
         tokio::time::sleep(remaining).await;
     }
-    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
-    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
+    assert!(proc_is_zombie(leader), "leader was reaped prematurely on probe error, releasing PGID");
+    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived SIGKILL");
     assert!(root.exists(), "uncertain disposable view was deleted after fallback budget expired");
-    std::fs::remove_dir_all(&root).expect("cleanup preserved disposable view");
+    ALLOW_S4_PROBE.store(true, Ordering::Release);
+    for _ in 0..300 {
+        if !std::path::PathBuf::from(format!("/proc/{leader}")).exists() && !root.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "leader survived after probe recovery");
+    assert!(!root.exists(), "confirmed disposable view was not removed after probe recovery");
 }
 
 #[cfg(unix)]

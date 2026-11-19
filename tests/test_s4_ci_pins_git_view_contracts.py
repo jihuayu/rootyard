@@ -278,9 +278,8 @@ class SourceContracts(unittest.TestCase):
         self.assertNotIn(".wait()).await.is_ok()", reaper)
         self.assertIn("InFlightEntryGuard", reaper)
         self.assertIn("ensure_standby_sweeper", reaper)
-        self.assertIn("ConfirmedRelease", reaper)
-        self.assertIn("unverified_scratch", reaper)
-        self.assertIn("reap_fallback_bounded", reaper)
+        self.assertIn("spawn_fallback_on_handle", reaper)
+        self.assertIn("reap_fallback_guarded", reaper)
         self.assertIn("state.retained", reaper)
         for test_body in (
             text(CI_PINS / "s4_tests.rs"),

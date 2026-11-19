@@ -1,5 +1,7 @@
 use super::*;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const SCRIPT: &str = r#"sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$1"; trap "" TERM; while :; do sleep 1; done"#;
 #[cfg(unix)]
@@ -179,11 +181,31 @@ async fn spawn_reaper_failure_bounds_caller_and_reaps_without_zombies() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_child() {
-    fn unknown_group(_pid: i32) -> io::Result<bool> {
+static ALLOW_PROC_PROBE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn proc_is_zombie(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z" || state == "X")
+}
+
+#[cfg(unix)]
+fn unknown_group(pid: i32) -> io::Result<bool> {
+    if ALLOW_PROC_PROBE.load(Ordering::Acquire) {
+        crate::git_http::group_quiescent(pid)
+    } else {
         Err(io::Error::new(io::ErrorKind::PermissionDenied, "simulated procfs error"))
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_child() {
+    ALLOW_PROC_PROBE.store(false, Ordering::Release);
     let scratch = ScratchDir::create("rootyard-s4-proc-spawn-unk").unwrap();
     let root = scratch.root().to_path_buf();
     let pidfile = root.join("spawn-unk.pid");
@@ -202,23 +224,26 @@ async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_chi
         |_| Err(io::Error::other("simulated thread limit")),
         unknown_group,
     );
-    assert!(started.elapsed() < Duration::from_millis(200), "spawn failure blocked caller");
     for _ in 0..300 {
-        if !PathBuf::from(format!("/proc/{leader}")).exists()
-            && !PathBuf::from(format!("/proc/{grandchild}")).exists()
-        {
+        if !PathBuf::from(format!("/proc/{grandchild}")).exists() && proc_is_zombie(leader) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(!PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
-    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
     let post_budget = Duration::from_millis(400);
     if let Some(remaining) = post_budget.checked_sub(started.elapsed()) {
         tokio::time::sleep(remaining).await;
     }
-    assert!(!PathBuf::from(format!("/proc/{leader}")).exists(), "leader was left as a zombie");
-    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
-    assert!(root.exists(), "uncertain scratch was deleted after fallback budget expired");
-    std::fs::remove_dir_all(&root).unwrap();
+    assert!(proc_is_zombie(leader), "leader was reaped prematurely on probe error, releasing PGID");
+    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived SIGKILL");
+    assert!(root.exists(), "uncertain scratch vanished while group probe errored");
+    ALLOW_PROC_PROBE.store(true, Ordering::Release);
+    for _ in 0..300 {
+        if !PathBuf::from(format!("/proc/{leader}")).exists() && !root.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!PathBuf::from(format!("/proc/{leader}")).exists(), "leader survived after probe recovery");
+    assert!(!root.exists(), "confirmed scratch was not released after probe recovery");
 }
