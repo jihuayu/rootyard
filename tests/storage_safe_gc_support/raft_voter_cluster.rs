@@ -134,7 +134,7 @@ impl MtlsNode {
             tls.read_exact(&mut len)?;
             let mut buf = vec![0_u8; u32::from_be_bytes(len) as usize];
             tls.read_exact(&mut buf)?;
-            let _ = tls.conn.send_close_notify();
+            tls.conn.send_close_notify();
             let _ = tls.flush();
             Ok(serde_json::from_slice(&buf)?)
         })
