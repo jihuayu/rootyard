@@ -315,6 +315,14 @@ pub(super) async fn push_private(
         if rebases > 0 && !admission_realm_matches_serving(&baseline, serving) {
             return Err(GatewayError::Conflict("repository authority changed; retry"));
         }
+        // Test-only pre-admission rendezvous for the existing #174 same-ref
+        // case. It runs once after the authoritative baseline capture and
+        // before the late probe/admission authority locks; a rebase iteration
+        // never pauses twice. No DB guard is held here.
+        #[cfg(test)]
+        if rebases == 0 {
+            state.pause_before_admission(verified.operation_id()).await;
+        }
         // Resolve any public wrapper or explicit legacy record that appeared
         // after the pre-native probe. This is the only place the private path
         // consults a known operation, and it never enters the legacy writer.

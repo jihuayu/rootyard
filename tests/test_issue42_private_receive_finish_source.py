@@ -68,6 +68,24 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertNotIn("get_legacy_locked(", probe)
         self.assertNotIn("admit_slot_zero_in_tx(", probe)
 
+    def test_private_route_has_one_pre_admission_pause_after_baseline(self):
+        private = slice_between(
+            self.publish,
+            "pub(super) async fn push_private(",
+            "async fn complete_private_probe(",
+        )
+        pause = "state.pause_before_admission(verified.operation_id()).await;"
+        self.assertEqual(private.count(pause), 1)
+        self.assertIn("if rebases == 0 {", private)
+        self.assertLess(private.index("capture_baseline("), private.index(pause))
+        self.assertLess(private.index(pause), private.index("operation::probe_public("))
+        self.assertLess(private.index(pause), private.index("begin_slot_zero("))
+        self.assertEqual(private.count("state.pause_after_admission(verified.operation_id()).await;"), 1)
+        self.assertLess(
+            private.index("Start::Fresh { plan, _token: token }"),
+            private.index("state.pause_after_admission(verified.operation_id()).await;"),
+        )
+
     def test_native_failure_never_closes_a_private_pending_operation_with_raw_ng(self):
         block = slice_between(
             self.receive_prod,
