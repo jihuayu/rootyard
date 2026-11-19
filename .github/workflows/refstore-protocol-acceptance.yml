@@ -79,6 +79,7 @@ jobs:
     env:
       ISSUE42_MANUAL_REF: refs/heads/codex/goal-issue42-original-ac-source-audit-20261117
       ISSUE42_SLOT_ONE_HANDOFF_MANUAL_REF: refs/heads/codex/goal-issue42-slot-one-handoff-qualification-20261119
+      ISSUE42_RECLAIM_READONLY_MANUAL_REF: refs/heads/codex/goal-issue42-reclaim-readonly-qualification-20261119
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_protocol
       SESSION174_DATABASE_ADMIN_URL: postgresql://rootyard@127.0.0.1:55432/postgres
       SESSION174_DATABASE_PREFIX: session174_foundation
@@ -2579,6 +2580,72 @@ jobs:
             --report-dir "$evidence" \
             --timeout 600 \
             --stdout-limit 16384
+      - name: "Replay exactly one #42 read-only reclaim discovery case on the owned #174 scope"
+        # One closed gate only: the manually dispatched, dedicated reclaim-ref.
+        # Every other ref keeps the legacy slot-one, handoff, #174 and PR/main
+        # gates and the exact existing selectors unchanged.
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && github.ref == env.ISSUE42_RECLAIM_READONLY_MANUAL_REF }}
+        timeout-minutes: 12
+        shell: bash
+        env:
+          SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME:-}" != 'workflow_dispatch' ] ||
+             [ "${GITHUB_REF:-}" != 'refs/heads/codex/goal-issue42-reclaim-readonly-qualification-20261119' ]; then
+            echo "refusing to run outside the exact reclaim read-only manual ref" >&2
+            exit 1
+          fi
+          if [ ! -s "$RUNNER_TEMP/refstore-object-store.env" ]; then echo "missing object-store env" >&2; exit 1; fi
+          evidence="$RUNNER_TEMP/session174-foundation"
+          lib="${ROOTYARD_174_LIB_ALIAS:-}"
+          receipt="${ROOTYARD_174_LIB_ALIAS_RECEIPT:-}"
+          if [ -z "$lib" ] || [ -z "$receipt" ]; then
+            echo "missing preflighted #174 libtest aliases" >&2
+            exit 1
+          fi
+          if [ ! -s "$evidence/preflight.json" ]; then
+            echo "missing preflighted #174 evidence" >&2
+            exit 1
+          fi
+          if [ -z "${SESSION174_DATABASE:-}" ]; then
+            echo "missing owned #174 database" >&2
+            exit 1
+          fi
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"
+          if [ "$SESSION174_DATABASE" != "$expected" ]; then echo "refusing to run on a database not owned by this run" >&2; exit 1; fi
+          case "$SESSION174_DATABASE" in ''|*[!a-z0-9_]*|postgres|rootyard_protocol|template*)
+            echo "refusing to run on a shared or unsafe database" >&2
+            exit 1
+            ;;
+          esac
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="session174-reclaim-readonly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          export ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1
+          export ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1
+          export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
+          export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
+          python3 scripts/refstore_issue42_slot_one_checkpoint.py \
+            --lib "$lib" \
+            --receipt "$receipt" \
+            --preflight "$evidence/preflight.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --expected-commit "$GITHUB_SHA" \
+            --case ref_store::pg::slot_one::tests::native::reclaim::public_reclaim_discovery_reads_both_real_slots_read_only \
+            --report "$evidence/reclaim-readonly.json" \
+            --timeout 600 \
+            --stdout-limit 16384
       - name: "Drop only the run-owned #174 foundation database"
         if: always()
         timeout-minutes: 5
@@ -2673,7 +2740,8 @@ jobs:
                       standalone-build.json cases.log session174-foundation.json \
                       database-cleanup.log receipt-copy-check.json \
                       slot-one-rotation.json slot-one-handoff-qualification.json \
-                      slot-one-handoff-fresh.json slot-one-handoff-replay.json; do
+                      slot-one-handoff-fresh.json slot-one-handoff-replay.json \
+                      reclaim-readonly.json; do
             if [ -f "$evidence/$name" ]; then
               cp "$evidence/$name" "$upload/" || status=1
             fi

@@ -25,6 +25,11 @@ CASE = (
     "ref_store::pg::slot_one::tests::native::"
     "slot_one_rotation_replays_identical_wire_command_on_real_a3_a4_a5"
 )
+RECLAIM_CASE = (
+    "ref_store::pg::slot_one::tests::native::reclaim::"
+    "public_reclaim_discovery_reads_both_real_slots_read_only"
+)
+RECLAIM_REF = "refs/heads/codex/goal-issue42-reclaim-readonly-qualification-20261119"
 
 
 def selected_output(status="ok", name=CASE, summary=None):
@@ -83,6 +88,26 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(
             checkpoint.listing_command("/tmp/libtest"),
             ["/tmp/libtest", "--list", "--ignored", "--format", "terse"])
+
+    def test_reclaim_case_uses_the_same_closed_runner_contract(self):
+        self.assertEqual(checkpoint.CASE, CASE)
+        self.assertNotEqual(RECLAIM_CASE, CASE)
+        self.assertEqual(checkpoint.REPORT_SCHEMA,
+                         "rootyard/refstore-issue42-slot-one-checkpoint/v1")
+        self.assertEqual(
+            checkpoint.exact_command("/tmp/libtest", RECLAIM_CASE),
+            ["/tmp/libtest", "--ignored", "--exact", RECLAIM_CASE,
+             "--test-threads=1"])
+        names = [CASE, RECLAIM_CASE]
+        self.assertEqual(checkpoint.require_membership(names, RECLAIM_CASE),
+                         "unique")
+        with self.assertRaises(checkpoint.CheckpointError) as missing:
+            checkpoint.require_membership([CASE], RECLAIM_CASE)
+        self.assertEqual(str(missing.exception), "selection_missing")
+        with self.assertRaises(checkpoint.CheckpointError) as duplicate:
+            checkpoint.require_membership([RECLAIM_CASE, RECLAIM_CASE],
+                                          RECLAIM_CASE)
+        self.assertEqual(str(duplicate.exception), "selection_duplicate")
 
     def test_listing_membership_is_exactly_once(self):
         names = checkpoint.parse_listing(
@@ -302,23 +327,94 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertIn(required, step)
         self.assertNotIn("GITHUB_ENV", step)
 
-    def test_only_the_scoped_step_requests_owned_disposable_postgres(self):
+    def test_scoped_steps_request_owned_disposable_postgres(self):
         marker = "ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1"
-        self.assertEqual(self.text.count(marker), 1)
-        step = self.step('"Replay exactly one #42 slot-one rotation case')
+        self.assertEqual(self.text.count(marker), 2)
+        legacy = self.step('"Replay exactly one #42 slot-one rotation case')
+        reclaim = self.step(
+            '"Replay exactly one #42 read-only reclaim discovery case')
         default_step = self.step('"Exercise the #174 HTTP foundation cases')
-        self.assertIn("export " + marker, step)
+        expected = (
+            'expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}'
+            '_a${GITHUB_RUN_ATTEMPT}"')
+        for step in (legacy, reclaim):
+            self.assertIn("export " + marker, step)
+            opt_in = step.index("export " + marker)
+            self.assertIn(expected, step)
+            self.assertLess(step.index(expected), opt_in)
+            self.assertIn('if [ "$SESSION174_DATABASE" != "$expected" ]', step)
+            self.assertLess(
+                step.index('if [ "$SESSION174_DATABASE" != "$expected" ]'),
+                opt_in)
         self.assertNotIn(marker, default_step)
-        # The opt-in is emitted only after the exact run-owned name is checked.
-        opt_in = step.index("export " + marker)
+
+    def test_reclaim_gate_is_scoped_to_its_own_manual_ref(self):
+        self.assertEqual(self.text.count(RECLAIM_REF), 2)
+        step = self.step(
+            '"Replay exactly one #42 read-only reclaim discovery case')
+        self.assertEqual(step.count("github.ref"), 1)
+        self.assertIn("workflow_dispatch", step)
+        self.assertIn("success()", step)
+        self.assertIn("ISSUE42_RECLAIM_READONLY_MANUAL_REF", step)
+        self.assertIn(
+            '[ "${GITHUB_EVENT_NAME:-}" != \'workflow_dispatch\' ]', step)
+        self.assertIn(
+            '[ "${GITHUB_REF:-}" != \'' + RECLAIM_REF + '\' ]', step)
+        self.assertNotIn("GITHUB_REF^^", step)
+        self.assertNotIn("GITHUB_REF,,", step)
+        self.assertLess(step.index("set -euo pipefail"),
+                        step.index("GITHUB_REF"))
+
+    def test_reclaim_gate_uses_exact_case_preflight_and_owned_scope(self):
+        step = self.step(
+            '"Replay exactly one #42 read-only reclaim discovery case')
+        self.assertIn("scripts/refstore_issue42_slot_one_checkpoint.py", step)
+        for required in (
+                '--lib "$lib"', '--receipt "$receipt"',
+                '--preflight "$evidence/preflight.json"',
+                '--expected-commit "$GITHUB_SHA"',
+                '--case ' + RECLAIM_CASE,
+                '--report "$evidence/reclaim-readonly.json"',
+                '--timeout 600', '--stdout-limit 16384',
+                'ROOTYARD_BLOB_ROOT="session174-reclaim-readonly-'
+                '$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"',
+                'export ROOTYARD_TEST_GIT="$(command -v git)"',
+                'export ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1',
+                'export ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1'):
+            self.assertIn(required, step)
         expected = (
             'expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}'
             '_a${GITHUB_RUN_ATTEMPT}"')
         self.assertIn(expected, step)
-        self.assertLess(step.index(expected), opt_in)
         self.assertIn('if [ "$SESSION174_DATABASE" != "$expected" ]', step)
-        self.assertLess(
-            step.index('if [ "$SESSION174_DATABASE" != "$expected" ]'), opt_in)
+        self.assertIn(
+            'export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/'
+            '$SESSION174_DATABASE"', step)
+        for forbidden in ("GITHUB_ENV", " tee ", "set -x", "cat ",
+                          "--report-schema", "--lib-alias-label"):
+            self.assertNotIn(forbidden, step)
+        self.assertNotIn(CASE, step)
+
+    def test_reclaim_gate_runs_after_handoff_and_before_cleanup(self):
+        legacy = self.text.index(
+            '"Replay exactly one #42 slot-one rotation case')
+        handoff = self.text.index(
+            '"Replay the two reviewed #42 slot-one handoff qualification cases')
+        reclaim = self.text.index(
+            '"Replay exactly one #42 read-only reclaim discovery case')
+        cleanup = self.text.index(
+            '"Drop only the run-owned #174 foundation database"')
+        self.assertLess(legacy, reclaim)
+        self.assertLess(handoff, reclaim)
+        self.assertLess(reclaim, cleanup)
+
+    def test_reclaim_gate_does_not_change_default_or_legacy_cases(self):
+        default_step = self.step('"Exercise the #174 HTTP foundation cases')
+        legacy = self.step('"Replay exactly one #42 slot-one rotation case')
+        handoff = self.step(
+            '"Replay the two reviewed #42 slot-one handoff qualification cases')
+        for step in (default_step, legacy, handoff):
+            self.assertNotIn(RECLAIM_CASE, step)
 
     def test_checkpoint_and_cleanup_use_the_same_owned_database_output(self):
         new = self.step('"Replay exactly one #42 slot-one rotation case')
@@ -343,6 +439,7 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_report_is_collected_with_existing_174_evidence(self):
         step = self.step('"Collect #174 acceptance evidence"')
         self.assertIn("slot-one-rotation.json", step)
+        self.assertIn("reclaim-readonly.json", step)
 
 
 if __name__ == "__main__":

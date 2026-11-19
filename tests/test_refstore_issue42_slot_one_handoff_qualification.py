@@ -512,7 +512,7 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertNotIn(forbidden, default_step)
             self.assertNotIn(forbidden, legacy_step)
         self.assertEqual(
-            self.text.count("ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1"), 1)
+            self.text.count("ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1"), 2)
         self.assertEqual(
             self.text.count(
                 "ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES: '1'"), 1)
