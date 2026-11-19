@@ -316,9 +316,14 @@ async fn unresolved_owner_cancellation_drains_pending_queue_and_clears_active_ta
 
 #[tokio::test]
 async fn unresolved_owner_failed_start_and_runtime_shutdown_retain_child_and_scratch() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("temp rt");
-    let dead_handle = rt.handle().clone();
-    drop(rt);
+    let dead_handle = std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("temp runtime");
+        let handle = rt.handle().clone();
+        drop(rt);
+        handle
+    })
+    .join()
+    .expect("temp runtime thread");
     let registry = Arc::new(UnresolvedRegistry::default());
     let (view1, root1, child1, pid1, leader1, grandchild1) = spawn_test_group().await;
     let entry1 = UnresolvedEntry::new(child1, pid1, vec![view1.hold()], default_probe());
