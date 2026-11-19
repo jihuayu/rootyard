@@ -87,6 +87,16 @@ def _project(records):
     )
 
 
+def _project_with(records, *, expected=None, owned=None):
+    return project_busy_witness(
+        records,
+        helper_tag=HELPER_TAG,
+        writer_tag=WRITER_TAG,
+        expected_mounts=EXPECTED if expected is None else expected,
+        owned_mounts=OWNED if owned is None else owned,
+    )
+
+
 def _line(record):
     return (
         "W1 kind={kind} role={role} entry_ns={entry_ns} result_ns={result_ns} "
@@ -131,11 +141,28 @@ class BusyWitnessProjectionTest(unittest.TestCase):
             _project([_umount(entry=1000, result=2000),
                       _close(entry=500, result=1000)]),
             ("writer", "overlapping"))
+        # A close that started exactly at the busy return is also uncertain.
+        self.assertEqual(
+            _project([_umount(entry=1000, result=2000),
+                      _close(entry=2000, result=2100)]),
+            ("writer", "overlapping"))
+        # Both sampled boundaries equal the busy call boundaries.
+        self.assertEqual(
+            _project([_umount(entry=1000, result=2000),
+                      _close(entry=1000, result=2000)]),
+            ("writer", "overlapping"))
 
     def test_failed_close_never_qualifies(self):
         self.assertEqual(
             _project([_umount(), _close(rc=-1, error=errno.EIO)]),
             ("writer", "unknown"))
+        self.assertEqual(
+            _project([_umount(), _close(rc=-1, error=0)]),
+            ("writer", "unknown"))
+        # A successful close is rc == 0; stale errno is not a failure signal.
+        self.assertEqual(
+            _project([_umount(), _close(rc=0, error=errno.EIO)]),
+            ("writer", "completed_before_unmount_entry"))
 
     def test_git_and_put_busy_targets_are_distinct(self):
         self.assertEqual(
@@ -164,6 +191,42 @@ class BusyWitnessProjectionTest(unittest.TestCase):
             (UNKNOWN, "completed_before_unmount_entry"))
         self.assertEqual(
             _project([_umount(owned=0), _close()]),
+            (UNKNOWN, "completed_before_unmount_entry"))
+
+    def test_identity_attribution_requires_three_distinct_owned_mounts(self):
+        duplicate = dict(EXPECTED)
+        duplicate["git"] = EXPECTED["writer"]
+        self.assertEqual(
+            _project_with([_umount(), _close()], expected=duplicate),
+            (UNKNOWN, "completed_before_unmount_entry"))
+        missing = {"writer": EXPECTED["writer"], "git": EXPECTED["git"]}
+        self.assertEqual(
+            _project_with([_umount(), _close()], expected=missing),
+            (UNKNOWN, "completed_before_unmount_entry"))
+        invalid = dict(EXPECTED)
+        invalid["put"] = None
+        self.assertEqual(
+            _project_with([_umount(), _close()], expected=invalid),
+            (UNKNOWN, "completed_before_unmount_entry"))
+        unowned = set(OWNED) - {EXPECTED["git"]}
+        self.assertEqual(
+            _project_with([_umount(mount_id=12, path=GIT_PATH), _close()],
+                          owned=unowned),
+            (UNKNOWN, "completed_before_unmount_entry"))
+
+    def test_unknown_binding_cannot_imply_other_owned(self):
+        # A missing route binding must not make an owned identity look like a
+        # fourth, independently attributed mount.
+        missing = {"writer": EXPECTED["writer"], "git": EXPECTED["git"]}
+        self.assertEqual(
+            _project_with([_umount(mount_id=14, path=OTHER_PATH), _close()],
+                          expected=missing),
+            (UNKNOWN, "completed_before_unmount_entry"))
+        # Nor may an unowned route binding license an "owner" inference.
+        unowned = set(OWNED) - {EXPECTED["put"]}
+        self.assertEqual(
+            _project_with([_umount(mount_id=14, path=OTHER_PATH), _close()],
+                          owned=unowned),
             (UNKNOWN, "completed_before_unmount_entry"))
 
     def test_ambiguous_busy_or_close_or_trace_is_unknown(self):

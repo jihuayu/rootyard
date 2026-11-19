@@ -735,12 +735,46 @@ def parse_witness_receipt(path) -> list[dict] | None:
     return records or None
 
 
+def _identity(value):
+    """Return one closed ``(mount_id, path_hash)`` pair, or ``None``."""
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    mount_id, path_hash = value
+    if (type(mount_id) is not int or type(path_hash) is not int
+            or mount_id <= 0 or path_hash <= 0):
+        return None
+    return (mount_id, path_hash)
+
+
 def _witness_target(record, expected_mounts, owned_mounts):
+    """Attribute only an independently owned, distinct route identity.
+
+    All three route bindings must be present, independently owned and
+    physically distinct.  A missing or ambiguous binding cannot imply an
+    owner, and therefore cannot turn an otherwise unknown identity into
+    ``other_owned``.
+    """
+    labels = ("writer", "git", "put")
+    expected = {}
+    for label in labels:
+        identity = _identity(expected_mounts.get(label))
+        if identity is None:
+            return UNKNOWN
+        expected[label] = identity
+    if len(set(expected.values())) != 3:
+        return UNKNOWN
+    owned = set()
+    for value in owned_mounts:
+        identity = _identity(value)
+        if identity is not None:
+            owned.add(identity)
+    if any(identity not in owned for identity in expected.values()):
+        return UNKNOWN
     identity = (record["mount_id"], record["path_hash"])
-    for label in ("writer", "git", "put"):
-        if identity == expected_mounts.get(label):
+    for label in labels:
+        if identity == expected[label]:
             return label if record["owned"] == 1 else UNKNOWN
-    if record["owned"] == 1 and identity in owned_mounts:
+    if record["owned"] == 1 and identity in owned:
         return "other_owned"
     return UNKNOWN
 
@@ -784,12 +818,17 @@ def project_busy_witness(records, *, helper_tag, writer_tag,
         and record["role"] == "writer"
         and record["proc_tag"] == writer_tag
     ]
-    if len(closes) != 1 or closes[0]["rc"] != 0:
+    if len(closes) != 1:
         return target, UNKNOWN
     close = closes[0]
+    # Only a successful close is evidence of a completed writer close.
+    if close["rc"] != 0:
+        return target, UNKNOWN
+    # Equal samples are uncertain: only a strictly earlier completion is
+    # "before", and only a strictly later start is "after".
     if close["result_ns"] < busy_record["entry_ns"]:
         state = "completed_before_unmount_entry"
-    elif close["entry_ns"] >= busy_record["result_ns"]:
+    elif close["entry_ns"] > busy_record["result_ns"]:
         state = "began_after_busy_return"
     else:
         state = "overlapping"
