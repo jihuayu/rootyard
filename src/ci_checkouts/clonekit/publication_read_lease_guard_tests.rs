@@ -30,7 +30,7 @@ fn guarded_locks_unlock_on_validation_error_with_duplicate_fd() {
 
     // Control: without an explicit unlock, a duplicate fd keeps the shared flock alive after
     // the original descriptor is closed.
-    let file = fs::OpenOptions::new().read(true).write(true).create(true).open(&path).expect("lock file");
+    let file = fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).expect("lock file");
     file.try_lock_shared().expect("shared lock");
     let duplicate = file.try_clone().expect("duplicate shared fd");
     drop(file);
