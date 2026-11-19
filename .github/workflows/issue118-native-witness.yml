@@ -1,0 +1,286 @@
+name: Issue 118 native merge attestation witness
+
+on:
+  push:
+    branches: [codex/goal-issue118-native-qualification-retry1-20261120]
+    paths: [.github/workflows/issue118-native-witness.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    if: >-
+      github.event.created && github.run_attempt == 1 &&
+      github.ref == 'refs/heads/codex/goal-issue118-native-qualification-retry1-20261120'
+    runs-on: ubuntu-24.04
+    # Allow 72 minutes of capped work, 4 for cleanup, and 14 for hosted setup.
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_witness
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --tmpfs /var/lib/postgresql/data
+          --log-driver none
+          --health-cmd "pg_isready -h 127.0.0.1 -U rootyard -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      CARGO_BUILD_JOBS: '2'
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Bind checkout to the verified current checkpoint
+        run: |
+          parent=0146f5056d500bce19d6bc780af808855272525a
+          expected_tree=36a5ad0aa6ebad09be5f17a42fada79d93de8763
+          test "${GITHUB_REF_NAME:-}" = codex/goal-issue118-native-qualification-retry1-20261120
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $parent"
+          test "$(git rev-list --count "$parent"..HEAD)" = 1
+          test "$(git rev-parse "$parent^{tree}")" = "$expected_tree"
+          test "$(git diff-tree --no-commit-id --name-status -r "$parent" HEAD)" = \
+            $'A\t.github/workflows/issue118-native-witness.yml'
+          test "$(git diff-tree --no-commit-id --name-only -r "$parent" HEAD | wc -l)" -eq 1
+          status=$(git status --porcelain)
+          test -z "$status"
+          directory=$(mktemp -d "$RUNNER_TEMP/issue118-witness.XXXXXXXX")
+          printf 'WITNESS_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          printf 'WITNESS_SOURCE_PARENT=%s\n' "$parent" >> "$GITHUB_ENV"
+          printf 'WITNESS_SOURCE_TREE=%s\n' "$expected_tree" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare stock Git and build tools
+        timeout-minutes: 6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git build-essential cmake clang libssl-dev openssl pkg-config
+          source scripts/ci_native_tools/lib.sh
+          require_git_243 /usr/bin/git
+      - name: Install pinned Rust and CargoFork
+        timeout-minutes: 25
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" --require-os linux
+      - name: Build one relocated integration test and receipt
+        timeout-minutes: 25
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" --require-os linux --require-path
+          if ! python3 scripts/build_native_test.py --test ref_store_merge_attestations \
+              --no-default-features --package-debug 0 --strip-debuginfo \
+              --output "$WITNESS_DIR/ref_store_merge_attestations" >/dev/null 2>&1; then
+            echo 'Issue 118 integration test build failed.' >&2
+            exit 1
+          fi
+          chmod a-w "$WITNESS_DIR/ref_store_merge_attestations"{,.build.json}
+      - name: Verify owned PostgreSQL 17 and start owned Garage
+        timeout-minutes: 8
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          ROOTYARD_FIXTURE_PULL_TIMEOUT: '120'
+        run: |
+          if [[ ! "$POSTGRES_CONTAINER" =~ ^[0-9a-f]{64}$ ]] ||
+             ! pg17=$(timeout -k 5s 20s docker exec "$POSTGRES_CONTAINER" \
+                 psql -XAt -v ON_ERROR_STOP=1 -U rootyard -d rootyard_witness \
+                 -c "SELECT current_setting('server_version_num')::int BETWEEN 170000 AND 179999" \
+                 2>/dev/null) || [[ "$pg17" != t ]]; then
+            echo 'Issue 118 PostgreSQL 17 preflight failed.' >&2
+            exit 1
+          fi
+          if ! timeout -k 5s 7m scripts/owned_garage_fixture.sh start \
+              --directory "$WITNESS_DIR/garage" --output-env "$WITNESS_DIR/garage.env" \
+              --bucket-prefix rootyard-issue118 --region garage >/dev/null 2>&1; then
+            echo 'Issue 118 Garage preflight failed.' >&2
+            exit 1
+          fi
+      - name: Run the exact SHA-1 and SHA-256 cases
+        timeout-minutes: 8
+        run: |
+          set -u
+          umask 077
+          mkdir "$WITNESS_DIR/tmp"
+          export TMPDIR="$WITNESS_DIR/tmp" ROOTYARD_TEST_GIT=/usr/bin/git
+          export ROOTYARD_TEST_DATABASE_URL='postgresql://rootyard@127.0.0.1:55432/rootyard_witness'
+          if ! source "$WITNESS_DIR/garage.env" >/dev/null 2>&1; then
+            echo 'Issue 118 Garage environment refused.' >&2
+            exit 1
+          fi
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3 ROOTYARD_BLOB_ROOT=issue118
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+
+          if python3 - 2>/dev/null <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, str(Path.cwd() / 'scripts'))
+          import issue107_native11_runner as runner
+          import native_build_receipt as receipts
+          import native_report_manifest as manifest
+
+          target = 'ref_store_merge_attestations'
+          cases = (
+              'sha1_stock_git_merge_attestations_are_read_only',
+              'sha256_stock_git_merge_attestations_are_read_only',
+          )
+          root = Path.cwd()
+          directory = Path(os.environ['WITNESS_DIR'])
+          binary = directory / target
+          receipt_path = binary.with_suffix('.build.json')
+          source = f'tests/{target}.rs'
+          source_hash = receipts.sha256_file(root / source)
+          state = receipts.require_clean_git_state(root)
+          validated = receipts.load_receipt(
+              receipt_path, source_root=root, binary_path=binary,
+              expected_commit=os.environ['GITHUB_SHA'], expected_profile='test',
+              expected_toolchain={
+                  'cargo': {'release': '1.101.0', 'commit_hash': '64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'},
+                  'rustc': {'release': '1.99.1'},
+              },
+              expected_artifacts=[{'kind': 'test', 'target': target, 'source': source,
+                                   'source_sha256': source_hash, 'profile': {'test': True}}],
+              expected_command=[
+                  'cargo', '--config', 'profile.dev.package.rootyard.debug=0',
+                  '--config', 'profile.test.package.rootyard.debug=0',
+                  '--config', 'profile.dev.package.rootyard.strip="debuginfo"',
+                  '--config', 'profile.test.package.rootyard.strip="debuginfo"',
+                  'rustc', '--locked', '--profile', 'test', '--test', target,
+                  '--no-default-features', '--message-format=json-render-diagnostics', '--jobs', '2',
+              ],
+              forbid_implicit_build=True,
+          )
+          payload = validated.payload
+          if (validated.schema != 'v2' or payload.get('kind') != 'rust-integration-test'
+                  or payload.get('relocated_artifact') is not True
+                  or Path(payload['target_dir']).resolve() in binary.resolve().parents
+                  or payload.get('integration_test_source') != source
+                  or payload.get('integration_test_source_sha256') != source_hash
+                  or payload.get('features') != {'enabled': [], 'no_default_features': True}
+                  or state['commit'] != validated.workspace_commit
+                  or payload.get('git_head') != state['commit']
+                  or payload.get('working_tree') != {'tree': state['tree'], 'status': ''}):
+              raise SystemExit(1)
+
+          listing = runner.run_bounded([str(binary), '--list', '--ignored', '--format', 'terse'], 15)
+          if sorted(runner.parse_listing(listing)) != sorted(cases):
+              raise SystemExit(1)
+          outcomes = {}
+          for case in cases:
+              try:
+                  output = runner.run_bounded(
+                      [str(binary), case, '--exact', '--ignored', '--test-threads=1', '--format', 'pretty'], 180,
+                  )
+                  runner.parse_case_result(output, case)
+                  outcomes[case] = 'passed'
+              except runner.RunnerError as error:
+                  outcomes[case] = {
+                      'native_timeout': 'timed_out',
+                      'native_process_failed': 'failed',
+                      'test_not_executed': 'unconfirmed',
+                      'test_summary_missing': 'unconfirmed',
+                      'test_partial_or_skipped': 'unconfirmed',
+                  }.get(error.code, 'runner_failed')
+                  if error.code == 'cleanup_unresolved':
+                      break
+
+          if (receipts.sha256_file(receipt_path) != validated.receipt_sha256
+                  or receipts.sha256_file(binary) != validated.binary_sha256
+                  or receipts.require_clean_git_state(root) != state):
+              raise SystemExit(1)
+          witness = {
+              'commit': validated.workspace_commit,
+              'parent': os.environ['WITNESS_SOURCE_PARENT'],
+              'tree': state['tree'],
+              'source_tree': os.environ['WITNESS_SOURCE_TREE'],
+              'fixture': 'postgres:17;garage:2.1.0',
+              'test_source': source,
+              'test_source_sha256': source_hash,
+              'receipt_sha256': validated.receipt_sha256,
+              'binary_sha256': validated.binary_sha256,
+              'cases': {case: outcomes.get(case, 'not_run') for case in cases},
+          }
+          text = json.dumps(witness, sort_keys=True)
+          if len(text.encode()) > 4096:
+              raise SystemExit(1)
+          manifest.scan_secrets('witness', text, manifest.secret_values())
+          receipts.atomic_write_json(directory / 'witness.json', witness)
+          raise SystemExit(0 if all(outcomes.get(case) == 'passed' for case in cases) else 1)
+          PY
+          then
+            exit 0
+          fi
+          echo 'Issue 118 receipt or exact-case witness failed.' >&2
+          exit 1
+      - name: Remove owned fixtures and publish the finite witness
+        if: always()
+        timeout-minutes: 4
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          status=0
+          if [[ ! "$POSTGRES_CONTAINER" =~ ^[0-9a-f]{64}$ ]] ||
+             ! timeout -k 5s 45s docker exec "$POSTGRES_CONTAINER" \
+               psql -XAt -v ON_ERROR_STOP=1 -U rootyard -d postgres \
+               -c 'DROP DATABASE IF EXISTS rootyard_witness WITH (FORCE)' >/dev/null 2>&1 ||
+             ! absent=$(timeout -k 5s 20s docker exec "$POSTGRES_CONTAINER" \
+                 psql -XAt -v ON_ERROR_STOP=1 -U rootyard -d postgres \
+                 -c "SELECT NOT EXISTS (SELECT FROM pg_database WHERE datname = 'rootyard_witness')" \
+                 2>/dev/null) || [[ "$absent" != t ]]; then
+            echo 'Issue 118 PostgreSQL cleanup failed.' >&2
+            status=1
+          fi
+          outcome=''
+          if [[ -n "${WITNESS_DIR:-}" ]]; then
+            if [[ "${WITNESS_DIR%/*}" != "$RUNNER_TEMP" ||
+                  "${WITNESS_DIR##*/}" != issue118-witness.???????? ||
+                  ! -d "$WITNESS_DIR" || -L "$WITNESS_DIR" ]]; then
+              echo 'Issue 118 cleanup directory refused.' >&2
+              exit 1
+            fi
+            if ! timeout -k 5s 45s scripts/owned_garage_fixture.sh stop \
+                --directory "$WITNESS_DIR/garage" >/dev/null 2>&1 ||
+               [[ -e "$WITNESS_DIR/garage" || -L "$WITNESS_DIR/garage" ||
+                  -e "$WITNESS_DIR/garage.env" || -L "$WITNESS_DIR/garage.env" ]]; then
+              echo 'Issue 118 Garage cleanup failed.' >&2
+              exit 1
+            fi
+            if [[ -f "$WITNESS_DIR/witness.json" ]]; then
+              outcome=$(<"$WITNESS_DIR/witness.json")
+              cp -- "$WITNESS_DIR/witness.json" "$RUNNER_TEMP/issue118-native-witness.json"
+              chmod 600 "$RUNNER_TEMP/issue118-native-witness.json"
+            fi
+            rm -rf -- "$WITNESS_DIR"
+          fi
+          test "$status" = 0
+          if [[ -n "$outcome" ]]; then
+            printf '%s\n' "$outcome" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload the finite witness
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue118-native-witness
+          path: ${{ runner.temp }}/issue118-native-witness.json
+          if-no-files-found: ignore
