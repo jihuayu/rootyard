@@ -525,7 +525,7 @@ async fn verify_private_committed_ack_in_tx(
     let claimed = operation::lookup_public_private_in_tx(tx, public_request, &evidence, request, wire_digest, bound)
         .await
         .map_err(|_| anyhow!("verified private operation binding was refused"))?;
-    let claimed_terminal = match claimed {
+    let claimed_terminal = match claimed.claim {
         operation::Claim::Replay(terminal) => terminal,
         operation::Claim::Fresh | operation::Claim::Pending | operation::Claim::Cancelled(_) => {
             return Err(anyhow!("verified private operation is not a committed ACK replay"));
