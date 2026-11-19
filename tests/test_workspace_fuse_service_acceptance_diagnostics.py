@@ -143,37 +143,34 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
         self.assertIsNone(_child_exit(
             subprocess.CalledProcessError(10 ** 6, ["secret-argv"])))
 
-    def test_api_exit_fallback_is_bounded_and_original_error_wins(self):
+    def test_child_exit_is_only_a_real_child_process_code(self):
         test = _case(REQUIRED_CASES[2])
-        for value, expected in (
-                (0, 0), (1, 1), (-11, -11),
-                (-255, -255), (255, 255),
-                (-256, None), (256, None), (10 ** 6, None),
-                (True, None), (False, None),
-                ("1", None), (1.0, None), (None, None)):
+        for value in (0, 1, -11, 255, -256, 10 ** 6, True, False,
+                      "1", 1.0, None):
             with self.subTest(api_exit=value):
                 test._rootyard_diagnostic_api_exit = value
                 record = _diagnostic_record(
                     test, AssertionError("synthetic"), None)
-                self.assertEqual(record["child_exit"], expected)
+                self.assertIsNone(
+                    record["child_exit"],
+                    "a service exit must never be relabelled as a child exit")
 
         no_attribute = _case(REQUIRED_CASES[2])
         self.assertIsNone(_diagnostic_record(
             no_attribute, AssertionError("synthetic"), None)["child_exit"])
 
-        # The original CalledProcessError code remains authoritative.
+        # Only a real CalledProcessError code belongs in child_exit.
         test._rootyard_diagnostic_api_exit = 7
         original = subprocess.CalledProcessError(
             3, ["secret-argv"], output=b"secret")
         self.assertEqual(_diagnostic_record(
             test, original, None)["child_exit"], 3)
 
-        # An absent or invalid original code falls back to the test value.
         invalid = subprocess.CalledProcessError(True, ["secret-argv"])
-        self.assertEqual(_diagnostic_record(
-            test, invalid, None)["child_exit"], 7)
-        self.assertEqual(_diagnostic_record(
-            test, AssertionError("synthetic"), None)["child_exit"], 7)
+        self.assertIsNone(_diagnostic_record(
+            test, invalid, None)["child_exit"])
+        self.assertIsNone(_diagnostic_record(
+            test, AssertionError("synthetic"), None)["child_exit"])
 
     def test_api_exit_poison_value_or_payload_is_never_serialized(self):
         class _Poison:
@@ -212,7 +209,7 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
         self.assertIsNone(payload_record["child_exit"])
         self.assertNotIn(SECRET, json.dumps(payload_record))
 
-    def test_api_exit_fallback_keeps_other_fields_and_pass_state(self):
+    def test_child_exit_fallback_removed_keeps_other_fields_and_pass_state(self):
         error = AssertionError("synthetic")
         tb = _traceback_at(
             str(ROOT / "tests/test_workspace_fuse_service.py"),
@@ -229,7 +226,7 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             "source": {"path": "tests/test_workspace_fuse_service.py", "line": 1},
             "http_status": None,
             "errno": None,
-            "child_exit": 1,
+            "child_exit": None,
             "shutdown_outcome": "unknown",
         })
         self.assertEqual(set(record), set(_unknown_diagnostic()))
@@ -255,6 +252,18 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             (capture + helper + (
                 "HTTP 503: workspace FUSE helper child exited unsuccessfully"),
              "helper_child_exit"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child exited with code 101"),
+             "helper_child_exit_101"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child exited with code 1"),
+             "helper_child_exit_1"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child was killed by SIGKILL"),
+             "helper_child_sigkill"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child was terminated by SIGTERM"),
+             "helper_child_sigterm"),
             (capture + helper + (
                 "HTTP 503: workspace FUSE helper child exit was not observed"),
              "helper_child_absent"),

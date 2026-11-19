@@ -61,6 +61,10 @@ SHUTDOWN_OUTCOME_MULTIPLE = "multiple"
 SHUTDOWN_OUTCOMES = frozenset((
     "helper_internal_503",
     "helper_child_exit",
+    "helper_child_exit_101",
+    "helper_child_exit_1",
+    "helper_child_sigkill",
+    "helper_child_sigterm",
     "helper_child_absent",
     "helper_child_reap_deadline",
     "helper_child_reap_error",
@@ -88,6 +92,10 @@ _SHUTDOWN_HELPER_CONTAINER = "workspace FUSE helper shutdown failed: "
 _SHUTDOWN_HELPER_CLAUSES = {
     "HTTP 503: service temporarily unavailable": "helper_internal_503",
     "HTTP 503: workspace FUSE helper child exited unsuccessfully": "helper_child_exit",
+    "HTTP 503: workspace FUSE helper child exited with code 101": "helper_child_exit_101",
+    "HTTP 503: workspace FUSE helper child exited with code 1": "helper_child_exit_1",
+    "HTTP 503: workspace FUSE helper child was killed by SIGKILL": "helper_child_sigkill",
+    "HTTP 503: workspace FUSE helper child was terminated by SIGTERM": "helper_child_sigterm",
     "HTTP 503: workspace FUSE helper child exit was not observed": "helper_child_absent",
     "HTTP 503: workspace FUSE helper child reap deadline expired": "helper_child_reap_deadline",
     "HTTP 503: workspace FUSE helper child wait failed": "helper_child_reap_error",
@@ -288,18 +296,6 @@ def _child_exit(error):
     return None
 
 
-def _diagnostic_child_exit(test, error):
-    """Use the original process code, else the test's returned API exit."""
-    value = _child_exit(error)
-    if value is not None:
-        return value
-    try:
-        value = getattr(test, "_rootyard_diagnostic_api_exit", None)
-    except BaseException:
-        return None
-    return _bounded_int(value, -255, 255)
-
-
 def _relative_source_path(filename):
     try:
         return Path(filename).resolve().relative_to(ROOT).as_posix()
@@ -370,7 +366,7 @@ def _diagnostic_record(test, error, tb):
         "source": _source_location(tb),
         "http_status": _http_status(error),
         "errno": _errno(error),
-        "child_exit": _diagnostic_child_exit(test, error),
+        "child_exit": _child_exit(error),
         "shutdown_outcome": _shutdown_outcome(test),
     }
 

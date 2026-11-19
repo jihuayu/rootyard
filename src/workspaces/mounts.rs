@@ -24,7 +24,7 @@ use crate::{
     AppState, Error,
     members::models::Role,
     workspace_lab::{
-        fuse_helper::{HelperClient, HelperError, HelperShutdownOutcome},
+        fuse_helper::{ChildExitClass, HelperClient, HelperError, HelperShutdownOutcome},
         fuse_mount::{LazySource, LegacySpawnFailure, MountHandle, MutationGate, Overlay},
     },
 };
@@ -582,12 +582,16 @@ enum HelperFailureRendering {
 fn helper_teardown_outcome(failures: &[HelperTeardownFailure]) -> HelperShutdownOutcome {
     fn rank(outcome: HelperShutdownOutcome) -> u8 {
         match outcome {
-            HelperShutdownOutcome::ChildExited => 0,
-            HelperShutdownOutcome::ChildMissing => 1,
-            HelperShutdownOutcome::ChildReapDeadline => 2,
-            HelperShutdownOutcome::ChildReapError => 3,
-            HelperShutdownOutcome::Timeout => 4,
-            HelperShutdownOutcome::Other => 5,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101) => 0,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1) => 1,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill) => 2,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm) => 3,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::Other) => 4,
+            HelperShutdownOutcome::ChildMissing => 5,
+            HelperShutdownOutcome::ChildReapDeadline => 6,
+            HelperShutdownOutcome::ChildReapError => 7,
+            HelperShutdownOutcome::Timeout => 8,
+            HelperShutdownOutcome::Other => 9,
         }
     }
     failures
@@ -601,7 +605,21 @@ fn helper_teardown_outcome(failures: &[HelperTeardownFailure]) -> HelperShutdown
 /// `Error::internal` redaction for every failure that is not helper-owned.
 fn helper_teardown_clause(outcome: HelperShutdownOutcome) -> Option<&'static str> {
     match outcome {
-        HelperShutdownOutcome::ChildExited => Some("workspace FUSE helper child exited unsuccessfully"),
+        HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101) => {
+            Some("workspace FUSE helper child exited with code 101")
+        }
+        HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1) => {
+            Some("workspace FUSE helper child exited with code 1")
+        }
+        HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill) => {
+            Some("workspace FUSE helper child was killed by SIGKILL")
+        }
+        HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm) => {
+            Some("workspace FUSE helper child was terminated by SIGTERM")
+        }
+        HelperShutdownOutcome::ChildExited(ChildExitClass::Other) => {
+            Some("workspace FUSE helper child exited unsuccessfully")
+        }
         HelperShutdownOutcome::ChildMissing => Some("workspace FUSE helper child exit was not observed"),
         HelperShutdownOutcome::ChildReapDeadline => Some("workspace FUSE helper child reap deadline expired"),
         HelperShutdownOutcome::ChildReapError => Some("workspace FUSE helper child wait failed"),
@@ -920,9 +938,17 @@ mod tests {
             helper_failure(HelperShutdownOutcome::ChildReapError, "wait error"),
             helper_failure(HelperShutdownOutcome::ChildReapDeadline, "reap deadline"),
             helper_failure(HelperShutdownOutcome::ChildMissing, "missing"),
-            helper_failure(HelperShutdownOutcome::ChildExited, "exit"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::Other), "exit"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm), "SIGTERM"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill), "SIGKILL"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1), "code 1"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101), "code 101"),
         ];
-        assert_eq!(helper_teardown_outcome(&all), HelperShutdownOutcome::ChildExited);
+        assert_eq!(helper_teardown_outcome(&all), HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101));
+        assert_eq!(helper_teardown_outcome(&all[..9]), HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1));
+        assert_eq!(helper_teardown_outcome(&all[..8]), HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill));
+        assert_eq!(helper_teardown_outcome(&all[..7]), HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm));
+        assert_eq!(helper_teardown_outcome(&all[..6]), HelperShutdownOutcome::ChildExited(ChildExitClass::Other));
         assert_eq!(helper_teardown_outcome(&all[..5]), HelperShutdownOutcome::ChildMissing);
         assert_eq!(helper_teardown_outcome(&all[..4]), HelperShutdownOutcome::ChildReapDeadline);
         assert_eq!(helper_teardown_outcome(&all[..3]), HelperShutdownOutcome::ChildReapError);
@@ -934,7 +960,26 @@ mod tests {
     #[test]
     fn private_evidence_rendering_uses_only_the_fixed_clause() {
         for (outcome, expected) in [
-            (HelperShutdownOutcome::ChildExited, "workspace FUSE helper child exited unsuccessfully"),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101),
+                "workspace FUSE helper child exited with code 101",
+            ),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1),
+                "workspace FUSE helper child exited with code 1",
+            ),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill),
+                "workspace FUSE helper child was killed by SIGKILL",
+            ),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm),
+                "workspace FUSE helper child was terminated by SIGTERM",
+            ),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::Other),
+                "workspace FUSE helper child exited unsuccessfully",
+            ),
             (HelperShutdownOutcome::ChildMissing, "workspace FUSE helper child exit was not observed"),
             (HelperShutdownOutcome::ChildReapDeadline, "workspace FUSE helper child reap deadline expired"),
             (HelperShutdownOutcome::ChildReapError, "workspace FUSE helper child wait failed"),
@@ -966,7 +1011,11 @@ mod tests {
             HelperShutdownOutcome::ChildReapError,
             HelperShutdownOutcome::ChildReapDeadline,
             HelperShutdownOutcome::ChildMissing,
-            HelperShutdownOutcome::ChildExited,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::Other),
         ] {
             let error = render_helper_teardown_error(
                 vec![helper_failure(outcome, "raw detail must not escape")],

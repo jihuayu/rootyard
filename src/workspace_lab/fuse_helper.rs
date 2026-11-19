@@ -49,7 +49,7 @@ pub mod protocol;
 #[path = "fuse_helper/server.rs"]
 pub mod server;
 
-pub(crate) use client::HelperShutdownOutcome;
+pub(crate) use client::{ChildExitClass, HelperShutdownOutcome};
 pub use client::{HelperClient, HelperError, RemoteFreezeToken};
 pub use server::run as run_child;
 

@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 #[path = "client_child.rs"]
 mod child_lifecycle;
-use child_lifecycle::{ChildSlot, ExitObservation, ExitView, ReapFailure};
+use child_lifecycle::{ChildSlot, ExitKind, ExitObservation, ExitView, ReapFailure};
 
 /// Bound on queued cancel frames. One worker sends them, so a caller that
 /// abandons a begin/mount can never spawn an unbounded number of threads.
@@ -109,13 +109,31 @@ impl std::fmt::Display for HelperError {
     }
 }
 
+/// Sealed exact child-status label. It records only the numeric exit code or
+/// terminating signal; a label selects an investigation family, never a cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildExitClass {
+    /// Exact nonzero exit code 101. This is the helper's existing panic-family
+    /// fail-stop entry, but the label does not assert a particular cause.
+    ExitCode101,
+    /// Exact nonzero exit code 1 (the helper's generic fail-stop entry).
+    ExitCode1,
+    /// Exact SIGKILL. The parent's bounded reaper is the only current sender;
+    /// this label directs control-reaper investigation.
+    SignalKill,
+    /// Exact SIGTERM.
+    SignalTerm,
+    /// Any other nonzero exit code or terminating signal.
+    Other,
+}
+
 /// Closed private reason a normal-shutdown teardown failed. It is carried
 /// beside [`HelperError`] only inside the crate; the public error keeps its
 /// original errno/message shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelperShutdownOutcome {
     Other,
-    ChildExited,
+    ChildExited(ChildExitClass),
     ChildMissing,
     ChildReapDeadline,
     ChildReapError,
@@ -314,15 +332,28 @@ where
     })
 }
 
+/// Classify only the exact allowlisted child-status shapes. The label carries
+/// no cause and no arbitrary value; every unlisted shape remains `Other`.
+fn child_exit_class(kind: ExitKind) -> ChildExitClass {
+    match kind {
+        ExitKind::Code(101) => ChildExitClass::ExitCode101,
+        ExitKind::Code(1) => ChildExitClass::ExitCode1,
+        ExitKind::Signal(libc::SIGKILL) => ChildExitClass::SignalKill,
+        ExitKind::Signal(libc::SIGTERM) => ChildExitClass::SignalTerm,
+        ExitKind::Code(_) | ExitKind::Signal(_) => ChildExitClass::Other,
+    }
+}
+
 /// Map one non-sleeping child observation to the shared shutdown outcome.
 /// `None` means the child is still running/reaping and the caller must apply
 /// its existing absolute deadline; it is never success.
 fn terminal_exit(observation: ExitObservation) -> Option<Result<(), HelperShutdownError>> {
     match observation {
         ExitObservation::Exited(Ok(status)) if status.success => Some(Ok(())),
-        ExitObservation::Exited(Ok(status)) => {
-            Some(Err(HelperShutdownError::new(HelperError::child_exited(&status), HelperShutdownOutcome::ChildExited)))
-        }
+        ExitObservation::Exited(Ok(status)) => Some(Err(HelperShutdownError::new(
+            HelperError::child_exited(&status),
+            HelperShutdownOutcome::ChildExited(child_exit_class(status.kind)),
+        ))),
         ExitObservation::Exited(Err(ReapFailure::Deadline)) => Some(Err(HelperShutdownError::new(
             HelperError::child_reap_deadline(),
             HelperShutdownOutcome::ChildReapDeadline,
@@ -1389,6 +1420,17 @@ mod tests {
     }
 
     #[test]
+    fn child_exit_class_is_sealed_to_the_known_status_shapes() {
+        assert_eq!(child_exit_class(ExitKind::Code(101)), ChildExitClass::ExitCode101);
+        assert_eq!(child_exit_class(ExitKind::Code(1)), ChildExitClass::ExitCode1);
+        assert_eq!(child_exit_class(ExitKind::Signal(libc::SIGKILL)), ChildExitClass::SignalKill);
+        assert_eq!(child_exit_class(ExitKind::Signal(libc::SIGTERM)), ChildExitClass::SignalTerm);
+        assert_eq!(child_exit_class(ExitKind::Signal(libc::SIGINT)), ChildExitClass::Other);
+        assert_eq!(child_exit_class(ExitKind::Code(9)), ChildExitClass::Other);
+        assert_eq!(child_exit_class(ExitKind::Code(0)), ChildExitClass::Other);
+    }
+
+    #[test]
     fn public_shutdown_error_messages_are_reconstructed_from_private_observations() {
         let deadline = terminal_exit(ExitObservation::Exited(Err(ReapFailure::Deadline)))
             .expect("a recorded reap failure is terminal")
@@ -1410,10 +1452,11 @@ mod tests {
         let exited = terminal_exit(ExitObservation::Exited(Ok(ExitView {
             success: false,
             description: "exit status: 9".into(),
+            kind: ExitKind::Code(9),
         })))
         .expect("a recorded exit is terminal")
         .expect_err("a nonzero exit is never success");
-        assert_eq!(exited.outcome, HelperShutdownOutcome::ChildExited);
+        assert_eq!(exited.outcome, HelperShutdownOutcome::ChildExited(ChildExitClass::Other));
         assert_eq!(exited.error.code, libc::ECHILD);
         assert_eq!(exited.error.message, "workspace FUSE helper exited with exit status: 9");
     }
