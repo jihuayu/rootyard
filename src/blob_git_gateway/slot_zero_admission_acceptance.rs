@@ -65,6 +65,7 @@ use crate::{
             CoreGate,
             pack_commit::{PackCommitBaseline, PackCommitPlan},
         },
+        pg::{OPERATION_LOCK_DOMAIN, OPERATION_LOCK_SQL},
         serving::{self, ProvisionRequest, ServingRepository},
     },
 };
@@ -76,15 +77,29 @@ const ISSUER_LANE: &str = "blob-git-receive";
 /// rollback around this explicitly shorter lock bound.
 const AUTHORITY_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '2000ms'";
 
-/// One positive wait observation. The observed backend is active inside the
-/// exact first-lane INSERT and PostgreSQL names the fixture creator as its
-/// blocker. Elapsed time or an unfinished task alone is never evidence. The
-/// separate authority transaction below proves the lock-order property: the
-/// lane INSERT's foreign-key `FOR KEY SHARE` is compatible with its
+/// One positive wait observation. The observed backend is the dedicated
+/// gateway pool (unique `application_name`), is active inside the exact
+/// first-lane INSERT, names the fixture creator as its blocker, and already
+/// holds its real transaction advisory locks. The creator likewise holds its
+/// published operation advisory key. Elapsed time, global SQL text or an
+/// unfinished task alone is never the identity/evidence. The separate
+/// authority transaction below proves the lock-order property: the lane
+/// INSERT's foreign-key `FOR KEY SHARE` is compatible with its
 /// `FOR NO KEY UPDATE`, while a pre-lane serving `FOR SHARE` is not.
-const LANE_WAIT_PROBE: &str = "SELECT a.pid, pg_blocking_pids(a.pid)
+const LANE_WAIT_PROBE: &str = "SELECT
+        a.pid,
+        pg_blocking_pids(a.pid),
+        EXISTS(
+            SELECT 1 FROM pg_locks l
+            WHERE l.pid=$1 AND l.locktype='advisory' AND l.granted
+        ) AS creator_holds_operation_key,
+        EXISTS(
+            SELECT 1 FROM pg_locks l
+            WHERE l.pid=a.pid AND l.locktype='advisory' AND l.granted
+        ) AS waiter_holds_operation_key
     FROM pg_stat_activity a
     WHERE a.datname=current_database()
+      AND a.application_name=$2
       AND a.state='active' AND a.wait_event_type='Lock'
       AND $1::int = ANY(pg_blocking_pids(a.pid))
       AND a.query LIKE 'INSERT INTO ref_store_issuer_lanes%'";
@@ -130,10 +145,13 @@ const LEDGER_SNAPSHOT: &str = "SELECT jsonb_build_object(
 #[tokio::test]
 #[ignore = "requires CREATEDB, ROOTYARD_TEST_DATABASE_URL, Linux procfs and an executable Git"]
 async fn first_lane_insert_waits_before_authority_locks() -> Result<()> {
-    let (admin, database, pool) = setup_owned_database().await?;
-    let outcome = AssertUnwindSafe(case(&pool)).catch_unwind().await;
+    let application_name = format!("issue42_slot0_gateway_{}", Uuid::new_v4().simple());
+    let (admin, database, pool, gateway_pool) = setup_owned_database(&application_name).await?;
+    let outcome = AssertUnwindSafe(case(&pool, &gateway_pool, &application_name)).catch_unwind().await;
     pool.close();
+    gateway_pool.close();
     drop(pool);
+    drop(gateway_pool);
     let cleanup = timeout(WAIT, cleanup_owned_database(&admin, &database))
         .await
         .context("owned database cleanup did not finish")?;
@@ -162,7 +180,7 @@ fn append_cleanup(mut error: anyhow::Error, label: &str, cleanup: anyhow::Error)
     error
 }
 
-async fn setup_owned_database() -> Result<(Pool, String, Pool)> {
+async fn setup_owned_database(application_name: &str) -> Result<(Pool, String, Pool, Pool)> {
     let base_url =
         std::env::var("ROOTYARD_TEST_DATABASE_URL").context("ROOTYARD_TEST_DATABASE_URL must name the owned server")?;
     let admin = db::pool(&base_url).context("owned database admin pool rejected")?;
@@ -176,19 +194,24 @@ async fn setup_owned_database() -> Result<(Pool, String, Pool)> {
         .context("owned database CREATE did not finish")??;
     drop(create);
 
-    let setup: Result<Pool> = async {
+    let setup: Result<(Pool, Pool)> = async {
         let mut config: tokio_postgres::Config = base_url.parse()?;
         config.dbname(database.as_str());
         config.options("-c search_path=public -c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000");
-        let pool =
+        let pool = Pool::builder(Manager::new(config.clone(), tokio_postgres::NoTls))
+            .runtime(Runtime::Tokio1)
+            .max_size(8)
+            .build()?;
+        config.application_name(application_name);
+        let gateway_pool =
             Pool::builder(Manager::new(config, tokio_postgres::NoTls)).runtime(Runtime::Tokio1).max_size(8).build()?;
         db::migrate(&pool).await?;
-        Ok(pool)
+        Ok((pool, gateway_pool))
     }
     .await;
 
     match setup {
-        Ok(pool) => Ok((admin, database, pool)),
+        Ok((pool, gateway_pool)) => Ok((admin, database, pool, gateway_pool)),
         Err(original) => {
             let cleanup = cleanup_owned_database(&admin, &database).await;
             Err(match cleanup {
@@ -217,7 +240,7 @@ async fn cleanup_owned_database(admin: &Pool, database: &str) -> Result<()> {
     Ok(())
 }
 
-async fn case(db: &Pool) -> Result<()> {
+async fn case(db: &Pool, gateway_pool: &Pool, gateway_application_name: &str) -> Result<()> {
     let resources =
         ResourceLimits::new(2, 2, 1 << 20).map_err(|error| anyhow!("memory Blob budget rejected: {error}"))?;
     let (store, _resources) = test_support::store(resources);
@@ -225,7 +248,7 @@ async fn case(db: &Pool) -> Result<()> {
     let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
     let state = Arc::new(
         BlobGitState::new(BlobGitConfig {
-            pool: (*db).clone(),
+            pool: (*gateway_pool).clone(),
             store: store.clone(),
             git_binary: git.binary().to_path_buf(),
             scratch_root: scratch.path().to_path_buf(),
@@ -261,6 +284,8 @@ async fn case(db: &Pool) -> Result<()> {
         .map_err(|error| anyhow!("initial baseline capture refused: {error:?}"))?;
 
     let public_id = Uuid::new_v4();
+    let creator_operation = Uuid::new_v4();
+    ensure!(creator_operation != public_id, "the lane creator and gateway waiter reused one operation advisory key");
     let producer = RequestDigest::of("issue42-private-first-lane", &[public_id.as_bytes(), name.as_bytes()]);
     let request = PushRequest {
         commands: vec![PushCommand { old: "0".repeat(40), new: "a".repeat(40), name: "refs/heads/main".to_owned() }],
@@ -279,6 +304,12 @@ async fn case(db: &Pool) -> Result<()> {
     );
     let lane_pid: i32 = {
         let tx = lane_tx.as_ref().ok_or_else(|| anyhow!("lane creator transaction was not created"))?;
+        // The creator is a real operation participant: take the published
+        // migration-138 operation advisory key before touching the initially
+        // absent lane. The gateway waiter uses a different public operation id.
+        timeout(WAIT, tx.query_one(OPERATION_LOCK_SQL, &[&OPERATION_LOCK_DOMAIN, &repository_id, &creator_operation]))
+            .await
+            .context("lane creator operation advisory lock did not finish")??;
         let existing: i64 = timeout(
             WAIT,
             tx.query_one(
@@ -333,13 +364,13 @@ async fn case(db: &Pool) -> Result<()> {
         // Positive evidence: the gateway is in the first-lane INSERT, blocked
         // by the creator. The independent authority transaction below then
         // proves it has not taken repository/binding locks.
-        observe_blocked_first_lane(db, lane_pid, &mut waiter).await?;
+        observe_blocked_first_lane(db, lane_pid, gateway_application_name, &mut waiter).await?;
 
         // A third, independent authority transaction can lock both rows while
         // the gateway waiter is still parked. This is the regression: the lane
         // wait must happen before any repository/binding authority lock.
         third_authority_can_lock(db, repository_id).await?;
-        observe_blocked_first_lane(db, lane_pid, &mut waiter).await?;
+        observe_blocked_first_lane(db, lane_pid, gateway_application_name, &mut waiter).await?;
 
         let owned = lane_tx.take().ok_or_else(|| anyhow!("lane creator transaction was already consumed"))?;
         timeout(WAIT, owned.commit()).await.context("lane creator COMMIT did not finish")??;
@@ -361,7 +392,7 @@ async fn case(db: &Pool) -> Result<()> {
             plan.as_ref(),
             &serving,
             owner.identity.id,
-            &backend_identity,
+            backend_identity.as_str(),
             baseline.gate().revision(),
         )
         .await?;
@@ -462,7 +493,6 @@ async fn case(db: &Pool) -> Result<()> {
             cleanup.push(format!("gateway waiter abort/join: {error:#}"));
         }
     }
-    waiter = None;
     if let Some(owned) = lane_tx.take() {
         if let Err(error) = rollback_bounded(owned).await {
             cleanup.push(format!("lane creator rollback: {error:#}"));
@@ -522,6 +552,7 @@ async fn abort_worker<T>(worker: &mut JoinHandle<T>) -> Result<()> {
 async fn observe_blocked_first_lane(
     pool: &Pool,
     lane_pid: i32,
+    gateway_application_name: &str,
     waiter: &mut Option<JoinHandle<std::result::Result<Start, GatewayError>>>,
 ) -> Result<()> {
     let observer = checkout(pool, "lane witness").await?;
@@ -544,14 +575,24 @@ async fn observe_blocked_first_lane(
                 };
             }
             ensure!(waiter.is_some(), "gateway waiter task was lost before the first lane insert was observed");
-            let row = observer.query_opt(LANE_WAIT_PROBE, &[&lane_pid]).await?;
+            let row = observer.query_opt(LANE_WAIT_PROBE, &[&lane_pid, &gateway_application_name]).await?;
             if let Some(row) = row {
                 let waiter_pid: i32 = row.get(0);
                 let blockers: Vec<i32> = row.get(1);
+                let creator_holds_operation_key: bool = row.get(2);
+                let waiter_holds_operation_key: bool = row.get(3);
                 ensure!(waiter_pid != lane_pid, "the lane creator was mistaken for the blocked gateway waiter");
                 ensure!(
                     blockers.contains(&lane_pid),
                     "the gateway waiter's blocker dependency does not name the lane creator"
+                );
+                ensure!(
+                    creator_holds_operation_key,
+                    "the lane creator does not hold its published operation advisory key"
+                );
+                ensure!(
+                    waiter_holds_operation_key,
+                    "the gateway waiter has not taken its operation advisory key before the lane wait"
                 );
                 return Ok::<(), anyhow::Error>(());
             }
@@ -668,12 +709,11 @@ async fn assert_natural_admission(
                  w.group_epoch AS group_epoch,
                  w.restore_incarnation AS restore_incarnation,
                  a.private_id AS private_id,
-                 a.sequence AS attempt_sequence,
                  a.plan_digest AS plan_digest,
                  a.proof_digest AS proof_digest,
                  a.base_revision AS base_revision,
                  o.lane AS lane,
-                 o.sequence AS operation_sequence,
+                 o.sequence AS issuer_sequence,
                  o.request_digest AS operation_request_digest,
                  o.state AS operation_state,
                  s.producer_request_digest AS producer_request_digest,
@@ -733,7 +773,7 @@ async fn assert_natural_admission(
         "natural private attempt differs from the admitted plan"
     );
     ensure!(
-        row.get::<_, i64>("attempt_sequence") == 1 && identity.sequence() == 1,
+        row.get::<_, i64>("issuer_sequence") == 1 && identity.sequence() == 1,
         "natural admission did not reserve the first issuer sequence"
     );
     ensure!(
@@ -751,7 +791,10 @@ async fn assert_natural_admission(
         "natural attempt recorded another base revision"
     );
     ensure!(row.get::<_, String>("lane") == ISSUER_LANE, "natural operation recorded another issuer lane");
-    ensure!(row.get::<_, i64>("operation_sequence") == 1, "natural operation did not use the first issuer sequence");
+    ensure!(
+        row.get::<_, i64>("last_reserved_sequence") == row.get::<_, i64>("issuer_sequence"),
+        "issuer lane head differs from the migration-138 operation sequence"
+    );
     ensure!(
         row.get::<_, String>("operation_request_digest") == plan.parent_digest().as_hex(),
         "natural operation did not bind the canonical plan parent digest"
