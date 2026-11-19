@@ -67,6 +67,23 @@ pub async fn create(
             return Err(Error::bad_request());
         }
         owner_id = Some(access.owner_id);
+        if super::views::s4_git_view::is_refstore(&state, access.repo_id).await? {
+            let refreshed = auth::authorize_repo_with_role(
+                &tx,
+                &actor,
+                &m.owner,
+                &m.repository,
+                Role::Read,
+                RepoAction::ContentsRead,
+            )
+            .await?;
+            if refreshed.repo_id != access.repo_id {
+                return Err(Error::not_found());
+            }
+            super::views::s4_git_view::verify_mounted_commit(&state, &actor, m).await?;
+            repo_ids.push(access.repo_id);
+            continue;
+        }
         let source_lease =
             read_leases::shared(&state.pool, access.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
                 .await?;

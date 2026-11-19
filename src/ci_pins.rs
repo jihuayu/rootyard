@@ -33,7 +33,42 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/repos/{owner}/{name}/ci-pins/{job}/release",
             post(release_pin),
         )
+        .route(
+            "/ci/{target}/git/{owner}/{name}/info/refs",
+            axum::routing::get(s4_transport::info_refs),
+        )
+        .route(
+            "/ci/{target}/git/{owner}/{name}/git-upload-pack",
+            post(s4_transport::upload_pack)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/ci/{target}/git/{owner}/{name}/git-receive-pack",
+            post(s4_transport::receive_pack),
+        )
 }
+
+#[path = "ci_pins/s4_models.rs"]
+pub(crate) mod s4_models;
+#[path = "ci_pins/s4_schema.rs"]
+pub(crate) mod s4_schema;
+#[path = "ci_pins/s4_pin.rs"]
+pub(crate) mod s4_pin;
+#[path = "ci_pins/s4_release.rs"]
+pub(crate) mod s4_release;
+#[path = "ci_pins/s4_authority.rs"]
+pub(crate) mod s4_authority;
+#[path = "ci_pins/s4_git_runner.rs"]
+pub(crate) mod s4_git_runner;
+#[path = "ci_pins/s4_git_reaper.rs"]
+pub(crate) mod s4_git_reaper;
+#[path = "ci_pins/s4_checkout.rs"]
+pub(crate) mod s4_checkout;
+#[path = "ci_pins/s4_transport.rs"]
+pub(crate) mod s4_transport;
+#[path = "ci_pins/s4_tests.rs"]
+#[cfg(test)]
+mod s4_tests;
 
 #[path = "ci_pins/models.rs"]
 mod models;

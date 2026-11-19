@@ -17,6 +17,18 @@ use std::{
 };
 use uuid::Uuid;
 
+#[rustfmt::skip]
+#[path = "s4_git_view.rs"]
+pub(super) mod s4_git_view;
+
+#[rustfmt::skip]
+#[path = "s4_git_proc.rs"]
+pub(crate) mod s4_git_proc;
+
+#[rustfmt::skip]
+#[path = "s4_git_proc_reverse.rs"]
+pub(crate) mod s4_git_proc_reverse;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateView {
@@ -157,6 +169,11 @@ pub async fn create(
         auth::finish_tx(tx, &actor, false).await?;
         access
     };
+    // A `pg_refstore` repository has no local GitFS clone: its view is a durable
+    // retention root plus a `s4_ci_retention.git_view_bindings` row.
+    if s4_git_view::is_refstore(&state, access.repo_id).await? {
+        return s4_git_view::create(&state, &actor, id, &input, mount, access.repo_id).await;
+    }
     let vid = Uuid::new_v4();
     let temp = projection_root(&state).join(format!("stage-{vid}"));
     let final_path = projection_root(&state).join(vid.to_string());
@@ -305,9 +322,15 @@ pub async fn bundle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, Error> {
+) -> Result<axum::response::Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let view = load_for_actor(&state, &actor, id).await?;
+    // `pg_refstore` views are never materialized under `workspace-service/views`.
+    if s4_git_view::is_refstore(&state, view.repository_id).await? {
+        let (headers, bytes) = s4_git_view::bundle(&state, &view, id).await?;
+        load_for_actor(&state, &actor, view.id).await?;
+        return Ok((headers, bytes).into_response());
+    }
     let root = projection_root(&state).join(id.to_string());
     let path = root.parent().ok_or_else(Error::not_found)?.join(format!("{id}-{}.bundle", Uuid::new_v4()));
     let _guard = FileGuard(Some(path.clone()));
@@ -317,5 +340,6 @@ pub async fn bundle(
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "view bundle too large"));
     }
     load_for_actor(&state, &actor, view.id).await?;
-    Ok(([(header::CONTENT_TYPE, "application/x-git-bundle"), (header::CACHE_CONTROL, "no-store")], bytes))
+    Ok(([(header::CONTENT_TYPE, "application/x-git-bundle"), (header::CACHE_CONTROL, "no-store")], bytes)
+        .into_response())
 }

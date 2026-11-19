@@ -172,6 +172,10 @@ fn build_source_commit(
     git_input(source, &["commit-tree", &new_tree, "-p", &view.source_oid], body.as_bytes(), Some(actor))
 }
 
+#[rustfmt::skip]
+#[path = "s4_git_view_reverse.rs"]
+mod s4_git_view_reverse;
+
 pub async fn create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -214,6 +218,11 @@ pub async fn create(
     .await?;
     if access.repo_id != view.repository_id {
         return Err(Error::not_found());
+    }
+    if views::s4_git_view::is_refstore(&state, view.repository_id).await? {
+        auth::finish_tx(tx, &actor, true).await?;
+        drop(client);
+        return s4_git_view_reverse::create(&state, &actor, &view, mount, ns.id, &input, &bundle).await;
     }
     let generation: i64 = tx
         .query_opt("SELECT storage_generation FROM repositories WHERE id=$1 AND state='ready'", &[&access.repo_id])
