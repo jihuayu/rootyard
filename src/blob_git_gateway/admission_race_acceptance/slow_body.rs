@@ -25,7 +25,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::Value;
-use tokio::{net::TcpListener, sync::oneshot, time::Instant};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::Instant};
 use uuid::Uuid;
 
 use super::super::session_http_acceptance::fixtures::{
@@ -36,8 +36,7 @@ use super::super::session_http_acceptance::fixtures::{
 use super::{
     Captures, INDEPENDENT_A, INDEPENDENT_B, SEED_CONTENT, SEED_FILE, SEED_REF, WitnessResources, clone_one, clone_url,
     core_event, create_repository, durable_ref, gate_revision, open_store, operation_row, pinned_operation,
-    provision_decision_realm, redacted, report_status, require_owned_disposable_blob_fixture,
-    require_per_run_blob_prefix, spawn_push_ref,
+    provision_decision_realm, report_status, require_owned_disposable_blob_fixture, require_per_run_blob_prefix,
 };
 use crate::{
     blob_git_gateway::{
@@ -57,6 +56,13 @@ const SLOW_PACK_BYTES: usize = 2 * 1024 * 1024;
 /// before handing it to the handler. This is body pacing, not response pacing
 /// and not a synthetic client frame.
 const SLOW_FRAME_PACE: Duration = Duration::from_millis(8);
+/// Bound each unchanged slice of an incoming data frame so minimal advancing
+/// observations do not depend on hyper's delivery chunk size.
+const MAX_OBSERVED_CHUNK_BYTES: usize = 16 * 1024;
+/// Above either fixture pack and below the gateway request ceiling. This is a
+/// command-local bound only; stock Git's global/default HTTP configuration is
+/// never read or written by this test.
+const FIXTURE_HTTP_POST_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// A progress segment must reach this much actual pack stream on both sides.
 const MIN_OVERLAP_PACK_BYTES: u64 = 64 * 1024;
 /// Bounded receipt: never retain an unbounded number of observed frames.
@@ -155,9 +161,10 @@ fn observe_receive_bodies(router: Router, witness: Arc<BodyWitness>) -> Router {
 }
 
 /// Replace only the two pinned request bodies with an observing stream. The
-/// wrapper records an actual data frame before yielding that same frame
-/// unchanged, adds a small finite pace, and marks completion only after the
-/// real response has been produced. Non-pinned requests take no wrapper.
+/// wrapper may split a large data frame into concatenation-identical bounded
+/// slices, applies a small finite pace, records each actual delivery immediately
+/// before yielding its unchanged bytes, and marks completion only after the real
+/// response has been produced. Non-pinned requests take no wrapper.
 async fn observe_receive_body(State(witness): State<Arc<BodyWitness>>, request: Request<Body>, next: Next) -> Response {
     let Some(operation) = pinned_operation(&request) else {
         return next.run(request).await;
@@ -171,13 +178,24 @@ async fn observe_receive_body(State(witness): State<Arc<BodyWitness>>, request: 
     let observed = async_stream::stream! {
         let mut body = body.into_data_stream();
         while let Some(frame) = body.next().await {
-            if let Ok(bytes) = &frame
-                && !bytes.is_empty()
-            {
-                body_witness.observe(operation, bytes);
-                tokio::time::sleep(SLOW_FRAME_PACE).await;
+            match frame {
+                Ok(bytes) if bytes.is_empty() => yield Ok(bytes),
+                Ok(bytes) => {
+                    let mut offset = 0usize;
+                    while offset < bytes.len() {
+                        let end = (offset + MAX_OBSERVED_CHUNK_BYTES).min(bytes.len());
+                        tokio::time::sleep(SLOW_FRAME_PACE).await;
+                        let chunk = bytes.slice(offset..end);
+                        // Timestamp immediately before the unchanged bytes are
+                        // yielded, after pacing. Only actual received body data
+                        // creates a progress sample.
+                        body_witness.observe(operation, &chunk);
+                        yield Ok(chunk);
+                        offset = end;
+                    }
+                }
+                Err(error) => yield Err(error),
             }
-            yield frame;
         }
     };
     let request = Request::from_parts(parts, Body::from_stream(observed));
@@ -356,6 +374,25 @@ fn deterministic_pack_bytes(mut state: u64) -> Vec<u8> {
     bytes
 }
 
+/// The exact two fixture pushes only: command-local `http.postBuffer` above
+/// each 2 MiB incompressible pack, plus the existing operation pin. The stock
+/// Git global/system configuration remains disabled by the shared fixture.
+fn spawn_fixture_push_ref(
+    git: &'static Git,
+    directory: std::path::PathBuf,
+    url: String,
+    operation: Uuid,
+    ref_name: &'static str,
+) -> JoinHandle<Result<git::Output>> {
+    tokio::spawn(async move {
+        let header = format!("http.extraHeader=X-Rootyard-Operation: {operation}");
+        let post_buffer = format!("http.postBuffer={FIXTURE_HTTP_POST_BUFFER_BYTES}");
+        let target = format!("HEAD:{ref_name}");
+        git.run(&directory, &["-c", post_buffer.as_str(), "-c", header.as_str(), "push", url.as_str(), target.as_str()])
+            .await
+    })
+}
+
 async fn commit_bytes(git: &Git, directory: &Path, file: &str, bytes: &[u8], message: &str) -> Result<String> {
     std::fs::write(directory.join(file), bytes).with_context(|| format!("write fixture file {file}"))?;
     git.ok(directory, &["add", file]).await?;
@@ -428,12 +465,12 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         let work = resources.work.insert(tempfile::tempdir().context("temporary Git work root")?);
         let direct_url = clone_url(address, &owner, &name);
         let seeded = git.clone(work.path(), &direct_url, "seed").await?;
-        ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed: {}", redacted(&seeded));
+        ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
         let seed_dir = work.path().join("seed");
         let seed = git.commit(&seed_dir, SEED_FILE, SEED_CONTENT, "seed commit").await?;
         let seed_target = format!("HEAD:{SEED_REF}");
         let pushed = git.run(&seed_dir, &["push", "origin", seed_target.as_str()]).await?;
-        ensure!(pushed.success, "seed push was refused: {}", redacted(&pushed));
+        ensure!(pushed.success, "seed push was refused");
 
         let first_dir = clone_one(git, work.path(), &direct_url, "slow-a").await?;
         let second_dir = clone_one(git, work.path(), &direct_url, "slow-b").await?;
@@ -448,10 +485,14 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         ensure!(first_new != second_new, "the two slow-body commits are identical");
         let revision_before = gate_revision(db, repository_id).await?;
 
+        ensure!(
+            FIXTURE_HTTP_POST_BUFFER_BYTES > SLOW_PACK_BYTES && FIXTURE_HTTP_POST_BUFFER_BYTES < 16 * 1024 * 1024,
+            "the command-local fixture post buffer is outside its exact fixture pack bound"
+        );
         *resources.first_push =
-            Some(spawn_push_ref(git, first_dir, direct_url.clone(), first_operation, INDEPENDENT_A));
+            Some(spawn_fixture_push_ref(git, first_dir, direct_url.clone(), first_operation, INDEPENDENT_A));
         *resources.second_push =
-            Some(spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
+            Some(spawn_fixture_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
 
         // Both stock children were spawned before either join; the second body
         // is not started only after the first finishes. The fixture's own Git
@@ -481,9 +522,10 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
         // refs/OIDs, nontrivial actual pack progress on both sides, and a
         // paired progress interval ending before either response completed.
         let requests = witness.request_counts();
+        ensure!(requests.len() == 2, "the pinned receive-pack POSTs were not exactly the two operations");
         ensure!(
-            requests.len() == 2 && requests.iter().all(|count| *count == 1),
-            "the two pinned receive-pack operations did not each arrive exactly once"
+            requests.iter().all(|count| *count == 1),
+            "a pinned receive-pack operation issued more than one POST, including a flush-only preflight"
         );
         let first_trace =
             witness.trace(first_operation).ok_or_else(|| anyhow!("the first receive body was not observed"))?;
@@ -533,8 +575,8 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             second_verdicts == vec![(INDEPENDENT_B.to_owned(), None)],
             "the second slow-body report-status is not exactly one ok on {INDEPENDENT_B}: {second_verdicts:?}"
         );
-        ensure!(first_output.success, "the first slow-body stock push was refused: {}", redacted(&first_output));
-        ensure!(second_output.success, "the second slow-body stock push was refused: {}", redacted(&second_output));
+        ensure!(first_output.success, "the first slow-body stock push was refused");
+        ensure!(second_output.success, "the second slow-body stock push was refused");
 
         // Durable refs/OIDs, both exact committed terminals, exactly two gate
         // revisions and one committed core event per pinned operation.
@@ -598,7 +640,7 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             revision_before + 2
         );
         let readback = git.clone(work.path(), &direct_url, "slow-readback").await?;
-        ensure!(readback.success, "the fresh stock readback clone failed: {}", redacted(&readback));
+        ensure!(readback.success, "the fresh stock readback clone failed");
         let readback_dir = work.path().join("slow-readback");
         git.ok(&readback_dir, &["fsck", "--strict"]).await?;
         let first_read = git.text(&readback_dir, &["rev-parse", "refs/remotes/origin/indep-a"]).await?;
