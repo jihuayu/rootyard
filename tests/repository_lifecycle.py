@@ -5,11 +5,17 @@ crash-recoverable ownership transfer against the real binary and PostgreSQL."""
 import argparse
 import base64
 import concurrent.futures
+import contextlib
+from contextlib import ExitStack
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import stat
+import subprocess
 import sys
 import time
 import traceback
@@ -23,10 +29,60 @@ if str(TESTS_DIR) not in sys.path:
 from web_sessions import BrowserHarness  # noqa: E402
 
 LFS_MIME = "application/vnd.git-lfs+json"
+REMOTE_TENANT_LFS_CASE = "remote_tenant_lfs_cold_retention"
+OBJECT_STORE_FIELDS = tuple(
+    "ROOTYARD_OBJECT_STORE_" + field for field in ("ENDPOINT", "BUCKET", "REGION", "ACCESS_KEY", "SECRET_KEY")
+)
 
 
 def quote(value):
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def remote_tenant_lfs_env(environ):
+    fixture = {name: environ.get(name, "") for name in OBJECT_STORE_FIELDS}
+    if not all(value and value == value.strip() for value in fixture.values()):
+        raise ValueError("remote tenant LFS requires explicit object-store fixture settings")
+    try:
+        endpoint = urllib.parse.urlsplit(fixture["ROOTYARD_OBJECT_STORE_ENDPOINT"])
+        port = endpoint.port
+    except ValueError:
+        raise ValueError("remote tenant LFS requires a loopback HTTP object-store origin") from None
+    if not port or fixture["ROOTYARD_OBJECT_STORE_ENDPOINT"] != f"http://127.0.0.1:{port}":
+        raise ValueError("remote tenant LFS requires a loopback HTTP object-store origin")
+    return fixture
+
+
+def verify_owned_lfs_cache(root, repository_id, payload, *, evict=False):
+    oid = hashlib.sha256(payload).hexdigest()
+    uid = os.geteuid()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as owners:
+        directory = os.open(root, directory_flags)
+        owners.callback(os.close, directory)
+        if os.fstat(directory).st_uid != uid:
+            raise ValueError("LFS scratch directory is not owned")
+        for component in ("data", "lfs", str(uuid.UUID(repository_id))):
+            directory = os.open(component, directory_flags, dir_fd=directory)
+            owners.callback(os.close, directory)
+            if os.fstat(directory).st_uid != uid:
+                raise ValueError("LFS cache directory is not owned")
+        entry = os.stat(oid, dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(entry.st_mode) or entry.st_uid != uid or entry.st_nlink != 1:
+            raise ValueError("LFS cache is not an owned regular file")
+        fd = os.open(oid, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        owners.callback(os.close, fd)
+        if not os.path.samestat(entry, os.fstat(fd)) or os.read(fd, len(payload) + 1) != payload:
+            raise ValueError("LFS cache bytes do not match the fixture")
+        if evict:
+            if not os.path.samestat(entry, os.stat(oid, dir_fd=directory, follow_symlinks=False)):
+                raise ValueError("LFS cache was replaced before eviction")
+            os.unlink(oid, dir_fd=directory)
+            try:
+                os.stat(oid, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise ValueError("LFS cache still exists after eviction")
 
 
 class RepositoryLifecycleHarness(BrowserHarness):
@@ -57,6 +113,104 @@ class RepositoryLifecycleHarness(BrowserHarness):
         for k, v in raw_headers:
             lowered[k.lower()] = v
         return status, data, lowered
+
+    @contextlib.contextmanager
+    def held_table_share_lock(self, table, application_name="rootyard-fixture-rekey-gate"):
+        """Hold SHARE on one fixture-private table in an owned psql session.
+
+        SHARE is compatible with the transfer path's reads and SELECT FOR SHARE,
+        but conflicts with the rekey transaction's first DELETE (ROW EXCLUSIVE).
+        The fixture session is the only owner of this lock. Cleanup rolls back
+        or terminates only this exact tagged backend, even on assertion errors.
+        """
+        env = {**self.env, "PGAPPNAME": application_name}
+        proc = subprocess.Popen(
+            ["psql", "--dbname", self.db, "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        pid = None
+        pending = b""
+
+        def backend_gone() -> bool:
+            if pid is None:
+                return True
+            try:
+                return self.sql(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    f"WHERE pid={pid} AND application_name={quote(application_name)}"
+                ) == "0"
+            except Exception:
+                return False
+
+        try:
+            proc.stdin.write(
+                f"BEGIN; LOCK TABLE {table} IN SHARE MODE; "
+                "SELECT 'ready|' || pg_backend_pid();\n".encode()
+            )
+            proc.stdin.flush()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and pid is None:
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    if line.strip().startswith(b"ready|"):
+                        pid = int(line.strip().split(b"|", 1)[1])
+                        break
+                if pid is not None or proc.poll() is not None:
+                    break
+                ready, _, _ = select.select(
+                    [proc.stdout], [], [], max(0.0, deadline - time.monotonic())
+                )
+                if not ready:
+                    break
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                pending += chunk
+            if pid is None:
+                raise AssertionError("fixture table-SHARE session did not become ready")
+            yield pid
+        finally:
+            if pid is not None:
+                try:
+                    proc.stdin.write(b"ROLLBACK;\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if pid is not None:
+                    try:
+                        self.sql(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            f"WHERE pid={pid} AND application_name={quote(application_name)}"
+                        )
+                    except Exception:
+                        pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if pid is not None:
+                release_deadline = time.monotonic() + 5.0
+                while time.monotonic() < release_deadline and not backend_gone():
+                    time.sleep(0.01)
+                assert backend_gone(), "fixture table-SHARE backend survived bounded release"
+            try:
+                proc.communicate(timeout=1)
+            except Exception:
+                pass
 
     def push_file(self, owner, repo, work_dir, filename, content, branch, message, token):
         if not work_dir.exists():
@@ -346,6 +500,30 @@ class RepositoryLifecycleHarness(BrowserHarness):
         repo_b = self.create_repository({"owner": "alice", "name": "shared-b"}, token=self.alice)
         shared_oid = self.batch_upload("alice", "shared-a", shared_payload, self.alice)
         self.batch_upload("alice", "shared-b", shared_payload, self.alice)
+
+        if self.args.remote_tenant_lfs:
+            peer_repo = self.create_repository({"owner": "charlie", "name": "purge-peer"}, token=self.charlie)
+            alice_tenant, peer_tenant = self.alice["user_id"], self.charlie["user_id"]
+            assert alice_tenant != peer_tenant
+            peer_payload = b"cross-tenant-purge-lfs-" * 64
+            alice_oid = self.batch_upload("alice", "shared-a", peer_payload, self.alice)
+            peer_oid = self.batch_upload("charlie", "purge-peer", peer_payload, self.charlie)
+            assert alice_oid == peer_oid == hashlib.sha256(peer_payload).hexdigest()
+            assert peer_oid != shared_oid
+            bindings = self.sql(
+                "SELECT repository_id::text || ':' || tenant_id::text || ':' || size::text || ':' || state "
+                f"FROM lfs_objects WHERE oid = {quote(peer_oid)}"
+            ).splitlines()
+            assert set(bindings) == {
+                f"{repo_a['id']}:{alice_tenant}:{len(peer_payload)}:ready",
+                f"{peer_repo['id']}:{peer_tenant}:{len(peer_payload)}:ready",
+            }
+            object_path = f"/info/lfs/objects/{peer_oid}/{len(peer_payload)}"
+            peer_download = f"/git/charlie/purge-peer.git{object_path}"
+            assert self.expect(f"/git/alice/shared-a.git{object_path}", 200, token=self.alice) == peer_payload
+            self.expect(peer_download, 404, token=self.alice)
+            assert self.expect(peer_download, 200, token=self.charlie) == peer_payload
+
         work_a = self.root / "shared-a-work"
         base_a = self.push_file("alice", "shared-a", work_a, "data.txt", "keep me\n", "main", "seed a", self.alice)
 
@@ -360,6 +538,14 @@ class RepositoryLifecycleHarness(BrowserHarness):
             extra_headers={"Idempotency-Key": "rename-shared-a"},
         )
 
+        repo_path = "/api/repos/alice/shared-a2"
+        issue_path = f"{repo_path}/issues"
+        issue_body = {"title": "Read-only collaborator must not create issues"}
+        self.expect(repo_path, 404, token=self.bob)
+        self.expect(f"{repo_path}/collaborators/bob", 201, token=self.alice, method="PUT", body={"role": "read"})
+        assert self.doc(repo_path, 200, token=self.bob)["id"] == repo_a["id"]
+        self.expect(issue_path, 403, token=self.bob, method="POST", body=issue_body)
+
         # Soft-delete with 7-day grace window hides repo & aliases across every surface.
         deleted_a = self.doc(
             "/api/repos/alice/shared-a2",
@@ -371,6 +557,8 @@ class RepositoryLifecycleHarness(BrowserHarness):
         )
         assert deleted_a["deleted"], deleted_a
         self.expect("/api/repos/alice/shared-a2", 404, token=self.alice)
+        self.expect(repo_path, 404, token=self.bob)
+        self.expect(issue_path, 404, token=self.bob, method="POST", body=issue_body)
         st_al, _, hdr_al = self.raw_http("/api/repos/alice/shared-a", token=self.alice)
         assert st_al == 404 and "location" not in hdr_al, (st_al, hdr_al)
         assert self.git("ls-remote", self.base + "/git/alice/shared-a2.git", token=self.alice, check=False).returncode != 0
@@ -399,6 +587,8 @@ class RepositoryLifecycleHarness(BrowserHarness):
         assert not restored["deleted"] and restored["version"] == deleted_a["version"] + 1, restored
         assert self.git("ls-remote", self.base + "/git/alice/shared-a2.git", "refs/heads/main", token=self.alice).stdout.decode().split()[0] == base_a
         assert self.expect(f"/git/alice/shared-a2.git/info/lfs/objects/{shared_oid}/{len(shared_payload)}", 200, token=self.alice) == shared_payload
+        assert self.doc(repo_path, 200, token=self.bob)["id"] == repo_a["id"]
+        self.expect(issue_path, 403, token=self.bob, method="POST", body=issue_body)
 
         # Re-delete with 0s grace period to test operational holds + fail-closed final purge.
         del_now = self.doc(
@@ -458,7 +648,19 @@ class RepositoryLifecycleHarness(BrowserHarness):
             200,
             token=self.alice,
         ) == shared_payload
-        return {"blocked_hold_kinds": sorted(hold_kinds), "purged_repo": repo_a["id"]}
+        detail = {
+            "blocked_hold_kinds": sorted(hold_kinds),
+            "purged_repo": repo_a["id"],
+            "restored_collaborator_role": "read",
+        }
+        if self.args.remote_tenant_lfs:
+            assert purged["deleted_lfs_keys"] == 1 and purged["preserved_shared_lfs_keys"] == 1
+            verify_owned_lfs_cache(self.root, peer_repo["id"], peer_payload, evict=True)
+            status, body, _ = self.raw_http(peer_download, token=self.charlie)
+            assert status == 200 and body == peer_payload, "cold LFS download did not return the fixture bytes"
+            verify_owned_lfs_cache(self.root, peer_repo["id"], peer_payload)
+            detail[REMOTE_TENANT_LFS_CASE] = True
+        return detail
 
     def ownership_transfer_and_crash_recovery(self):
         org = self.doc("/api/orgs", 201, token=self.alice, method="POST", body={"slug": "dest-org"}, extra_headers={"Idempotency-Key": "org-dest"})
@@ -502,38 +704,227 @@ class RepositoryLifecycleHarness(BrowserHarness):
         assert self.expect(f"/git/dest-org/gamma.git/info/lfs/objects/{gamma_lfs_oid}/{len(gamma_lfs)}", 200, token=self.alice) == gamma_lfs
         assert self.doc("/api/repos/dest-org/gamma/transfer", 200, token=self.alice)["state"] == "completed"
 
-        # Crash/restart recovery simulation: seed an interrupted in-flight org -> personal transfer on restart.
+        # Legacy/GitFS storage only: prepare_transfer rejects pg_refstore, so this
+        # proves the supported transfer path, not a pg_refstore transfer contract.
         rec = self.create_repository({"owner": "dest-org", "name": "recover-me"}, token=self.alice)
+        self.expect(
+            "/api/repos/dest-org/recover-me/collaborators/bob",
+            201,
+            token=self.alice,
+            method="PUT",
+            body={"role": "read"},
+        )
         rec_work = self.root / "recover-work"
-        self.push_file("dest-org", "recover-me", rec_work, "state.txt", "before crash\n", "main", "seed recover", self.alice)
+        rec_oid = self.push_file(
+            "dest-org", "recover-me", rec_work, "state.txt", "before crash\n", "main", "seed recover", self.alice
+        )
         lc_r = self.doc("/api/repos/dest-org/recover-me/lifecycle", 200, token=self.alice)
 
-        self.stop(hard=True)
-        xfer_id = str(uuid.uuid4())
-        self.sql(
-            "INSERT INTO repository_transfers "
-            "(id, repository_id, from_owner_id, to_owner_id, from_name, to_name, "
-            " initiated_by, state, expected_version, revoke_collaborators, keep_alias, copied_objects) "
-            f"VALUES ({quote(xfer_id)}, {quote(rec['id'])}, {quote(org['id'])}, {quote(self.alice['user_id'])}, "
-            "'recover-me', 'recover-me', "
-            f"{quote(self.alice['user_id'])}, 'rekeying_db', {lc_r['version']}, true, true, '[]'::jsonb)"
-        )
-        self.start()
+        # Drive the real authorized org -> personal POST. SHARE on the
+        # fixture-private team-member table is compatible with every earlier
+        # transfer read (including SELECT FOR SHARE in authorization) but
+        # conflicts with the rekey transaction's first write, so the request
+        # must park inside phase_rekey_db_with_pool at its DELETE.
+        gate_app = "rootyard-fixture-rekey-gate"
+        dispatch = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = None
+        xfer_id = None
+        blocked_pid = None
+        requester_disconnect = None
+        initial_epoch = None
+        try:
+            with self.held_table_share_lock("repository_team_members", gate_app) as gate_pid:
+                try:
+                    future = dispatch.submit(
+                        self.raw_http,
+                        "/api/repos/dest-org/recover-me/transfer",
+                        token=self.alice,
+                        method="POST",
+                        body={
+                            "new_owner": "alice",
+                            "expected_version": lc_r["version"],
+                            "revoke_collaborators": True,
+                        },
+                        extra_headers={"Idempotency-Key": "xfer-recover-org-to-personal"},
+                    )
+                    block_deadline = time.monotonic() + 10.0
+                    # One read-only statement detects the exact blocked service
+                    # backend and proves the same repository's committed durable
+                    # transfer row, phase, lease, and original owner/version in
+                    # one snapshot. This keeps the crash inside the service's 3s
+                    # lock_timeout window.
+                    block_query = (
+                        "SELECT a.pid::text || '|' || t.id::text || '|' || t.state "
+                        "|| '|' || t.from_owner_id::text || '|' || t.to_owner_id::text "
+                        "|| '|' || t.expected_version::text "
+                        "|| '|' || (t.lease_until > clock_timestamp())::text || '|' || t.lease_epoch::text "
+                        "|| '|' || r.owner_id::text || '|' || r.version::text "
+                        "|| '|' || (SELECT count(*) FROM repository_transfers a2 "
+                        "WHERE a2.repository_id=t.repository_id "
+                        "AND a2.state NOT IN ('completed','rolled_back','failed'))::text "
+                        "FROM pg_stat_activity a "
+                        "JOIN repository_transfers t ON "
+                        f"t.repository_id={quote(rec['id'])} "
+                        "AND t.state NOT IN ('completed','rolled_back','failed') "
+                        "JOIN repositories r ON r.id=t.repository_id "
+                        "WHERE a.state='active' AND a.wait_event_type='Lock' AND a.wait_event='relation' "
+                        "AND a.application_name='rootyard' "
+                        f"AND {gate_pid} = ANY(pg_blocking_pids(a.pid)) AND a.pid <> {gate_pid} "
+                        "AND a.query LIKE 'DELETE FROM repository_team_members WHERE repository_id = $1%' "
+                        "ORDER BY a.pid"
+                    )
+                    while time.monotonic() < block_deadline:
+                        rows = [row for row in self.sql(block_query).splitlines() if row]
+                        if len(rows) > 1:
+                            raise AssertionError("multiple rootyard backends or transfer rows parked on gate")
+                        if rows:
+                            fields = rows[0].split("|")
+                            assert len(fields) == 11, rows[0]
+                            blocked_pid = int(fields[0])
+                            xfer_id = fields[1]
+                            assert fields[2] == "rekeying_db", rows[0]
+                            assert fields[3] == org["id"] and fields[4] == self.alice["user_id"], rows[0]
+                            assert fields[5] == str(lc_r["version"]) and fields[6] == "true", rows[0]
+                            initial_epoch = int(fields[7])
+                            assert fields[8] == org["id"] and fields[9] == str(lc_r["version"]), rows[0]
+                            assert fields[10] == "1", "active transfer count is not one"
+                            break
+                        if future.done():
+                            status, _, _ = future.result()
+                            raise AssertionError(f"transfer finished before phase_rekey_db gate: {status}")
+                        time.sleep(0.01)
+                    assert blocked_pid is not None and xfer_id is not None, (
+                        "transfer never parked at phase_rekey_db DELETE with durable rekeying_db row"
+                    )
 
-        deadline = time.monotonic() + 20
-        recovered_view = None
-        while time.monotonic() < deadline:
-            st, body, _ = self.http("/api/repos/alice/recover-me/transfer", token=self.alice)
-            if st == 200:
-                recovered_view = json.loads(body)
-                if recovered_view["state"] == "completed":
-                    break
+                    self.stop(hard=True)
+                    try:
+                        future.result(timeout=15)
+                    except concurrent.futures.TimeoutError:
+                        raise AssertionError("requester stayed connected after owned SIGKILL") from None
+                    except Exception as exc:
+                        assert isinstance(exc, (OSError, http.client.HTTPException)), type(exc).__name__
+                        requester_disconnect = type(exc).__name__
+                    else:
+                        raise AssertionError("requester completed despite owned SIGKILL")
+
+                    wait_deadline = time.monotonic() + 10.0
+                    backend_state = None
+                    while time.monotonic() < wait_deadline:
+                        backend_state = self.sql(
+                            "SELECT count(*)::text || '|' || "
+                            "coalesce(sum(CASE WHEN wait_event_type='Lock' AND wait_event='relation' "
+                            f"AND {gate_pid} = ANY(pg_blocking_pids(pid)) THEN 1 ELSE 0 END), 0)::text "
+                            f"FROM pg_stat_activity WHERE pid={blocked_pid}"
+                        )
+                        if backend_state == "0|0":
+                            break
+                        time.sleep(0.01)
+                    assert backend_state == "0|0", "killed rootyard backend still waits on the fixture gate"
+                finally:
+                    if self.proc is not None:
+                        self.stop(hard=True)
+        finally:
+            if future is not None:
+                try:
+                    future.result(timeout=10)
+                except BaseException:
+                    pass
+            dispatch.shutdown(wait=True)
+
+        assert xfer_id is not None
+        assert requester_disconnect is not None
+
+        # Wait for the killed process's real lease to expire under PostgreSQL's
+        # clock. No transfer or lease row is injected, mutated, or shortened.
+        lease_deadline = time.monotonic() + 75.0
+        before_restart = None
+        while time.monotonic() < lease_deadline:
+            before_restart = self.sql(
+                "SELECT (clock_timestamp() >= t.lease_until)::text || '|' || t.state "
+                "|| '|' || r.owner_id::text || '|' || r.version::text "
+                "FROM repository_transfers t JOIN repositories r ON r.id=t.repository_id "
+                f"WHERE t.id={quote(xfer_id)}"
+            )
+            if before_restart.split("|", 1)[0] == "true":
+                break
             time.sleep(0.25)
-        assert recovered_view and recovered_view["state"] == "completed", recovered_view
-        assert self.sql(f"SELECT owner_id FROM repositories WHERE id = {quote(rec['id'])}") == self.alice["user_id"]
+        assert before_restart is not None and before_restart.split("|", 1)[0] == "true", (
+            "actual transfer lease did not expire under the PostgreSQL clock"
+        )
+        assert before_restart.split("|")[1:] == ["rekeying_db", org["id"], str(lc_r["version"])], before_restart
+
+        self.start()
+        recovery_deadline = time.monotonic() + 30.0
+        recovered = None
+        while time.monotonic() < recovery_deadline:
+            recovered = self.sql(
+                "SELECT state || '|' || lease_epoch::text FROM repository_transfers "
+                f"WHERE id={quote(xfer_id)}"
+            )
+            if recovered.startswith("completed|"):
+                break
+            time.sleep(0.1)
+        assert recovered == f"completed|{initial_epoch + 1}", recovered
+
+        owner_version = self.sql(
+            "SELECT owner_id::text || '|' || version::text FROM repositories "
+            f"WHERE id={quote(rec['id'])}"
+        )
+        assert owner_version == f"{self.alice['user_id']}|{lc_r['version'] + 1}", owner_version
+        assert self.sql(
+            "SELECT count(*) FROM repositories "
+            f"WHERE owner_id={quote(self.alice['user_id'])} AND name='recover-me'"
+        ) == "1", "destination owner does not have exactly one repository row"
+        assert self.sql(
+            "SELECT count(*) FROM repositories "
+            f"WHERE owner_id={quote(org['id'])} AND name='recover-me'"
+        ) == "0", "old organization still has a repository row"
+        assert self.sql(
+            "SELECT count(*) FROM repository_aliases WHERE repository_id="
+            f"{quote(rec['id'])}"
+        ) == "1", "old origin alias count is not one"
+        assert self.sql(
+            "SELECT count(*) FROM repository_transfers WHERE repository_id="
+            f"{quote(rec['id'])}"
+        ) == "1", "durable transfer row count is not one"
+        assert self.sql(
+            "SELECT count(*) FROM repository_audit_log WHERE repository_id="
+            f"{quote(rec['id'])} AND action='repository.transfer_started'"
+        ) == "1", "transfer_started event count is not one"
+        assert self.sql(
+            "SELECT count(*) FROM repository_audit_log WHERE repository_id="
+            f"{quote(rec['id'])} AND action='repository.transferred'"
+        ) == "1", "transferred event count is not one"
+        assert self.sql(
+            "SELECT count(*) FROM repository_collaborators WHERE repository_id="
+            f"{quote(rec['id'])}"
+        ) == "0", "revoked collaborator rows remain"
+        assert self.sql(
+            "SELECT count(*) FROM repository_team_members WHERE repository_id="
+            f"{quote(rec['id'])}"
+        ) == "0", "revoked team-member rows remain"
+
+        recovered_view = self.doc("/api/repos/alice/recover-me/transfer", 200, token=self.alice)
+        assert recovered_view["transfer_id"] == xfer_id, recovered_view
+        assert recovered_view["state"] == "completed", recovered_view
+        assert recovered_view["version"] == lc_r["version"] + 1, recovered_view
         st_rec, _, hdr_rec = self.raw_http("/api/repos/dest-org/recover-me", token=self.alice)
         assert st_rec == 308 and hdr_rec.get("location") == "/api/repos/alice/recover-me", (st_rec, hdr_rec)
-        return {"transferred_repo": gamma["id"], "recovered_transfer_id": xfer_id}
+        assert self.raw_http("/api/repos/dest-org/recover-me", token=self.bob)[0] == 404
+        assert self.raw_http("/api/repos/alice/recover-me", token=self.bob)[0] == 404
+
+        recover_clone = self.root / "recover-after-crash"
+        self.git("clone", self.base + "/git/alice/recover-me.git", str(recover_clone), token=self.alice)
+        assert (recover_clone / "state.txt").read_text() == "before crash\n"
+        assert self.git("rev-parse", "HEAD", cwd=recover_clone).stdout.decode().strip() == rec_oid
+        return {
+            "transferred_repo": gamma["id"],
+            "recovered_transfer_id": xfer_id,
+            "crash_gate": "repository_team_members_share",
+            "storage_contract": "legacy_gitfs",
+            "version_delta": 1,
+        }
 
     def issue_scoped_token(self, owner_token, name, grants, read_only=False):
         st, raw, _ = self.http(
@@ -1225,18 +1616,84 @@ class RepositoryLifecycleHarness(BrowserHarness):
         return {"parity_repo": repo["id"], "ws_uncertain_kept_closed": ws_uncertain}
 
 
+def run_remote_tenant_lfs(args, fixture):
+    h = None
+    passed = False
+    binary_sha256 = source_head = None
+    try:
+        binary_sha256 = hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"], cwd=TESTS_DIR.parent,
+            capture_output=True, check=True, text=True, timeout=5,
+        ).stdout.strip()
+        if len(head) != 40 or any(char not in "0123456789abcdef" for char in head):
+            raise ValueError("remote tenant LFS source commit is invalid")
+        source_head = head
+        h = RepositoryLifecycleHarness(args)
+        h.env = {
+            name: value for name, value in h.env.items()
+            if not name.startswith(("AWS_", "ROOTYARD_OBJECT_STORE_"))
+        }
+        h.env.update(fixture)
+        h.setup()
+        h.charlie = h.account("create-user", "charlie")
+        passed = h.soft_delete_restore_and_purge_holds().get(REMOTE_TENANT_LFS_CASE) is True
+    except Exception:
+        print("remote tenant LFS qualification failed", file=sys.stderr)
+    finally:
+        if h is not None:
+            try:
+                h.cleanup()
+            except Exception:
+                passed = False
+                print("remote tenant LFS scratch cleanup failed", file=sys.stderr)
+    report = {
+        "passed": passed,
+        "cases": [{
+            "name": REMOTE_TENANT_LFS_CASE,
+            "status": "passed" if passed else "failed",
+            "detail": {REMOTE_TENANT_LFS_CASE: passed},
+        }],
+        "binary_sha256": binary_sha256,
+        "source_head": source_head,
+    }
+    try:
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(report, indent=2) + "\n")
+    except OSError:
+        print("remote tenant LFS report write failed", file=sys.stderr)
+        return 1
+    print(json.dumps(report, indent=2))
+    return 0 if passed else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--remote-tenant-lfs", action="store_true",
+        help="Run only the soft-delete case with an explicit loopback object-store fixture",
+    )
     args = parser.parse_args()
+    fixture = None
+    if args.remote_tenant_lfs:
+        if args.keep or not __debug__:
+            parser.error("--remote-tenant-lfs requires scratch cleanup and enabled assertions")
+        try:
+            fixture = remote_tenant_lfs_env(os.environ)
+        except ValueError as exc:
+            parser.error(str(exc))
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
         parser.error("ROOTYARD_TEST_DATABASE_URL is required; use a dedicated test database")
     for exe in ("git", "git-lfs", "psql", args.binary):
         if not shutil.which(exe):
             parser.error("Required executable not found: " + exe)
+    if fixture is not None:
+        return run_remote_tenant_lfs(args, fixture)
     h = RepositoryLifecycleHarness(args)
     passed = False
     try:

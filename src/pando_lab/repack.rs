@@ -7,6 +7,12 @@ use std::{
     process::Command as StdCommand,
 };
 
+mod authority;
+#[cfg(test)]
+mod pg_tests;
+#[cfg(test)]
+mod test_support;
+
 fn default_sync_object_store() -> bool {
     true
 }
@@ -24,11 +30,7 @@ pub struct RepackOptions {
 
 impl Default for RepackOptions {
     fn default() -> Self {
-        Self {
-            prune_superseded: false,
-            pin_oids: Vec::new(),
-            sync_object_store: true,
-        }
+        Self { prune_superseded: false, pin_oids: Vec::new(), sync_object_store: true }
     }
 }
 
@@ -78,12 +80,24 @@ pub fn valid_sha1_oid(oid: &str) -> bool {
 fn run_sync_git(git_bin: &Path, cwd: &Path, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     let mut cmd = StdCommand::new(git_bin);
     for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("GIT_") && k != "GIT_EXEC_PATH" { cmd.env_remove(k); }
+        if k.to_string_lossy().starts_with("GIT_") && k != "GIT_EXEC_PATH" {
+            cmd.env_remove(k);
+        }
     }
-    let mut child = cmd.current_dir(cwd).args(args).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_NO_REPLACE_OBJECTS", "1").env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    if let Some(mut stdin) = child.stdin.take() { stdin.write_all(input)?; }
+    let mut child = cmd
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input)?;
+    }
     let out = child.wait_with_output()?;
     ensure!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     Ok(out.stdout)
@@ -95,7 +109,9 @@ pub fn compact_packs_offline(
     input_packs: &[(Uuid, Vec<u8>, Vec<u8>)],
     roots: &[String],
 ) -> Result<Option<CompactedPackArtifact>> {
-    for r in roots { ensure!(valid_sha1_oid(r), "invalid root OID: {r}"); }
+    for r in roots {
+        ensure!(valid_sha1_oid(r), "invalid root OID: {r}");
+    }
     let staging = scratch_dir.join("repack-staging.git");
     std::fs::create_dir_all(&staging)?;
     run_sync_git(git_bin, &staging, &["init", "--bare", "--object-format=sha1", "--initial-branch=main", "."], b"")?;
@@ -108,16 +124,28 @@ pub fn compact_packs_offline(
     }
     let objects_before = before_store.objects.len();
     let wants: Vec<String> = roots.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect();
-    if wants.is_empty() { return Ok(None); }
+    if wants.is_empty() {
+        return Ok(None);
+    }
 
     let walk_before = graph::walk_reachable(&before_store, &wants, &[])?;
     let rev_input = format!("{}\n", wants.join("\n"));
-    let git_rev_out = String::from_utf8(run_sync_git(git_bin, &staging, &["rev-list", "--objects", "--no-object-names", "--stdin"], rev_input.as_bytes())?)?;
+    let git_rev_out = String::from_utf8(run_sync_git(
+        git_bin,
+        &staging,
+        &["rev-list", "--objects", "--no-object-names", "--stdin"],
+        rev_input.as_bytes(),
+    )?)?;
     let git_reachable: BTreeSet<String> = git_rev_out.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
     let walk_set: BTreeSet<String> = walk_before.reachable_oids.iter().cloned().collect();
     ensure!(walk_set == git_reachable, "dual-operator reachability mismatch before pack compaction");
 
-    let compacted_pack = run_sync_git(git_bin, &staging, &["pack-objects", "--stdout", "--revs", "--delta-base-offset"], rev_input.as_bytes())?;
+    let compacted_pack = run_sync_git(
+        git_bin,
+        &staging,
+        &["pack-objects", "--stdout", "--revs", "--delta-base-offset"],
+        rev_input.as_bytes(),
+    )?;
     ensure!(compacted_pack.len() <= LIMIT, "compacted pack exceeds size limit");
 
     let after_rep = delta::verify_pack(&compacted_pack, &delta::Limits::default())?;
@@ -127,7 +155,10 @@ pub fn compact_packs_offline(
     let after_set: BTreeSet<String> = walk_after.reachable_oids.iter().cloned().collect();
     ensure!(after_set == walk_set && after_store.objects.len() == walk_set.len(), "compacted pack closure mismatch");
     for oid in &walk_before.reachable_oids {
-        ensure!(before_store.objects.get(oid) == after_store.objects.get(oid), "object content mismatch after compaction for {oid}");
+        ensure!(
+            before_store.objects.get(oid) == after_store.objects.get(oid),
+            "object content mismatch after compaction for {oid}"
+        );
     }
 
     let verify_git = scratch_dir.join("repack-verify.git");
@@ -143,26 +174,45 @@ pub fn compact_packs_offline(
     fsck_args.extend(wants.iter().map(String::as_str));
     run_sync_git(git_bin, &verify_git, &fsck_args, b"")?;
 
-    let pruned_oids: Vec<String> = before_store.objects.keys().filter(|oid| !walk_set.contains(*oid)).cloned().collect();
+    let pruned_oids: Vec<String> =
+        before_store.objects.keys().filter(|oid| !walk_set.contains(*oid)).cloned().collect();
     Ok(Some(CompactedPackArtifact {
-        pack_id, pack_sha256: delta::sha256_hex(&compacted_pack), idx_sha256: delta::sha256_hex(&idx_bytes),
-        pack_bytes: compacted_pack, idx_bytes, objects_before, objects_after: after_store.objects.len(),
-        reachable_oids: walk_after.reachable_oids, pruned_oids,
+        pack_id,
+        pack_sha256: delta::sha256_hex(&compacted_pack),
+        idx_sha256: delta::sha256_hex(&idx_bytes),
+        pack_bytes: compacted_pack,
+        idx_bytes,
+        objects_before,
+        objects_after: after_store.objects.len(),
+        reachable_oids: walk_after.reachable_oids,
+        pruned_oids,
     }))
 }
 
 pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOptions) -> Result<RepackReport> {
-    for pin in &opts.pin_oids { ensure!(valid_sha1_oid(pin), "invalid --pin-oid '{pin}'"); }
-    let mut c = config.db().await?;
-    let meta = c.query_one("SELECT generation,storage_generation,storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1", &[&repo]).await?;
-    let (pre_gen, pre_sgen, backend, paused): (i64, i64, String, bool) = (meta.get(0), meta.get(1), meta.get(2), meta.get(3));
+    for pin in &opts.pin_oids {
+        ensure!(valid_sha1_oid(pin), "invalid --pin-oid '{pin}'");
+    }
+    let c = config.db().await?;
+    let meta = c
+        .query_one(
+            "SELECT generation,storage_generation,storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1",
+            &[&repo],
+        )
+        .await?;
+    let (pre_gen, pre_sgen, backend, paused): (i64, i64, String, bool) =
+        (meta.get(0), meta.get(1), meta.get(2), meta.get(3));
     ensure!(!paused && backend == "pando", "repack requires active pando repository authority");
 
     let mut ref_roots = BTreeSet::new();
     let mut pinned_roots = BTreeSet::new();
     for r in c.query("SELECT name,oid FROM pando_lab.refs WHERE repo=$1 ORDER BY name", &[&repo]).await? {
         let (name, oid): (String, String) = (r.get(0), r.get(1));
-        if name.starts_with("refs/rootyard-ci/") { pinned_roots.insert(oid); } else { ref_roots.insert(oid); }
+        if name.starts_with("refs/rootyard-ci/") {
+            pinned_roots.insert(oid);
+        } else {
+            ref_roots.insert(oid);
+        }
     }
     for r in c.query("SELECT oid FROM pando_lab.pinned_roots WHERE repo=$1 ORDER BY name", &[&repo]).await? {
         pinned_roots.insert(r.get::<_, String>(0));
@@ -170,55 +220,125 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
     pinned_roots.extend(opts.pin_oids.iter().cloned());
 
     let mut snapshot_roots = BTreeSet::new();
-    for r in c.query("SELECT refs FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()", &[&repo]).await? {
+    for r in
+        c.query("SELECT refs FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()", &[&repo]).await?
+    {
         let s_refs: BTreeMap<String, String> = serde_json::from_value(r.get(0))?;
         snapshot_roots.extend(s_refs.into_values());
     }
 
-    let m_rows = c.query("SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 ORDER BY pack_id", &[&repo]).await?;
-    let db_objs_before: i64 = c.query_one("SELECT count(*) FROM pando_lab.objects WHERE repo=$1", &[&repo]).await?.get(0);
+    let m_rows = c
+        .query(
+            "SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 ORDER BY pack_id",
+            &[&repo],
+        )
+        .await?;
+    let db_objs_before: i64 =
+        c.query_one("SELECT count(*) FROM pando_lab.objects WHERE repo=$1", &[&repo]).await?.get(0);
     let mut input_packs = Vec::with_capacity(m_rows.len());
     for r in &m_rows {
         let pack = Pack { id: r.get(0), pack_sha256: r.get(1), idx_sha256: r.get(2) };
         object_store::ensure_local_pack_cached(config, repo, &pack).await?;
         let pfx = config.root.join("objects").join(repo.to_string()).join(pack.id.to_string());
         let (pb, ib) = (std::fs::read(pfx.with_extension("pack"))?, std::fs::read(pfx.with_extension("idx"))?);
-        ensure!(delta::sha256_hex(&pb) == pack.pack_sha256 && delta::sha256_hex(&ib) == pack.idx_sha256, "pack checksum mismatch before repack");
+        ensure!(
+            delta::sha256_hex(&pb) == pack.pack_sha256 && delta::sha256_hex(&ib) == pack.idx_sha256,
+            "pack checksum mismatch before repack"
+        );
         input_packs.push((pack.id, pb, ib));
     }
+    drop(c);
 
-    let roots_vec: Vec<String> = ref_roots.iter().chain(pinned_roots.iter()).chain(snapshot_roots.iter()).cloned().collect();
-    let session = Session::new(config)?;
-    let compacted = compact_packs_offline(&config.git, &session.0, &input_packs, &roots_vec)?;
+    let roots_vec: Vec<String> =
+        ref_roots.iter().chain(pinned_roots.iter()).chain(snapshot_roots.iter()).cloned().collect();
+    let scratch = Session::new(config)?;
+    let compacted = compact_packs_offline(&config.git, &scratch.0, &input_packs, &roots_vec)?;
+
+    // Snapshot reads and compaction are deliberately outside every SQL
+    // transaction. The shared publication gate is then acquired before the
+    // rotation target/provider is read and is held on this one owned session
+    // through the final short authority transaction.
+    let mut session = lifecycle::publication::writer_session(config, repo).await?;
+    let checkpoint = lifecycle::publication::active_rotation(session.client(), repo).await?;
+    let selected = lifecycle::provider_selection::selected_kind()?;
+
+    if compacted.is_some() && opts.sync_object_store && object_store::remote_enabled() {
+        bail!(
+            "composed S3 repack publication is unsupported: repack cannot stage remote object-store authority and commit it with Pando authority in one SQL transaction; standalone remote put/get/verify remain unchanged, and repack with sync_object_store=false is only supported when no authenticated target is active"
+        );
+    }
+    if compacted.is_some()
+        && !opts.sync_object_store
+        && (checkpoint.is_some() || selected == lifecycle::provider_selection::PandoProviderSelection::VaultTransit)
+    {
+        bail!(
+            "repack with sync_object_store=false cannot satisfy the active authenticated object-store target; publish the compacted pack with sync_object_store=true or remove the rotation/Vault target dependency"
+        );
+    }
 
     let repo_obj_dir = config.root.join("objects").join(repo.to_string());
     std::fs::create_dir_all(&repo_obj_dir)?;
-    let mut object_store_synced = false;
     if let Some(ref art) = compacted {
         for (ext, data) in [("pack", &art.pack_bytes), ("idx", &art.idx_bytes)] {
-            let mut f = OpenOptions::new().write(true).create_new(true).open(repo_obj_dir.join(format!("{}.{ext}", art.pack_id)))?;
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(repo_obj_dir.join(format!("{}.{ext}", art.pack_id)))?;
             f.write_all(data)?;
             f.sync_all()?;
         }
         File::open(&repo_obj_dir)?.sync_all()?;
-        if opts.sync_object_store {
-            object_store::put_pack(config, repo, art.pack_id, &object_store::ObjectStorePutOptions::default()).await?;
-            object_store_synced = true;
-        }
     }
 
-    let t = c.transaction().await?;
+    let prepared = if let Some(ref art) = compacted {
+        if opts.sync_object_store {
+            let pack =
+                Pack { id: art.pack_id, pack_sha256: art.pack_sha256.clone(), idx_sha256: art.idx_sha256.clone() };
+            Some(
+                object_store::prepare_known_pack_publication(
+                    config,
+                    session.client(),
+                    repo,
+                    &pack,
+                    checkpoint.as_ref(),
+                    "hot",
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    #[cfg(test)]
+    test_support::barrier("after-prepare").await?;
+
+    // The repository lock can wait behind a retained-snapshot commit. Explicit
+    // read committed makes the post-wait live-snapshot scan fresh even when the
+    // server or session default is repeatable read.
+    let t = session
+        .client_mut()
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .read_only(false)
+        .start()
+        .await?;
     let lk = t.query_one("SELECT generation,storage_generation,storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1 FOR UPDATE", &[&repo]).await?;
     let (cur_gen, cur_sgen, cur_b, cur_p): (i64, i64, String, bool) = (lk.get(0), lk.get(1), lk.get(2), lk.get(3));
-    if cur_p || cur_b != "pando" || cur_gen != pre_gen || cur_sgen != pre_sgen {
+    if cur_gen != pre_gen || cur_sgen != pre_sgen || cur_b != backend || cur_p != paused {
         if let Some(ref art) = compacted {
-            let _ = std::fs::remove_file(repo_obj_dir.join(format!("{}.pack", art.pack_id)));
-            let _ = std::fs::remove_file(repo_obj_dir.join(format!("{}.idx", art.pack_id)));
+            authority::remove_staged_local_artifacts(&repo_obj_dir, art);
         }
         bail!("concurrent repository state change during repack");
     }
+    ensure!(!cur_p && cur_b == "pando", "repack requires active pando repository authority");
+    #[cfg(test)]
+    super::store::snapshot_pg_barrier::barrier_tx("repack-after-lock", repo, &t).await?;
 
-    let live_snaps = t.query("SELECT packs FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()", &[&repo]).await?;
+    let live_snaps = t
+        .query("SELECT packs FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()", &[&repo])
+        .await?;
     let mut retained_set = BTreeSet::new();
     for r in &live_snaps {
         let spacks: Vec<Pack> = serde_json::from_value(r.get(0))?;
@@ -226,8 +346,15 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
     }
 
     t.batch_execute("SET LOCAL pando.allow_repack_mutation = 'on'").await?;
-    let (packs_after, objects_after, unreachable_pruned, comp_id, comp_psha, comp_isha) = if let Some(ref art) = compacted {
-        t.execute("INSERT INTO pando_lab.manifests(repo,pack_id,pack_sha256,idx_sha256) VALUES($1,$2,$3,$4)", &[&repo, &art.pack_id, &art.pack_sha256, &art.idx_sha256]).await?;
+    let (packs_after, objects_after, unreachable_pruned, mut comp_id, mut comp_psha, mut comp_isha) = if let Some(
+        ref art,
+    ) = compacted
+    {
+        t.execute(
+            "INSERT INTO pando_lab.manifests(repo,pack_id,pack_sha256,idx_sha256) VALUES($1,$2,$3,$4)",
+            &[&repo, &art.pack_id, &art.pack_sha256, &art.idx_sha256],
+        )
+        .await?;
         for oid in &art.reachable_oids {
             t.execute("INSERT INTO pando_lab.objects(repo,oid,pack_id) VALUES($1,$2,$3) ON CONFLICT(repo,oid) DO UPDATE SET pack_id=EXCLUDED.pack_id", &[&repo, oid, &art.pack_id]).await?;
         }
@@ -235,13 +362,29 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
             let pin_name = format!("pin-{}", &pin[..12]);
             t.execute("INSERT INTO pando_lab.pinned_roots(repo,name,oid) VALUES($1,$2,$3) ON CONFLICT(repo,name) DO UPDATE SET oid=EXCLUDED.oid", &[&repo, &pin_name, pin]).await?;
         }
-        let pruned = t.execute("DELETE FROM pando_lab.objects WHERE repo=$1 AND NOT (oid = ANY($2))", &[&repo, &art.reachable_oids]).await? as usize;
+        let pruned = t
+            .execute(
+                "DELETE FROM pando_lab.objects WHERE repo=$1 AND NOT (oid = ANY($2))",
+                &[&repo, &art.reachable_oids],
+            )
+            .await? as usize;
         t.execute("DELETE FROM pando_lab.manifests WHERE repo=$1 AND pack_id<>$2", &[&repo, &art.pack_id]).await?;
         if opts.prune_superseded {
             let keep: Vec<Uuid> = retained_set.iter().copied().chain(std::iter::once(art.pack_id)).collect();
-            t.execute("DELETE FROM pando_lab.object_store_manifests WHERE repo=$1 AND NOT (pack_id = ANY($2))", &[&repo, &keep]).await?;
+            t.execute(
+                "DELETE FROM pando_lab.object_store_manifests WHERE repo=$1 AND NOT (pack_id = ANY($2))",
+                &[&repo, &keep],
+            )
+            .await?;
         }
-        (1usize, art.reachable_oids.len(), pruned.max(art.pruned_oids.len()), Some(art.pack_id), Some(art.pack_sha256.clone()), Some(art.idx_sha256.clone()))
+        (
+            1usize,
+            art.reachable_oids.len(),
+            pruned.max(art.pruned_oids.len()),
+            Some(art.pack_id),
+            Some(art.pack_sha256.clone()),
+            Some(art.idx_sha256.clone()),
+        )
     } else {
         let pruned = t.execute("DELETE FROM pando_lab.objects WHERE repo=$1", &[&repo]).await? as usize;
         t.execute("DELETE FROM pando_lab.manifests WHERE repo=$1", &[&repo]).await?;
@@ -250,17 +393,26 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
 
     let (mut superseded_packs, mut snapshot_retained_packs) = (Vec::new(), Vec::new());
     for (old_id, _, _) in &input_packs {
-        if retained_set.contains(old_id) { snapshot_retained_packs.push(*old_id); } else { superseded_packs.push(*old_id); }
+        if retained_set.contains(old_id) {
+            snapshot_retained_packs.push(*old_id);
+        } else {
+            superseded_packs.push(*old_id);
+        }
     }
+    // Measure superseded local cache without deleting it. Physical removal is
+    // a postcommit action so a rolled-back authority transaction cannot destroy
+    // pack files still referenced by the previous committed manifest set.
     let (mut pruned_pack_files, mut reclaimed_bytes) = (0usize, 0u64);
     if opts.prune_superseded {
         for old_id in &superseded_packs {
             for ext in ["pack", "idx"] {
                 let p = repo_obj_dir.join(format!("{old_id}.{ext}"));
-                if let Ok(m) = std::fs::metadata(&p) { reclaimed_bytes += m.len(); std::fs::remove_file(&p)?; pruned_pack_files += 1; }
+                if let Ok(metadata) = std::fs::metadata(&p) {
+                    reclaimed_bytes += metadata.len();
+                    pruned_pack_files += 1;
+                }
             }
         }
-        if pruned_pack_files > 0 { File::open(&repo_obj_dir)?.sync_all()?; }
     }
 
     let repack_id = Uuid::new_v4();
@@ -271,14 +423,78 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
         &[&repack_id, &repo, &cur_gen, &cur_sgen, &(packs_before as i64), &(packs_after as i64), &(objects_before as i64), &(objects_after as i64), &(unreachable_pruned as i64), &(pinned_roots.len() as i64), &(live_snaps.len() as i64), &comp_id, &serde_json::to_value(&superseded_packs)?, &serde_json::to_value(&snapshot_retained_packs)?, &(reclaimed_bytes as i64)],
     ).await?;
+
+    // The prepared publication and every Pando authority row share this one
+    // transaction. The receipt is the actual validated DB winner; it is never
+    // replaced with the prepared self-view.
+    let mut receipt = None;
+    if let Some(prepared) = &prepared {
+        let winner = prepared.publish_in(&t).await?;
+        let manifest = winner.manifest();
+        comp_id = Some(manifest.pack_id);
+        comp_psha = Some(manifest.pack_sha256.clone());
+        comp_isha = Some(manifest.idx_sha256.clone());
+        receipt = Some(winner);
+    }
+
+    // Existing-pair recovery inside publish_in is not new-link proof. Re-read
+    // the active target in this final transaction and bind the actual receipt
+    // envelope to it before committing.
+    let fresh = lifecycle::publication::active_rotation(t.client(), repo).await?;
+    authority::validate_final_publication_target(
+        checkpoint.as_ref(),
+        fresh.as_ref(),
+        receipt.as_ref().map(|receipt| receipt.envelope()),
+    )?;
+    #[cfg(test)]
+    test_support::fault("after-publication")?;
+
     t.commit().await?;
+    // Only the committed DB winner may repair the file mirror.
+    if let Some(receipt) = &receipt {
+        receipt.refresh_mirrors();
+    }
+    // Superseded local cache is removed only after the authority transaction is
+    // durable. A rollback therefore leaves the previous pack set intact.
+    if opts.prune_superseded {
+        pruned_pack_files = 0;
+        for old_id in &superseded_packs {
+            for ext in ["pack", "idx"] {
+                let p = repo_obj_dir.join(format!("{old_id}.{ext}"));
+                if std::fs::remove_file(&p).is_ok() {
+                    pruned_pack_files += 1;
+                }
+            }
+        }
+        if pruned_pack_files > 0 {
+            let _ = File::open(&repo_obj_dir).and_then(|dir| dir.sync_all());
+        }
+    }
+    let object_store_synced = receipt.is_some();
 
     Ok(RepackReport {
-        repack_id, repo, generation: cur_gen, storage_generation: cur_sgen, packs_before, packs_after,
-        objects_before, objects_after, reachable_objects: objects_after, unreachable_objects_pruned: unreachable_pruned,
-        ref_roots_count: ref_roots.len(), pinned_roots_count: pinned_roots.len(), active_snapshots_count: live_snaps.len(),
-        compacted_pack_id: comp_id, compacted_pack_sha256: comp_psha, compacted_idx_sha256: comp_isha,
-        superseded_packs, snapshot_retained_packs, pruned_pack_files, reclaimed_bytes, object_store_synced, dual_operator_verified: true,
+        repack_id,
+        repo,
+        generation: cur_gen,
+        storage_generation: cur_sgen,
+        packs_before,
+        packs_after,
+        objects_before,
+        objects_after,
+        reachable_objects: objects_after,
+        unreachable_objects_pruned: unreachable_pruned,
+        ref_roots_count: ref_roots.len(),
+        pinned_roots_count: pinned_roots.len(),
+        active_snapshots_count: live_snaps.len(),
+        compacted_pack_id: comp_id,
+        compacted_pack_sha256: comp_psha,
+        compacted_idx_sha256: comp_isha,
+        superseded_packs,
+        snapshot_retained_packs,
+        pruned_pack_files,
+        reclaimed_bytes,
+        object_store_synced,
+        dual_operator_verified: true,
     })
 }
 
@@ -289,21 +505,39 @@ pub(super) async fn pin_root(config: &Config, repo: Uuid, name: &str, oid: &str)
 }
 
 pub(super) async fn unpin_root(config: &Config, repo: Uuid, name: &str) -> Result<serde_json::Value> {
-    let deleted = config.db().await?.execute("DELETE FROM pando_lab.pinned_roots WHERE repo=$1 AND name=$2", &[&repo, &name]).await?;
+    let deleted = config
+        .db()
+        .await?
+        .execute("DELETE FROM pando_lab.pinned_roots WHERE repo=$1 AND name=$2", &[&repo, &name])
+        .await?;
     Ok(serde_json::json!({"repo": repo, "name": name, "unpinned": deleted > 0}))
 }
 
 pub(super) async fn packs_status(config: &Config, repo: Uuid) -> Result<serde_json::Value> {
     let c = config.db().await?;
-    let row = c.query_one("SELECT generation,storage_generation,storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1", &[&repo]).await?;
+    let row = c
+        .query_one(
+            "SELECT generation,storage_generation,storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1",
+            &[&repo],
+        )
+        .await?;
     let packs: Vec<serde_json::Value> = c.query("SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 ORDER BY pack_id", &[&repo]).await?
         .iter().map(|r| serde_json::json!({"pack_id": r.get::<_, Uuid>(0), "pack_sha256": r.get::<_, String>(1), "idx_sha256": r.get::<_, String>(2)})).collect();
-    let pinned_roots: Vec<serde_json::Value> = c.query("SELECT name,oid FROM pando_lab.pinned_roots WHERE repo=$1 ORDER BY name", &[&repo]).await?
-        .iter().map(|r| serde_json::json!({"name": r.get::<_, String>(0), "oid": r.get::<_, String>(1)})).collect();
-    let active_snapshots: i64 = c.query_one("SELECT count(*) FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()", &[&repo]).await?.get(0);
+    let pinned_roots: Vec<serde_json::Value> = c
+        .query("SELECT name,oid FROM pando_lab.pinned_roots WHERE repo=$1 ORDER BY name", &[&repo])
+        .await?
+        .iter()
+        .map(|r| serde_json::json!({"name": r.get::<_, String>(0), "oid": r.get::<_, String>(1)}))
+        .collect();
+    let active_snapshots: i64 = c
+        .query_one("SELECT count(*) FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()", &[&repo])
+        .await?
+        .get(0);
     let latest_repack = c.query_opt("SELECT id,packs_before,packs_after,objects_before,objects_after,unreachable_objects_pruned,compacted_pack_id,superseded_packs,snapshot_retained_packs,reclaimed_bytes FROM pando_lab.repacks WHERE repo=$1 ORDER BY created_at DESC LIMIT 1", &[&repo]).await?
         .map(|r| serde_json::json!({"repack_id": r.get::<_, Uuid>(0), "packs_before": r.get::<_, i64>(1), "packs_after": r.get::<_, i64>(2), "objects_before": r.get::<_, i64>(3), "objects_after": r.get::<_, i64>(4), "unreachable_objects_pruned": r.get::<_, i64>(5), "compacted_pack_id": r.get::<_, Option<Uuid>>(6), "superseded_packs": r.get::<_, serde_json::Value>(7), "snapshot_retained_packs": r.get::<_, serde_json::Value>(8), "reclaimed_bytes": r.get::<_, i64>(9)}));
-    Ok(serde_json::json!({"repo": repo, "generation": row.get::<_, i64>(0), "storage_generation": row.get::<_, i64>(1), "storage_backend": row.get::<_, String>(2), "write_paused": row.get::<_, bool>(3), "active_pack_count": packs.len(), "pack_count": packs.len(), "packs": packs, "pinned_roots": pinned_roots, "active_snapshots": active_snapshots, "latest_repack": latest_repack}))
+    Ok(
+        serde_json::json!({"repo": repo, "generation": row.get::<_, i64>(0), "storage_generation": row.get::<_, i64>(1), "storage_backend": row.get::<_, String>(2), "write_paused": row.get::<_, bool>(3), "active_pack_count": packs.len(), "pack_count": packs.len(), "packs": packs, "pinned_roots": pinned_roots, "active_snapshots": active_snapshots, "latest_repack": latest_repack}),
+    )
 }
 
 #[cfg(test)]
@@ -312,7 +546,9 @@ mod tests {
     #[test]
     fn multi_pack_compaction_prunes_orphans_and_retains_pinned_roots() {
         let git_bin = Path::new("/usr/bin/git");
-        if !git_bin.exists() { return; }
+        if !git_bin.exists() {
+            return;
+        }
         let tmp = std::env::temp_dir().join(format!("pando-repack-test-{}", Uuid::new_v4()));
         let work = tmp.join("work");
         std::fs::create_dir_all(&work).unwrap();
@@ -323,7 +559,10 @@ mod tests {
             std::fs::write(work.join(f), msg).unwrap();
             run_sync_git(git_bin, &work, &["add", f], b"").unwrap();
             run_sync_git(git_bin, &work, &["commit", "-m", msg], b"").unwrap();
-            String::from_utf8(run_sync_git(git_bin, &work, &["rev-parse", "HEAD"], b"").unwrap()).unwrap().trim().to_owned()
+            String::from_utf8(run_sync_git(git_bin, &work, &["rev-parse", "HEAD"], b"").unwrap())
+                .unwrap()
+                .trim()
+                .to_owned()
         };
         let pack = |revs: &str| -> (Uuid, Vec<u8>, Vec<u8>) {
             let pb = run_sync_git(git_bin, &work, &["pack-objects", "--stdout", "--revs"], revs.as_bytes()).unwrap();
@@ -341,7 +580,9 @@ mod tests {
         let p4 = pack(&format!("{c4_main}\n^{c1}\n"));
         let scratch = tmp.join("scratch");
         std::fs::create_dir_all(&scratch).unwrap();
-        let art = compact_packs_offline(git_bin, &scratch, &[p1, p2, p3, p4], &[c4_main.clone(), c2_pin.clone()]).unwrap().unwrap();
+        let art = compact_packs_offline(git_bin, &scratch, &[p1, p2, p3, p4], &[c4_main.clone(), c2_pin.clone()])
+            .unwrap()
+            .unwrap();
         assert!(art.reachable_oids.contains(&c4_main) && art.reachable_oids.contains(&c2_pin));
         assert!(art.pruned_oids.contains(&c3_orp));
         let _ = std::fs::remove_dir_all(&tmp);

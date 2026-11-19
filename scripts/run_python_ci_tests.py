@@ -22,24 +22,36 @@ result semantics:
 faulthandler reports thread stacks only; it does not dump locals, arguments,
 the environment, or a core file. The per-test markers are written immediately
 with ``os.write`` and never contain a raw test id, description, failure text or
-other unbounded value. The periodic timer is cancelled on every exit.
+other unbounded value. The periodic timer is cancelled on every exit. An opt-in JSON report uses
+only projected unittest outcomes and a verified checkout identity.
 """
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
 import faulthandler
 import hashlib
+from itertools import chain, islice
+import json
 import os
-import sys
-import unittest
 from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
 from typing import TextIO
+import unittest
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 TESTS_DIR = ROOT / "tests"
 TEST_PATTERN = "test_*.py"
 TRACEBACK_INTERVAL_SECONDS = 120
+REPORT_MAX_CASES = 32
+REPORT_MAX_COUNT = 99_999_999
+REPORT_MAX_ELAPSED_MS = 24 * 60 * 60 * 1000
+REPORT_MAX_BYTES = 8192
 
 MARKER_PREFIX = b"DSH-RUNNER-DIAG v=1 state="
 MARKER_STATE_START = b"START"
@@ -116,10 +128,16 @@ class _MarkerEmitter:
 
 def _diagnostic_result_class(
     emitter: _MarkerEmitter,
+    observe_result: Callable[[unittest.TextTestResult], None] | None = None,
 ) -> type[unittest.TextTestResult]:
-    """Return a TextTestResult that emits one START/DONE pair per test."""
+    """Return the TextTestResult that emits one START/DONE pair per test."""
 
     class _DiagnosticTextTestResult(unittest.TextTestResult):
+        def startTestRun(self) -> None:
+            super().startTestRun()
+            if observe_result is not None:
+                observe_result(self)
+
         def startTest(self, test: unittest.TestCase) -> None:
             super().startTest(test)
             emitter.emit(MARKER_STATE_START, self.testsRun, test)
@@ -173,6 +191,73 @@ def discover(tests_dir: Path = TESTS_DIR) -> unittest.TestSuite:
     )
 
 
+def _checkout_binding(expected_commit: str | None) -> tuple[str, str] | None:
+    if expected_commit is None or not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        return None
+    try:
+        git = subprocess.run(
+            ["git", "--no-replace-objects", "rev-parse", "HEAD^{commit}", "HEAD^{tree}"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not re.fullmatch(rb"[0-9a-f]{40}\n[0-9a-f]{40}\n", git.stdout):
+        return None
+    commit, tree = git.stdout.decode("ascii").splitlines()
+    return (commit, tree) if commit == expected_commit else None
+
+
+def _unittest_evidence(result: unittest.TextTestResult | None) -> dict:
+    # Read the existing result's recorded outcomes. Hash the owning test for
+    # subtests so their parameters do not affect the lookup key.
+    failures = result.failures if result is not None else ()
+    errors = result.errors if result is not None else ()
+    unexpected = result.unexpectedSuccesses if result is not None else ()
+    counts = {
+        "tests_run": result.testsRun if result is not None else 0,
+        "failures": len(failures),
+        "errors": len(errors),
+        "skipped": len(result.skipped) if result is not None else 0,
+        "expected_failures": len(result.expectedFailures) if result is not None else 0,
+        "unexpected_successes": len(unexpected),
+    }
+    tests = chain(
+        (("failure", test) for test, _ in failures),
+        (("error", test) for test, _ in errors),
+        (("unexpected_success", test) for test in unexpected),
+    )
+    cases = []
+    for outcome, test in islice(tests, REPORT_MAX_CASES):
+        try:
+            if isinstance(test, unittest.case._SubTest):
+                test = test.test_case
+            digest = _test_id_sha256(test)
+        except Exception:
+            continue
+        cases.append({"test_sha256": digest, "outcome": outcome})
+    return {
+        "counts": {name: min(max(value, 0), REPORT_MAX_COUNT) for name, value in counts.items()},
+        "cases": cases,
+        "cases_truncated": len(failures) + len(errors) + len(unexpected) > len(cases),
+    }
+
+
+def _write_report(path: Path, report: dict) -> None:
+    payload = (json.dumps(report, separators=(",", ":")) + "\n").encode("ascii")
+    if len(payload) > REPORT_MAX_BYTES:
+        raise OSError("Python CI report exceeds its size limit")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(payload)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def run(
     tests_dir: Path = TESTS_DIR,
     *,
@@ -185,6 +270,8 @@ def run(
     disable_fatal_handler: Callable[[], None] = faulthandler.disable,
     is_fatal_handler_enabled: Callable[[], bool] = faulthandler.is_enabled,
     marker_write: Callable[[bytes], int] = _write_marker_to_stderr,
+    report_out: Path | None = None,
+    expected_commit: str | None = None,
 ) -> int:
     """Run discovery and return unittest's success/failure exit status.
 
@@ -195,44 +282,87 @@ def run(
     output = sys.stderr if stream is None else stream
     diagnostics = sys.stderr if watchdog_stream is None else watchdog_stream
     emitter = _MarkerEmitter(marker_write)
-    result_class = _diagnostic_result_class(emitter)
+    result = None
+
+    def capture_result(active_result: unittest.TextTestResult) -> None:
+        # Keep the outcomes recorded before a suite-level interruption.
+        nonlocal result
+        result = active_result
+
+    result_class = _diagnostic_result_class(emitter, capture_result if report_out is not None else None)
+    report_start = time.monotonic_ns() if report_out is not None else 0
+    binding = _checkout_binding(expected_commit) if report_out is not None else None
+    code = None
+    stage = "setup"
     fatal_handler_owned = False
     timer_started = False
     try:
-        fatal_handler_owned = _install_fatal_handler(
-            is_enabled=is_fatal_handler_enabled,
-            enable=enable_fatal_handler,
-        )
-        start_timer(traceback_interval, repeat=True, file=diagnostics)
-        timer_started = True
-        suite = discover(tests_dir)
-        result = unittest.TextTestRunner(
-            stream=output, verbosity=2, resultclass=result_class
-        ).run(suite)
+        try:
+            fatal_handler_owned = _install_fatal_handler(
+                is_enabled=is_fatal_handler_enabled,
+                enable=enable_fatal_handler,
+            )
+            start_timer(traceback_interval, repeat=True, file=diagnostics)
+            timer_started = True
+            stage = "discovery"
+            suite = discover(tests_dir)
+            stage = "suite"
+            result = unittest.TextTestRunner(
+                stream=output, verbosity=2, resultclass=result_class
+            ).run(suite)
+            stage = "cleanup"
+        finally:
+            try:
+                if timer_started:
+                    stop_timer()
+            finally:
+                if fatal_handler_owned:
+                    disable_fatal_handler()
+
+        stage = "suite"
         # Match unittest.main.TestProgram.runTests: an empty selection with no
         # recorded skips exits 5, never 0, so an empty gate cannot go green.
         if result.testsRun == 0 and len(result.skipped) == 0:
-            return 5
-        code = 0 if result.wasSuccessful() else 1
-        # Marker failures must never hide a real failure or an empty selection,
-        # but they must not leave an otherwise green run green either.
-        return 1 if emitter.failed else code
+            code = 5
+        elif not result.wasSuccessful():
+            code = 1
+        elif emitter.failed:
+            stage = "markers"
+            code = 1
+        else:
+            code = 0
     finally:
-        try:
-            if timer_started:
-                stop_timer()
-        finally:
-            if fatal_handler_owned:
-                disable_fatal_handler()
+        if report_out is not None:
+            try:
+                if binding is None or binding != _checkout_binding(expected_commit):
+                    raise OSError("checkout binding unavailable")
+                elapsed_ms = (time.monotonic_ns() - report_start) // 1_000_000
+                _write_report(report_out, {
+                    "version": 1,
+                    "source_commit": binding[0],
+                    "source_tree": binding[1],
+                    "stage": stage,
+                    "outcome": {None: "incomplete", 0: "passed", 1: "failed", 5: "empty"}[code],
+                    "exit_code": code,
+                    "elapsed_ms": min(max(elapsed_ms, 0), REPORT_MAX_ELAPSED_MS),
+                    **_unittest_evidence(result),
+                })
+            except OSError:
+                print("Python CI report unavailable", file=sys.stderr)
+                if code == 0:
+                    code = 1
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    if args:
-        print("usage: run_python_ci_tests.py", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--report-out", type=Path)
+    parser.add_argument("--expected-commit")
+    args = parser.parse_args(argv)
+    if (args.report_out is None) != (args.expected_commit is None):
+        parser.error("--report-out and --expected-commit must be supplied together")
     _restore_repo_root_import_context()
-    return run()
+    return run(report_out=args.report_out, expected_commit=args.expected_commit)
 
 
 if __name__ == "__main__":

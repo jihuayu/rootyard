@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Actual owned LFS source-descriptor witness for Issue #37."""
+from array import array
 from dataclasses import dataclass
+import fcntl
 import os
 from pathlib import Path
 import stat as stat_module
+
+try:
+    import termios
+except ImportError:  # pragma: no cover - every supported CI platform has it
+    termios = None
 
 from transfer_revocation_observer import parse_proc_stat
 
@@ -34,6 +41,22 @@ SOURCE_FAILURE_NO_CANDIDATE = 22
 SOURCE_FAILURE_WRITER_RUNNING = 23
 SOURCE_FAILURE_NO_BLOCKED_WRITER = 24
 SOURCE_FAILURE_PRE_ANCHOR = 25
+SOURCE_FAILURE_PIPE_NOT_FULL = 26
+
+
+# Positive proof kinds are a fixed enum.  They describe how the owned writer
+# was shown to be blocked, never what bytes, endpoints, or paths were seen.
+SOURCE_PROOF_KIND_NONE = 0
+SOURCE_PROOF_KIND_PIPE_WRITE_SLEEP = 1
+SOURCE_PROOF_KIND_OWNED_STDOUT_PIPE_FULL = 2
+
+
+# One non-consuming full-pipe observation.  The numeric sizes stay local to
+# the observation function and are never returned or serialized.
+PIPE_FULL_UNAVAILABLE = 0
+PIPE_FULL_NOT_FULL = 1
+PIPE_FULL_PROVEN = 2
+PIPE_FULL_MISMATCH = 3
 
 
 class SourceParseError(ValueError):
@@ -104,6 +127,7 @@ def parse_syscall(text):
         raise SourceParseError("short syscall form")
     try:
         fd = int(fields[1], 16)
+        # writev's third argument is the iovec count, never a byte count.
         count = int(fields[3], 16)
     except ValueError as error:
         raise SourceParseError("invalid syscall arguments") from error
@@ -155,6 +179,65 @@ def read_pipe_inode(proc_root, pid, fd):
         return int(target[6:-1], 10)
     except ValueError as error:
         raise SourceParseError("invalid pipe inode") from error
+
+
+def pipe_full_observation_supported():
+    return (
+        hasattr(fcntl, "F_GETPIPE_SZ")
+        and termios is not None
+        and hasattr(termios, "FIONREAD")
+    )
+
+
+def observe_owned_stdout_pipe_full(proc_root, service_pid, service_fd, *,
+                                   expected_dev, expected_ino):
+    """Observe one owned read end without reading or consuming payload.
+
+    The service read end is opened through the existing proc path with
+    O_NONBLOCK|O_CLOEXEC.  Only when the same descriptor reports a FIFO with
+    the bound device/inode and FIONREAD == F_GETPIPE_SZ > 0 is a positive
+    full-pipe observation returned.  The observation descriptor is closed
+    exactly once; a failed close makes the whole observation unavailable.
+    """
+    if (not isinstance(expected_dev, int) or expected_dev < 0
+            or not isinstance(expected_ino, int) or expected_ino <= 0):
+        return PIPE_FULL_UNAVAILABLE
+    if not pipe_full_observation_supported():
+        return PIPE_FULL_UNAVAILABLE
+    get_pipe_sz = getattr(fcntl, "F_GETPIPE_SZ", None)
+    if get_pipe_sz is None:
+        return PIPE_FULL_UNAVAILABLE
+    path = Path(proc_root) / str(service_pid) / "fd" / str(service_fd)
+    try:
+        observed = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return PIPE_FULL_UNAVAILABLE
+    result = PIPE_FULL_UNAVAILABLE
+    try:
+        info = os.fstat(observed)
+        if not stat_module.S_ISFIFO(info.st_mode):
+            result = PIPE_FULL_MISMATCH
+        elif info.st_dev != expected_dev or info.st_ino != expected_ino:
+            result = PIPE_FULL_MISMATCH
+        else:
+            capacity = fcntl.fcntl(observed, get_pipe_sz)
+            unread = array("i", [0])
+            fcntl.ioctl(observed, termios.FIONREAD, unread, True)
+            if not isinstance(capacity, int) or capacity <= 0:
+                result = PIPE_FULL_UNAVAILABLE
+            elif unread[0] <= 0 or unread[0] != capacity:
+                result = PIPE_FULL_NOT_FULL
+            else:
+                result = PIPE_FULL_PROVEN
+    except (OSError, ValueError):
+        result = PIPE_FULL_UNAVAILABLE
+    finally:
+        try:
+            os.close(observed)
+        except OSError:
+            # The number may already be reused; never retry the close.
+            result = PIPE_FULL_UNAVAILABLE
+    return result
 
 
 def _fd_numbers(proc_root, pid):
