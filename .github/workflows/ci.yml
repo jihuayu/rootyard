@@ -20,9 +20,11 @@ jobs:
     # reaps orphaned Git grandchildren. Do not introduce a global child
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
-    # Keep the 115-minute verify/lifecycle budget and add three minutes for
-    # the Redis partition drill plus one for cleanup and report binding.
-    timeout-minutes: 119
+    # 95 minutes baseline, 12 for the #304 cold tenant LFS gate on owned Garage,
+    # and 28 for the full Redis qualification (13 build, 5 restore/flush,
+    # 3 partition, 4 failover, 3 cleanup and manifest binding), plus 40 for the
+    # Pando package gates: 95 + 12 + 28 + 40 = 175 minutes.
+    timeout-minutes: 175
     services:
       postgres:
         image: postgres:17
@@ -52,7 +54,8 @@ jobs:
         run: |
           scripts/install_ci_native_tools.sh install \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/ci-native-tools/provenance.json
+            --provenance test-results/ci-native-tools/provenance.json \
+            --phase-record test-results/ci-native-tools/phase.json
       - name: Verify native CI tool profile
         timeout-minutes: 5
         run: |
@@ -60,7 +63,8 @@ jobs:
           echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
           scripts/install_ci_native_tools.sh preflight \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/ci-native-tools/provenance.json
+            --provenance test-results/ci-native-tools/provenance.json \
+            --phase-record test-results/ci-native-tools/phase.json
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -178,8 +182,18 @@ jobs:
             --bin rootyard-pando-lab=ROOTYARD_PANDO_LAB_BIN \
             --bin rootyard-vfs-mount=ROOTYARD_VFS_MOUNT_BIN \
             --bin-receipt rootyard=ROOTYARD_BUILD_RECEIPT \
+            --bin-receipt rootyard-pando-lab=ROOTYARD_PANDO_BUILD_RECEIPT \
             --test ref_store_snapshot_backup_fixture=ROOTYARD_SNAPSHOT_FIXTURE \
             --test ref_store_holds_backup_fixture=ROOTYARD_HOLDS_FIXTURE
+      - name: Run the 17 ignored Pando Local PostgreSQL producer cases
+        timeout-minutes: 10
+        run: |
+          python3 scripts/run_pando_producer_pg.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --expected-commit "$GITHUB_SHA" \
+            --product-receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --report test-results/pando-producer-pg.json \
+            --timeout-seconds 540
       - name: Exercise trusted CI HTTP authority boundaries
         timeout-minutes: 10
         run: python3 tests/ci_trust_boundaries.py --binary "$ROOTYARD_BIN" --report test-results/ci-trust-boundaries.json --expected-commit "$GITHUB_SHA"
@@ -206,6 +220,50 @@ jobs:
       - name: Exercise repository archive, rename aliases, soft-delete purge, and ownership transfer (#85)
         timeout-minutes: 10
         run: python3 tests/repository_lifecycle.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle.json
+      - name: "Qualify #85 cold tenant LFS retention on owned Garage"
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          umask 077
+          final_report="test-results/repository-lifecycle-remote-tenant-lfs.json"
+          [[ ! -e "$final_report" && ! -L "$final_report" ]]
+          scratch="$(mktemp -d "$RUNNER_TEMP/issue85-tenant-lfs.XXXXXX")"
+          garage_dir="$scratch/garage"
+          object_store_env="$scratch/object-store.env"
+          staged_report="$scratch/report.json"
+          fixture_started=0
+          finalize() {
+            local status=$?
+            trap - EXIT
+            if [[ "$fixture_started" == 1 && ! -d "$garage_dir" ]] ||
+               ! scripts/owned_garage_fixture.sh stop --directory "$garage_dir" >/dev/null 2>&1 ||
+               [[ -e "$garage_dir" || -L "$garage_dir" || -e "$object_store_env" || -L "$object_store_env" ]]; then
+              echo "Owned Garage cleanup failed." >&2
+              exit 1
+            fi
+            rm -f -- "$staged_report"
+            rmdir -- "$scratch"
+            if [[ "$status" == 0 ]]; then
+              printf '%s\n' "$report_json" >"$final_report"
+            fi
+            exit "$status"
+          }
+          trap finalize EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          ROOTYARD_FIXTURE_PULL_TIMEOUT=120 scripts/owned_garage_fixture.sh start \
+            --directory "$garage_dir" --output-env "$object_store_env" \
+            --bucket-prefix rootyard-issue85-lfs >/dev/null 2>&1
+          fixture_started=1
+          (
+            set -a
+            source "$object_store_env"
+            set +a
+            timeout --signal=INT --kill-after=15 240 python3 tests/repository_lifecycle.py \
+              --remote-tenant-lfs --binary "$ROOTYARD_BIN" --report "$staged_report"
+          ) >/dev/null 2>&1
+          [[ -f "$staged_report" && ! -L "$staged_report" && -s "$staged_report" ]]
+          report_json="$(<"$staged_report")"
       - name: Exercise deleted webhook-claim fence (#85)
         timeout-minutes: 10
         run: ROOTYARD_EXPECTED_SOURCE_COMMIT="$GITHUB_SHA" python3 tests/repository_lifecycle_deleted_claim_acceptance.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle-deleted-claim.json
@@ -215,7 +273,14 @@ jobs:
       - name: Run all Python unit and Tier-5 adversarial contract suites
         # Full discovery stays unfiltered; the runner adds per-test progress and
         # periodic stderr thread stacks without changing exit semantics.
-        run: python3 scripts/run_python_ci_tests.py
+        env:
+          ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 283 && 'test-results/python-ci-result.json' || '' }}
+        run: |
+          report_args=()
+          if [[ -n "$ROOTYARD_PYTHON_CI_REPORT" ]]; then
+            report_args=(--report-out "$ROOTYARD_PYTHON_CI_REPORT" --expected-commit="${GITHUB_SHA:-}")
+          fi
+          python3 scripts/run_python_ci_tests.py "${report_args[@]}"
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary "$ROOTYARD_BIN" --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror
@@ -223,7 +288,7 @@ jobs:
       - name: Exercise exact-target source retention and mirror preparation
         run: python3 tests/ci_source_pins.py --binary "$ROOTYARD_BIN" --report test-results/ci-source-pins.json
       - name: Verify browse cache incarnation across restore with owned Redis
-        timeout-minutes: 24
+        timeout-minutes: 28
         shell: bash
         run: |
           set -euo pipefail
@@ -238,9 +303,12 @@ jobs:
           manifest="$scratch/native-browse-restore-cache.json"
           partition_report="$scratch/redis-wake-partition.json"
           partition_manifest="$scratch/native-redis-wake-partition.json"
+          failover_report="$scratch/redis-wake-failover.json"
+          failover_manifest="$scratch/native-redis-wake-failover.json"
           restore_case=browse_restore_incarnation_cache
           flush_case=browse_flushall_preserves_git_authority
           partition_case=real_redis_partition_pg_fallback_and_wake
+          failover_case=real_redis_advisory_replica_promotion_and_duplicate_wakes
           tree=$(git rev-parse 'HEAD^{tree}')
 
           publish_failure() {
@@ -256,6 +324,8 @@ jobs:
                           {"source_warm_backup", "restore", "restored_preview", "flush_authority"}),
               "partition": ("redis-wake-partition-failure.json", "real_redis_partition_pg_fallback_and_wake",
                             {"fixture", "partition"}),
+              "failover": ("redis-wake-failover-failure.json",
+                           "real_redis_advisory_replica_promotion_and_duplicate_wakes", {"fixture", "promotion"}),
           }[mode]
           with Path(source_path).open("rb") as source:
               raw = source.read(4097)
@@ -381,6 +451,29 @@ jobs:
             exit 1
           fi
           mv -- "$partition_report" "$partition_manifest" test-results/
+
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 4m python3 tests/cross_process_failover.py \
+              --binary "$binary" --expect-commit "$GITHUB_SHA" --report "$failover_report" >/dev/null 2>&1; then
+            publish_failure "$failover_report" failover
+            echo 'Redis wake failover proof failed'
+            exit 1
+          fi
+          if ! write_manifest "$failover_report" \
+            --manifest-out "$failover_manifest" --build-receipt "$published_receipt" \
+            --report "redis_wake_failover=$failover_report" \
+            --require-case "redis_wake_failover=$failover_case" \
+            --harness tests/cross_process_failover.py \
+            --harness tests/cross_process_partition.py \
+            --harness tests/redis_partition_relay.py; then
+            echo 'Redis wake failover native manifest failed'
+            exit 1
+          fi
+          if ! verify_proof_binding "$failover_manifest" "$failover_report" redis_wake_failover "$failover_case"; then
+            echo 'Redis wake failover cleanup or receipt binding failed'
+            exit 1
+          fi
+          mv -- "$failover_report" "$failover_manifest" test-results/
           rm -rf -- "$scratch"
           test ! -e "$scratch"
           trap - EXIT INT TERM
@@ -505,6 +598,81 @@ jobs:
           test -n "$latest_pando"
           test -f "$latest_pando/results.json"
           cp "$latest_pando/results.json" test-results/pando-lab.json
+      - name: Qualify pinned real Vault rotation and bind the Pando native gate
+        timeout-minutes: 20
+        run: |
+          python3 tests/pando_vault_rotation.py \
+            --binary "$ROOTYARD_PANDO_LAB_BIN" \
+            --receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --source-root "$GITHUB_WORKSPACE" \
+            --expected-commit "$GITHUB_SHA" \
+            --timeout-seconds 1080 \
+            --cleanup-reserve-seconds 90 \
+            --report test-results/pando-vault-rotation.json
+          python3 tests/pando_vault_rotation_ci_report.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --binary "$ROOTYARD_PANDO_LAB_BIN" \
+            --receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --expected-commit "$GITHUB_SHA" \
+            --raw-report test-results/pando-vault-rotation.json \
+            --output test-results/pando-vault-native-report.json
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/pando-vault-gate.json \
+            --build-receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --binary "$ROOTYARD_PANDO_LAB_BIN" \
+            --expect-commit "$GITHUB_SHA" \
+            --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
+            --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
+            --fixture-rust-from-receipt \
+            --fixture postgres=postgres:17 \
+            --fixture vault=hashicorp/vault@sha256:dfa48c2fa2b0099ccb47681ec5c4804bf5aec9d6879ecfee07ad4b92a5427ad6 \
+            --fixture vault_version=2.2.2 \
+            --report pando_vault=test-results/pando-vault-native-report.json \
+            --require-case pando_vault=vault_fixture_and_app_capability_boundary \
+            --require-case pando_vault=authentic_envelope_digest_and_cold_read \
+            --require-case pando_vault=admin_rotated_target_interrupted_resume_and_new_write \
+            --require-case pando_vault=wrong_key_ciphertext_envelope_and_provider_revocation_fail_closed \
+            --require-case pando_vault=owned_resource_cleanup \
+            --harness tests/pando_vault_rotation.py \
+            --harness tests/pando_vault_rotation_budget.py \
+            --harness tests/pando_vault_rotation_cases.py \
+            --harness tests/pando_vault_rotation_ci_report.py \
+            --harness tests/pando_vault_rotation_command.py \
+            --harness tests/pando_vault_rotation_context.py \
+            --harness tests/pando_vault_rotation_fixture.py \
+            --harness tests/pando_vault_rotation_fixture_resources.py \
+            --harness tests/pando_vault_rotation_fixture_vault.py \
+            --harness tests/pando_vault_rotation_http.py \
+            --harness tests/pando_vault_rotation_http_child.py \
+            --harness tests/pando_vault_rotation_mirror.py \
+            --harness tests/pando_vault_rotation_negative.py \
+            --harness tests/pando_vault_rotation_service.py \
+            --harness tests/pando_vault_rotation_source.py \
+            --harness tests/pando_vault_rotation_source_child.py \
+            --harness tests/pando_vault_rotation_support.py \
+            --harness tests/test_pando_vault_rotation_binding_failure.py \
+            --harness tests/test_pando_vault_rotation_budget.py \
+            --harness tests/test_pando_vault_rotation_ci_report.py \
+            --harness tests/test_pando_vault_rotation_ci_report_duplicates.py \
+            --harness tests/test_pando_vault_rotation_db_tamper_oracle.py \
+            --harness tests/test_pando_vault_rotation_deadline.py \
+            --harness tests/test_pando_vault_rotation_fixture.py \
+            --harness tests/test_pando_vault_rotation_http.py \
+            --harness tests/test_pando_vault_rotation_http_fixture.py \
+            --harness tests/test_pando_vault_rotation_implementation.py \
+            --harness tests/test_pando_vault_rotation_interrupt_oracle.py \
+            --harness tests/test_pando_vault_rotation_receipt_v2.py \
+            --harness tests/test_pando_vault_rotation_resource_ownership.py \
+            --harness tests/test_pando_vault_rotation_source.py \
+            --harness scripts/native_build_receipt.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/native_artifact_store.py \
+            --harness scripts/build_native_batch.py \
+            --harness scripts/export_native_artifacts.py \
+            --harness scripts/pando_producer_pg/__init__.py \
+            --harness scripts/pando_producer_pg/errors.py \
+            --harness scripts/pando_producer_pg/process.py \
+            --harness .github/workflows/ci.yml
       - name: Exercise live Pando PITR fencing, retention roots, and pg_dump clone safety
         timeout-minutes: 10
         run: |
@@ -598,6 +766,7 @@ jobs:
             --manifest-out test-results/native-pr-gate.json \
             --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
             --binary "$ROOTYARD_BIN" \
+            --expect-commit "$GITHUB_SHA" \
             --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
             --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
             --report web_sessions=test-results/web-sessions.json \
@@ -618,6 +787,7 @@ jobs:
             --report organizations_lifecycle=test-results/organizations-lifecycle.json \
             --report forge_collaboration=test-results/forge-collaboration.json \
             --report repository_lifecycle=test-results/repository-lifecycle.json \
+            --report repository_lifecycle_remote_tenant_lfs=test-results/repository-lifecycle-remote-tenant-lfs.json \
             --report repository_lifecycle_deleted_claim=test-results/repository-lifecycle-deleted-claim.json \
             --report issue85_literal_lifecycle=test-results/repository-lifecycle-issue85-literal.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
@@ -702,6 +872,8 @@ jobs:
             --harness tests/organizations_direct_view_acceptance.py \
             --harness tests/forge_collaboration.py \
             --harness tests/repository_lifecycle.py \
+            --harness scripts/owned_garage_fixture.sh \
+            --harness scripts/owned_object_store_env.py \
             --harness tests/repository_lifecycle_deleted_claim_acceptance.py \
             --harness tests/repository_lifecycle_acceptance.py \
             --harness tests/repository_lifecycle_acceptance_support.py \
@@ -791,6 +963,10 @@ jobs:
             --require-case repository_lifecycle=rename_aliases_and_authz_before_redirect \
             --require-case repository_lifecycle=soft_delete_restore_and_purge_holds \
             --require-case repository_lifecycle=ownership_transfer_and_crash_recovery \
+            --require-case repository_lifecycle=remediation_lifecycle_and_alias_scope_boundaries \
+            --require-case repository_lifecycle=remediation_fault_injection_and_concurrency \
+            --require-case repository_lifecycle=remediation_alias_parity_and_uncertain_claim_fail_closed \
+            --require-case repository_lifecycle_remote_tenant_lfs=remote_tenant_lfs_cold_retention \
             --require-case repository_lifecycle_deleted_claim=source_claim_fence_contract \
             --require-case repository_lifecycle_deleted_claim=live_control_secret_claim_and_expired_reclaim \
             --require-case repository_lifecycle_deleted_claim=live_main_run_expired_lease_fixture \
@@ -814,11 +990,17 @@ jobs:
           path: |
             test-results/*.json
             ${{ env.ROOTYARD_BUILD_RECEIPT }}
+            ${{ env.ROOTYARD_PANDO_BUILD_RECEIPT }}
             ${{ env.ROOTYARD_BATCH_MANIFEST }}
+            test-results/pando-producer-pg.json
+            test-results/pando-vault-rotation.json
+            test-results/pando-vault-native-report.json
+            test-results/pando-vault-gate.json
             test-results/ci-webhook-regressions.log
             test-results/evidence/*.jsonl
             test-results/*-evidence/*.jsonl
             test-results/ci-native-tools/provenance.json
+            test-results/ci-native-tools/phase.json
           if-no-files-found: ignore
 
   container:
