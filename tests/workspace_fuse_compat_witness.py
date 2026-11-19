@@ -58,7 +58,7 @@ for directory in (REPO_ROOT, TESTS_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-from e2e import Harness  # noqa: E402
+from lfs import LfsHarness  # noqa: E402
 from runtime_binary import select_runtime_binary  # noqa: E402
 from test_workspace_fuse_service import MOUNT_MODE  # noqa: E402
 
@@ -67,14 +67,20 @@ HELLO = b"ordinary write through live mount\n"
 OLD_HELLO = b"second\n"
 ATTRS_NAME = ".gitattributes"
 POINTER_NAME = "lfs-pointer.bin"
+# Exactly 12 deterministic bytes; the pointer below is the only source
+# representation of this object. The service must already possess the verified
+# object before the source push introduces a pointer that references it.
+LFS_PAYLOAD = b"rootyard-lfs"
+LFS_SIZE = len(LFS_PAYLOAD)
+LFS_OID = hashlib.sha256(LFS_PAYLOAD).hexdigest()
 ATTRS = (
     b"# Inert LFS marker: this fixture configures no local clean/smudge driver.\n"
     b"lfs-pointer.bin filter=lfs diff=lfs -text\n"
 )
 POINTER = (
     b"version https://git-lfs.github.com/spec/v1\n"
-    b"oid sha256:" + b"0" * 64 + b"\n"
-    b"size 12\n"
+    b"oid sha256:" + LFS_OID.encode("ascii") + b"\n"
+    b"size " + str(LFS_SIZE).encode("ascii") + b"\n"
 )
 ARTIFACT_LIMIT = 16 * 1024 * 1024
 
@@ -309,13 +315,52 @@ git fsck --full --strict > /artifacts/{prefix}_fsck 2>&1
                 + ' "$@"\n'
             )
             wrapper.chmod(0o700)
-            h = Harness(argparse.Namespace(binary=str(wrapper), keep=False))
+            h = LfsHarness(argparse.Namespace(binary=str(wrapper), keep=False))
             try:
                 h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = MOUNT_MODE
                 h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
                 h.setup()
                 h.api()
                 h.roundtrip()
+
+                # Register, upload, verify and read back the deterministic
+                # 12-byte object before the source push can reference it. The
+                # pointer stays inert in Git; this only makes the promised LFS
+                # bytes available to the existing pre-receive verifier.
+                self.assertEqual(LFS_SIZE, 12)
+                self.assertEqual(LFS_OID, hashlib.sha256(LFS_PAYLOAD).hexdigest())
+                upload = h.lfs_batch(
+                    "upload", [{"oid": LFS_OID, "size": LFS_SIZE}], token=h.alice
+                )
+                self.assertEqual(upload["transfer"], "basic")
+                self.assertEqual(len(upload["objects"]), 1)
+                uploaded = upload["objects"][0]
+                self.assertEqual(uploaded["oid"], LFS_OID)
+                self.assertEqual(uploaded["size"], LFS_SIZE)
+                upload_action = uploaded["actions"]["upload"]
+                verify_action = uploaded["actions"]["verify"]
+                status, _, _ = h.lfs_put(
+                    upload_action["href"], LFS_PAYLOAD, token=h.alice, code=200
+                )
+                self.assertEqual(status, 200)
+                verified = h.lfs_verify(
+                    verify_action["href"], LFS_OID, LFS_SIZE, token=h.alice, code=200
+                )
+                self.assertEqual(verified.get("verified"), True)
+                self.assertEqual(verified.get("oid"), LFS_OID)
+                self.assertEqual(verified.get("size"), LFS_SIZE)
+                download = h.lfs_batch(
+                    "download", [{"oid": LFS_OID, "size": LFS_SIZE}], token=h.alice
+                )
+                self.assertEqual(download["objects"][0]["oid"], LFS_OID)
+                self.assertEqual(download["objects"][0]["size"], LFS_SIZE)
+                download_href = download["objects"][0]["actions"]["download"]["href"]
+                status, readback, _ = h.lfs_get(
+                    download_href, token=h.alice, code=200
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(readback, LFS_PAYLOAD)
+                self.assertEqual(hashlib.sha256(readback).hexdigest(), LFS_OID)
 
                 # Fixture: a real source commit whose HEAD tracks an inert LFS
                 # pointer and its attributes. No local filter driver exists.
