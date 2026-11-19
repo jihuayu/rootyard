@@ -157,16 +157,35 @@ jobs:
           test -f "$RUNNER_TEMP/a4-native/rootyard.build.json"
 
       - name: Start owned Garage S3 fixture
+        id: garage_start
         timeout-minutes: 12
         shell: bash
         run: |
           set -euo pipefail
-          scripts/owned_garage_fixture.sh start \
-            --directory "$RUNNER_TEMP/a4-garage" \
-            --output-env "$RUNNER_TEMP/a4-object-store.env" \
-            --bucket-prefix rootyard-a4-wake --region garage
-          cp "$RUNNER_TEMP/a4-garage/garage-image.json" "$RUNNER_TEMP/a4/garage-image.json"
-          touch "$RUNNER_TEMP/a4/garage-started"
+          mkdir -p "$RUNNER_TEMP/a4"
+          garage_log="$RUNNER_TEMP/a4/garage-start.log"
+          set +e
+          {
+            scripts/owned_garage_fixture.sh start \
+              --directory "$RUNNER_TEMP/a4-garage" \
+              --output-env "$RUNNER_TEMP/a4-object-store.env" \
+              --bucket-prefix rootyard-a4-wake --region garage &&
+            cp "$RUNNER_TEMP/a4-garage/garage-image.json" "$RUNNER_TEMP/a4/garage-image.json" &&
+            touch "$RUNNER_TEMP/a4/garage-started"
+          } >"$garage_log" 2>&1
+          status=$?
+          set -e
+          rm -f -- "$garage_log"
+          case "$status" in
+            '' | *[!0-9]*) status=1 ;;
+          esac
+          if [ "$status" -gt 255 ]; then
+            status=1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "owned Garage setup failed" >&2
+            exit "$status"
+          fi
 
       - name: Run real external A4 acceptance
         id: harness
@@ -234,6 +253,7 @@ jobs:
         shell: bash
         env:
           HARNESS_OUTCOME: ${{ steps.harness.outcome }}
+          GARAGE_START_OUTCOME: ${{ steps.garage_start.outcome }}
           GARAGE_OUTCOME: ${{ steps.garage_stop.outcome }}
         run: |
           set -euo pipefail
@@ -292,6 +312,7 @@ jobs:
 
           def main():
               harness = os.environ.get("HARNESS_OUTCOME", "missing")
+              garage_start = os.environ.get("GARAGE_START_OUTCOME", "missing")
               garage_outcome = os.environ.get("GARAGE_OUTCOME", "missing")
               commit = os.environ.get("GITHUB_SHA", "")
               tree = os.environ.get("A4_SOURCE_TREE", "")
@@ -333,11 +354,15 @@ jobs:
                   and receipt.get("features") == {"enabled": ["state-redis"], "no_default_features": False}
                   and receipt.get("working_tree") == {"tree": tree, "status": ""}
               )
-              status = "passed" if harness == "success" and garage_outcome == "success" and report_state_ok and report_binding_ok and receipt_ok else "failed"
+              status = "passed" if harness == "success" and garage_start == "success" and garage_outcome == "success" and report_state_ok and report_binding_ok and receipt_ok else "failed"
               if status == "passed":
                   stage = None
               elif report.get("cleanup_failed") is True or report.get("cleanup_error") is not None:
                   stage = "cleanup"
+              elif garage_start == "failure":
+                  stage = "garage_setup"
+              elif garage_start != "success":
+                  stage = "not_run"
               elif harness == "failure":
                   stage = "harness"
               elif harness != "success":
@@ -383,7 +408,7 @@ jobs:
                   "runtime": {"postgres_major": report.get("postgres_major"), "postgres_server_version_num": report.get("postgres_server_version_num"), "git_version": version(["git", "--version"]), "redis_version": version(["/usr/bin/redis-server", "--version"]), "psql_version": version(["psql", "--version"]), "rustc_version": version(["rustc", "-V"]), "cargo_version": version(["cargo", "-vV"]), "garage_version": garage.get("version"), "garage_image_digest": garage.get("image_digest")},
                   "report": {"kind": kind, "passed": passed},
                   "case": {"name": case.get("name"), "status": case.get("status"), "observations": observations},
-                  "cleanup": {"harness_outcome": harness, "garage_outcome": garage_outcome, "owned_cleanup_completed": detail.get("owned_cleanup_completed") is True, "cleanup_failed": report.get("cleanup_failed"), "cleanup_error": report.get("cleanup_error"), "postgres_container": "job-owned"},
+                  "cleanup": {"harness_outcome": harness, "garage_start_outcome": garage_start, "garage_outcome": garage_outcome, "owned_cleanup_completed": detail.get("owned_cleanup_completed") is True, "cleanup_failed": report.get("cleanup_failed"), "cleanup_error": report.get("cleanup_error"), "postgres_container": "job-owned"},
               }
               OUT.mkdir(parents=True, exist_ok=True)
               if report_raw is not None and kind == KIND:
@@ -400,7 +425,7 @@ jobs:
               try:
                   OUT.mkdir(parents=True, exist_ok=True)
                   temporary = EVIDENCE.with_suffix(".json.tmp")
-                  temporary.write_text(json.dumps({"schema": SCHEMA, "status": "failed", "stage": "evidence", "source": {"head": os.environ.get("GITHUB_SHA"), "tree": os.environ.get("A4_SOURCE_TREE")}, "cleanup": {"harness_outcome": os.environ.get("HARNESS_OUTCOME"), "garage_outcome": os.environ.get("GARAGE_OUTCOME"), "postgres_container": "job-owned"}}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                  temporary.write_text(json.dumps({"schema": SCHEMA, "status": "failed", "stage": "evidence", "source": {"head": os.environ.get("GITHUB_SHA"), "tree": os.environ.get("A4_SOURCE_TREE")}, "cleanup": {"harness_outcome": os.environ.get("HARNESS_OUTCOME"), "garage_start_outcome": os.environ.get("GARAGE_START_OUTCOME"), "garage_outcome": os.environ.get("GARAGE_OUTCOME"), "postgres_container": "job-owned"}}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
                   temporary.replace(EVIDENCE)
               except Exception:
                   pass
@@ -416,5 +441,5 @@ jobs:
           path: |
             test-results/a4/report.json
             test-results/a4/evidence.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
