@@ -86,7 +86,8 @@ jobs:
           set -euo pipefail
           scripts/install_ci_native_tools.sh install \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance "$RUNNER_TEMP/a4-native-tools.json"
+            --provenance "$RUNNER_TEMP/a4-native-tools.json" \
+            --phase-record "$RUNNER_TEMP/a4/native-tools-phase.json"
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
       - name: Install pinned Rust 1.99.1
@@ -272,6 +273,13 @@ jobs:
           RECEIPT = pathlib.Path(str(BINARY) + ".build.json")
           HARNESS = ROOT / "tests" / "a4_redis_wake_partition.py"
           WORKFLOW = ROOT / ".github" / "workflows" / "a4-redis-wake-external-native.yml"
+          INSTALLER = ROOT / "scripts" / "install_ci_native_tools.sh"
+          PHASE = TMP / "a4" / "native-tools-phase.json"
+          PHASE_KEYS = {"mode", "phase", "state", "wrapper_sha256"}
+          PHASE_MODES = {"install", "preflight"}
+          PHASE_NAMES = {"setup", "apt", "git_build", "bubblewrap_build", "profile_export", "preflight", "provenance"}
+          PHASE_STATES = {"entered", "failed", "complete"}
+          PHASE_LIMIT = 512
           GARAGE = TMP / "a4" / "garage-image.json"
           OUT = ROOT / "test-results" / "a4"
           EVIDENCE = OUT / "evidence.json"
@@ -283,6 +291,31 @@ jobs:
                   return hashlib.sha256(path.read_bytes()).hexdigest()
               except OSError:
                   return None
+
+
+          def installer_phase():
+              unavailable = {"available": False}
+              if PHASE.is_symlink() or not PHASE.is_file():
+                  return unavailable
+              try:
+                  with PHASE.open("rb") as stream:
+                      raw = stream.read(PHASE_LIMIT + 1)
+              except OSError:
+                  return unavailable
+              if len(raw) > PHASE_LIMIT:
+                  return unavailable
+              try:
+                  record = json.loads(raw.decode("utf-8"))
+              except (UnicodeError, ValueError):
+                  return unavailable
+              if not isinstance(record, dict) or set(record) != PHASE_KEYS:
+                  return unavailable
+              if record["mode"] not in PHASE_MODES or record["phase"] not in PHASE_NAMES or record["state"] not in PHASE_STATES:
+                  return unavailable
+              wrapper = digest(INSTALLER)
+              if not isinstance(record["wrapper_sha256"], str) or wrapper is None or record["wrapper_sha256"] != wrapper:
+                  return unavailable
+              return {"available": True, "mode": record["mode"], "phase": record["phase"], "state": record["state"], "wrapper_sha256": record["wrapper_sha256"]}
 
 
           def load(path):
@@ -324,6 +357,13 @@ jobs:
               case = cases[0] if isinstance(cases, list) and len(cases) == 1 and isinstance(cases[0], dict) else {}
               detail = case.get("detail") if isinstance(case.get("detail"), dict) else {}
               observations = {key: value for key, value in detail.items() if isinstance(value, bool)}
+              phase = installer_phase()
+              phase_complete = (
+                  phase.get("available") is True
+                  and phase.get("mode") == "install"
+                  and phase.get("phase") == "provenance"
+                  and phase.get("state") == "complete"
+              )
               binary_sha, receipt_sha, harness_sha = digest(BINARY), digest(RECEIPT), digest(HARNESS)
               source_inputs = report.get("source_inputs_sha256")
               kind, passed = report.get("kind"), report.get("passed") is True
@@ -402,6 +442,8 @@ jobs:
               } if receipt else None
               payload = {
                   "schema": SCHEMA, "status": status, "stage": stage,
+                  "installer_phase": phase,
+                  "installer_complete": phase_complete,
                   "source": {"head": commit, "tree": tree, "source_inputs_sha256": source_inputs, "harness_sha256": harness_sha, "workflow_sha256": digest(WORKFLOW), "report_sha256": digest(REPORT)},
                   "run": {key: os.environ.get(key) for key in ("GITHUB_EVENT_NAME", "GITHUB_REF", "GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")},
                   "binary": {"sha256": binary_sha, "build_receipt_sha256": receipt_sha, "receipt": view},
