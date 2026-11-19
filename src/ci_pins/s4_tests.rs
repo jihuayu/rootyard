@@ -225,7 +225,8 @@ fn digest_and_hex_width_helpers_are_exact() {
 
 #[cfg(unix)]
 const FINAL_SCRIPT: &str = r#"#!/bin/sh
-exec >/dev/null; sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$0.pids"
+exec >/dev/null; sh -c 'trap "" TERM; while :; do sleep 1; done' &
+sh -c 'printf "%s %s\n" "$1" "$2" > "$3"' sh "$$" "$!" "$0.pids"
 trap "" TERM; while :; do sleep 1; done
 "#;
 
