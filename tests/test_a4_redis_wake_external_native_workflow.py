@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Static regression for the A4 installer-phase evidence projection."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
+import textwrap
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github" / "workflows" / "a4-redis-wake-external-native.yml"
+
+
+def workflow_phase_prefix():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    start_marker = "          python3 - <<'PY'\n"
+    end_marker = "\n          PY\n"
+    start = text.index(start_marker) + len(start_marker)
+    end = text.index(end_marker, start)
+    code = textwrap.dedent(text[start:end])
+    return code.split("\ndef main():", 1)[0]
+
+
+class InstallerPhaseProjectionTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.workspace = Path(self.temp.name) / "workspace"
+        self.runner = Path(self.temp.name) / "runner"
+        (self.workspace / "scripts").mkdir(parents=True)
+        (self.runner / "a4").mkdir(parents=True)
+        (self.workspace / "scripts" / "install_ci_native_tools.sh").write_bytes(
+            (ROOT / "scripts" / "install_ci_native_tools.sh").read_bytes()
+        )
+        self.old_cwd = os.getcwd()
+        self.old_runner_temp = os.environ.get("RUNNER_TEMP")
+        os.chdir(self.workspace)
+        os.environ["RUNNER_TEMP"] = str(self.runner)
+        self.addCleanup(self._restore_environment)
+        namespace = {}
+        exec(compile(workflow_phase_prefix(), str(WORKFLOW), "exec"), namespace)
+        self.phase = namespace["installer_phase"]
+        self.phase_path = self.runner / "a4" / "native-tools-phase.json"
+        self.wrapper_sha = hashlib.sha256(
+            (self.workspace / "scripts" / "install_ci_native_tools.sh").read_bytes()
+        ).hexdigest()
+        self.phases = namespace["PHASE_NAMES"]
+        self.modes = namespace["PHASE_MODES"]
+
+    def _restore_environment(self):
+        os.chdir(self.old_cwd)
+        if self.old_runner_temp is None:
+            os.environ.pop("RUNNER_TEMP", None)
+        else:
+            os.environ["RUNNER_TEMP"] = self.old_runner_temp
+
+    def _write_record(self, payload):
+        self.phase_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _record(self, mode="install", phase="provenance", state="complete", wrapper=None):
+        return {
+            "mode": mode,
+            "phase": phase,
+            "state": state,
+            "wrapper_sha256": self.wrapper_sha if wrapper is None else wrapper,
+        }
+
+    def test_actual_extracted_function_accepts_producer_state_combinations(self):
+        producer_phases = {
+            "install": self.phases,
+            "preflight": {"setup", "preflight", "provenance"},
+        }
+        self.assertEqual(set(producer_phases), self.modes)
+        for mode, phases in producer_phases.items():
+            for phase in sorted(phases):
+                for state in ("entered", "failed"):
+                    with self.subTest(mode=mode, phase=phase, state=state):
+                        record = self._record(mode, phase, state)
+                        self._write_record(record)
+                        self.assertEqual(self.phase(), {"available": True, **record})
+            with self.subTest(mode=mode, phase="provenance", state="complete"):
+                record = self._record(mode, "provenance", "complete")
+                self._write_record(record)
+                self.assertEqual(self.phase(), {"available": True, **record})
+
+    def test_nonstring_typed_values_are_fixed_unavailable(self):
+        bad_values = (["install"], 7, {"mode": "install"})
+        for field in ("mode", "phase", "state"):
+            for value in bad_values:
+                with self.subTest(field=field, value=value):
+                    record = self._record()
+                    record[field] = value
+                    self._write_record(record)
+                    self.assertEqual(self.phase(), {"available": False})
+        for value in (["sha"], 7, {"sha": "x"}):
+            with self.subTest(field="wrapper_sha256", value=value):
+                record = self._record(wrapper=value)
+                self._write_record(record)
+                self.assertEqual(self.phase(), {"available": False})
+
+    def test_duplicate_top_level_keys_are_fixed_unavailable(self):
+        wrapper = self.wrapper_sha
+        raw = (
+            '{"mode":"invalid","mode":"install","phase":"provenance",'
+            f'"state":"complete","wrapper_sha256":"{wrapper}"}}'
+        )
+        self.phase_path.write_text(raw, encoding="utf-8")
+        self.assertEqual(self.phase(), {"available": False})
+        raw_phase = (
+            '{"mode":"install","phase":"invalid","phase":"provenance",'
+            f'"state":"complete","wrapper_sha256":"{wrapper}"}}'
+        )
+        self.phase_path.write_text(raw_phase, encoding="utf-8")
+        self.assertEqual(self.phase(), {"available": False})
+
+    def test_oversize_and_wrong_hash_are_fixed_unavailable(self):
+        self.phase_path.write_bytes(b"x" * 513)
+        self.assertEqual(self.phase(), {"available": False})
+        self._write_record(self._record(wrapper="0" * 64))
+        self.assertEqual(self.phase(), {"available": False})
+
+
+if __name__ == "__main__":
+    unittest.main()

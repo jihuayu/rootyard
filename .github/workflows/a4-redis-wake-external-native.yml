@@ -295,6 +295,11 @@ jobs:
 
           def installer_phase():
               unavailable = {"available": False}
+              def phase_object(pairs):
+                  keys = [key for key, _ in pairs]
+                  if len(keys) != len(set(keys)):
+                      raise ValueError("duplicate phase key")
+                  return dict(pairs)
               if PHASE.is_symlink() or not PHASE.is_file():
                   return unavailable
               try:
@@ -305,15 +310,17 @@ jobs:
               if len(raw) > PHASE_LIMIT:
                   return unavailable
               try:
-                  record = json.loads(raw.decode("utf-8"))
+                  record = json.loads(raw.decode("utf-8"), object_pairs_hook=phase_object)
               except (UnicodeError, ValueError):
                   return unavailable
               if not isinstance(record, dict) or set(record) != PHASE_KEYS:
                   return unavailable
+              if not all(isinstance(record[key], str) for key in PHASE_KEYS):
+                  return unavailable
               if record["mode"] not in PHASE_MODES or record["phase"] not in PHASE_NAMES or record["state"] not in PHASE_STATES:
                   return unavailable
               wrapper = digest(INSTALLER)
-              if not isinstance(record["wrapper_sha256"], str) or wrapper is None or record["wrapper_sha256"] != wrapper:
+              if wrapper is None or record["wrapper_sha256"] != wrapper:
                   return unavailable
               return {"available": True, "mode": record["mode"], "phase": record["phase"], "state": record["state"], "wrapper_sha256": record["wrapper_sha256"]}
 
