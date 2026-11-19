@@ -10,13 +10,60 @@ use serde_json::{Value, json};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use uuid::Uuid;
 
-async fn batch(state: &AppState, id: Uuid, after: i64) -> Result<Vec<Value>, Error> {
+async fn batch(state: &AppState, id: Uuid, after: i64) -> Result<(i64, Vec<Value>), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
-    let rows = client.query("SELECT revision,kind,payload FROM workspace_events WHERE workspace_id=$1 AND revision>$2 ORDER BY revision LIMIT 100", &[&id,&after]).await.map_err(Error::internal)?;
-    Ok(rows
+    // One statement gives the replay and its durable watermark the same snapshot.
+    let rows = client
+        .query(
+            "WITH snapshot AS (SELECT revision FROM workspaces WHERE id=$1) \
+             SELECT snapshot.revision,ev.revision,ev.kind,ev.payload \
+             FROM snapshot LEFT JOIN LATERAL ( \
+                 SELECT revision,kind,payload FROM workspace_events \
+                 WHERE workspace_id=$1 AND revision>$2 ORDER BY revision LIMIT 100 \
+             ) ev ON true",
+            &[&id, &after],
+        )
+        .await
+        .map_err(Error::internal)?;
+    let snapshot_revision = rows.first().ok_or_else(Error::not_found)?.get::<_, i64>(0);
+    let events = rows
         .iter()
-        .map(|r| json!({"revision":r.get::<_,i64>(0),"kind":r.get::<_,String>(1),"payload":r.get::<_,Value>(2)}))
-        .collect())
+        .filter_map(|row| {
+            Some(json!({
+                "revision": row.get::<_, Option<i64>>(1)?,
+                "kind": row.get::<_, Option<String>>(2)?,
+                "payload": row.get::<_, Option<Value>>(3)?,
+            }))
+        })
+        .collect();
+    Ok((snapshot_revision, events))
+}
+
+fn cursor(query: Option<i64>, headers: &HeaderMap) -> i64 {
+    // A native EventSource keeps the original query string on reconnect and
+    // advances through Last-Event-ID. Use the highest valid cursor so neither
+    // the query-only clients nor a reconnect replay an already-seen revision.
+    let header = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0);
+    match header {
+        Some(header) => query.unwrap_or(0).max(header),
+        None => query.unwrap_or(0),
+    }
+}
+
+fn gap(after: i64, snapshot_revision: i64, events: &[Value]) -> bool {
+    let mut expected = after.saturating_add(1);
+    for event in events {
+        let Some(revision) = event["revision"].as_i64() else { return true };
+        if revision != expected {
+            return true;
+        }
+        expected = revision.saturating_add(1);
+    }
+    events.is_empty() && after < snapshot_revision
 }
 
 pub async fn list(
@@ -31,12 +78,14 @@ pub async fn list(
     if after < 0 || after > ws.revision {
         return Err(Error::bad_request());
     }
-    let events = batch(&state, id, after).await?;
-    let gap = events.first().and_then(|v| v["revision"].as_i64()).is_some_and(|first| first > after + 1);
-    Ok(Json(if gap {
-        json!({"kind":"RESYNC_REQUIRED","snapshot_revision":ws.revision})
+    let (snapshot_revision, events) = batch(&state, id, after).await?;
+    if after > snapshot_revision {
+        return Err(Error::bad_request());
+    }
+    Ok(Json(if gap(after, snapshot_revision, &events) {
+        json!({"kind":"RESYNC_REQUIRED","snapshot_revision":snapshot_revision})
     } else {
-        json!({"events":events,"snapshot_revision":ws.revision})
+        json!({"events":events,"snapshot_revision":snapshot_revision})
     }))
 }
 
@@ -48,7 +97,7 @@ pub async fn stream(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, Error> {
     let ws =
         service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
-    let mut after = query.after_revision.unwrap_or(0);
+    let mut after = cursor(query.after_revision, &headers);
     if after < 0 || after > ws.revision {
         return Err(Error::bad_request());
     }
@@ -56,12 +105,12 @@ pub async fn stream(
         loop {
             if service::authorized(&state,&headers,id,Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await.is_err() { break; }
             match batch(&state,id,after).await {
-                Ok(events) => {
-                    if let Some(first) = events.first().and_then(|v|v["revision"].as_i64())
-                        && first>after+1 {
-                            yield Ok(Event::default().event("RESYNC_REQUIRED").data(json!({"snapshot_revision":first}).to_string()));
-                            break;
-                        }
+                Ok((snapshot_revision,events)) => {
+                    if after > snapshot_revision { break; }
+                    if gap(after,snapshot_revision,&events) {
+                        yield Ok(Event::default().event("RESYNC_REQUIRED").data(json!({"snapshot_revision":snapshot_revision}).to_string()));
+                        break;
+                    }
                     for item in events {
                         if let Some(rev)=item["revision"].as_i64() { after=rev; }
                         yield Ok(Event::default().id(after.to_string()).event("workspace").data(item.to_string()));
