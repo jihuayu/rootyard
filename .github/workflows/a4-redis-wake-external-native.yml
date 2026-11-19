@@ -1,0 +1,715 @@
+name: A4 Redis wake external native acceptance
+
+# Experimental, opt-in native qualification for issue #111. This workflow is
+# intentionally separate from the PR/main gates and is bound to one exact
+# codex branch so it can be reviewed before the coordinator creates that branch.
+# It is not a pull_request, main, wildcard, schedule or workflow_dispatch gate.
+on:
+  push:
+    branches:
+      - codex/goal-issue111-a4-redis-external-native-20261119
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a4-redis-wake-external-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  a4-redis-wake-native:
+    # The runner is one dedicated Ubuntu 22.04 VM, not a container. The harness
+    # runs as a standalone Python process so its PR_SET_CHILD_SUBREAPER covers
+    # only the owned A4 fixture subtree.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/goal-issue111-a4-redis-external-native-20261119' &&
+      github.repository == 'jihuayu/rootyard' &&
+      github.event.repository.full_name == 'jihuayu/rootyard' &&
+      github.event.repository.owner.login == 'jihuayu' &&
+      github.event.repository.name == 'rootyard'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      A4_EXPECTED_BRANCH: codex/goal-issue111-a4-redis-external-native-20261119
+      A4_EXPECTED_REPOSITORY: jihuayu/rootyard
+      A4_EXPECTED_SOURCE_INPUTS_SHA256: 2617ff842faabd74d104f0f89497b8f5b8725f9967fc7c351a93399475a05a5e
+      A4_DATABASE_PREFIX: rootyard_a4_wake
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify exact push source, ref, repository, and clean checkout
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_REF" = "refs/heads/$A4_EXPECTED_BRANCH"
+          test "$GITHUB_REF_NAME" = "$A4_EXPECTED_BRANCH"
+          test "$GITHUB_REPOSITORY" = "$A4_EXPECTED_REPOSITORY"
+          case "$GITHUB_SHA" in
+            '' | *[!0-9a-f]*)
+              echo "GITHUB_SHA is not lowercase 40-hex" >&2
+              exit 1
+              ;;
+          esac
+          test "${#GITHUB_SHA}" -eq 40
+          python3 - "$GITHUB_EVENT_PATH" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_REPOSITORY" "$A4_EXPECTED_REPOSITORY" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          event_path, sha, ref, repository, expected_repository = sys.argv[1:]
+          event = json.loads(pathlib.Path(event_path).read_text(encoding="utf-8"))
+          source = event.get("repository") or {}
+          owner = source.get("owner") or {}
+          head_commit = event.get("head_commit") or {}
+          if source.get("full_name") != expected_repository:
+              raise SystemExit("push source repository is not the reviewed repository")
+          if owner.get("login") != "jihuayu" or source.get("name") != "rootyard":
+              raise SystemExit("push source repository identity differs")
+          if event.get("ref") != ref:
+              raise SystemExit("push event ref differs from GITHUB_REF")
+          if event.get("after") != sha:
+              raise SystemExit("push event tip differs from GITHUB_SHA")
+          if head_commit.get("id") != sha:
+              raise SystemExit("push event head commit differs from GITHUB_SHA")
+          if event.get("deleted") is True:
+              raise SystemExit("deleted branch push is not a source checkpoint")
+          print("exact push event/ref/source/repository verified")
+          PY
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse --verify HEAD^{commit})" = "$GITHUB_SHA"
+          tree="$(git rev-parse HEAD^{tree})"
+          case "$tree" in
+            '' | *[!0-9a-f]*)
+              echo "checkout tree is not lowercase 40-hex" >&2
+              exit 1
+              ;;
+          esac
+          test "${#tree}" -eq 40
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          echo "A4_SOURCE_TREE=$tree" >> "$GITHUB_ENV"
+          echo "clean exact checkout verified: $GITHUB_SHA"
+
+      - name: Install the reviewed native Linux tool profile
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance "$RUNNER_TEMP/a4/native-tools.json" \
+            --phase-record "$RUNNER_TEMP/a4/native-tools-phase.json"
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned Rust 1.99.1
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record "$RUNNER_TEMP/a4/cargo-fork.json"
+
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+
+      - name: Verify trusted Git, official redis-server, and PostgreSQL 17
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(command -v git)" = "$RUNNER_TEMP/rootyard-ci-native/bin/git"
+          git --version | grep -Eq '^git version 2\.43\.'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$A4_SOURCE_TREE"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          test "$(command -v redis-server)" = "/usr/bin/redis-server"
+          test "$(dpkg-query -W -f='${Status}' redis-server)" = "install ok installed"
+          redis-server --version | grep -Eq '^Redis server v=[0-9]+\.[0-9]+\.[0-9]+ '
+          psql --version | grep -Eq '^psql \(PostgreSQL\) 17\.'
+          pg_isready -h 127.0.0.1 -p 55432 -U rootyard -d postgres
+
+      - name: Create the job-owned PostgreSQL 17 test database
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_RUN_ID" in
+            '' | *[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;;
+          esac
+          case "$GITHUB_RUN_ATTEMPT" in
+            '' | *[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;;
+          esac
+          database="${A4_DATABASE_PREFIX}_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          [[ "$database" =~ ^rootyard_a4_wake_[0-9]+_[0-9]+$ ]]
+          test "${#database}" -le 63
+          admin_url="postgresql://rootyard@127.0.0.1:55432/postgres"
+          test "$(psql "$admin_url" -X -t -A -v ON_ERROR_STOP=1 -c 'SELECT current_database()')" = "postgres"
+          case "$(psql "$admin_url" -X -t -A -v ON_ERROR_STOP=1 -c 'SHOW server_version_num')" in
+            17[0-9][0-9][0-9][0-9]) ;;
+            *) echo "job-owned PostgreSQL is not major 17" >&2; exit 1 ;;
+          esac
+          preexisting="$(psql "$admin_url" -X -t -A -v ON_ERROR_STOP=1 \
+            -c "SELECT count(*) FROM pg_database WHERE datname = '$database';")"
+          test "$preexisting" = "0"
+          echo "A4_DATABASE=$database" >> "$GITHUB_ENV"
+          createdb --host 127.0.0.1 --port 55432 --username rootyard "$database"
+          created="$(psql "$admin_url" -X -t -A -v ON_ERROR_STOP=1 \
+            -c "SELECT count(*) FROM pg_database WHERE datname = '$database';")"
+          test "$created" = "1"
+          echo "ROOTYARD_TEST_DATABASE_URL=postgresql://rootyard@127.0.0.1:55432/$database" >> "$GITHUB_ENV"
+
+      - name: Build the exact state-redis binary and v2 receipt
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a4-native" "$RUNNER_TEMP/a4"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          unset CARGO_BUILD_JOBS CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          # Match the documented build_binding command exactly: one explicit
+          # state-redis feature, defaults left on, and only debuginfo stripping.
+          # Do not add --no-default-features, --package-debug or CARGO_BUILD_JOBS.
+          python3 scripts/build_native.py \
+            --features state-redis \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            --output "$RUNNER_TEMP/a4-native/rootyard" \
+            > "$RUNNER_TEMP/a4-native/build-summary.json"
+          test -x "$RUNNER_TEMP/a4-native/rootyard"
+          test -f "$RUNNER_TEMP/a4-native/rootyard.build.json"
+          test ! -w "$RUNNER_TEMP/a4-native/rootyard"
+          test ! -w "$RUNNER_TEMP/a4-native/rootyard.build.json"
+
+      - name: Validate exact state-redis receipt, features, and source binding
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/a4-native/rootyard" "$GITHUB_SHA" "$A4_SOURCE_TREE" \
+            "$A4_EXPECTED_SOURCE_INPUTS_SHA256" \
+            "$RUNNER_TEMP/a4-native/build-summary.json" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          sys.path.insert(0, str(pathlib.Path("tests").resolve()))
+          from backup_recovery_cache import build_binding
+
+          binary, commit, tree, expected_source_inputs, summary_path = sys.argv[1:]
+          binding = build_binding(binary, commit)
+          if binding["source_tree"] != tree:
+              raise SystemExit("build receipt source tree differs from the exact checkout")
+          if binding["source_inputs_sha256"] != expected_source_inputs:
+              raise SystemExit("build receipt product source inputs differ from the reviewed baseline")
+          summary = json.loads(pathlib.Path(summary_path).read_text(encoding="utf-8"))
+          if summary.get("workspace_commit") != commit:
+              raise SystemExit("build summary workspace commit differs")
+          features = summary.get("features")
+          if features != {"enabled": ["state-redis"], "no_default_features": False}:
+              raise SystemExit("build summary features differ from exact state-redis/defaults")
+          store = summary.get("artifact_store")
+          if not isinstance(store, dict) or store.get("schema") != "rootyard/native-artifact-store/v1":
+              raise SystemExit("immutable artifact-store receipt is missing")
+          binary_sha = hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest()
+          if store.get("binary_sha256") != binary_sha:
+              raise SystemExit("immutable artifact-store binary digest differs")
+          canonical = pathlib.Path(store.get("build_receipt") or "")
+          adjacent = pathlib.Path(binary + ".build.json")
+          if not canonical.is_file() or canonical.read_bytes() != adjacent.read_bytes():
+              raise SystemExit("canonical and adjacent v2 receipts differ")
+          alias = store.get("output_alias") or {}
+          if alias.get("overwrote_existing") is not False:
+              raise SystemExit("immutable output alias was not created fresh")
+          if pathlib.Path(alias.get("path") or "").resolve() != pathlib.Path(binary).resolve():
+              raise SystemExit("immutable output alias path differs")
+          print("build binding: exact state-redis, defaults on, canonical adjacent v2 receipt, clean source")
+          PY
+
+      - name: Start the job-owned Garage S3 fixture
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/owned_garage_fixture.sh start \
+            --directory "$RUNNER_TEMP/a4-garage" \
+            --output-env "$RUNNER_TEMP/a4-object-store.env" \
+            --bucket-prefix rootyard-a4-wake --region garage
+
+      - name: Run the source-bound external A4 Redis wake acceptance
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/a4-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal
+          export ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_DELETE=disabled
+          export ROOTYARD_BLOB_ROOT="a4-redis-wake-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_GIT="$(command -v git)"
+          export ROOTYARD_TEST_REDIS_SERVER="/usr/bin/redis-server"
+          test "$ROOTYARD_GIT" = "$RUNNER_TEMP/rootyard-ci-native/bin/git"
+          test "$ROOTYARD_TEST_REDIS_SERVER" = "/usr/bin/redis-server"
+          test "$ROOTYARD_BLOB_DELETE" = "disabled"
+          python3 - <<'PY'
+          import os
+          import urllib.parse
+
+          db = urllib.parse.urlsplit(os.environ["ROOTYARD_TEST_DATABASE_URL"])
+          blob = urllib.parse.urlsplit(os.environ["ROOTYARD_BLOB_ENDPOINT"])
+          if db.scheme not in ("postgresql", "postgres") or db.hostname != "127.0.0.1" or db.query:
+              raise SystemExit("test database is not the job-owned loopback PostgreSQL instance")
+          if not db.path.startswith("/rootyard_a4_wake_"):
+              raise SystemExit("test database is not the dedicated job-owned database")
+          if blob.scheme != "http" or blob.hostname != "127.0.0.1":
+              raise SystemExit("Blob endpoint is not the job-owned loopback Garage fixture")
+          if blob.path not in ("", "/") or blob.query or blob.username or blob.password:
+              raise SystemExit("Blob endpoint is not a bare loopback origin")
+          PY
+          mkdir -p "$RUNNER_TEMP/a4"
+          set +e
+          # Direct standalone invocation: no pipe, tee, container or timeout
+          # wrapper, so the harness keeps its own signal and exit status.
+          python3 tests/a4_redis_wake_partition.py \
+            --binary "$RUNNER_TEMP/a4-native/rootyard" \
+            --git "$ROOTYARD_GIT" \
+            --expect-commit "$GITHUB_SHA" \
+            --report "$RUNNER_TEMP/a4/report.json"
+          harness_status=$?
+          set -e
+          printf 'A4 acceptance harness exit status: %s\n' "$harness_status"
+          exit "$harness_status"
+
+      - name: Validate the closed A4 report and stage exact evidence
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/a4-object-store.env"
+          set +a
+          python3 - "$GITHUB_SHA" "$A4_SOURCE_TREE" "$A4_EXPECTED_SOURCE_INPUTS_SHA256" \
+            "$RUNNER_TEMP/a4/report.json" \
+            "$RUNNER_TEMP/a4-native/rootyard" "$RUNNER_TEMP/a4-native/rootyard.build.json" \
+            "tests/a4_redis_wake_partition.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import shutil
+          import sys
+
+          CASE = "real_a4_redis_wake_external_pg_fallback"
+          KIND = "rootyard/a4-redis-wake-external-acceptance"
+          EXPECTED_BOOLEANS = (
+              "external_worker_mode_serving",
+              "no_embedded_consumer_before_external_start",
+              "external_worker_only_claim",
+              "healthy_publish_forwarded",
+              "healthy_delivery_before_periodic_poll",
+              "durable_terminal_ref_object_hold_outbox",
+              "redis_cut_push_acknowledged",
+              "redis_cut_delivery_by_postgres_poll",
+              "redis_cut_no_publish_forwarded",
+              "healed_resubscribe_and_wake_before_poll",
+              "duplicate_and_invalid_hints_preserved_snapshot",
+              "no_legacy_ref_index_or_projection",
+              "read_only_denied",
+              "outside_actor_denied",
+              "authorized_read_after_denials",
+              "owned_cleanup_completed",
+          )
+          EXPECTED_COMMAND = [
+              "cargo", "build", "--locked", "--bin", "rootyard",
+              "--features", "state-redis",
+              "--config", 'profile.dev.package.rootyard.strip="debuginfo"',
+              "--message-format=json-render-diagnostics",
+          ]
+          HEX64 = re.compile(r"^[0-9a-f]{64}$")
+          UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+          def fail(message):
+              raise SystemExit("A4 closed report rejected: " + message)
+
+          def digest(path):
+              return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+          def regular(path, label):
+              path = pathlib.Path(path)
+              if path.is_symlink() or not path.is_file():
+                  fail(label + " is not a regular non-symlink file")
+              return path
+
+          commit, source_tree, expected_source_inputs, report_path, binary_path, receipt_path, harness_path = sys.argv[1:]
+          report_file = regular(report_path, "report")
+          binary = regular(binary_path, "binary")
+          receipt_file = regular(receipt_path, "build receipt")
+          harness = regular(harness_path, "harness")
+          raw_report = report_file.read_bytes()
+          try:
+              report = json.loads(raw_report.decode("utf-8"))
+          except (UnicodeError, ValueError):
+              fail("report is not UTF-8 JSON")
+          try:
+              receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
+          except (UnicodeError, ValueError):
+              fail("build receipt is not UTF-8 JSON")
+
+          if not isinstance(report, dict) or not isinstance(receipt, dict):
+              fail("report or receipt is not a JSON object")
+          if report.get("kind") != KIND:
+              fail("report kind differs")
+          if report.get("passed") is not True:
+              fail("report did not pass")
+          if report.get("qualification_kind") != "clean-candidate":
+              fail("report is not a clean candidate")
+          if report.get("measurement_kind") != "native_execution":
+              fail("report is not native execution")
+          if report.get("simulated_fields") is not False:
+              fail("report claims simulated fields")
+          if report.get("source_head") != commit:
+              fail("report source_head differs from GITHUB_SHA")
+          if report.get("source_tree") != source_tree:
+              fail("report source_tree differs from the exact checkout")
+          if report.get("cleanup_failed") is not None or report.get("cleanup_error") is not None:
+              fail("report records an ambiguous cleanup")
+          if report.get("case_count") != 1 or report.get("expected_count") != 1:
+              fail("report case counts are not exactly one")
+          if report.get("expected_cases") != [CASE]:
+              fail("report expected case inventory differs")
+          if report.get("skips") != 0 or report.get("pending_cases") != []:
+              fail("report skipped or pended a case")
+          cases = report.get("cases")
+          if not isinstance(cases, list) or len(cases) != 1:
+              fail("report does not contain exactly one case")
+          case = cases[0]
+          if not isinstance(case, dict) or case.get("name") != CASE or case.get("status") != "passed":
+              fail("report case is not the exact passed case")
+          if any(key in case for key in ("error", "trace", "failure_traceback")):
+              fail("report case carries failure diagnostics")
+          detail = case.get("detail")
+          if not isinstance(detail, dict):
+              fail("report case has no detail object")
+          for name in EXPECTED_BOOLEANS:
+              if detail.get(name) is not True:
+                  fail("report case detail is not true: " + name)
+          if detail.get("poll_seconds") != 20:
+              fail("report poll interval differs")
+          for name in ("initial_operation", "healthy_operation", "cut_operation", "healed_operation"):
+              if not isinstance(detail.get(name), str) or UUID.fullmatch(detail[name]) is None:
+                  fail("report operation identity is malformed: " + name)
+          if report.get("postgres_major") != 17:
+              fail("report PostgreSQL major is not 17")
+          server_version = report.get("postgres_server_version_num")
+          if not isinstance(server_version, int) or not 170000 <= server_version <= 179999:
+              fail("report PostgreSQL server version is not major 17")
+          intake = report.get("source_inputs_sha256")
+          if not isinstance(intake, str) or HEX64.fullmatch(intake) is None:
+              fail("report source input digest is malformed")
+          if intake != expected_source_inputs:
+              fail("report product source inputs differ from the reviewed baseline")
+          if report.get("binary_sha256") != digest(binary):
+              fail("report binary digest differs from the executed binary")
+          if report.get("build_receipt_sha256") != digest(receipt_file):
+              fail("report build receipt digest differs")
+          if report.get("harness_sha256") != digest(harness):
+              fail("report harness digest differs")
+          if receipt.get("receipt_schema") != "rootyard/native-build-receipt/v2":
+              fail("build receipt is not v2")
+          if receipt.get("kind") != "native-binary":
+              fail("build receipt kind is not native-binary")
+          if receipt.get("workspace_commit") != commit:
+              fail("build receipt workspace commit differs")
+          if receipt.get("git_head") != commit:
+              fail("build receipt git head differs")
+          if receipt.get("source_inputs_sha256") != intake:
+              fail("build receipt source inputs differ from the report")
+          if receipt.get("binary_sha256") != report.get("binary_sha256"):
+              fail("build receipt binary digest differs from the report")
+          if receipt.get("features") != {"enabled": ["state-redis"], "no_default_features": False}:
+              fail("build receipt does not enable exactly state-redis with defaults")
+          if receipt.get("command") != EXPECTED_COMMAND:
+              fail("build receipt command is not the documented state-redis command")
+          if receipt.get("working_tree") != {"tree": source_tree, "status": ""}:
+              fail("build receipt working tree differs from the exact clean checkout")
+
+          sensitive = [
+              os.environ.get(name, "")
+              for name in (
+                  "ROOTYARD_TEST_DATABASE_URL",
+                  "ROOTYARD_BLOB_ACCESS_KEY_ID",
+                  "ROOTYARD_BLOB_SECRET_ACCESS_KEY",
+                  "ROOTYARD_BLOB_ENDPOINT",
+                  "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+                  "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+                  "ROOTYARD_OBJECT_STORE_ENDPOINT",
+                  "ROOTYARD_OBJECT_STORE_BUCKET",
+              )
+          ]
+          for label, path in (("report", report_file), ("build receipt", receipt_file)):
+              text = path.read_text(encoding="utf-8")
+              for value in sensitive:
+                  if value and value in text:
+                      fail(label + " contains a live fixture value")
+              for forbidden in (
+                  "postgresql://",
+                  "redis://",
+                  "http://127.0.0.1:",
+                  "https://127.0.0.1:",
+                  "ROOTYARD_BLOB_SECRET_ACCESS_KEY",
+                  "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+              ):
+                  if forbidden in text:
+                      fail(label + " contains forbidden raw configuration")
+
+          staged = pathlib.Path("test-results/a4/upload")
+          if staged.exists() or staged.is_symlink():
+              fail("evidence staging path already exists")
+          staged.mkdir(parents=True)
+          shutil.copyfile(report_file, staged / "report.json")
+          shutil.copyfile(receipt_file, staged / "rootyard.build.json")
+          if digest(report_file) != digest(staged / "report.json"):
+              fail("staged report bytes changed")
+          if digest(receipt_file) != digest(staged / "rootyard.build.json"):
+              fail("staged build receipt bytes changed")
+          print("closed A4 report: 1/1 passed, exact source/tree/binary/receipt/harness, cleanup complete")
+          PY
+
+      - name: Bind reviewed provenance to the exact binary, report, and harnesses
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/a4-object-store.env"
+          set +a
+          garage_fixture="$(python3 - "$RUNNER_TEMP/a4-garage/garage-image.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          record = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          digest = record.get("image_digest", "")
+          version = record.get("version", "")
+          if not digest.startswith("sha256:") or version != "2.1.0":
+              raise SystemExit("job-owned Garage image identity is missing or differs")
+          print("Garage v" + version + " " + digest)
+          PY
+          )"
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/a4/upload/native-job-manifest.json \
+            --expect-commit "$GITHUB_SHA" \
+            --build-receipt test-results/a4/upload/rootyard.build.json \
+            --binary "$RUNNER_TEMP/a4-native/rootyard" \
+            --report "a4=test-results/a4/upload/report.json" \
+            --require-case "a4=real_a4_redis_wake_external_pg_fallback" \
+            --fixture "postgres=postgres:17" \
+            --fixture "garage=$garage_fixture" \
+            --fixture "git=$(git --version)" \
+            --fixture "redis=$(redis-server --version)" \
+            --fixture "psql=$(psql --version)" \
+            --fixture-rust-from-receipt \
+            --harness .github/workflows/a4-redis-wake-external-native.yml \
+            --harness tests/a4_redis_wake_partition.py \
+            --harness tests/blob_only_service.py \
+            --harness tests/e2e.py \
+            --harness tests/native_evidence.py \
+            --harness tests/ops_provenance.py \
+            --harness tests/owned_fuse_cleanup.py \
+            --harness scripts/http_report_contract.py \
+            --harness tests/cross_process.py \
+            --harness tests/redis_partition_relay.py \
+            --harness tests/backup_recovery_cache.py \
+            --harness scripts/build_native.py \
+            --harness scripts/native_build_receipt.py \
+            --harness scripts/native_artifact_store.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/install_ci_native_tools.sh \
+            --harness scripts/install_ci_cargo_fork.sh \
+            --harness scripts/owned_garage_fixture.sh \
+            --harness scripts/owned_object_store_env.py \
+            --harness Cargo.toml \
+            --harness Cargo.lock \
+            --harness rust-toolchain.toml
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          root = pathlib.Path("test-results/a4/upload")
+          manifest_path = root / "native-job-manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          report = root / "report.json"
+          receipt = root / "rootyard.build.json"
+          binary = pathlib.Path(os.environ["RUNNER_TEMP"]) / "a4-native" / "rootyard"
+          if manifest.get("kind") != "rootyard/native-acceptance-job-manifest":
+              raise SystemExit("provenance manifest kind differs")
+          if manifest.get("status") != "passed":
+              raise SystemExit("provenance manifest did not pass")
+          if manifest.get("source_commit") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("provenance manifest source commit differs")
+          if manifest.get("source_inputs_sha256") != os.environ["A4_EXPECTED_SOURCE_INPUTS_SHA256"]:
+              raise SystemExit("provenance manifest product source inputs differ")
+          if manifest.get("binary_sha256") != hashlib.sha256(binary.read_bytes()).hexdigest():
+              raise SystemExit("provenance manifest binary digest differs")
+          if manifest.get("build_receipt", {}).get("sha256") != hashlib.sha256(receipt.read_bytes()).hexdigest():
+              raise SystemExit("provenance manifest build receipt digest differs")
+          report_record = manifest.get("reports", {}).get("a4") or {}
+          if report_record.get("sha256") != hashlib.sha256(report.read_bytes()).hexdigest():
+              raise SystemExit("provenance manifest report digest differs")
+          if report_record.get("case_names") != ["real_a4_redis_wake_external_pg_fallback"]:
+              raise SystemExit("provenance manifest case inventory differs")
+          harnesses = manifest.get("harnesses") or {}
+          for path in (
+              ".github/workflows/a4-redis-wake-external-native.yml",
+              "tests/a4_redis_wake_partition.py",
+              "tests/blob_only_service.py",
+              "scripts/build_native.py",
+              "scripts/owned_garage_fixture.sh",
+          ):
+              if harnesses.get(path) != hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest():
+                  raise SystemExit("provenance manifest harness digest differs: " + path)
+          fixtures = manifest.get("fixtures") or {}
+          if fixtures.get("postgres") != "postgres:17":
+              raise SystemExit("provenance manifest PostgreSQL fixture differs")
+          if not str(fixtures.get("garage", "")).startswith("Garage v2.1.0 sha256:"):
+              raise SystemExit("provenance manifest Garage fixture differs")
+          if not str(fixtures.get("rust", "")).startswith("rustc 1.99.1"):
+              raise SystemExit("provenance manifest Rust fixture differs")
+          secrets = [
+              os.environ.get(name, "")
+              for name in (
+                  "ROOTYARD_TEST_DATABASE_URL",
+                  "ROOTYARD_BLOB_ACCESS_KEY_ID",
+                  "ROOTYARD_BLOB_SECRET_ACCESS_KEY",
+                  "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+                  "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+                  "ROOTYARD_OBJECT_STORE_ENDPOINT",
+                  "ROOTYARD_OBJECT_STORE_BUCKET",
+              )
+          ]
+          text = manifest_path.read_text(encoding="utf-8")
+          for value in secrets:
+              if value and value in text:
+                  raise SystemExit("provenance manifest contains a live fixture value")
+          for forbidden in (
+              "postgresql://",
+              "redis://",
+              "http://127.0.0.1:",
+              "https://127.0.0.1:",
+              "ROOTYARD_BLOB_SECRET_ACCESS_KEY",
+              "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+          ):
+              if forbidden in text:
+                  raise SystemExit("provenance manifest contains forbidden raw configuration")
+          print("reviewed provenance: exact report, receipt, binary, harnesses, PostgreSQL 17 and owned Garage")
+          PY
+
+      - name: Stop the job-owned Garage fixture
+        if: always()
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          garage_dir="$RUNNER_TEMP/a4-garage"
+          object_env="$RUNNER_TEMP/a4-object-store.env"
+          cleanup_status=0
+          if [ -e "$garage_dir" ] || [ -L "$garage_dir" ]; then
+            scripts/owned_garage_fixture.sh stop --directory "$garage_dir" || cleanup_status=$?
+          fi
+          if [ "$cleanup_status" -eq 0 ]; then
+            rm -f -- "$object_env"
+          fi
+          if [ -e "$garage_dir" ] || [ -L "$garage_dir" ] || [ -e "$object_env" ] || [ -L "$object_env" ]; then
+            echo "owned Garage cleanup did not close the fixture; refusing to report a pass" >&2
+            exit 1
+          fi
+          exit "$cleanup_status"
+
+      - name: Drop the job-owned PostgreSQL 17 test database
+        if: always()
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          database="${A4_DATABASE:-}"
+          if [ -z "$database" ]; then
+            exit 0
+          fi
+          [[ "$database" =~ ^rootyard_a4_wake_[0-9]+_[0-9]+$ ]]
+          dropdb --host 127.0.0.1 --port 55432 --username rootyard --if-exists --force "$database"
+          absent="$(psql --host 127.0.0.1 --port 55432 --username rootyard --dbname postgres \
+            -X -t -A -v ON_ERROR_STOP=1 \
+            -c "SELECT count(*) FROM pg_database WHERE datname = '$database';")"
+          test "$absent" = "0"
+
+      - name: Upload the closed report, reviewed provenance, and build receipt
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a4-redis-wake-external-native
+          path: |
+            test-results/a4/upload/report.json
+            test-results/a4/upload/native-job-manifest.json
+            test-results/a4/upload/rootyard.build.json
+          if-no-files-found: error
+          retention-days: 7
