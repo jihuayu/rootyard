@@ -97,13 +97,20 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         for proc, log in list(self.workers):
             try:
                 CrossProcessHarness.stop_process(proc)
-            except (Exception, KeyboardInterrupt) as error:  # keep stopping remaining owned workers
+                if proc.poll() is None:
+                    raise RuntimeError("owned A4 worker did not exit after SIGKILL")
+            except (Exception, KeyboardInterrupt) as error:
+                # Keep the exact owner tuple and open log for diagnosis. Parent
+                # cleanup will not touch the schema/scratch until every worker
+                # reports a positive exit.
                 first = first or error
-            finally:
-                try:
-                    log.close()
-                finally:
-                    self.workers.remove((proc, log))
+                continue
+            try:
+                log.close()
+            except (Exception, KeyboardInterrupt) as error:
+                first = first or error
+                continue
+            self.workers.remove((proc, log))
         if first is not None:
             raise first
 
@@ -163,11 +170,19 @@ class A4RedisWakeHarness(BlobOnlyHarness):
 
     def cleanup(self):
         first = None
-        for action in (self.stop_workers, self.stop, self.close_relay, self.stop_redis, super().cleanup):
+        # Always attempt the independently owned process/socket stops. The
+        # inherited schema/scratch teardown runs only after every worker and the
+        # serve-blob process have positively exited and all stops succeeded.
+        for action in (self.stop_workers, self.stop, self.close_relay, self.stop_redis):
             try:
                 action()
             except (Exception, KeyboardInterrupt) as error:
                 first = first or error
+        if first is None:
+            try:
+                super().cleanup()
+            except (Exception, KeyboardInterrupt) as error:
+                first = error
         if first is not None:
             raise first
 
@@ -656,22 +671,24 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None):
     binding = {}
     harness = None
     harness_sha256 = None
-    stage = "preflight"
+    primary = "preflight"
+    cleanup_error = None
+    detail = None
     try:
         prepared = prepare(args)
         binding = prepared.binding
         harness_sha256 = prepared.harness_sha256
-        stage = "fixture"
+        primary = "fixture"
         harness = (harness_type or A4RedisWakeHarness)(
             args, prepared.profile, prepared.blob_profile, prepared.redis_binary
         )
         harness.setup_partition()
-        stage = "case"
+        primary = "case"
         detail = harness.run_case()
-        stage = "receipt_changed"
+        primary = "receipt_changed"
         assert build_binding(args.binary, args.expect_commit) == binding, "source/receipt binding changed"
         assert sha256_file(Path(__file__)) == harness_sha256, "acceptance harness changed"
-        stage = None
+        primary = None
     except (Exception, KeyboardInterrupt):
         pass
     finally:
@@ -679,13 +696,15 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None):
             try:
                 harness.cleanup()
             except (Exception, KeyboardInterrupt):
-                stage = "cleanup"
-    case = (
-        dict(name=CASE, status="failed", error=stage)
-        if stage
-        else dict(name=CASE, status="passed", detail=dict(detail, owned_cleanup_completed=True))
-    )
-    return result_report(binding, case, stage is None, harness_sha256)
+                cleanup_error = "cleanup"
+    passed = primary is None and cleanup_error is None
+    if passed:
+        case = dict(name=CASE, status="passed", detail=dict(detail, owned_cleanup_completed=True))
+    else:
+        case = dict(name=CASE, status="failed", error=primary or cleanup_error)
+        if primary is not None and cleanup_error is not None:
+            case["cleanup_error"] = cleanup_error
+    return result_report(binding, case, passed, harness_sha256)
 
 
 def main(argv=None):

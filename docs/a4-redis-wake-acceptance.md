@@ -182,8 +182,14 @@ fixed hint counter, subscriber count and relay forwarding.
 - The worker resubscription acknowledgment itself triggers a scan; the test must
   account for that catch-up scan when counting scans, as the generic partition
   harness already does.
-- Cleanup must stop the worker and producer, close the relay, stop the owned
-  Redis, and drop only the random schema; it must run on every failure path.
+- Cleanup must attempt every independently owned stop on every failure path. It
+  requires a positive exit/reap check for each worker and for the `serve-blob`
+  process before the inherited schema/scratch teardown may run. An unconfirmed
+  worker/server (or another failed owned-stop) retains its exact process/log
+  owner tuple and diagnostics, and the schema/scratch are left in place; other
+  independently owned relay/Redis members are still stopped best-effort where
+  safe. Cleanup failure is recorded without overwriting an earlier primary case
+  failure.
 
 ## Report contract
 
@@ -195,7 +201,11 @@ fixed hint counter, subscriber count and relay forwarding.
 and the acceptance harness SHA-256, plus the fixed limitations list. It never
 contains a DSN, token, Redis URL, S3 credential or exception body. Failure stages
 are fixed labels (`preflight`, `fixture`, `case`, `receipt_changed`, `cleanup`)
-and `owned_cleanup_completed` appears only after a successful owned cleanup.
+and `owned_cleanup_completed` appears only after a successful owned cleanup. If
+an earlier primary stage and cleanup both fail, the case keeps the primary error
+and adds `cleanup_error: "cleanup"`; a later cleanup failure can never make the
+report pass. If cleanup fails after an otherwise successful case, the case is
+failed with `error: "cleanup"`.
 
 ## Explicit non-goals
 
