@@ -87,22 +87,36 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
         )
         self.assertIn('lock_public_attempt(', preflight)
         self.assertIn('lock_operation(', preflight)
-        self.assertIn('lock_expected_lane(', preflight)
+        self.assertIn('lock_or_create_expected_lane(', preflight)
         self.assertIn("tx: &deadpool_postgres::Transaction<'_>", preflight)
         self.assertIn('lookup_in_tx(', preflight)
         self.assertIn('lookup_public_attempt(', preflight)
         self.assertIn('LegacyPath', preflight)
-        self.assertLess(preflight.index('lock_expected_lane('), preflight.index('lookup_in_tx('))
+        self.assertLess(preflight.index('lookup_public_attempt('), preflight.index('lock_or_create_expected_lane('))
+        self.assertLess(preflight.index('lock_or_create_expected_lane('), preflight.index('lookup_in_tx('))
+        self.assertLess(preflight.index('lookup_in_tx('), preflight.rindex('lookup_public_attempt('))
+        self.assertEqual(preflight.count('lock_or_create_expected_lane('), 1)
+        fresh_route = slice_between(
+            preflight,
+            'if route == SlotZeroRoute::Fresh {',
+            '// Authorization and the live restore/realm fence',
+        )
+        self.assertIn('lock_or_create_expected_lane(', fresh_route)
+        self.assertIn('Ok(PublicAttemptLookup::Unknown) => (SlotZeroRoute::Fresh, None)', preflight)
+        self.assertIn('Err(error) => (SlotZeroRoute::Replay, Some(GatewayError::from(error)))', preflight)
 
         lane_lock = slice_between(
             self.pg,
-            'pub(crate) async fn lock_expected_lane(',
+            'pub(crate) async fn lock_or_create_expected_lane(',
             '    /// Reserve the next sequence',
         )
         self.assertIn('SELECT 1 FROM ref_store_issuer_lanes', lane_lock)
         self.assertIn('FOR NO KEY UPDATE', lane_lock)
+        self.assertIn('INSERT INTO ref_store_issuer_lanes(', lane_lock)
+        self.assertIn('ON CONFLICT(repository_id,issuer_id,lane) DO NOTHING', lane_lock)
+        self.assertIn('RETURNING 1', lane_lock)
         self.assertNotIn('last_reserved_sequence + 1', lane_lock)
-        self.assertNotIn('INSERT INTO ref_store_issuer_lanes', lane_lock)
+        self.assertNotIn('advance_sequence(', lane_lock)
 
         unknown = slice_between(
             preflight,

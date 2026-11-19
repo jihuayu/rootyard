@@ -60,19 +60,22 @@ impl PgRefStore {
         Capabilities::pg_transition_increment()
     }
 
-    /// Lock an existing expected issuer-lane row before an
-    /// authorization/repository read in a caller-owned transaction.
+    /// Lock the expected issuer lane, creating its zero row only when it does
+    /// not yet exist.
     ///
-    /// This is deliberately a lock-only preflight and never evaluates
-    /// `last_reserved_sequence + 1`, inserts a missing lane or reserves a
-    /// sequence. An absent lane is a no-op here; a fresh admission allocates it
-    /// later in the same transaction, after this preflight and before its
-    /// repository/gate writes. A replay therefore cannot overflow on an
-    /// exhausted lane or enter the allocation path. A concurrently uncommitted
-    /// lane creation is not visible to this read; the fresh coordinator's own
-    /// insert remains the first lane wait in that case. The caller must already
-    /// hold the operation key and must roll back on later refusal.
-    pub(crate) async fn lock_expected_lane(
+    /// This is the gateway's fresh-admission lane acquisition and must run after
+    /// the public/operation locks but before any repository/binding authority
+    /// read. It never evaluates `last_reserved_sequence + 1` and never advances
+    /// a sequence; the slot-zero coordinator still previews and conditionally
+    /// advances the now-visible lane later in this same transaction.
+    ///
+    /// An existing lane takes one `FOR NO KEY UPDATE` lock. A missing lane is
+    /// initialized at zero with `ON CONFLICT DO NOTHING`; a concurrent creator
+    /// is visible to that insert's conflict wait, and the loser re-locks the
+    /// winner's row before returning. This closes the READ COMMITTED gap where
+    /// a plain select of an absent row cannot see an in-flight insert. The
+    /// caller must hold the operation key and roll back on later refusal.
+    pub(crate) async fn lock_or_create_expected_lane(
         &self,
         tx: &Transaction<'_>,
         repository_id: Uuid,
@@ -83,14 +86,24 @@ impl PgRefStore {
         if repository_id.is_nil() || issuer_id.is_nil() {
             return Err(RefStoreError::InvalidIdentity("expected lane ids must be non-nil".into()));
         }
+        const LOCK: &str = "SELECT 1 FROM ref_store_issuer_lanes
+             WHERE (repository_id,issuer_id,lane)=($1,$2,$3) FOR NO KEY UPDATE";
+        const CREATE: &str = "INSERT INTO ref_store_issuer_lanes(
+                 repository_id,issuer_id,lane,last_reserved_sequence)
+             VALUES($1,$2,$3,0) ON CONFLICT(repository_id,issuer_id,lane) DO NOTHING
+             RETURNING 1";
         bound(tx, deadline).await?;
-        tx.query_opt(
-            "SELECT 1 FROM ref_store_issuer_lanes
-             WHERE (repository_id,issuer_id,lane)=($1,$2,$3) FOR NO KEY UPDATE",
-            &[&repository_id, &issuer_id, &lane.as_str()],
-        )
-        .await
-        .map_err(db_error)?;
+        let lane_name = lane.as_str();
+        let params: &[&(dyn ToSql + Sync)] = &[&repository_id, &issuer_id, &lane_name];
+        if tx.query_opt(LOCK, params).await.map_err(db_error)?.is_some() {
+            return Ok(());
+        }
+        if tx.query_opt(CREATE, params).await.map_err(db_error)?.is_some() {
+            return Ok(());
+        }
+        // A concurrent creator committed the same issuer lane between the read
+        // and insert. Re-lock that row before returning to the authority reads.
+        tx.query_one(LOCK, params).await.map_err(db_error)?;
         Ok(())
     }
 
