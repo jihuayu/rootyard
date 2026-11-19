@@ -362,6 +362,90 @@ async fn receive_pack_authorized(
     command.arg("receive-pack").arg("--stateless-rpc").arg(view.repo());
     let captured = native::run_capture(command, Some(request_path.as_path()), 4 * 1024 * 1024, deadline).await?;
     if !captured.success {
+        // A raw native `unpack ...`/all-`ng` report is only a pre-admission
+        // compatibility surface when this public operation is still provably
+        // Fresh. A wrapper that is pending, already terminal, cancelled or a
+        // retirement candidate must never be closed from raw child output.
+        match operation::probe_public(
+            &state,
+            &serving,
+            receive.actor,
+            operation,
+            receive.request(),
+            receive.digest(),
+            receive.mode(),
+            deadline,
+        )
+        .await?
+        {
+            operation::Probe::Fresh => {
+                if pending_retirement.is_some() {
+                    return Err(GatewayError::OutcomeUnknown);
+                }
+            }
+            operation::Probe::Pending => return Err(GatewayError::OutcomeUnknown),
+            operation::Probe::Cancelled { reason } => {
+                return terminal_response(receive.request(), &cancelled_results(receive.request(), reason), operation);
+            }
+            operation::Probe::Replay { terminal, private_id } => {
+                materialize_durable_gateway_receipt(receipt_args(false, private_id)).await?;
+                let results = report_results(receive.request(), &terminal)?;
+                let body = protocol::report_status(receive.request().wants_report(), &results);
+                return committed_response(CommittedResponse {
+                    state: &state,
+                    identity: &identity,
+                    owner: &owner,
+                    name,
+                    authorized: &serving,
+                    terminal: &terminal,
+                    body,
+                    operation,
+                    deadline,
+                })
+                .await;
+            }
+            operation::Probe::Finish { terminal, private_id, record, .. } => {
+                match publish::finish_public_terminal(
+                    &state,
+                    &serving,
+                    receive.actor,
+                    operation,
+                    receive.digest(),
+                    receive.mode(),
+                    &record,
+                    deadline,
+                )
+                .await?
+                {
+                    PublicAttemptTerminalOutcome::Mirrored(_) => {
+                        materialize_durable_gateway_receipt(receipt_args(false, Some(private_id))).await?;
+                        let results = report_results(receive.request(), &terminal)?;
+                        let body = protocol::report_status(receive.request().wants_report(), &results);
+                        return committed_response(CommittedResponse {
+                            state: &state,
+                            identity: &identity,
+                            owner: &owner,
+                            name,
+                            authorized: &serving,
+                            terminal: &terminal,
+                            body,
+                            operation,
+                            deadline,
+                        })
+                        .await;
+                    }
+                    PublicAttemptTerminalOutcome::RetirementRequired(_) => {
+                        // No authoritative terminal exists for the public
+                        // operation yet, and this failed native attempt has no
+                        // pairs to feed the slot-one retirement path.
+                        return Err(GatewayError::OutcomeUnknown);
+                    }
+                }
+            }
+            operation::Probe::FinishCancelled { .. } => {
+                return Err(GatewayError::Conflict("operation cancellation requires reconciliation"));
+            }
+        }
         // Unknown when probed, so only an all-`ng`/unpack-failure report passes through.
         if protocol::native_report_is_rejection(&captured.stdout) {
             return response(StatusCode::OK, "application/x-git-receive-pack-result", captured.stdout, operation);

@@ -68,6 +68,27 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertNotIn("get_legacy_locked(", probe)
         self.assertNotIn("admit_slot_zero_in_tx(", probe)
 
+    def test_native_failure_never_closes_a_private_pending_operation_with_raw_ng(self):
+        block = slice_between(
+            self.receive_prod,
+            "if !captured.success {",
+            "let new_pairs = collect_pairs",
+        )
+        self.assertIn("operation::probe_public(", block)
+        self.assertIn("operation::Probe::Fresh =>", block)
+        self.assertIn("pending_retirement.is_some()", block)
+        self.assertIn("operation::Probe::Pending => return Err(GatewayError::OutcomeUnknown)", block)
+        self.assertIn("operation::Probe::Finish { terminal, private_id, record, .. } =>", block)
+        self.assertIn("PublicAttemptTerminalOutcome::RetirementRequired(_) =>", block)
+        self.assertIn("return Err(GatewayError::OutcomeUnknown)", block)
+        self.assertIn('GatewayError::Conflict("operation cancellation requires reconciliation")', block)
+        self.assertIn("native_report_is_rejection(&captured.stdout)", block)
+        self.assertLess(
+            block.index("operation::probe_public("),
+            block.index("native_report_is_rejection(&captured.stdout)"),
+            "the raw child report must be gated by the authoritative public probe",
+        )
+
     def test_private_fresh_entry_selects_begin_slot_zero_and_never_the_legacy_writer(self):
         private = slice_between(
             self.publish,
