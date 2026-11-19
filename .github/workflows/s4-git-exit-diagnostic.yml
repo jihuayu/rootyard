@@ -1,0 +1,173 @@
+name: S4 Git Child-Exit Diagnostic (owned branch)
+
+on:
+  push:
+    branches:
+      - codex/goal-s4-pr317-exact-product-probe-20261120
+
+permissions:
+  contents: read
+
+concurrency:
+  group: s4-git-exit-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGOFORK_VERSION: 1.101.0
+  CARGOFORK_COMMIT: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b
+  EXPECTED_BASE_COMMIT: 7f64273448790d05d3717affa8501086bc5a93ca
+  EXPECTED_BASE_TREE: f9390398bd5e4f16a37a903b03c13713c7d5562c
+  EXPECTED_BASE_PARENT_ONE: ea52363e1747de6288747ed65873fe93d5c3e49d
+  EXPECTED_BASE_PARENT_TWO: 997005c54623f6cc6aaa44c301125cf1554551f5
+
+jobs:
+  s4-git-exit-diagnostic:
+    name: S4 failure-only Git child-exit diagnostic (PG17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: rootyard_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rootyard_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://postgres:password@localhost:5432/rootyard_test
+      ROOTYARD_TEST_DATABASE_URL: postgres://postgres:password@localhost:5432/rootyard_test
+      ROOTYARD_TEST_GIT: /usr/bin/git
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bind exact source base and diagnostic-only diff
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/codex/goal-s4-pr317-exact-product-probe-20261120"
+          test "$(git rev-parse HEAD)" != "$EXPECTED_BASE_COMMIT"
+          test "$(git rev-parse "${EXPECTED_BASE_COMMIT}^{tree}")" = "$EXPECTED_BASE_TREE"
+          test "$(git rev-list --parents -n 1 "$EXPECTED_BASE_COMMIT")" = \
+            "$EXPECTED_BASE_COMMIT $EXPECTED_BASE_PARENT_ONE $EXPECTED_BASE_PARENT_TWO"
+          git merge-base --is-ancestor "$EXPECTED_BASE_COMMIT" HEAD
+          # The product source and the real S4 acceptance fixture stay exactly
+          # at the bound base commit.
+          git diff --quiet "$EXPECTED_BASE_COMMIT" HEAD -- \
+            src tests/s4_ci_pins_git_view.rs tests/s4_ci_pins_git_view_support
+          # Only the diagnostic observer files and this workflow may differ.
+          unexpected="$(git diff --name-only "$EXPECTED_BASE_COMMIT" HEAD | \
+            grep -Ev '^(\.github/workflows/s4-git-exit-diagnostic\.yml|tests/s4_git_exit_debugger\.py|tests/s4_git_exit_gdb\.py|tests/s4_git_exit_preflight\.gdb|tests/test_s4_git_exit_debugger\.py)$' || true)"
+          test -z "$unexpected"
+          echo "bound source base: $EXPECTED_BASE_COMMIT"
+
+      - name: Install Rust 1.99.1 toolchain (rustfmt + clippy)
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+          rustup default 1.99.1
+
+      - name: Cache CargoFork 1.101.0 (64a6ee6a)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          mkdir -p test-results/s4-git-exit-diagnostic
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/s4-git-exit-diagnostic/cargo-fork.json
+
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+
+      - name: Verify selected Git and GDB
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/s4-git-exit-diagnostic
+          test -x /usr/bin/git
+          /usr/bin/git --version
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends gdb
+          fi
+          gdb --version | sed -n '1p'
+
+      - name: Build exact unstripped S4 test executable
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/s4-git-exit-diagnostic
+          # build_native_test.py is the normal exact-target Rust subprocess
+          # selector and runs cargo rustc --locked --profile test --test
+          # s4_ci_pins_git_view. Debug information is kept deliberately.
+          python3 scripts/build_native_test.py \
+            --test s4_ci_pins_git_view \
+            --package-debug 2 \
+            --output test-results/s4-git-exit-diagnostic/s4_ci_pins_git_view \
+            > test-results/s4-git-exit-diagnostic/build-summary.json
+          test -x test-results/s4-git-exit-diagnostic/s4_ci_pins_git_view
+          test -s test-results/s4-git-exit-diagnostic/s4_ci_pins_git_view.build.json
+          file test-results/s4-git-exit-diagnostic/s4_ci_pins_git_view | grep -Eq 'not stripped|debug_info'
+          # A rebuild is bound by the observed SHA-256 only. It can differ from
+          # a prior hosted binary because the build path and runner layout differ.
+
+      - name: Run failure-only Git child-exit observer
+        run: |
+          set -euo pipefail
+          # The observer passes exactly --ignored --test-threads=1 to the test
+          # executable and does not filter individual test names. Its exit
+          # status is the test binary's exit status.
+          python3 tests/s4_git_exit_debugger.py \
+            --binary test-results/s4-git-exit-diagnostic/s4_ci_pins_git_view \
+            --report test-results/s4-git-exit-diagnostic/report.json \
+            --work-dir target/s4-git-exit-debugger/run \
+            --source-root "$GITHUB_WORKSPACE" \
+            --gdb "$(command -v gdb)" \
+            --git /usr/bin/git \
+            --base-commit "$EXPECTED_BASE_COMMIT" \
+            --base-tree "$EXPECTED_BASE_TREE" \
+            --base-parent "$EXPECTED_BASE_PARENT_ONE" \
+            --base-parent "$EXPECTED_BASE_PARENT_TWO" \
+            --timeout-seconds 1800
+
+      - name: Validate fixed bounded report
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from tests.s4_git_exit_debugger import validate_report
+
+          path = Path("test-results/s4-git-exit-diagnostic/report.json")
+          report = json.loads(path.read_text(encoding="utf-8"))
+          validate_report(report)
+          print("report validated: status=" + str(report["status"]))
+          PY
+
+      - name: Upload fixed bounded diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4-git-exit-diagnostic-report
+          path: test-results/s4-git-exit-diagnostic/report.json
+          if-no-files-found: warn
+          retention-days: 7
