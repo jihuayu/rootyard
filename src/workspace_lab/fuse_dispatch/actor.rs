@@ -1,14 +1,14 @@
 //! Per-mount actor: owns the overlay and executes queued operations.
 
+use super::read_pool::ReadPool;
 use super::*;
 use fuser::ReplyData;
-use super::read_pool::ReadPool;
 
-struct Actor {
-    overlay: Overlay,
-    shared: Arc<Shared>,
+pub(super) struct Actor {
+    pub(super) overlay: Overlay,
+    pub(super) shared: Arc<Shared>,
     gate: Arc<MutationGate>,
-    pool: &'static ReadPool,
+    pub(super) pool: &'static ReadPool,
 }
 
 impl Actor {
