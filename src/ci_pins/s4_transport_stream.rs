@@ -345,12 +345,9 @@ where
                 biased;
                 result = &mut failure, if failure_open => {
                     failure_open = false;
-                    match result {
-                        Ok(error) => {
-                            yield Err(error);
-                            return;
-                        }
-                        Err(_) => {}
+                    if let Ok(error) = result {
+                        yield Err(error);
+                        return;
                     }
                 }
                 item = data.recv() => match item {

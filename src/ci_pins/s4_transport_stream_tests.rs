@@ -23,7 +23,7 @@ struct FakeOwner {
     offset: usize,
     exit: PackExit,
     cancelled: Arc<AtomicBool>,
-    observed: ObservedSlot,
+    _observed: ObservedSlot,
 }
 
 /// Drops the slot before signalling task completion, without drop-order guesses.
@@ -99,7 +99,7 @@ where
         offset: 0,
         exit,
         cancelled: cancelled.clone(),
-        observed: ObservedSlot { slot: Some(StreamSlot::from_permit(permit)), done: Some(done_tx) },
+        _observed: ObservedSlot { slot: Some(StreamSlot::from_permit(permit)), done: Some(done_tx) },
     };
     Harness {
         owner_tx,
