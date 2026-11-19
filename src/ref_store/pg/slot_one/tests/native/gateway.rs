@@ -73,28 +73,16 @@ SELECT jsonb_build_object(
         SELECT jsonb_agg(to_jsonb(o) ORDER BY o.operation_id)
           FROM ref_store_operations o
          WHERE o.repository_id=$1
-           AND o.operation_id IN (
-               SELECT private_id FROM ref_store_private_attempts
-                WHERE repository_id=$1 AND public_id=$2
-           )
     ), '[]'::jsonb),
     'bindings', COALESCE((
         SELECT jsonb_agg(to_jsonb(s) ORDER BY s.operation_id)
           FROM ref_store_serving_operations s
          WHERE s.repository_id=$1
-           AND s.operation_id IN (
-               SELECT private_id FROM ref_store_private_attempts
-                WHERE repository_id=$1 AND public_id=$2
-           )
     ), '[]'::jsonb),
     'events', COALESCE((
         SELECT jsonb_agg(to_jsonb(e) ORDER BY e.event_id)
           FROM ref_store_core_events e
          WHERE e.repository_id=$1
-           AND e.operation_id IN (
-               SELECT private_id FROM ref_store_private_attempts
-                WHERE repository_id=$1 AND public_id=$2
-           )
     ), '[]'::jsonb),
     'refs', COALESCE((
         SELECT jsonb_agg(to_jsonb(r) ORDER BY r.ref_name)
@@ -103,6 +91,22 @@ SELECT jsonb_build_object(
     ), '[]'::jsonb),
     'gate', (
         SELECT to_jsonb(g) FROM ref_store_core_gates g WHERE g.repository_id=$1
+    ),
+    'head', (
+        SELECT to_jsonb(r)
+          FROM ref_store_core_refs r
+          JOIN ref_store_core_gates g
+            ON g.repository_id=r.repository_id
+         WHERE r.repository_id=$1 AND r.ref_name=g.head_ref
+    ),
+    'counts', jsonb_build_object(
+        'public_operations', (SELECT count(*) FROM ref_store_public_operations WHERE repository_id=$1),
+        'private_attempts', (SELECT count(*) FROM ref_store_private_attempts WHERE repository_id=$1),
+        'operations', (SELECT count(*) FROM ref_store_operations WHERE repository_id=$1),
+        'bindings', (SELECT count(*) FROM ref_store_serving_operations WHERE repository_id=$1),
+        'events', (SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1),
+        'refs', (SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1),
+        'publications', (SELECT count(*) FROM ref_store_core_pack_publications WHERE repository_id=$1)
     ),
     'lanes', COALESCE((
         SELECT jsonb_agg(to_jsonb(l) ORDER BY l.issuer_id, l.lane)
@@ -327,7 +331,7 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
                     "mirrored retired event id changed"
                 );
             }
-            other => bail!("mirrored public attempt is not committed: {other:?}"),
+            _ => bail!("mirrored public attempt is not committed"),
         }
 
         // The public terminal receipt and the durable wrapper expose no private
@@ -435,8 +439,15 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
         );
         let replay_baseline = capture_baseline(&db, retired.repository.id, retired.verified.tenant).await?;
         ensure!(replay_baseline.gate().revision() == later_gate.revision(), "replay baseline is not the later gate");
+        ensure!(
+            baseline.gate().revision() < replay_baseline.gate().revision(),
+            "historical replay baseline did not precede the later gate"
+        );
         let before_replay = ledger_snapshot(&db, retired.repository.id, retired.public.public_id).await?;
+        assert_snapshot_invariants(&before_replay)?;
 
+        // Pass the pre-advance historical baseline: replay must use the stored
+        // rotation rather than silently requiring the current gate baseline.
         let replay = acceptance::rotate_direct(
             &state,
             &serving,
@@ -445,7 +456,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             &body,
             &retired.p0_files.pack,
             &retired.p0_files.idx,
-            &replay_baseline,
+            &baseline,
             evidence,
             &retired.retirement,
             deadline(),
@@ -466,10 +477,12 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
                 && replay_receipt.wire_digest == fresh.wire_digest,
             "later-gate replay changed the original private rotation"
         );
+        let after_replay = ledger_snapshot(&db, retired.repository.id, retired.public.public_id).await?;
         ensure!(
-            ledger_snapshot(&db, retired.repository.id, retired.public.public_id).await? == before_replay,
+            after_replay == before_replay,
             "later-gate replay changed candidate, sequence, ref, event or write effects"
         );
+        assert_snapshot_invariants(&after_replay)?;
         ensure!(
             operation_event_id(&db, retired.repository.id, retired.admission.private_id).await?
                 == Some(retired.retirement.event_id),
@@ -497,10 +510,9 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             matches!(refused_replay, Err(GatewayError::Unauthorized)),
             "revoked exact replay did not fail the same-outer live authorization"
         );
-        ensure!(
-            ledger_snapshot(&db, retired.repository.id, retired.public.public_id).await? == before_replay,
-            "revoked exact replay left a durable effect"
-        );
+        let after_refused_replay = ledger_snapshot(&db, retired.repository.id, retired.public.public_id).await?;
+        ensure!(after_refused_replay == before_replay, "revoked exact replay left a durable effect");
+        assert_snapshot_invariants(&after_refused_replay)?;
 
         // Restore a second time and prove the same live identity/realm still
         // replays the original pending rotation without any effect count change.
@@ -527,10 +539,12 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             }
             acceptance::Admission::Fresh { .. } => bail!("restored exact rotation was not a replay"),
         }
+        let after_restored_replay = ledger_snapshot(&db, retired.repository.id, retired.public.public_id).await?;
         ensure!(
-            ledger_snapshot(&db, retired.repository.id, retired.public.public_id).await? == before_replay,
+            after_restored_replay == before_replay,
             "restored exact replay changed candidate, sequence, ref, event or write effects"
         );
+        assert_snapshot_invariants(&after_restored_replay)?;
         Ok(())
     }
     .await;
@@ -654,7 +668,7 @@ async fn public_lookup(db: &db::Db, request: &PublicAttemptRequest) -> Result<Pu
     let tx = client.transaction().await?;
     let result = PgRefStore.lookup_public_attempt(&tx, request, deadline()).await;
     tx.rollback().await?;
-    result.map_err(|error| anyhow!("public attempt lookup failed: {error:?}"))
+    result.map_err(|_| anyhow!("public attempt lookup failed"))
 }
 
 async fn mirror_committed_terminal(
@@ -673,9 +687,9 @@ async fn mirror_committed_terminal(
             tx.rollback().await?;
             bail!("committed slot-one terminal mirror requested retirement")
         }
-        Err(error) => {
+        Err(_) => {
             tx.rollback().await?;
-            Err(anyhow!("committed slot-one terminal mirror failed: {error:?}"))
+            Err(anyhow!("committed slot-one terminal mirror failed"))
         }
     }
 }
@@ -739,6 +753,27 @@ async fn attempt_rows(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Resu
 async fn ledger_snapshot(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Result<Value> {
     let row = db.pool.get().await?.query_one(LEDGER_SNAPSHOT, &[&repository_id, &public_id]).await?;
     Ok(row.get(0))
+}
+
+fn assert_snapshot_invariants(snapshot: &Value) -> Result<()> {
+    for key in ["operations", "bindings", "events", "refs", "publications"] {
+        let entries =
+            snapshot[key].as_array().ok_or_else(|| anyhow!("ledger snapshot {key} is not a full-repository array"))?;
+        let count =
+            snapshot["counts"][key].as_i64().ok_or_else(|| anyhow!("ledger snapshot count {key} is missing"))?;
+        ensure!(count == entries.len() as i64, "ledger snapshot count {key} differs from its full-repository entries");
+    }
+    ensure!(
+        snapshot["head"].is_object() && snapshot["head"]["oid"].is_string(),
+        "ledger snapshot has no durable head ref"
+    );
+    ensure!(
+        snapshot["lanes"].as_array().is_some_and(|lanes| lanes
+            .iter()
+            .any(|lane| lane["last_reserved_sequence"].as_i64().is_some_and(|sequence| sequence > 0))),
+        "ledger snapshot has no durable issuer lane sequence"
+    );
+    Ok(())
 }
 
 async fn revoke_identity(pool: &Pool, identity: &Identity) -> Result<()> {

@@ -23,7 +23,7 @@ pub(super) async fn operation_record(db: &db::Db, repository_id: Uuid, operation
     let lookup = PgRefStore
         .get(&tx, repository_id, operation_id, deadline())
         .await
-        .map_err(|error| anyhow!("operation lookup failed: {error:?}"))?;
+        .map_err(|_| anyhow!("operation lookup failed"))?;
     tx.rollback().await?;
     match lookup {
         OperationLookup::Known(record) => Ok(record),

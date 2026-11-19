@@ -275,7 +275,7 @@ async fn retirement_required(
     let record = match PgRefStore
         .get(&tx, public.repository_id, private_id, deadline())
         .await
-        .map_err(|error| anyhow!("P0 operation lookup failed: {error:?}"))?
+        .map_err(|_| anyhow!("P0 operation lookup failed"))?
     {
         OperationLookup::Known(record) => record,
         _ => bail!("P0 operation is not visible to the terminal mirror"),
@@ -284,11 +284,11 @@ async fn retirement_required(
     let outcome = PgRefStore
         .mirror_public_attempt_terminal_in_tx(&tx, public, &record, deadline())
         .await
-        .map_err(|error| anyhow!("public terminal mirror failed: {error:?}"))?;
+        .map_err(|_| anyhow!("public terminal mirror failed"))?;
     let retirement = match outcome {
         PublicAttemptTerminalOutcome::RetirementRequired(retirement) => retirement,
-        PublicAttemptTerminalOutcome::Mirrored(receipt) => {
-            bail!("terminal mirror published instead of selecting retirement: {receipt:?}")
+        PublicAttemptTerminalOutcome::Mirrored(_) => {
+            bail!("terminal mirror published instead of selecting retirement")
         }
     };
     tx.rollback().await?;

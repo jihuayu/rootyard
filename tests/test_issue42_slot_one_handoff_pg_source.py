@@ -83,6 +83,31 @@ class SlotOneHandoffPostgresSourceTest(unittest.TestCase):
         )
         self.assertNotIn("error::GatewayError", self.gateway)
 
+    def test_replay_uses_historical_baseline_and_full_repository_snapshot(self):
+        case = self.gateway.split(CASES[1], 1)[1]
+        self.assertIn(
+            "baseline.gate().revision() < replay_baseline.gate().revision()",
+            case,
+        )
+        historical = case.split("// Pass the pre-advance historical baseline", 1)
+        self.assertEqual(len(historical), 2)
+        self.assertIn("&baseline,", historical[1].split("let replay_receipt", 1)[0])
+        self.assertIn("assert_snapshot_invariants(&before_replay)", case)
+        self.assertIn("assert_snapshot_invariants(&after_replay)", case)
+        self.assertIn("assert_snapshot_invariants(&after_refused_replay)", case)
+        self.assertIn("assert_snapshot_invariants(&after_restored_replay)", case)
+        self.assertIn("'head'", self.gateway)
+        self.assertIn("'counts'", self.gateway)
+        self.assertNotIn("o.operation_id IN", self.gateway)
+        self.assertNotIn("s.operation_id IN", self.gateway)
+        self.assertNotIn("e.operation_id IN", self.gateway)
+        self.assertIn('anyhow!("public attempt lookup failed")', self.gateway)
+        self.assertIn('anyhow!("committed slot-one terminal mirror failed")', self.gateway)
+        self.assertNotIn("public attempt lookup failed: {error:?}", self.gateway)
+        self.assertNotIn("committed slot-one terminal mirror failed: {error:?}", self.gateway)
+        self.assertNotIn("P0 operation lookup failed: {error:?}", self.retirement)
+        self.assertNotIn("public terminal mirror failed: {error:?}", self.retirement)
+
     def test_receive_stays_on_legacy_publish_push(self):
         production_receive = production(self.receive)
         self.assertIn("publish::push(", production_receive)
