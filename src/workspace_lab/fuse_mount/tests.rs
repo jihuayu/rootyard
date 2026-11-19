@@ -221,3 +221,29 @@ fn unproved_identity_is_a_static_failure_category_without_a_path() {
     assert_eq!(text, "FUSE mount identity was not captured; exact unmount is unproved");
     assert!(!text.contains('/'), "the ownership failure category must not expose a mount path");
 }
+
+#[test]
+fn typed_teardown_classes_keep_equal_errno_distinct_and_unknown_status_separate() {
+    let identity = MountTeardownError::UnmountIdentity;
+    let busy = MountTeardownError::UnmountBusy(io::Error::from_raw_os_error(libc::EBUSY));
+    assert_eq!(identity.class(), MountTeardownClass::IdentityOrProbe);
+    assert_eq!(busy.class(), MountTeardownClass::MatchedIdBusy);
+    assert_eq!(
+        MountTeardownError::UnmountProbe(io::Error::from_raw_os_error(libc::EIO)).class(),
+        MountTeardownClass::IdentityOrProbe
+    );
+    assert_eq!(
+        MountTeardownError::UnmountOther(io::Error::from_raw_os_error(libc::EACCES)).class(),
+        MountTeardownClass::OtherUnmount
+    );
+    assert_eq!(MountTeardownError::ActorJoinPanicked.class(), MountTeardownClass::JoinOrState);
+    assert_eq!(MountTeardownError::SessionJoinAlreadyFailed.class(), MountTeardownClass::JoinOrState);
+}
+
+#[test]
+fn classified_teardown_keeps_the_borrowed_owner_contract() {
+    fn classified(handle: &mut MountHandle) -> Result<(), MountTeardownClass> {
+        handle.teardown_owned_classified()
+    }
+    let _: for<'a> fn(&'a mut MountHandle) -> Result<(), MountTeardownClass> = classified;
+}
