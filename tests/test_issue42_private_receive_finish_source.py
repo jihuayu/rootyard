@@ -95,8 +95,8 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
             "async fn mirror_public_terminal_with_request(",
             "/// The one terminal produced",
         )
-        self.assertIn("lock_public_attempt(&**tx, public_request, record.identity().operation_id()", mirror)
-        self.assertIn("lookup_public_attempt_finish(&**tx, public_request, deadline)", mirror)
+        self.assertIn("lock_public_attempt(&tx, public_request, record.identity().operation_id()", mirror)
+        self.assertIn("lookup_public_attempt_finish(&tx, public_request, deadline)", mirror)
         self.assertIn("found.wrapper_state == OperationState::Pending", mirror)
         self.assertIn("crate::ref_store::serving::lookup_in_tx(", mirror)
         self.assertIn("fresh.gate.repository_id() != public_request.repository_id", mirror)
@@ -114,6 +114,14 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertNotIn("loop {", mirror)
         self.assertNotIn("private_id", mirror)
         self.assertNotIn("format!(", mirror)
+        self.assertNotIn("&**tx", mirror, "the owned mirror transaction must use &tx deref coercion")
+        preflight = slice_between(
+            self.publish,
+            "async fn slot_zero_public_preflight(",
+            "/// One fresh slot-zero admission transaction",
+        )
+        self.assertIn("lock_public_attempt(&**tx", preflight)
+        self.assertIn("lookup_in_tx(&**tx", preflight)
 
     def test_private_fresh_entry_selects_begin_slot_zero_and_never_the_legacy_writer(self):
         private = slice_between(

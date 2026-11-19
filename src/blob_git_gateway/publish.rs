@@ -753,12 +753,12 @@ async fn mirror_public_terminal_with_request(
         Err(_) => return Err(GatewayError::Timeout),
     };
     if let Err(error) =
-        PgRefStore.lock_public_attempt(&**tx, public_request, record.identity().operation_id(), deadline).await
+        PgRefStore.lock_public_attempt(&tx, public_request, record.identity().operation_id(), deadline).await
     {
         let _ = rollback_deadpool_bounded(tx, deadline).await;
         return Err(GatewayError::from(error));
     }
-    let may_mutate = match PgRefStore.lookup_public_attempt_finish(&**tx, public_request, deadline).await {
+    let may_mutate = match PgRefStore.lookup_public_attempt_finish(&tx, public_request, deadline).await {
         Ok(PublicAttemptFinishLookup::Evidence(found)) => found.wrapper_state == OperationState::Pending,
         Ok(_) => false,
         Err(error) => {
@@ -800,7 +800,7 @@ async fn mirror_public_terminal_with_request(
     }
     let mirrored = timeout_at(
         deadline,
-        PgRefStore.mirror_public_attempt_terminal_in_tx(&**tx, public_request, record, deadline),
+        PgRefStore.mirror_public_attempt_terminal_in_tx(&tx, public_request, record, deadline),
     )
     .await;
     let outcome = match mirrored {
