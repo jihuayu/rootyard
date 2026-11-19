@@ -76,6 +76,22 @@ async fn issue_inner(
     input: Issue,
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
+    // `pg_refstore` jobs are issued by the S4 producer: the retained root, the
+    // pin, the job and its closure grant commit in one transaction.
+    if crate::ci_pins::s4_pin::refstore_repository(&state, &owner, &name)
+        .await?
+        .is_some()
+    {
+        let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+        let s4 = crate::ci_pins::s4_checkout::IssueInput {
+            job_id: input.job_id,
+            target_oid: input.target_oid,
+            storage_generation: input.storage_generation,
+            mirror_audience: input.mirror_audience,
+            expires_unix: input.expires_unix,
+        };
+        return crate::ci_pins::s4_checkout::issue(&state, &actor, &owner, &name, &s4, deadline).await;
+    }
     let repo = repository(&state, &actor, &owner, &name).await?;
     if !ci_pins::valid_oid(&input.target_oid)
         || input.target_oid.bytes().all(|b|b==b'0')
@@ -231,6 +247,14 @@ async fn terminal(
     cancel: bool,
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
+    if crate::ci_pins::s4_pin::refstore_repository(&state, &owner, &name)
+        .await?
+        .is_some()
+    {
+        let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+        return crate::ci_pins::s4_checkout::terminal(&state, &actor, &owner, &name, job, cancel, deadline)
+            .await;
+    }
     let repo = repository(&state, &actor, &owner, &name).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
