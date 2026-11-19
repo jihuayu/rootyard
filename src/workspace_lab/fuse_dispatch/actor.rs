@@ -197,7 +197,5 @@ pub(super) fn spawn(
     pool: &'static ReadPool,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let actor = Actor { overlay, shared, gate, pool };
-    std::thread::Builder::new()
-        .name("rootyard-fuse-actor".into())
-        .spawn(move || actor.run())
+    std::thread::Builder::new().name("rootyard-fuse-actor".into()).spawn(move || actor.run())
 }
