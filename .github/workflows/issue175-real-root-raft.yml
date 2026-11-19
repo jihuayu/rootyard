@@ -1,0 +1,164 @@
+name: Real Root Raft backend (#175)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/issue175-real-root-raft.yml'
+      - 'tests/ref_store_real_raft_backend.rs'
+      - 'tests/scope_drain_support/**'
+      - 'tests/test_run_root_raft_backend_tests.py'
+      - 'scripts/run_root_raft_backend_tests.py'
+      - 'src/ref_store/raft_backend.rs'
+      - 'src/ref_store/raft_backend/**'
+      - 'src/ref_store/core/state_machine.rs'
+      - 'src/ref_store/core/state_machine/**'
+      - 'crates/refcas-log/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/build_native_test.py'
+      - 'scripts/build_native.py'
+      - 'scripts/native_artifact_store.py'
+      - 'scripts/native_build_receipt.py'
+      - 'scripts/native_report_manifest.py'
+      - 'scripts/install_ci_cargo_fork.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue175-real-root-raft-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real-root-raft:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install native prerequisites (OpenSSL, build and mTLS fixture tools)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates openssl libssl-dev pkg-config git build-essential \
+            libfuse3-dev fuse3 cmake clang
+          git --version
+          openssl version
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/issue175-real-root-raft/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: issue175-real-root-raft
+          workspaces: ". -> target"
+      - name: Verify formatting and strict clippy
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_PROFILE_TEST_DEBUG: '0'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --test ref_store_real_raft_backend -- -D warnings
+      - name: Build the exact relocated root raft integration test
+        timeout-minutes: 20
+        run: |
+          mkdir -p test-results/issue175-real-root-raft
+          python3 scripts/build_native_test.py \
+            --test ref_store_real_raft_backend \
+            --package-debug 0 \
+            --strip-debuginfo \
+            --artifact-store "$RUNNER_TEMP/rootyard-native-artifacts" \
+            --output test-results/issue175-real-root-raft/ref_store_real_raft_backend \
+            > test-results/issue175-real-root-raft/build-summary.json
+          test -s test-results/issue175-real-root-raft/ref_store_real_raft_backend
+          test -s test-results/issue175-real-root-raft/ref_store_real_raft_backend.build.json
+      - name: Run the exact root raft integration test once
+        timeout-minutes: 15
+        run: |
+          python3 scripts/run_root_raft_backend_tests.py \
+            --test-binary test-results/issue175-real-root-raft/ref_store_real_raft_backend \
+            --build-receipt test-results/issue175-real-root-raft/ref_store_real_raft_backend.build.json \
+            --report test-results/issue175-real-root-raft/root-raft-report.json \
+            --expected-commit "$GITHUB_SHA" \
+            --timeout-seconds 900
+      - name: Bind the sanitized report and source harnesses
+        if: always()
+        run: |
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/issue175-real-root-raft/native-job-manifest.json \
+            --build-receipt test-results/issue175-real-root-raft/ref_store_real_raft_backend.build.json \
+            --binary test-results/issue175-real-root-raft/ref_store_real_raft_backend \
+            --expect-commit "$GITHUB_SHA" \
+            --report root_raft=test-results/issue175-real-root-raft/root-raft-report.json \
+            --require-case root_raft=real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart \
+            --require-case root_raft=pruned_receipts_export_restore_and_sqlite_reopen \
+            --require-case root_raft=scope_drain_support::privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete \
+            --harness .github/workflows/issue175-real-root-raft.yml \
+            --harness scripts/run_root_raft_backend_tests.py \
+            --harness tests/test_run_root_raft_backend_tests.py \
+            --harness tests/ref_store_real_raft_backend.rs \
+            --harness tests/scope_drain_support/mod.rs \
+            --harness tests/scope_drain_support/failure_phase.rs \
+            --harness tests/scope_drain_support/quorum_diagnostic.rs \
+            --harness src/ref_store/raft_backend.rs \
+            --harness src/ref_store/raft_backend/node.rs \
+            --harness src/ref_store/raft_backend/reducer.rs \
+            --harness src/ref_store/raft_backend/backend/cause.rs \
+            --harness src/ref_store/core/state_machine.rs \
+            --harness crates/refcas-log/src/lib.rs \
+            --harness crates/refcas-log/src/cluster.rs \
+            --harness crates/refcas-log/src/mtls.rs \
+            --harness crates/refcas-log/src/state_machine.rs \
+            --harness Cargo.toml \
+            --harness Cargo.lock \
+            --harness rust-toolchain.toml \
+            --harness scripts/build_native_test.py \
+            --harness scripts/build_native.py \
+            --harness scripts/native_artifact_store.py \
+            --harness scripts/native_build_receipt.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/install_ci_cargo_fork.sh
+      - name: Upload sanitized root raft evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue175-real-root-raft-evidence
+          path: |
+            test-results/issue175-real-root-raft/ref_store_real_raft_backend
+            test-results/issue175-real-root-raft/ref_store_real_raft_backend.build.json
+            test-results/issue175-real-root-raft/root-raft-report.json
+            test-results/issue175-real-root-raft/native-job-manifest.json
+            test-results/issue175-real-root-raft/cargo-fork.json
+          if-no-files-found: ignore

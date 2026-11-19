@@ -76,6 +76,8 @@ impl MtlsServer {
     }
 
     async fn accept_tls_leaf(&self, stream: TcpStream) -> io::Result<(server::TlsStream<TcpStream>, Vec<u8>)> {
+        // Latency-sensitive RPC frames are small; avoid Nagle coalescing delays before the handshake.
+        stream.set_nodelay(true)?;
         let tls = self.acceptor.accept(stream).await?;
         let leaf_der = {
             let certs = tls
@@ -138,6 +140,8 @@ impl MtlsClient {
         let server_name = ServerName::try_from(expected_dns.to_owned())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid DNS server name: {e}")))?;
         let tcp = TcpStream::connect(addr).await?;
+        // Latency-sensitive RPC frames are small; avoid Nagle coalescing delays before the handshake.
+        tcp.set_nodelay(true)?;
         TlsConnector::from(self.config.clone()).connect(server_name, tcp).await
     }
 
@@ -274,6 +278,9 @@ mod tests {
                             PeerIdentity::Node(i) => format!("node:{i}"),
                             PeerIdentity::Client => "client".to_owned(),
                         };
+                        let nodelay =
+                            tls.get_ref().0.nodelay().expect("accepted mTLS TCP stream must expose TCP_NODELAY");
+                        let tag = format!("{tag} nodelay={nodelay}");
                         let _ = tls.write_all(tag.as_bytes()).await;
                         let _ = tls.shutdown().await;
                     }
@@ -284,16 +291,24 @@ mod tests {
         // 1. Valid peer node-2 -> node-1
         let c_n2 = MtlsClient::from_paths(&n2).unwrap();
         let mut s = c_n2.connect_peer(&addr, 1).await.unwrap();
+        assert!(
+            s.get_ref().0.nodelay().expect("query client TCP_NODELAY"),
+            "outbound mTLS TCP stream must enable TCP_NODELAY"
+        );
         let mut buf = String::new();
         s.read_to_string(&mut buf).await.unwrap();
-        assert_eq!(buf, "node:2");
+        assert_eq!(buf, "node:2 nodelay=true");
 
         // 2. Valid client -> node-1
         let c_cli = MtlsClient::from_paths(&cli).unwrap();
         let mut s = c_cli.connect_peer(&addr, 1).await.unwrap();
+        assert!(
+            s.get_ref().0.nodelay().expect("query client TCP_NODELAY"),
+            "outbound mTLS TCP stream must enable TCP_NODELAY"
+        );
         buf.clear();
         s.read_to_string(&mut buf).await.unwrap();
-        assert_eq!(buf, "client");
+        assert_eq!(buf, "client nodelay=true");
 
         // 3. Wrong expected server identity (node-1 cert cannot validate as node-2)
         assert!(c_n2.connect_peer(&addr, 2).await.is_err());

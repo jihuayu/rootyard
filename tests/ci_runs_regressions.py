@@ -2,12 +2,56 @@
 """Native PostgreSQL/HTTP tests for trusted CI run claims and stale evidence."""
 import argparse
 import json
+import subprocess
+import urllib.parse
 import uuid
 from pathlib import Path
 import sys
 import time
 
 from webhooks import WebhooksHarness
+
+
+def _remaining_seconds(deadline, now=None):
+    return max(0.0, deadline - (time.monotonic() if now is None else now))
+
+
+def _statement_timeout_ms(deadline, now=None):
+    remaining = _remaining_seconds(deadline, now)
+    return 0 if remaining <= 0 else max(1, int(remaining * 1000))
+
+
+def _scoped_dsn(base_db, timeout_ms):
+    if timeout_ms <= 0:
+        raise ValueError("timeout budget must be positive")
+    parts = urllib.parse.urlsplit(base_db)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    options = [value for key, value in query if key == "options"]
+    if len(options) != 1 or "search_path" not in options[0]:
+        raise ValueError("isolated DSN must retain an explicit search_path option")
+    merged = (options[0].strip() +
+        f" -c statement_timeout={timeout_ms} -c lock_timeout={timeout_ms}")
+    query = [(key, merged if key == "options" else value) for key, value in query]
+    return urllib.parse.urlunsplit(
+        parts._replace(query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote)))
+
+
+def _receipt(output):
+    lines = [line for line in output.splitlines() if line.startswith("pull-sync-receipt=")]
+    if len(lines) != 1:
+        return None
+    return lines[0].split("=", 1)[1]
+
+
+def _injection_outcome(returncode, output, timed_out=False):
+    if timed_out or returncode != 0:
+        return "fail"
+    receipt = _receipt(output)
+    if receipt == "1,1,1,1,0,0":
+        return "applied"
+    if receipt == "lock_not_available":
+        return "retry_lock"
+    return "fail"
 
 
 def _start_prewarm_trap():
@@ -157,26 +201,179 @@ def main():
         h.git("commit","-am","new candidate",cwd=h.work)
         new_oid=h.git("rev-parse","HEAD",cwd=h.work).stdout.decode().strip()
         h.git("push","origin","HEAD:refs/heads/feature",cwd=h.work,token=h.alice)
-        until=time.monotonic()+15
-        while time.monotonic()<until:
-            new_pr=h.document(f"{h.pullspath}/{pr['number']}")
-            new_runs=h.sql(f"SELECT count(*) FROM ci_runs WHERE repository_id='{pr['repository_id']}' AND head_oid='{new_oid}'")
-            if new_pr["head_oid"]==new_oid and new_runs=="2":break
+        def psql_until(sql, deadline):
+            budget=_statement_timeout_ms(deadline)
+            if budget<=0:
+                return None,"",True
+            try:
+                scoped_db=_scoped_dsn(h.db,budget)
+            except ValueError:
+                return None,"",False
+            env=h.env.copy()
+            env["PGDATABASE"]=scoped_db
+            argv=["psql","-w","--dbname",env["PGDATABASE"],"-X","-v",
+                  "ON_ERROR_STOP=1","-At","-c",sql]
+            remaining=_remaining_seconds(deadline)
+            if remaining<=0:
+                return None,"",True
+            try:
+                p=subprocess.run(argv,env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
+                                 text=True,timeout=remaining)
+            except subprocess.TimeoutExpired:
+                return None,"",True
+            except OSError:
+                return None,"",False
+            return p.returncode,p.stdout,False
+
+        def psql_value(sql, deadline):
+            returncode,stdout,timed_out=psql_until(sql,deadline)
+            if timed_out:
+                raise AssertionError("pull-sync fixture: psql deadline exceeded")
+            if returncode!=0:
+                raise AssertionError("pull-sync fixture: psql failed closed")
+            return stdout.strip()
+
+        # The producer writes the completion marker last. Wait on one snapshot
+        # covering the current tuple, both contexts and the matching marker.
+        def pull_sync_snapshot(deadline):
+            row=psql_value(
+                "SELECT p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation,"
+                "count(r.id),count(r.id) FILTER (WHERE r.context='ci/test'),"
+                "count(r.id) FILTER (WHERE r.context='ci/lint'),"
+                "(SELECT count(*) FROM ci_pull_sync_progress s WHERE s.repository_id=p.repository_id "
+                "AND s.pull_number=p.number AND s.pull_version=p.version AND s.head_oid=p.head_oid "
+                "AND s.base_oid=p.base_oid AND s.storage_generation=repo.storage_generation) "
+                "FROM forge_pulls p JOIN repositories repo ON repo.id=p.repository_id "
+                "LEFT JOIN ci_runs r ON r.repository_id=p.repository_id AND r.pull_number=p.number "
+                "AND r.pull_version=p.version AND r.head_oid=p.head_oid AND r.base_oid=p.base_oid "
+                "AND r.storage_generation=repo.storage_generation "
+                f"WHERE p.repository_id='{pr['repository_id']}' AND p.number={pr['number']} "
+                "GROUP BY p.repository_id,p.number,p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation",
+                deadline)
+            parts=row.split("|")
+            if len(parts)!=9:return "missing_pull",None
+            state,version,head,base,generation,runs,test,lint,marker=parts
+            runs,test,lint,marker=int(runs),int(test),int(lint),int(marker)
+            if state!="open":return "not_open",None
+            if head!=new_oid:return "head_not_advanced",None
+            if runs<2:return "runs_incomplete",None
+            if runs>2:return "runs_extra",None
+            if test!=1:return "test_mismatch",None
+            if lint!=1:return "lint_mismatch",None
+            if marker!=1:return "marker_missing",None
+            return "ready",(version,head,base,int(generation))
+
+        deadline=time.monotonic()+15
+        state,snapshot=None,None
+        while time.monotonic()<deadline:
+            state,snapshot=pull_sync_snapshot(deadline)
+            if state=="ready":break
             time.sleep(.2)
-        assert new_pr["head_oid"]==new_oid,new_pr
-        assert new_runs=="2",new_runs
-        h.sql(f"DELETE FROM ci_runs WHERE repository_id='{pr['repository_id']}' AND "
-              f"pull_number={pr['number']} AND pull_version={new_pr['version']} "
-              "AND context='ci/lint'")
-        h.sql(f"DELETE FROM ci_pull_sync_progress WHERE repository_id='{pr['repository_id']}' "
-              f"AND pull_number={pr['number']} AND pull_version={new_pr['version']}")
-        until=time.monotonic()+15
-        while time.monotonic()<until:
-            repaired=h.sql(f"SELECT count(*) FROM ci_runs WHERE repository_id='{pr['repository_id']}' "
-                f"AND pull_number={pr['number']} AND pull_version={new_pr['version']}")
-            if repaired=="2":break
+        assert state=="ready",state
+        version,head,base,generation=snapshot
+        exact=(f"repository_id='{pr['repository_id']}' AND pull_number={pr['number']} "
+               f"AND pull_version={version} AND head_oid='{head}' AND base_oid='{base}' "
+               f"AND storage_generation={generation}")
+        # Recheck the observed tuple, delete one run and one marker, and prove
+        # the post-delete state in the same transaction before committing.
+        # The exception subtransaction covers lock acquisition only: a 55P03
+        # there is before any delete, while every later error aborts the txn.
+        injection_sql=(
+            "BEGIN; "
+            "DO $rootyard_fixture$ DECLARE tuple_ok int; current_generation bigint; "
+            "retry_lock boolean := false; lint_returned int; marker_returned int; "
+            "lint_deleted bigint; marker_deleted bigint; run_total bigint; test_total bigint; "
+            "lint_total bigint; marker_total bigint; BEGIN "
+            "BEGIN "
+            f"SELECT 1 INTO tuple_ok FROM forge_pulls WHERE repository_id='{pr['repository_id']}' "
+            f"AND number={pr['number']} AND state='open' AND version={version} "
+            f"AND head_oid='{head}' AND base_oid='{base}' FOR UPDATE NOWAIT; "
+            "IF tuple_ok IS NULL THEN RAISE EXCEPTION 'pull-sync fixture: current tuple drifted'; END IF; "
+            f"SELECT storage_generation INTO current_generation FROM repositories "
+            f"WHERE id='{pr['repository_id']}' FOR SHARE NOWAIT; "
+            f"IF current_generation IS DISTINCT FROM {generation} THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: generation drifted'; END IF; "
+            "EXECUTE 'LOCK TABLE ci_runs IN SHARE ROW EXCLUSIVE MODE NOWAIT'; "
+            "EXECUTE 'LOCK TABLE ci_pull_sync_progress IN SHARE ROW EXCLUSIVE MODE NOWAIT'; "
+            "EXCEPTION WHEN lock_not_available THEN retry_lock := true; END; "
+            "IF retry_lock THEN "
+            "PERFORM set_config('rootyard.fixture_pull_sync_receipt','lock_not_available',true); "
+            "ELSE "
+            "SELECT count(*),count(*) FILTER (WHERE context='ci/test'),"
+            f"count(*) FILTER (WHERE context='ci/lint') INTO run_total,test_total,lint_total "
+            f"FROM ci_runs WHERE {exact}; "
+            f"SELECT count(*) INTO marker_total FROM ci_pull_sync_progress WHERE {exact}; "
+            "IF run_total<>2 OR test_total<>1 OR lint_total<>1 OR marker_total<>1 THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: ready state changed'; END IF; "
+            f"DELETE FROM ci_runs WHERE {exact} AND context='ci/lint' RETURNING 1 INTO lint_returned; "
+            "GET DIAGNOSTICS lint_deleted = ROW_COUNT; "
+            "IF lint_deleted<>1 OR lint_returned IS DISTINCT FROM 1 THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: lint delete not exact'; END IF; "
+            f"DELETE FROM ci_pull_sync_progress WHERE {exact} RETURNING 1 INTO marker_returned; "
+            "GET DIAGNOSTICS marker_deleted = ROW_COUNT; "
+            "IF marker_deleted<>1 OR marker_returned IS DISTINCT FROM 1 THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: marker delete not exact'; END IF; "
+            "SELECT count(*),count(*) FILTER (WHERE context='ci/test'),"
+            f"count(*) FILTER (WHERE context='ci/lint') INTO run_total,test_total,lint_total "
+            f"FROM ci_runs WHERE {exact}; "
+            f"SELECT count(*) INTO marker_total FROM ci_pull_sync_progress WHERE {exact}; "
+            "IF run_total<>1 OR test_total<>1 OR lint_total<>0 OR marker_total<>0 THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: post-delete state'; END IF; "
+            "PERFORM set_config('rootyard.fixture_pull_sync_receipt',"
+            "lint_deleted::text||','||marker_deleted::text||','||run_total::text||','||"
+            "test_total::text||','||lint_total::text||','||marker_total::text,true); "
+            "END IF; END $rootyard_fixture$; "
+            "SELECT 'pull-sync-receipt='||current_setting('rootyard.fixture_pull_sync_receipt'); "
+            "COMMIT;")
+
+        # Only the exact pre-delete lock_not_available receipt is retryable,
+        # and only inside the remaining original preparation deadline.
+        def inject_pull_sync(deadline):
+            while True:
+                if _remaining_seconds(deadline)<=0:
+                    raise AssertionError("pull-sync fixture: injection preparation window exhausted")
+                returncode,stdout,timed_out=psql_until(injection_sql,deadline)
+                outcome=_injection_outcome(returncode,stdout,timed_out)
+                if outcome=="applied":return
+                if outcome!="retry_lock":
+                    raise AssertionError("pull-sync fixture: injection failed closed")
+                time.sleep(min(.05,max(0.0,deadline-time.monotonic())))
+
+        inject_pull_sync(deadline)
+
+        def pull_sync_final(deadline):
+            row=psql_value(
+                "SELECT (p.state='open' AND p.version="+str(version)+" AND p.head_oid='"+head+
+                "' AND p.base_oid='"+base+"' AND repo.storage_generation="+str(generation)+")::int,"
+                "count(r.id),count(r.id) FILTER (WHERE r.context='ci/test'),"
+                "count(r.id) FILTER (WHERE r.context='ci/lint'),"
+                "(SELECT count(*) FROM ci_pull_sync_progress s WHERE s.repository_id=p.repository_id "
+                "AND s.pull_number=p.number AND s.pull_version=p.version AND s.head_oid=p.head_oid "
+                "AND s.base_oid=p.base_oid AND s.storage_generation=repo.storage_generation) "
+                "FROM forge_pulls p JOIN repositories repo ON repo.id=p.repository_id "
+                "LEFT JOIN ci_runs r ON r.repository_id=p.repository_id AND r.pull_number=p.number "
+                "AND r.pull_version=p.version AND r.head_oid=p.head_oid AND r.base_oid=p.base_oid "
+                "AND r.storage_generation=repo.storage_generation "
+                f"WHERE p.repository_id='{pr['repository_id']}' AND p.number={pr['number']} "
+                "GROUP BY p.repository_id,p.number,p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation",
+                deadline)
+            parts=row.split("|")
+            if len(parts)!=5:return "missing_pull"
+            identity,total,test,lint,marker=map(int,parts)
+            if identity!=1:return "identity_drift"
+            # A duplicate late writer is surfaced as marker_without_lint, not
+            # assumed away; only the exact restored tuple is accepted.
+            return {(2,1,1,1):"ready",(1,1,0,1):"marker_without_lint",
+                    (2,1,1,0):"runs_without_marker",(1,1,0,0):"awaiting_repair"}.get(
+                        (total,test,lint,marker),"unexpected")
+
+        deadline=time.monotonic()+15
+        state=None
+        while time.monotonic()<deadline:
+            state=pull_sync_final(deadline)
+            if state=="ready":break
             time.sleep(.2)
-        assert repaired=="2",repaired
+        assert state=="ready",state
         print("push reconciles PR candidate and creates new runs: passed",flush=True)
 
         verify_multi_mirror_and_orchestration(h, hook["id"], secret)
