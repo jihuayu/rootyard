@@ -149,7 +149,7 @@ impl CloneKitPublicationStore {
             return Err(CloneKitError::InvalidConfig("publication lock is not a regular file"));
         }
         match FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(PublicationGuard { _file: file }),
+            Ok(()) => Ok(PublicationGuard { file }),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(CloneKitError::GitFailed(
                 "clonekit publication busy: another process holds the repository publication lock".into(),
             )),
@@ -276,7 +276,19 @@ impl CloneKitPublicationStore {
 
 #[derive(Debug)]
 struct PublicationGuard {
-    _file: File,
+    file: File,
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        // A duplicate descriptor sharing this open file description (for example one inherited by a
+        // process forked while the lock is held, before O_CLOEXEC closes it at exec) otherwise keeps
+        // the flock held after this owning descriptor closes. LOCK_UN on the shared description
+        // releases it; the following field close remains the fallback if the best-effort unlock fails.
+        if let Err(error) = FileExt::unlock(&self.file) {
+            eprintln!("rootyard: clonekit publication lock release failed; closing owner as fallback: {error}");
+        }
+    }
 }
 
 struct OwnedAttempt {
