@@ -2,7 +2,7 @@
 """Real external A4 Redis wake, partition and PG-fallback acceptance.
 
 This is an opt-in native acceptance entry point, never part of a generic gate.
-It owns one random PostgreSQL schema, one disposable Redis process, one
+It owns one random PostgreSQL 17 schema, one disposable Redis process, one
 byte-transparent loopback relay, one real ``rootyard serve-blob`` process with
 ``ROOTYARD_A4_WORKER_MODE=external``, and one distinct ``rootyard worker`` in
 ``ROOTYARD_WORKER_SCOPE=a4-target-audit``. Repository creation and every push are
@@ -67,7 +67,7 @@ TARGET_CONSUMER = "audit-log"
 TARGET_REF = "refs/heads/main"
 POLL_SECONDS = 20
 LIMITATIONS = [
-    "This opt-in case requires an exact attested binary, matching clean source commit, loopback PostgreSQL, owned Redis and an owned Garage/S3 profile; it does not run in the generic gate.",
+    "This opt-in case requires an exact attested binary, matching clean source commit, loopback PostgreSQL 17, owned Redis and an owned Garage/S3 profile; it does not run in the generic gate.",
     "Loopback functional timings are not a scalability benchmark.",
     "A cut relay proves advisory Redis loss and PostgreSQL polling repair; it is not kernel, power-loss, Redis HA or multi-host failover evidence.",
     "The fixture uses the real stock Git CLI over Smart HTTP; SSH and non-loopback HTTP are outside this case.",
@@ -770,7 +770,7 @@ def main(argv=None):
     parser.add_argument("--git", help="absolute trusted Git (defaults to ROOTYARD_GIT)")
     parser.add_argument("--expect-commit", required=True, help="exact clean source commit bound to the binary")
     parser.add_argument("--report", type=Path, required=True, help="exact JSON report destination")
-    parser.add_argument("--keep", action="store_true", help="keep owned temporary files; the random schema is still dropped")
+    parser.add_argument("--keep", action="store_true", help="keep temporary files on successful cleanup; failed cleanup retains diagnostics and schema")
     args = parser.parse_args(argv)
     args.binary = str(args.binary.resolve())
 
