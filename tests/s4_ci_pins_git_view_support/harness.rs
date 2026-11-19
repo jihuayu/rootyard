@@ -416,11 +416,10 @@ impl Cluster {
                 "source_ref": source_ref,
                 "message": "reverse fixture merge",
             }))
-            .send()
-            .await?;
+            .send().await.map_err(|_| anyhow!("reverse_changeset failure class=transport"))?;
         let status = response.status();
         ensure!(status.is_success(), "reverse_changeset failure http_status={}", status.as_u16());
-        response.json().await.context("reverse fixture returned invalid JSON")
+        response.json().await.map_err(|_| anyhow!("reverse_changeset failure class=json"))
     }
 
     pub async fn post_json(&self, url: &str, token: &str, body: Value) -> Result<Value> {

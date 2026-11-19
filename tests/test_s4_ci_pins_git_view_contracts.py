@@ -399,10 +399,21 @@ class SourceContracts(unittest.TestCase):
         reverse = harness.split("pub async fn reverse", 1)[1].split("pub async fn post_json", 1)[0]
         self.assertIn("reverse_changeset failure http_status={}", reverse)
         self.assertIn("status.as_u16()", reverse)
+        self.assertIn('map_err(|_| anyhow!("reverse_changeset failure class=transport"))?', reverse)
+        self.assertIn('map_err(|_| anyhow!("reverse_changeset failure class=json"))', reverse)
+        self.assertNotIn("send().await?", reverse)
+        self.assertNotIn(".context(", reverse)
         self.assertNotIn("post_json(", reverse)
         self.assertNotIn("{url}", reverse)
         self.assertNotIn("{value}", reverse)
-        self.assertIn("response.json().await.context", reverse)
+
+        fixture = text(TESTS / "s4_ci_pins_git_view.rs")
+        self.assertEqual(fixture.count('changeset["state"].as_str() == Some("complete")'), 2)
+        self.assertIn('"reverse_changeset failure class=state sha1"', fixture)
+        self.assertIn('"reverse_changeset failure class=state sha256"', fixture)
+        self.assertNotIn('"reverse merge did not complete: {changeset}"', fixture)
+        self.assertNotIn('"SHA-256 reverse merge incomplete: {changeset}"', fixture)
+        self.assertNotIn("{changeset}", fixture)
 
     def test_hold_regressions_cover_the_two_review_items(self) -> None:
         body = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")

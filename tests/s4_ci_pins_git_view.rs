@@ -414,7 +414,7 @@ async fn s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree() -
         cluster.git.commit(&tree, "b.txt", "after reverse\n", "reverse fixture merge").await?;
         let proposal = proposal_bundle(&cluster, &tree).await?;
         let changeset = cluster.reverse(&view, &proposal, "refs/heads/main").await?;
-        ensure!(changeset["state"].as_str() == Some("complete"), "reverse merge did not complete: {changeset}");
+        ensure!(changeset["state"].as_str() == Some("complete"), "reverse_changeset failure class=state sha1");
 
         let source = cluster.clone_source(&repo).await?;
         let merged = std::fs::read_to_string(source.join("dir/b.txt"))?;
@@ -454,7 +454,7 @@ async fn s4_sha256_pin_clone_and_reverse_round_trip() -> Result<()> {
         cluster.git.commit(&tree, "note.txt", "sha256 after\n", "sha256 reverse").await?;
         let proposal = proposal_bundle(&cluster, &tree).await?;
         let changeset = cluster.reverse(&view, &proposal, "refs/heads/main").await?;
-        ensure!(changeset["state"].as_str() == Some("complete"), "SHA-256 reverse merge incomplete: {changeset}");
+        ensure!(changeset["state"].as_str() == Some("complete"), "reverse_changeset failure class=state sha256");
 
         let source = cluster.clone_source(&repo).await?;
         ensure!(std::fs::read_to_string(source.join("note.txt"))? == "sha256 after\n", "SHA-256 source not merged");
