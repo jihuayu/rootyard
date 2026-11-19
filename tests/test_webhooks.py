@@ -806,6 +806,63 @@ class WebhooksTrackAContractTest(unittest.TestCase):
         for tok in ("failover", "ci-mirrors", "requeue_only", "wait_for_ready_ms", "X-Rootyard-CI-State"):
             self.assertIn(tok, reg_src, f"ci_runs_regressions.py missing coverage for {tok}")
 
+    def test_ci_runs_pull_sync_repair_window_is_bounded(self):
+        src = (ROOT / "tests/ci_runs_regressions.py").read_text(encoding="utf-8")
+        ast.parse(src)
+        start = src.index('new_oid=h.git("rev-parse"')
+        end = src.index('print("push reconciles PR candidate and creates new runs: passed"', start)
+        block = src[start:end]
+        self.assertEqual(block.count("time.monotonic()+15"), 2)
+        self.assertEqual(block.count("h.sql("), 3, "one pre-delete snapshot, one injection, one final proof")
+        self.assertEqual(block.count("FROM forge_pulls p JOIN repositories repo"), 2)
+        self.assertEqual(block.count("DELETE FROM ci_runs"), 1)
+        self.assertEqual(block.count("DELETE FROM ci_pull_sync_progress"), 1)
+        self.assertIn("BEGIN; ", block)
+        self.assertIn("COMMIT;", block)
+        self.assertIn("LOCK TABLE ci_runs IN SHARE ROW EXCLUSIVE MODE NOWAIT", block)
+        self.assertIn("LOCK TABLE ci_pull_sync_progress IN SHARE ROW EXCLUSIVE MODE NOWAIT", block)
+        self.assertIn("FOR UPDATE", block)
+        self.assertIn("FOR SHARE", block)
+        self.assertIn("RETURNING 1 INTO lint_returned", block)
+        self.assertIn("RETURNING 1 INTO marker_returned", block)
+        self.assertIn("GET DIAGNOSTICS lint_deleted = ROW_COUNT", block)
+        self.assertIn("GET DIAGNOSTICS marker_deleted = ROW_COUNT", block)
+        self.assertGreaterEqual(block.count("RAISE EXCEPTION 'pull-sync fixture:"), 5)
+        self.assertIn("IF run_total<>2 OR test_total<>1 OR lint_total<>1 OR marker_total<>1", block)
+        self.assertIn("IF run_total<>1 OR test_total<>1 OR lint_total<>0 OR marker_total<>0", block)
+        self.assertIn("pull-sync-receipt=1,1,1,1,0,0", block)
+        self.assertIn("current_setting('rootyard.fixture_pull_sync_receipt')", block)
+        self.assertIn('"marker_without_lint"', block)
+        self.assertIn('"runs_without_marker"', block)
+        self.assertIn('"marker_missing"', block)
+        self.assertNotIn('if new_runs=="2" and marker_count=="1":break', block)
+        self.assertNotIn("new_runs=h.sql", block)
+        self.assertNotIn("marker_count=h.sql", block)
+        self.assertNotIn("WITH removed_run AS (DELETE FROM ci_runs WHERE", block)
+        self.assertNotIn('h.sql(f"DELETE FROM ci_runs WHERE repository_id', block)
+        self.assertNotIn('h.sql(f"DELETE FROM ci_pull_sync_progress WHERE repository_id', block)
+        self.assertLess(block.index("pull_sync_snapshot"), block.index("injected=h.sql("))
+        self.assertLess(block.index("injected=h.sql("), block.index("pull_sync_final"))
+        self.assertLess(block.index("BEGIN; "), block.index("DELETE FROM ci_runs"))
+        self.assertLess(block.index("DELETE FROM ci_runs"), block.index("COMMIT;"))
+        self.assertLess(
+            block.index("RETURNING 1 INTO lint_returned"),
+            block.index("GET DIAGNOSTICS lint_deleted = ROW_COUNT"),
+        )
+        self.assertLess(
+            block.index("GET DIAGNOSTICS marker_deleted = ROW_COUNT"),
+            block.index("IF run_total<>1 OR test_total<>1 OR lint_total<>0 OR marker_total<>0"),
+        )
+        delivery = (ROOT / "src/webhooks/delivery.rs").read_text(encoding="utf-8")
+        start = delivery.index("pub async fn on_pull_synchronized")
+        end = delivery.index("pub async fn orchestrate_pull_ci", start)
+        producer = delivery[start:end]
+        self.assertEqual(producer.count("INSERT INTO ci_pull_sync_progress"), 1)
+        marker = producer.index("INSERT INTO ci_pull_sync_progress")
+        self.assertGreater(marker, producer.index("INSERT INTO ci_runs"))
+        self.assertGreater(marker, producer.index("reconcile_on_pull_sync"))
+        self.assertGreater(marker, producer.index("enqueue_webhook_delivery"))
+
 
 if __name__ == "__main__":
     unittest.main()

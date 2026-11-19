@@ -157,26 +157,125 @@ def main():
         h.git("commit","-am","new candidate",cwd=h.work)
         new_oid=h.git("rev-parse","HEAD",cwd=h.work).stdout.decode().strip()
         h.git("push","origin","HEAD:refs/heads/feature",cwd=h.work,token=h.alice)
+        # The producer writes the completion marker last. Wait on one snapshot
+        # covering the current tuple, both contexts and the matching marker.
+        def pull_sync_snapshot():
+            row=h.sql(
+                "SELECT p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation,"
+                "count(r.id),count(r.id) FILTER (WHERE r.context='ci/test'),"
+                "count(r.id) FILTER (WHERE r.context='ci/lint'),"
+                "(SELECT count(*) FROM ci_pull_sync_progress s WHERE s.repository_id=p.repository_id "
+                "AND s.pull_number=p.number AND s.pull_version=p.version AND s.head_oid=p.head_oid "
+                "AND s.base_oid=p.base_oid AND s.storage_generation=repo.storage_generation) "
+                "FROM forge_pulls p JOIN repositories repo ON repo.id=p.repository_id "
+                "LEFT JOIN ci_runs r ON r.repository_id=p.repository_id AND r.pull_number=p.number "
+                "AND r.pull_version=p.version AND r.head_oid=p.head_oid AND r.base_oid=p.base_oid "
+                "AND r.storage_generation=repo.storage_generation "
+                f"WHERE p.repository_id='{pr['repository_id']}' AND p.number={pr['number']} "
+                "GROUP BY p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation")
+            parts=row.split("|")
+            if len(parts)!=9:return "missing_pull",None
+            state,version,head,base,generation,runs,test,lint,marker=parts
+            runs,test,lint,marker=int(runs),int(test),int(lint),int(marker)
+            if state!="open":return "not_open",None
+            if head!=new_oid:return "head_not_advanced",None
+            if runs<2:return "runs_incomplete",None
+            if runs>2:return "runs_extra",None
+            if test!=1:return "test_mismatch",None
+            if lint!=1:return "lint_mismatch",None
+            if marker!=1:return "marker_missing",None
+            return "ready",(version,head,base,int(generation))
+
         until=time.monotonic()+15
+        state,snapshot=None,None
         while time.monotonic()<until:
-            new_pr=h.document(f"{h.pullspath}/{pr['number']}")
-            new_runs=h.sql(f"SELECT count(*) FROM ci_runs WHERE repository_id='{pr['repository_id']}' AND head_oid='{new_oid}'")
-            if new_pr["head_oid"]==new_oid and new_runs=="2":break
+            state,snapshot=pull_sync_snapshot()
+            if state=="ready":break
             time.sleep(.2)
-        assert new_pr["head_oid"]==new_oid,new_pr
-        assert new_runs=="2",new_runs
-        h.sql(f"DELETE FROM ci_runs WHERE repository_id='{pr['repository_id']}' AND "
-              f"pull_number={pr['number']} AND pull_version={new_pr['version']} "
-              "AND context='ci/lint'")
-        h.sql(f"DELETE FROM ci_pull_sync_progress WHERE repository_id='{pr['repository_id']}' "
-              f"AND pull_number={pr['number']} AND pull_version={new_pr['version']}")
+        assert state=="ready",state
+        version,head,base,generation=snapshot
+        exact=(f"repository_id='{pr['repository_id']}' AND pull_number={pr['number']} "
+               f"AND pull_version={version} AND head_oid='{head}' AND base_oid='{base}' "
+               f"AND storage_generation={generation}")
+        # Recheck the observed tuple, delete one run and one marker, and prove
+        # the post-delete state in the same transaction before committing.
+        injected=h.sql(
+            "BEGIN; "
+            "DO $rootyard_fixture$ DECLARE tuple_ok int; current_generation bigint; "
+            "lint_returned int; marker_returned int; lint_deleted bigint; marker_deleted bigint; "
+            "run_total bigint; test_total bigint; lint_total bigint; marker_total bigint; BEGIN "
+            f"SELECT 1 INTO tuple_ok FROM forge_pulls WHERE repository_id='{pr['repository_id']}' "
+            f"AND number={pr['number']} AND state='open' AND version={version} "
+            f"AND head_oid='{head}' AND base_oid='{base}' FOR UPDATE; "
+            "IF tuple_ok IS NULL THEN RAISE EXCEPTION 'pull-sync fixture: current tuple drifted'; END IF; "
+            f"SELECT storage_generation INTO current_generation FROM repositories "
+            f"WHERE id='{pr['repository_id']}' FOR SHARE; "
+            f"IF current_generation IS DISTINCT FROM {generation} THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: generation drifted'; END IF; "
+            "EXECUTE 'LOCK TABLE ci_runs IN SHARE ROW EXCLUSIVE MODE NOWAIT'; "
+            "EXECUTE 'LOCK TABLE ci_pull_sync_progress IN SHARE ROW EXCLUSIVE MODE NOWAIT'; "
+            "SELECT count(*),count(*) FILTER (WHERE context='ci/test'),"
+            f"count(*) FILTER (WHERE context='ci/lint') INTO run_total,test_total,lint_total "
+            f"FROM ci_runs WHERE {exact}; "
+            f"SELECT count(*) INTO marker_total FROM ci_pull_sync_progress WHERE {exact}; "
+            "IF run_total<>2 OR test_total<>1 OR lint_total<>1 OR marker_total<>1 THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: ready state changed'; END IF; "
+            f"DELETE FROM ci_runs WHERE {exact} AND context='ci/lint' RETURNING 1 INTO lint_returned; "
+            "GET DIAGNOSTICS lint_deleted = ROW_COUNT; "
+            "IF lint_deleted<>1 OR lint_returned IS DISTINCT FROM 1 THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: lint delete not exact'; END IF; "
+            f"DELETE FROM ci_pull_sync_progress WHERE {exact} RETURNING 1 INTO marker_returned; "
+            "GET DIAGNOSTICS marker_deleted = ROW_COUNT; "
+            "IF marker_deleted<>1 OR marker_returned IS DISTINCT FROM 1 THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: marker delete not exact'; END IF; "
+            "SELECT count(*),count(*) FILTER (WHERE context='ci/test'),"
+            f"count(*) FILTER (WHERE context='ci/lint') INTO run_total,test_total,lint_total "
+            f"FROM ci_runs WHERE {exact}; "
+            f"SELECT count(*) INTO marker_total FROM ci_pull_sync_progress WHERE {exact}; "
+            "IF run_total<>1 OR test_total<>1 OR lint_total<>0 OR marker_total<>0 THEN "
+            "RAISE EXCEPTION 'pull-sync fixture: post-delete state'; END IF; "
+            "PERFORM set_config('rootyard.fixture_pull_sync_receipt',"
+            "lint_deleted::text||','||marker_deleted::text||','||run_total::text||','||"
+            "test_total::text||','||lint_total::text||','||marker_total::text,true); "
+            "END $rootyard_fixture$; "
+            "SELECT 'pull-sync-receipt='||current_setting('rootyard.fixture_pull_sync_receipt'); "
+            "COMMIT;")
+        receipts=[line for line in injected.splitlines() if line.startswith("pull-sync-receipt=")]
+        assert len(receipts)==1,"pull-sync injection receipt missing"
+        assert receipts[0]=="pull-sync-receipt=1,1,1,1,0,0","unexpected pull-sync injection receipt"
+
+        def pull_sync_final():
+            row=h.sql(
+                "SELECT (p.state='open' AND p.version="+str(version)+" AND p.head_oid='"+head+
+                "' AND p.base_oid='"+base+"' AND repo.storage_generation="+str(generation)+")::int,"
+                "count(r.id),count(r.id) FILTER (WHERE r.context='ci/test'),"
+                "count(r.id) FILTER (WHERE r.context='ci/lint'),"
+                "(SELECT count(*) FROM ci_pull_sync_progress s WHERE s.repository_id=p.repository_id "
+                "AND s.pull_number=p.number AND s.pull_version=p.version AND s.head_oid=p.head_oid "
+                "AND s.base_oid=p.base_oid AND s.storage_generation=repo.storage_generation) "
+                "FROM forge_pulls p JOIN repositories repo ON repo.id=p.repository_id "
+                "LEFT JOIN ci_runs r ON r.repository_id=p.repository_id AND r.pull_number=p.number "
+                "AND r.pull_version=p.version AND r.head_oid=p.head_oid AND r.base_oid=p.base_oid "
+                "AND r.storage_generation=repo.storage_generation "
+                f"WHERE p.repository_id='{pr['repository_id']}' AND p.number={pr['number']} "
+                "GROUP BY p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation")
+            parts=row.split("|")
+            if len(parts)!=5:return "missing_pull"
+            identity,total,test,lint,marker=map(int,parts)
+            if identity!=1:return "identity_drift"
+            # A duplicate late writer is surfaced as marker_without_lint, not
+            # assumed away; only the exact restored tuple is accepted.
+            return {(2,1,1,1):"ready",(1,1,0,1):"marker_without_lint",
+                    (2,1,1,0):"runs_without_marker",(1,1,0,0):"awaiting_repair"}.get(
+                        (total,test,lint,marker),"unexpected")
+
         until=time.monotonic()+15
+        state=None
         while time.monotonic()<until:
-            repaired=h.sql(f"SELECT count(*) FROM ci_runs WHERE repository_id='{pr['repository_id']}' "
-                f"AND pull_number={pr['number']} AND pull_version={new_pr['version']}")
-            if repaired=="2":break
+            state=pull_sync_final()
+            if state=="ready":break
             time.sleep(.2)
-        assert repaired=="2",repaired
+        assert state=="ready",state
         print("push reconciles PR candidate and creates new runs: passed",flush=True)
 
         verify_multi_mirror_and_orchestration(h, hook["id"], secret)
