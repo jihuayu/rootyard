@@ -21,7 +21,6 @@ import sys
 import tempfile
 import textwrap
 import threading
-import time
 import types
 import unittest
 from unittest import mock
@@ -476,27 +475,88 @@ class PeriodicDiagnosticsTest(unittest.TestCase):
             f_back=back,
         )
 
-    def test_snapshot_uses_basenames_and_omits_hostile_tokens(self) -> None:
-        hostile = self.frame(
-            "/private/secret/leak\nname.py",
-            "bad\nfunction",
-            "not-a-line",
+    @staticmethod
+    def scripted_stop(results: list[bool]):
+        class ScriptedStop:
+            def __init__(self) -> None:
+                self.results = list(results)
+                self.wait_calls = 0
+                self.set_called = False
+
+            def wait(self, interval: float) -> bool:
+                self.wait_calls += 1
+                if not self.results:
+                    return True
+                return self.results.pop(0)
+
+            def set(self) -> None:
+                self.set_called = True
+
+        return ScriptedStop()
+
+    def test_trusted_source_requires_repo_or_stdlib_and_bounded_components(
+        self,
+    ) -> None:
+        self.assertEqual(
+            runner._trusted_source_basename(str(ROOT / "tests" / "x.py")),
+            "x.py",
         )
-        allowed = self.frame(
-            "/private/secret/allowed_module.py",
+        self.assertEqual(
+            runner._trusted_source_basename(os.__file__),
+            os.path.basename(os.__file__),
+        )
+        self.assertIsNone(
+            runner._trusted_source_basename("/private/secret/x.py")
+        )
+        self.assertIsNone(
+            runner._trusted_source_basename(str(ROOT / ".." / "outside.py"))
+        )
+        deep = ROOT.joinpath(
+            *(["d"] * (runner.DIAGNOSTIC_MAX_PATH_COMPONENTS + 1)), "x.py"
+        )
+        self.assertIsNone(runner._trusted_source_basename(str(deep)))
+        long_component = "x" * (
+            runner.DIAGNOSTIC_MAX_PATH_COMPONENT_LENGTH + 1
+        )
+        self.assertIsNone(
+            runner._trusted_source_basename(
+                str(ROOT / long_component / "x.py")
+            )
+        )
+
+    def test_snapshot_emits_names_only_from_trusted_roots(self) -> None:
+        trusted = str(ROOT / "tests" / "allowed_module.py")
+        unknown = self.frame(
+            "/private/secret/leak\nname.py",
             "AllowedClass.test_case",
-            7,
-            back=hostile,
+            9,
+        )
+        hostile_function = self.frame(
+            trusted, "bad\nfunction", 8, back=unknown
+        )
+        hostile_line = self.frame(
+            trusted,
+            "AllowedClass.test_case",
+            "not-a-line",
+            back=hostile_function,
+        )
+        stdlib = self.frame(os.__file__, "stat", 11, back=hostile_line)
+        allowed = self.frame(
+            trusted, "AllowedClass.test_case", 7, back=stdlib
         )
         watchdog = runner._PeriodicDiagnostics(
             120, io.StringIO(), frames_snapshot=lambda: {12345: allowed}
         )
         payload = watchdog.render().decode("ascii")
         self.assertIn('file="allowed_module.py"', payload)
+        self.assertIn(f'file="{os.path.basename(os.__file__)}"', payload)
         self.assertIn("line=7", payload)
+        self.assertIn("line=11", payload)
         self.assertIn("function=AllowedClass.test_case", payload)
+        self.assertIn("function=stat", payload)
         self.assertIn("function=<omitted>", payload)
         self.assertIn("line=0", payload)
+        self.assertIn('file="<omitted>"', payload)
         for forbidden in (
             "/private/secret",
             "leak",
@@ -526,11 +586,17 @@ class PeriodicDiagnosticsTest(unittest.TestCase):
             )
 
     def test_snapshot_bounds_threads_frames_and_bytes(self) -> None:
-        frame = self.frame("module.py", "work", 1)
-        frames = {
-            ident: frame
-            for ident in range(1, runner.DIAGNOSTIC_MAX_THREADS + 6)
-        }
+        frame = self.frame(str(ROOT / "module.py"), "work", 1)
+        main_ident = threading.main_thread().ident
+        self.assertIsNotNone(main_ident)
+        assert main_ident is not None
+        other_ids = [
+            ident for ident in range(1, 100) if ident != main_ident
+        ][:36]
+        frames = {ident: frame for ident in other_ids}
+        frames[main_ident] = self.frame(
+            str(ROOT / "main.py"), "main", 2
+        )
         watchdog = runner._PeriodicDiagnostics(
             120, io.StringIO(), frames_snapshot=lambda: frames
         )
@@ -538,12 +604,25 @@ class PeriodicDiagnosticsTest(unittest.TestCase):
         self.assertIn(f"threads={len(frames)}", text)
         self.assertIn(f"shown={runner.DIAGNOSTIC_MAX_THREADS}", text)
         self.assertIn("threads_truncated=", text)
-        self.assertLessEqual(len(watchdog.render()), runner.DIAGNOSTIC_MAX_BYTES)
+        self.assertEqual(
+            text.count("thread ordinal="), runner.DIAGNOSTIC_MAX_THREADS
+        )
+        self.assertIn("thread ordinal=1 main=1", text)
+        self.assertLess(
+            text.index("thread ordinal=1 main=1"),
+            text.index("thread ordinal=2 main=0"),
+        )
+        self.assertLessEqual(
+            len(watchdog.render()), runner.DIAGNOSTIC_MAX_BYTES
+        )
 
         deep = None
         for index in range(runner.DIAGNOSTIC_MAX_FRAMES + 5):
             deep = self.frame(
-                "deep.py", f"level_{index}", index + 1, back=deep
+                str(ROOT / "deep.py"),
+                f"level_{index}",
+                index + 1,
+                back=deep,
             )
         deep_watchdog = runner._PeriodicDiagnostics(
             120, io.StringIO(), frames_snapshot=lambda: {1: deep}
@@ -561,16 +640,16 @@ class PeriodicDiagnosticsTest(unittest.TestCase):
 
     def test_snapshot_excludes_the_calling_thread(self) -> None:
         frames = {
-            1: self.frame("main.py", "main", 1),
-            2: self.frame("other.py", "other", 2),
+            1: self.frame(str(ROOT / "main.py"), "main", 1),
+            2: self.frame(str(ROOT / "other.py"), "other", 2),
         }
         watchdog = runner._PeriodicDiagnostics(
             120, io.StringIO(), frames_snapshot=lambda: frames
         )
         text = watchdog.render(exclude_ident=2).decode("ascii")
         self.assertIn("threads=1", text)
-        self.assertIn("thread id=1", text)
-        self.assertNotIn("thread id=2", text)
+        self.assertIn("thread ordinal=1", text)
+        self.assertNotIn("thread ordinal=2", text)
 
     def test_single_daemon_thread_dumps_and_stops_cleanly(self) -> None:
         class Sink:
@@ -592,7 +671,7 @@ class PeriodicDiagnosticsTest(unittest.TestCase):
                     return "".join(self.chunks)
 
         sink = Sink()
-        frames = {4242: self.frame("module.py", "work", 3)}
+        frames = {4242: self.frame(str(ROOT / "module.py"), "work", 3)}
         watchdog = runner._PeriodicDiagnostics(
             0.02, sink, frames_snapshot=lambda: frames
         )
@@ -604,10 +683,57 @@ class PeriodicDiagnosticsTest(unittest.TestCase):
         watchdog.stop()
         self.assertFalse(watchdog._thread.is_alive())
         settled = sink.text()
-        time.sleep(0.1)
-        self.assertEqual(sink.text(), settled)
         self.assertIn("state=PERIODIC", settled)
-        self.assertIn("thread id=4242", settled)
+        self.assertIn("thread ordinal=1", settled)
+
+    def test_run_writes_each_successful_tick_until_the_event_is_set(
+        self,
+    ) -> None:
+        class Sink:
+            def __init__(self) -> None:
+                self.writes = 0
+
+            def write(self, text: str) -> None:
+                self.writes += 1
+
+            def flush(self) -> None:
+                pass
+
+        sink = Sink()
+        watchdog = runner._PeriodicDiagnostics(
+            120, sink, frames_snapshot=lambda: {}
+        )
+        scripted = self.scripted_stop([False, False, True])
+        watchdog._stop = scripted
+        watchdog._run()
+        self.assertFalse(watchdog.failed)
+        self.assertFalse(scripted.set_called)
+        self.assertEqual(sink.writes, 2)
+        self.assertEqual(scripted.wait_calls, 3)
+
+    def test_run_stops_after_the_first_failed_dump(self) -> None:
+        class Sink:
+            def __init__(self) -> None:
+                self.writes = 0
+
+            def write(self, text: str) -> None:
+                self.writes += 1
+                raise OSError("diagnostics sink unavailable")
+
+            def flush(self) -> None:
+                pass
+
+        sink = Sink()
+        watchdog = runner._PeriodicDiagnostics(
+            120, sink, frames_snapshot=lambda: {}
+        )
+        scripted = self.scripted_stop([False, False, True])
+        watchdog._stop = scripted
+        watchdog._run()
+        self.assertTrue(watchdog.failed)
+        self.assertTrue(scripted.set_called)
+        self.assertEqual(sink.writes, 1)
+        self.assertEqual(scripted.wait_calls, 1)
 
     def test_broken_sink_cannot_fail_the_suite(self) -> None:
         class Broken:
@@ -620,7 +746,7 @@ class PeriodicDiagnosticsTest(unittest.TestCase):
         watchdog = runner._PeriodicDiagnostics(
             120, Broken(), frames_snapshot=lambda: {}
         )
-        watchdog.dump_once()
+        self.assertFalse(watchdog.dump_once())
         self.assertTrue(watchdog.failed)
 
     def test_default_run_does_not_use_the_faulthandler_periodic_timer(self) -> None:

@@ -23,11 +23,16 @@ result semantics:
 The periodic snapshot reads ``sys._current_frames`` and never calls
 ``faulthandler.dump_traceback_later``: the fatal-signal handler stays a
 separate, fatal-only path. The snapshot never reads frame locals, source line
-contents, call arguments or full paths. A file basename, line number or
-function name is emitted only when it matches a small ASCII allowlist;
-otherwise it is replaced with ``<omitted>``. Thread count, frame depth and
-total bytes are bounded, and the daemon thread is stopped and joined with a
-bounded timeout on every exit.
+contents, call arguments or full paths. It emits a basename and function name
+only for a lexically bounded path under the repository root or the stdlib
+root; unknown or synthetic roots use the closed ``<omitted>`` class. An ASCII
+pattern alone is not treated as proof that a synthetic name is safe. Thread
+count, frame depth and total bytes are bounded; the main thread is rendered
+first and at most 32 threads are selected without copying or sorting the whole
+snapshot. ``sys._current_frames`` itself necessarily observes active
+interpreter thread state, so this is bounded output, not a resource guarantee.
+The daemon stops after the first diagnostics failure and is stopped and joined
+with a bounded timeout on every exit.
 
 faulthandler reports thread stacks only on a fatal signal; it does not dump
 locals, arguments, the environment, or a core file. The per-test markers are
@@ -64,6 +69,8 @@ DIAGNOSTIC_MAX_FRAMES = 32
 DIAGNOSTIC_MAX_BYTES = 16 * 1024
 DIAGNOSTIC_MAX_BASENAME_LENGTH = 96
 DIAGNOSTIC_MAX_FUNCTION_LENGTH = 80
+DIAGNOSTIC_MAX_PATH_COMPONENTS = 32
+DIAGNOSTIC_MAX_PATH_COMPONENT_LENGTH = 128
 DIAGNOSTIC_MIN_INTERVAL_SECONDS = 0.01
 DIAGNOSTIC_STOP_TIMEOUT_SECONDS = 5.0
 DIAGNOSTIC_OMITTED = "<omitted>"
@@ -178,17 +185,76 @@ def _diagnostic_result_class(
     return _DiagnosticTextTestResult
 
 
-def _safe_basename(value: object) -> str:
-    """Return a path-free, allowlisted file basename or ``<omitted>``."""
-    if not isinstance(value, str):
-        return DIAGNOSTIC_OMITTED
+def _absolute_source_root(value: object) -> str | None:
+    """Return a lexical absolute path without resolving links or reading disk."""
+    if value is None:
+        return None
     try:
-        basename = os.path.basename(value)
+        path = os.fspath(value)
+    except TypeError:
+        return None
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return None
+    try:
+        return os.path.abspath(path)
     except (OSError, ValueError):
-        return DIAGNOSTIC_OMITTED
-    if basename in {".", ".."} or not DIAGNOSTIC_BASENAME.fullmatch(basename):
-        return DIAGNOSTIC_OMITTED
-    return basename
+        return None
+
+
+def _stdlib_source_root() -> str | None:
+    stdlib_file = _absolute_source_root(getattr(os, "__file__", None))
+    if stdlib_file is None:
+        return None
+    return os.path.dirname(stdlib_file)
+
+
+# Lexical trust boundary only: this is not a filesystem sandbox. It does not
+# resolve symlinks or read files, and it deliberately starts no I/O while the
+# periodic diagnostics thread holds the GIL.
+_TRUSTED_SOURCE_ROOTS = tuple(
+    root
+    for root in (
+        _absolute_source_root(ROOT),
+        _stdlib_source_root(),
+    )
+    if root is not None
+)
+
+
+def _trusted_source_basename(value: object) -> str | None:
+    """Return a basename only for a bounded path under a trusted source root.
+
+    An ASCII-safe basename alone is not proof that a synthetic filename is
+    privacy-safe. Unknown roots therefore use the closed ``<omitted>`` class.
+    """
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    try:
+        candidate = os.path.abspath(value)
+    except (OSError, ValueError):
+        return None
+    for root in _TRUSTED_SOURCE_ROOTS:
+        try:
+            if os.path.commonpath((root, candidate)) != root:
+                continue
+        except ValueError:
+            continue
+        relative = os.path.relpath(candidate, root)
+        components = relative.split(os.sep)
+        if not components or len(components) > DIAGNOSTIC_MAX_PATH_COMPONENTS:
+            continue
+        if any(
+            not component
+            or component in {".", ".."}
+            or len(component) > DIAGNOSTIC_MAX_PATH_COMPONENT_LENGTH
+            for component in components
+        ):
+            continue
+        basename = components[-1]
+        if basename in {".", ".."} or not DIAGNOSTIC_BASENAME.fullmatch(basename):
+            continue
+        return basename
+    return None
 
 
 def _safe_function(value: object) -> str:
@@ -225,13 +291,17 @@ def _frame_records(
             back = getattr(frame, "f_back", None)
         except Exception:
             break
-        records.append(
-            (
-                _safe_basename(filename),
-                _safe_lineno(lineno),
-                _safe_function(function),
+        basename = _trusted_source_basename(filename)
+        if basename is None:
+            # Unknown roots can carry synthetic names. Keep the bounded line
+            # number, but do not echo either name.
+            records.append(
+                (DIAGNOSTIC_OMITTED, _safe_lineno(lineno), DIAGNOSTIC_OMITTED)
             )
-        )
+        else:
+            records.append(
+                (basename, _safe_lineno(lineno), _safe_function(function))
+            )
         frame = back
     return records, frame is not None
 
@@ -246,6 +316,12 @@ class _PeriodicDiagnostics:
     attribute reads happen in Python under the GIL; the completed payload is
     then written as one bounded logical write. With no injected stream the
     writer uses fd 2 directly and never the buffered ``sys.stderr`` wrapper.
+
+    Filenames and function names are emitted only from lexically bounded paths
+    under the repository or stdlib root; other roots use ``<omitted>``.
+    Rendering selects the main thread first and at most 32 threads overall,
+    without copying or sorting the complete snapshot. The first diagnostics
+    failure stops the daemon.
     """
 
     def __init__(
@@ -282,15 +358,21 @@ class _PeriodicDiagnostics:
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
-            self.dump_once()
+            if not self.dump_once():
+                # Make the stop explicit for any later waiter, then leave the
+                # daemon loop instead of retrying a failed sink every tick.
+                self._stop.set()
+                break
 
-    def dump_once(self) -> None:
-        """Write one snapshot; a diagnostic failure must never fail the run."""
+    def dump_once(self) -> bool:
+        """Write one snapshot; return ``False`` after the first failure."""
         try:
             self._write(self.render(exclude_ident=threading.get_ident()))
         except Exception:
             # Stop after the first failure instead of spamming a broken sink.
             self.failed = True
+            return False
+        return True
 
     def render(
         self,
@@ -305,28 +387,56 @@ class _PeriodicDiagnostics:
             snapshot = {}
         if not isinstance(snapshot, dict):
             snapshot = {}
-        try:
-            items = [
-                (ident, frame)
-                for ident, frame in snapshot.items()
-                if isinstance(ident, int) and ident != exclude_ident
-            ]
-        except Exception:
-            items = []
         main_ident = getattr(threading.main_thread(), "ident", None)
-        items.sort(key=lambda item: (item[0] != main_ident, item[0]))
+        try:
+            total = len(snapshot)
+            excluded = (
+                1 if exclude_ident is not None and exclude_ident in snapshot else 0
+            )
+        except Exception:
+            total = 0
+            excluded = 0
+        available = max(total - excluded, 0)
 
-        total = len(items)
-        shown = min(total, DIAGNOSTIC_MAX_THREADS)
+        # Do not copy or sort the whole snapshot. Select the main thread first
+        # and then at most the remaining output slots in snapshot order. The
+        # snapshot call itself still observes active interpreter thread state;
+        # this selection carries no hidden resource guarantee about that call.
+        selected: list[tuple[int, object]] = []
+        try:
+            if (
+                main_ident is not None
+                and main_ident != exclude_ident
+                and main_ident in snapshot
+            ):
+                selected.append((main_ident, snapshot[main_ident]))
+            remaining = DIAGNOSTIC_MAX_THREADS - len(selected)
+            if remaining > 0:
+                selected.extend(
+                    islice(
+                        (
+                            (ident, frame)
+                            for ident, frame in snapshot.items()
+                            if isinstance(ident, int)
+                            and ident != exclude_ident
+                            and ident != main_ident
+                        ),
+                        remaining,
+                    )
+                )
+        except Exception:
+            selected = selected[:DIAGNOSTIC_MAX_THREADS]
+        shown = len(selected)
+
         interval_ms = min(max(int(round(self.interval * 1000)), 0), 2**31 - 1)
         lines = [
             "DSH-RUNNER-DIAG v=1 state=PERIODIC "
-            f"interval_ms={interval_ms} threads={total} shown={shown}\n",
+            f"interval_ms={interval_ms} threads={available} shown={shown}\n",
             "most recent call first\n",
         ]
-        for ident, frame in items[:shown]:
+        for ordinal, (ident, frame) in enumerate(selected, 1):
             lines.append(
-                f"thread id={ident} main={1 if ident == main_ident else 0}\n"
+                f"thread ordinal={ordinal} main={1 if ident == main_ident else 0}\n"
             )
             records, truncated = _frame_records(frame, DIAGNOSTIC_MAX_FRAMES)
             for basename, lineno, function in records:
@@ -335,8 +445,8 @@ class _PeriodicDiagnostics:
                 )
             if truncated:
                 lines.append("  frames_truncated=1\n")
-        if total > shown:
-            lines.append(f"threads_truncated={total - shown}\n")
+        if available > shown:
+            lines.append(f"threads_truncated={available - shown}\n")
 
         payload = "".join(lines).encode("ascii", "replace")
         if len(payload) > DIAGNOSTIC_MAX_BYTES:
