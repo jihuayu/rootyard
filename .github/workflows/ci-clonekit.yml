@@ -1,0 +1,218 @@
+name: CI CloneKit
+
+on:
+  pull_request:
+    paths:
+      - 'src/ci_checkouts.rs'
+      - 'src/ci_checkouts/**'
+      - 'src/blob_store/**'
+      - 'src/ref_store/**'
+      - 'tests/ci_clonekit.rs'
+      - 'tests/ci_clonekit_live_support/mod.rs'
+      - 'tests/test_ci_clonekit_contracts.py'
+      - 'tests/test_ci_clonekit_projection.py'
+      - 'tests/test_ci_clonekit_live_receipt.py'
+      - 'scripts/eval_ci_clonekit.py'
+      - 'scripts/ci_clonekit_focused_receipt.sh'
+      - 'scripts/ci_clonekit_integration_receipt.sh'
+      - 'scripts/ci_clonekit_live_receipt.sh'
+      - 'docs/ci-clonekit.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-clonekit.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-clonekit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_clonekit182
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U rootyard -d rootyard_clonekit182"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_clonekit182
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system build and Git packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates openssl libssl-dev pkg-config git build-essential \
+            libfuse3-dev fuse3 cmake clang
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+
+      - name: Cache CargoFork toolchain binary
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          set -euo pipefail
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/ci-clonekit/ci-cargo-fork.json
+
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          set -euo pipefail
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ci-clonekit-
+
+      - name: Static design, formatting, and contract checks
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest -v \
+            tests.test_ci_workflow_triggers \
+            tests.test_ci_cargo_fork_workflows \
+            tests.test_ci_clonekit_contracts \
+            tests.test_ci_clonekit_projection \
+            tests.test_ci_clonekit_live_receipt
+
+      - name: Clippy and CloneKit unit plus Smart-HTTP integration tests
+        run: |
+          set -euo pipefail
+          focused_receipt=test-results/ci-clonekit/focused-command.json
+          integration_receipt=test-results/ci-clonekit/integration-failure.json
+          focused_group=
+          trap 'status=$?; trap - EXIT; set +e; scripts/ci_clonekit_focused_receipt.sh "${focused_group:-invalid}" "$status" "$focused_receipt"; receipt_status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; [ "$receipt_status" -eq 0 ] || exit 1; exit 0' EXIT
+          focused_group=clippy
+          cargo clippy --locked --lib --test ci_clonekit -- -D warnings
+          focused_group=lib
+          cargo test --locked --lib ci_checkouts::clonekit
+          focused_group=integration
+          # Capture both stages before restoring errexit: a collector failure must not
+          # replace the producer's actual status.
+          set +e
+          cargo test --locked --test ci_clonekit 2>&1 | scripts/ci_clonekit_integration_receipt.sh "$integration_receipt"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          producer_status=${pipeline_status[0]:-1}
+          collector_status=${pipeline_status[1]:-1}
+          if [ "$producer_status" -ne 0 ]; then
+            exit "$producer_status"
+          fi
+          exit "$collector_status"
+
+      - name: Start job-owned Garage 2.1 S3 fixture
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clonekit-garage" test-results/ci-clonekit
+          echo "OBJECT_STORE_ENV_FILE=$RUNNER_TEMP/clonekit-garage/object-store.env" >>"$GITHUB_ENV"
+          scripts/owned_garage_fixture.sh start \
+            --directory "$RUNNER_TEMP/clonekit-garage/fixture" \
+            --output-env "$RUNNER_TEMP/clonekit-garage/object-store.env" \
+            --bucket-prefix rootyard-ci \
+            --region garage
+
+      - name: Run live PostgreSQL 17 and Garage S3 CloneKit acceptance test
+        run: |
+          set -euo pipefail
+          live_receipt=test-results/ci-clonekit/live-command.json
+          live_rust_receipt=test-results/ci-clonekit/live-rust.json
+          live_stage=env_setup
+          trap 'status=$?; trap - EXIT; set +e; scripts/ci_clonekit_live_receipt.sh stage "$live_stage" "$status" "$live_receipt"; receipt_status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; [ "$receipt_status" -eq 0 ] || exit 1; exit 0' EXIT
+          set -a
+          # shellcheck disable=SC1090
+          source "$OBJECT_STORE_ENV_FILE"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="ci-clonekit-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          live_completion_file=test-results/ci-clonekit/live-case-complete
+          rm -f -- "$live_completion_file"
+          export ROOTYARD_LIVE_COMPLETION_FILE="$live_completion_file"
+          live_stage=cargo_test
+          set +e
+          cargo test --locked --test ci_clonekit -- --ignored --test-threads=1 2>&1 | scripts/ci_clonekit_live_receipt.sh project "$live_rust_receipt"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          producer_status=${pipeline_status[0]:-1}
+          collector_status=${pipeline_status[1]:-1}
+          if [ "$producer_status" -ne 0 ]; then
+            exit "$producer_status"
+          fi
+          if [ "$collector_status" -ne 0 ]; then
+            exit "$collector_status"
+          fi
+          live_stage=complete
+
+      - name: Run full empirical CloneKit evaluation
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/ci-clonekit
+          python3 scripts/eval_ci_clonekit.py --scale full \
+            --output test-results/ci-clonekit/eval-full.json \
+            --markdown-out test-results/ci-clonekit/eval-full.md
+          cat test-results/ci-clonekit/eval-full.md
+
+      - name: Stop job-owned Garage 2.1 S3 fixture
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${OBJECT_STORE_ENV_FILE:-}" ]; then
+            rm -f -- "$OBJECT_STORE_ENV_FILE"
+          fi
+          if [ -n "${RUNNER_TEMP:-}" ]; then
+            scripts/owned_garage_fixture.sh stop --directory "$RUNNER_TEMP/clonekit-garage/fixture"
+          fi
+
+      - name: Upload CI CloneKit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-clonekit-evidence
+          path: test-results/ci-clonekit/
+          if-no-files-found: warn
