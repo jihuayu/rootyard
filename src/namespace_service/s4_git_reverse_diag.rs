@@ -90,7 +90,7 @@ type ReverseGitChildDiagnostics = Vec<(ReverseGitStage, ReverseGitChildOutcome)>
 #[cfg(test)]
 thread_local! {
     static REVERSE_GIT_CHILD_DIAGNOSTICS: std::cell::RefCell<ReverseGitChildDiagnostics> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
