@@ -2,12 +2,40 @@
 """Native PostgreSQL/HTTP tests for trusted CI run claims and stale evidence."""
 import argparse
 import json
+import subprocess
 import uuid
 from pathlib import Path
 import sys
 import time
 
 from webhooks import WebhooksHarness
+
+
+def _remaining_seconds(deadline, now=None):
+    return max(0.0, deadline - (time.monotonic() if now is None else now))
+
+
+def _statement_timeout_ms(deadline, now=None):
+    remaining = _remaining_seconds(deadline, now)
+    return 0 if remaining <= 0 else max(1, int(remaining * 1000))
+
+
+def _receipt(output):
+    lines = [line for line in output.splitlines() if line.startswith("pull-sync-receipt=")]
+    if len(lines) != 1:
+        return None
+    return lines[0].split("=", 1)[1]
+
+
+def _injection_outcome(returncode, output, timed_out=False):
+    if timed_out or returncode != 0:
+        return "fail"
+    receipt = _receipt(output)
+    if receipt == "1,1,1,1,0,0":
+        return "applied"
+    if receipt == "lock_not_available":
+        return "retry_lock"
+    return "fail"
 
 
 def _start_prewarm_trap():
@@ -157,10 +185,42 @@ def main():
         h.git("commit","-am","new candidate",cwd=h.work)
         new_oid=h.git("rev-parse","HEAD",cwd=h.work).stdout.decode().strip()
         h.git("push","origin","HEAD:refs/heads/feature",cwd=h.work,token=h.alice)
+        def psql_until(sql, deadline):
+            env=h.env.copy()
+            env["PGDATABASE"]=h.db
+            budget=_statement_timeout_ms(deadline)
+            if budget<=0:
+                return None,"","deadline exhausted",True
+            env["PGOPTIONS"]=(env.get("PGOPTIONS","").strip()+
+                f" -c statement_timeout={budget} -c lock_timeout={budget}").strip()
+            argv=["psql","-w","--dbname",env["PGDATABASE"],"-X","-v",
+                  "ON_ERROR_STOP=1","-At","-c",sql]
+            remaining=_remaining_seconds(deadline)
+            if remaining<=0:
+                return None,"","deadline exhausted",True
+            try:
+                p=subprocess.run(argv,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                 text=True,timeout=remaining)
+            except subprocess.TimeoutExpired:
+                return None,"","deadline exceeded",True
+            return p.returncode,p.stdout,p.stderr,False
+
+        def psql_error(stderr):
+            line=next((line.strip() for line in stderr.splitlines() if line.strip()),"")
+            return h.redact(line[:240])
+
+        def psql_value(sql, deadline):
+            returncode,stdout,stderr,timed_out=psql_until(sql,deadline)
+            if timed_out:
+                raise AssertionError("pull-sync fixture: psql deadline exceeded")
+            if returncode!=0:
+                raise AssertionError("pull-sync fixture: psql failed: "+psql_error(stderr))
+            return stdout.strip()
+
         # The producer writes the completion marker last. Wait on one snapshot
         # covering the current tuple, both contexts and the matching marker.
-        def pull_sync_snapshot():
-            row=h.sql(
+        def pull_sync_snapshot(deadline):
+            row=psql_value(
                 "SELECT p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation,"
                 "count(r.id),count(r.id) FILTER (WHERE r.context='ci/test'),"
                 "count(r.id) FILTER (WHERE r.context='ci/lint'),"
@@ -172,7 +232,8 @@ def main():
                 "AND r.pull_version=p.version AND r.head_oid=p.head_oid AND r.base_oid=p.base_oid "
                 "AND r.storage_generation=repo.storage_generation "
                 f"WHERE p.repository_id='{pr['repository_id']}' AND p.number={pr['number']} "
-                "GROUP BY p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation")
+                "GROUP BY p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation",
+                deadline)
             parts=row.split("|")
             if len(parts)!=9:return "missing_pull",None
             state,version,head,base,generation,runs,test,lint,marker=parts
@@ -186,10 +247,10 @@ def main():
             if marker!=1:return "marker_missing",None
             return "ready",(version,head,base,int(generation))
 
-        until=time.monotonic()+15
+        deadline=time.monotonic()+15
         state,snapshot=None,None
-        while time.monotonic()<until:
-            state,snapshot=pull_sync_snapshot()
+        while time.monotonic()<deadline:
+            state,snapshot=pull_sync_snapshot(deadline)
             if state=="ready":break
             time.sleep(.2)
         assert state=="ready",state
@@ -199,21 +260,29 @@ def main():
                f"AND storage_generation={generation}")
         # Recheck the observed tuple, delete one run and one marker, and prove
         # the post-delete state in the same transaction before committing.
-        injected=h.sql(
+        # The exception subtransaction covers lock acquisition only: a 55P03
+        # there is before any delete, while every later error aborts the txn.
+        injection_sql=(
             "BEGIN; "
             "DO $rootyard_fixture$ DECLARE tuple_ok int; current_generation bigint; "
-            "lint_returned int; marker_returned int; lint_deleted bigint; marker_deleted bigint; "
-            "run_total bigint; test_total bigint; lint_total bigint; marker_total bigint; BEGIN "
+            "retry_lock boolean := false; lint_returned int; marker_returned int; "
+            "lint_deleted bigint; marker_deleted bigint; run_total bigint; test_total bigint; "
+            "lint_total bigint; marker_total bigint; BEGIN "
+            "BEGIN "
             f"SELECT 1 INTO tuple_ok FROM forge_pulls WHERE repository_id='{pr['repository_id']}' "
             f"AND number={pr['number']} AND state='open' AND version={version} "
-            f"AND head_oid='{head}' AND base_oid='{base}' FOR UPDATE; "
+            f"AND head_oid='{head}' AND base_oid='{base}' FOR UPDATE NOWAIT; "
             "IF tuple_ok IS NULL THEN RAISE EXCEPTION 'pull-sync fixture: current tuple drifted'; END IF; "
             f"SELECT storage_generation INTO current_generation FROM repositories "
-            f"WHERE id='{pr['repository_id']}' FOR SHARE; "
+            f"WHERE id='{pr['repository_id']}' FOR SHARE NOWAIT; "
             f"IF current_generation IS DISTINCT FROM {generation} THEN "
             "RAISE EXCEPTION 'pull-sync fixture: generation drifted'; END IF; "
             "EXECUTE 'LOCK TABLE ci_runs IN SHARE ROW EXCLUSIVE MODE NOWAIT'; "
             "EXECUTE 'LOCK TABLE ci_pull_sync_progress IN SHARE ROW EXCLUSIVE MODE NOWAIT'; "
+            "EXCEPTION WHEN lock_not_available THEN retry_lock := true; END; "
+            "IF retry_lock THEN "
+            "PERFORM set_config('rootyard.fixture_pull_sync_receipt','lock_not_available',true); "
+            "ELSE "
             "SELECT count(*),count(*) FILTER (WHERE context='ci/test'),"
             f"count(*) FILTER (WHERE context='ci/lint') INTO run_total,test_total,lint_total "
             f"FROM ci_runs WHERE {exact}; "
@@ -237,15 +306,29 @@ def main():
             "PERFORM set_config('rootyard.fixture_pull_sync_receipt',"
             "lint_deleted::text||','||marker_deleted::text||','||run_total::text||','||"
             "test_total::text||','||lint_total::text||','||marker_total::text,true); "
-            "END $rootyard_fixture$; "
+            "END IF; END $rootyard_fixture$; "
             "SELECT 'pull-sync-receipt='||current_setting('rootyard.fixture_pull_sync_receipt'); "
             "COMMIT;")
-        receipts=[line for line in injected.splitlines() if line.startswith("pull-sync-receipt=")]
-        assert len(receipts)==1,"pull-sync injection receipt missing"
-        assert receipts[0]=="pull-sync-receipt=1,1,1,1,0,0","unexpected pull-sync injection receipt"
 
-        def pull_sync_final():
-            row=h.sql(
+        # Only the exact pre-delete lock_not_available receipt is retryable,
+        # and only inside the remaining original preparation deadline.
+        def inject_pull_sync(deadline):
+            while True:
+                if _remaining_seconds(deadline)<=0:
+                    raise AssertionError("pull-sync fixture: injection preparation window exhausted")
+                returncode,stdout,stderr,timed_out=psql_until(injection_sql,deadline)
+                outcome=_injection_outcome(returncode,stdout,timed_out)
+                if outcome=="applied":return
+                if outcome!="retry_lock":
+                    detail=psql_error(stderr)
+                    raise AssertionError("pull-sync fixture: injection failed closed"+
+                                         (": "+detail if detail else ""))
+                time.sleep(min(.05,max(0.0,deadline-time.monotonic())))
+
+        inject_pull_sync(deadline)
+
+        def pull_sync_final(deadline):
+            row=psql_value(
                 "SELECT (p.state='open' AND p.version="+str(version)+" AND p.head_oid='"+head+
                 "' AND p.base_oid='"+base+"' AND repo.storage_generation="+str(generation)+")::int,"
                 "count(r.id),count(r.id) FILTER (WHERE r.context='ci/test'),"
@@ -258,7 +341,8 @@ def main():
                 "AND r.pull_version=p.version AND r.head_oid=p.head_oid AND r.base_oid=p.base_oid "
                 "AND r.storage_generation=repo.storage_generation "
                 f"WHERE p.repository_id='{pr['repository_id']}' AND p.number={pr['number']} "
-                "GROUP BY p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation")
+                "GROUP BY p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation",
+                deadline)
             parts=row.split("|")
             if len(parts)!=5:return "missing_pull"
             identity,total,test,lint,marker=map(int,parts)
@@ -269,10 +353,10 @@ def main():
                     (2,1,1,0):"runs_without_marker",(1,1,0,0):"awaiting_repair"}.get(
                         (total,test,lint,marker),"unexpected")
 
-        until=time.monotonic()+15
+        deadline=time.monotonic()+15
         state=None
-        while time.monotonic()<until:
-            state=pull_sync_final()
+        while time.monotonic()<deadline:
+            state=pull_sync_final(deadline)
             if state=="ready":break
             time.sleep(.2)
         assert state=="ready",state
