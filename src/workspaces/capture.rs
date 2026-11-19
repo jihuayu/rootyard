@@ -236,11 +236,19 @@ async fn commit_reconciled(
     Ok(changed)
 }
 
-async fn process_page(state: &AppState, ids: Vec<Uuid>, operation: &OperationContext) {
+async fn process_page(state: &AppState, ids: Vec<Uuid>, operation: &OperationContext, stop: &CancellationToken) {
+    let stop = stop.clone();
     futures_util::stream::iter(ids)
         .map(|id| {
             let operation = operation.clone();
+            let stop = stop.clone();
             async move {
+                // Stop admitting new reconciles once shutdown starts, but keep
+                // awaiting every scan already admitted on this page: dropping
+                // those callers would hide an owned freeze from the drain.
+                if stop.is_cancelled() {
+                    return;
+                }
                 let _ = observability::worker::run(&operation, Phase::Reconcile, reconcile_one(state, id)).await;
             }
         })
@@ -265,13 +273,13 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
         let mut pages = futures_util::stream::FuturesUnordered::new();
         loop {
             if stop.is_cancelled() {
-                return;
+                break;
             }
             let rows = match observability::worker::run(&operation, Phase::Scan, eligible_page(&state, cursor)).await {
                 Ok(rows) => rows,
                 Err(_) => break,
             };
-            if rows.is_empty() {
+            if stop.is_cancelled() || rows.is_empty() {
                 break;
             }
             let complete = (rows.len() as i64) < PAGE;
@@ -286,7 +294,7 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
             // Pages are processed independently instead of waiting for the
             // previous 100 IDs. A slow or permanently bad early workspace then
             // cannot delay the fair scan of later UUIDs.
-            pages.push(process_page(&state, ids, &operation));
+            pages.push(process_page(&state, ids, &operation, &stop));
             if pages.len() >= 2 {
                 let _ = pages.next().await;
             }
@@ -295,10 +303,12 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
                 break;
             }
         }
-        while pages.next().await.is_some() {
-            if stop.is_cancelled() {
-                return;
-            }
+        // Cancellation stops new pages and IDs, but the pages already admitted
+        // stay owned until their scans return. The caller applies the shutdown
+        // deadline; a timed-out scan remains visible through `scan::wait_idle`.
+        while pages.next().await.is_some() {}
+        if stop.is_cancelled() {
+            break;
         }
     }
 }
