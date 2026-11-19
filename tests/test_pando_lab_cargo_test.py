@@ -150,16 +150,35 @@ class PandoLabCargoTest(unittest.TestCase):
         """, 101, "test", names=KNOWN_TESTS[:8], truncated=True)
 
     def test_named_merkle_case_projects_exact_captured_block(self):
-        for suffix in ("-0123456789abcdef", ""):
-            with self.subTest(executable=suffix or "no-hash"):
-                output = f"""     Running unittests src/lib.rs (/workspace/rootyard/target/debug/deps/rootyard-c512e8eeea7428b7)
+        # Actual pinned-fork shapes: legacy deps (absolute shared cache) and the
+        # default new build layout (relative target dir). Each case has a prior
+        # successful non-target harness using the other layout and the same leaf.
+        cases = (
+            (
+                "legacy-target-new-non-target",
+                "/home/runner/.cargo/targets/rootyard-ec2a3e00/debug/deps/workspace_merkle_sync-0123456789abcdef",
+                "/home/runner/.cargo/targets/rootyard-ec2a3e00/debug/build/rootyard/0e80d81c87db4057/out/rootyard-c512e8eeea7428b7",
+                "error: test failed, to rerun pass `--test workspace_merkle_sync`",
+                "0 filtered out",
+            ),
+            (
+                "new-target-legacy-non-target",
+                "target/debug/build/rootyard/0e80d81c87db4057/out/workspace_merkle_sync",
+                "target/debug/deps/rootyard-c512e8eeea7428b7",
+                "error: test failed, to rerun pass `-p rootyard --test workspace_merkle_sync`",
+                "1 filtered out",
+            ),
+        )
+        for name, target_exe, prior_exe, footer, filtered in cases:
+            with self.subTest(case=name):
+                output = f"""     Running unittests src/lib.rs ({prior_exe})
 
 running 1 test
 test {MERKLE_TEST} ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running tests/workspace_merkle_sync.rs (/workspace/rootyard/target/debug/deps/workspace_merkle_sync{suffix})
+     Running tests/workspace_merkle_sync.rs ({target_exe})
 
 running 2 tests
 test {MERKLE_TEST} ... FAILED
@@ -174,14 +193,28 @@ Error: private diagnostic /private/path
 failures:
     {MERKLE_TEST}
 
-test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; {filtered}; finished in 0.01s
 
-error: test failed, to rerun pass `--test workspace_merkle_sync`
+{footer}
 """
                 self.run_output(
                     output, 101, "test", names=(MERKLE_TEST,),
                     checkpoint=("base_capture", "not_quiescent"),
                 )
+
+    def test_named_merkle_case_accepts_rootyard_package_footer(self):
+        marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
+        output = self.merkle_harness_output(
+            marker,
+            footer=(
+                "error: test failed, to rerun pass "
+                "`-p rootyard --test workspace_merkle_sync`"
+            ),
+        )
+        self.run_output(
+            output, 101, "test", names=(MERKLE_TEST,),
+            checkpoint=("base_capture", "not_quiescent"),
+        )
 
     def test_named_merkle_case_rejects_filtered_second_failure(self):
         output = f"""     Running tests/workspace_merkle_sync.rs (/workspace/rootyard/target/debug/deps/workspace_merkle_sync-0123456789abcdef)
@@ -273,27 +306,30 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         self.run_output(output, 101, "test", names=(MERKLE_TEST,))
 
     def merkle_harness_output(
-        self, body, *, summary_failed=1, include_summary=True,
-        extra="", executable="workspace_merkle_sync-0123456789abcdef",
+        self, body, *, summary_failed=1, summary_passed=1, running_count=2,
+        include_summary=True, extra="", filtered_out=0,
+        footer="error: test failed, to rerun pass `--test workspace_merkle_sync`",
+        failed_row=None, source="tests/workspace_merkle_sync.rs",
+        executable="target/debug/build/rootyard/0e80d81c87db4057/out/workspace_merkle_sync-0123456789abcdef",
     ):
+        failed_row = failed_row or f"test {MERKLE_TEST} ... FAILED"
         summary = (
-            f"test result: FAILED. 1 passed; {summary_failed} failed; "
-            "0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n"
-            "error: test failed, to rerun pass `--test workspace_merkle_sync`\n"
+            f"test result: FAILED. {summary_passed} passed; {summary_failed} failed; "
+            f"0 ignored; 0 measured; {filtered_out} filtered out; finished in 0.01s\n\n"
             if include_summary else ""
         )
+        footer_line = f"{footer}\n" if footer else ""
         return (
-            f"     Running tests/workspace_merkle_sync.rs "
-            f"(/workspace/rootyard/target/debug/deps/{executable})\n\n"
-            f"running 2 tests\n"
-            f"test {MERKLE_TEST} ... FAILED\n"
+            f"     Running {source} ({executable})\n\n"
+            f"running {running_count} tests\n"
+            f"{failed_row}\n"
             f"test {KNOWN_TESTS[0]} ... ok\n\n"
             f"failures:\n\n"
             f"---- {MERKLE_TEST} stdout ----\n"
             f"{body}\n\n"
             f"failures:\n"
             f"    {MERKLE_TEST}\n\n"
-            f"{extra}{summary}"
+            f"{extra}{summary}{footer_line}"
         )
 
     def test_named_merkle_case_rejects_unbound_or_malformed_checkpoints(self):
@@ -306,12 +342,78 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             "trailing text": self.merkle_harness_output(marker + " /private/path"),
             "duplicate markers": self.merkle_harness_output(marker + "\n" + marker),
             "oversized marker line": self.merkle_harness_output("x" * 4097 + marker),
-            "missing summary": self.merkle_harness_output(
-                marker, include_summary=False,
-                extra="error: test failed, to rerun pass `--test workspace_merkle_sync`\n",
-            ),
+            "missing summary": self.merkle_harness_output(marker, include_summary=False),
             "contradictory count": self.merkle_harness_output(marker, summary_failed=2),
             "unbound marker": self.merkle_harness_output(marker, extra=marker + "\n"),
+        }
+        for context, output in cases.items():
+            with self.subTest(context=context):
+                self.run_output(output, 101, "test", names=(MERKLE_TEST,))
+
+    def test_named_merkle_case_rejects_foreign_or_generic_footer(self):
+        marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
+        cases = {
+            "foreign test footer": "error: test failed, to rerun pass `--test other_harness`",
+            "generic test footer": "error: test failed",
+            "foreign package footer": (
+                "error: test failed, to rerun pass `-p other --test workspace_merkle_sync`"
+            ),
+        }
+        for context, footer in cases.items():
+            with self.subTest(context=context):
+                output = self.merkle_harness_output(marker, footer=footer)
+                self.run_output(output, 101, "test", names=(MERKLE_TEST,))
+
+    def test_named_merkle_case_rejects_module_qualified_failed_row(self):
+        marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
+        output = self.merkle_harness_output(
+            marker,
+            failed_row=f"test foreign_module::{MERKLE_TEST} ... FAILED",
+        )
+        self.run_output(output, 101, "test", names=(MERKLE_TEST,))
+
+    def test_named_merkle_case_rejects_contradictory_libtest_totals(self):
+        marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
+        cases = {
+            "running count exceeds summary total": self.merkle_harness_output(
+                marker, running_count=3),
+            "summary total exceeds running count": self.merkle_harness_output(
+                marker, summary_passed=2),
+        }
+        for context, output in cases.items():
+            with self.subTest(context=context):
+                self.run_output(output, 101, "test", names=(MERKLE_TEST,))
+
+    def test_named_merkle_case_rejects_foreign_layout_identity(self):
+        marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
+        cases = {
+            "foreign package new layout": self.merkle_harness_output(
+                marker,
+                executable=(
+                    "target/debug/build/foreign/0e80d81c87db4057/out/"
+                    "workspace_merkle_sync-0123456789abcdef"
+                ),
+            ),
+            "foreign binary new layout": self.merkle_harness_output(
+                marker,
+                executable=(
+                    "target/debug/build/rootyard/0e80d81c87db4057/out/"
+                    "other_harness-0123456789abcdef"
+                ),
+            ),
+            "foreign harness new layout": self.merkle_harness_output(
+                marker,
+                source="tests/other_harness.rs",
+                executable=(
+                    "target/debug/build/rootyard/0e80d81c87db4057/out/"
+                    "workspace_merkle_sync-0123456789abcdef"
+                ),
+            ),
+            "foreign harness legacy layout": self.merkle_harness_output(
+                marker,
+                source="tests/other_harness.rs",
+                executable="target/debug/deps/workspace_merkle_sync-0123456789abcdef",
+            ),
         }
         for context, output in cases.items():
             with self.subTest(context=context):

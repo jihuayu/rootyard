@@ -53,7 +53,7 @@ MERKLE_CLASSES = frozenset({
 SGR = re.compile(rb"\x1b\[[0-9;]*m")
 IDENTIFIER = rb"[A-Za-z_][A-Za-z0-9_]*"
 FAILED_TEST = re.compile(rb"test (?:" + IDENTIFIER + rb"::)*(" + IDENTIFIER + rb") \.\.\. FAILED")
-RUNNING = re.compile(rb"running [0-9]{1,9} tests?")
+RUNNING = re.compile(rb"running ([0-9]{1,9}) tests?")
 MERKLE_TEST_BYTES = MERKLE_TEST.encode("ascii")
 MARKER_PREFIX = b"rootyard-merkle-checkpoint"
 MERKLE_CHECKPOINT = re.compile(
@@ -63,20 +63,47 @@ MERKLE_CHECKPOINT = re.compile(
     + rb"|".join(re.escape(code.encode("ascii")) for code in sorted(MERKLE_CLASSES))
     + rb")"
 )
-# Cargo identifies each selected test executable with this bounded banner. The
-# workspace harness is identified both by its test path and binary name so a
-# same-named leaf in another executable cannot claim its diagnostic.
-CARGO_HARNESS = re.compile(
-    rb"^[ \t]*(?:"
-    rb"Running (?:unittests |tests/|benches/|examples/)[A-Za-z0-9_./-]+\.rs "
-    rb"\([A-Za-z0-9_./-]+/deps/[A-Za-z0-9_-]+(?:-[0-9a-f]{8,64})?\)"
-    rb"|Doc-tests [A-Za-z0-9_-]+"
-    rb")[ \t]*$"
+# Explicit bounded grammar for the pinned CargoFork 64a6ee6a test banners.
+# Legacy layout keeps test executables under <profile>/deps; the default new
+# build-dir layout uses <profile>/build/<package>/<hash>/out. Only the exact
+# rootyard/workspace_merkle_sync identity may own the diagnostic:
+#   tests/workspace_merkle_sync.rs -> deps/workspace_merkle_sync[-hash]
+#   tests/workspace_merkle_sync.rs -> build/rootyard/<hash>/out/workspace_merkle_sync[-hash]
+# No path is retained or printed; this grammar is only a boolean identity gate.
+PATH_COMPONENT = rb"(?:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|\.[A-Za-z0-9_][A-Za-z0-9_.-]{0,126})"
+PATH_PREFIX = rb"(?:/?" + PATH_COMPONENT + rb"/){0,16}"
+PROFILE = rb"(?:debug|release)"
+BUILD_HASH = rb"[0-9a-f]{8,64}"
+BINARY = rb"[A-Za-z0-9_][A-Za-z0-9_-]{0,127}"
+PACKAGE = rb"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
+SOURCE_PATH = (
+    rb"(?:src|tests|benches|examples)/"
+    rb"(?:" + PATH_COMPONENT + rb"/){0,8}"
+    rb"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\.rs"
 )
-MERKLE_HARNESS = re.compile(
-    rb"^[ \t]*Running tests/workspace_merkle_sync\.rs "
-    rb"\([A-Za-z0-9_./-]+/deps/workspace_merkle_sync(?:-[0-9a-f]{8,64})?\)[ \t]*$"
+LEGACY_EXE = PATH_PREFIX + PROFILE + rb"/deps/" + BINARY + rb"(?:-" + BUILD_HASH + rb")?"
+NEW_EXE = (
+    PATH_PREFIX + PROFILE + rb"/build/" + PACKAGE + rb"/" + BUILD_HASH
+    + rb"/out/" + BINARY + rb"(?:-" + BUILD_HASH + rb")?"
 )
+GENERIC_EXE = rb"(?:" + LEGACY_EXE + rb"|" + NEW_EXE + rb")"
+TARGET_LEGACY_EXE = (
+    PATH_PREFIX + PROFILE + rb"/deps/workspace_merkle_sync(?:-" + BUILD_HASH + rb")?"
+)
+TARGET_NEW_EXE = (
+    PATH_PREFIX + PROFILE + rb"/build/rootyard/" + BUILD_HASH
+    + rb"/out/workspace_merkle_sync(?:-" + BUILD_HASH + rb")?"
+)
+TARGET_EXE = rb"(?:" + TARGET_LEGACY_EXE + rb"|" + TARGET_NEW_EXE + rb")"
+TARGET_EXE_RE = re.compile(TARGET_EXE)
+UNIT_HARNESS = re.compile(
+    rb"^[ \t]*Running unittests (" + SOURCE_PATH + rb") \((" + GENERIC_EXE + rb")\)[ \t]*$"
+)
+TEST_HARNESS = re.compile(
+    rb"^[ \t]*Running (" + SOURCE_PATH + rb") \((" + GENERIC_EXE + rb")\)[ \t]*$"
+)
+DOC_HARNESS = re.compile(rb"^[ \t]*Doc-tests [A-Za-z0-9_-]+[ \t]*$")
+TARGET_SOURCE = b"tests/workspace_merkle_sync.rs"
 TARGET_SECTION = re.compile(rb"---- " + re.escape(MERKLE_TEST_BYTES) + rb" stdout ----")
 SECTION_HEADER = re.compile(rb"---- [^\r\n]+ (?:stdout|stderr) ----")
 LIBTEST_SUMMARY = re.compile(
@@ -85,6 +112,16 @@ LIBTEST_SUMMARY = re.compile(
     rb"finished in [0-9]{1,9}(?:\.[0-9]{1,9})?s"
 )
 CARGO_TEST_FAILED = re.compile(rb"error: test failed(?:, to rerun pass `[^`]+`)?")
+MERKLE_FAILED_ROW = re.compile(rb"test " + re.escape(MERKLE_TEST_BYTES) + rb" \.\.\. FAILED")
+# CargoFork cli_args() adds "-p <pkg> " only when needs_spec_flag(ws) is true;
+# Packages::Default requires more than one default member. The rootyard manifest
+# has one default package, so it emits the first exact form. The second is the
+# sole explicitly allowed package-qualified variant if that workspace context
+# changes; any other package or harness footer is foreign.
+TARGET_FOOTERS = (
+    b"error: test failed, to rerun pass `--test workspace_merkle_sync`",
+    b"error: test failed, to rerun pass `-p rootyard --test workspace_merkle_sync`",
+)
 TEST_ATTRIBUTE = rb"^[ \t]*#\[(tokio::)?test([ \t]*\(|\])"
 TEST_FUNCTION = re.compile(rb"[ \t]*(?:async[ \t]+)?fn[ \t]+(" + IDENTIFIER + rb")[ \t]*\(")
 FAILURE_MARKERS = (
@@ -105,17 +142,26 @@ class Harness:
     def __init__(self, merkle):
         self.merkle = merkle
         self.running_seen = False
+        self.running_count = None
         self.failures_seen = False
         self.in_case_rows = False
         self.failed_rows = []
+        self.exact_failed_row = False
         self.rows_truncated = False
         self.summary_seen = False
         self.summary_status = None
         self.failed_count = None
+        self.passed_count = None
+        self.ignored_count = None
+        self.measured_count = None
+        self.filtered_count = None
+        self.captured_any = False
+        self.summary_list_seen = False
         self.target_seen = False
         self.captured_open = False
         self.captured_target = False
         self.markers = []
+        self.target_footer_seen = False
         self.malformed = False
 
 
@@ -135,6 +181,19 @@ def bounded_lines(stream):
     for line, oversized in bounded_lines_with_status(stream):
         if not oversized:
             yield line
+
+
+def classify_harness(line):
+    """Return None for non-banners, False for foreign harnesses, True for target."""
+    if DOC_HARNESS.fullmatch(line):
+        return False
+    if match := UNIT_HARNESS.fullmatch(line):
+        source, executable = match[1], match[2]
+    elif match := TEST_HARNESS.fullmatch(line):
+        source, executable = match[1], match[2]
+    else:
+        return None
+    return source == TARGET_SOURCE and TARGET_EXE_RE.fullmatch(executable) is not None
 
 
 def git_oid(revision):
@@ -192,7 +251,7 @@ def run_cargo(commit):
     unbound_marker = False
     stream_truncated = False
     too_many_harnesses = False
-    cargo_test_failed = 0
+    foreign_footer = False
     truncated = False
     try:
         cargo = subprocess.Popen(
@@ -216,7 +275,7 @@ def run_cargo(commit):
                     phases.add(phase)
 
             if current is not None and current.captured_open:
-                if CARGO_HARNESS.fullmatch(line):
+                if classify_harness(line) is not None:
                     current.malformed = True
                     current.captured_open = False
                 elif line == b"failures:" or SECTION_HEADER.fullmatch(line):
@@ -237,15 +296,27 @@ def run_cargo(commit):
                     continue
 
             if CARGO_TEST_FAILED.fullmatch(line):
-                cargo_test_failed = min(cargo_test_failed + 1, 2)
+                if (
+                    current is not None
+                    and current.merkle
+                    and current.summary_seen
+                    and line in TARGET_FOOTERS
+                    and not current.target_footer_seen
+                ):
+                    current.target_footer_seen = True
+                else:
+                    foreign_footer = True
+                    if current is not None:
+                        current.malformed = True
 
-            if CARGO_HARNESS.fullmatch(line):
+            harness_merkle = classify_harness(line)
+            if harness_merkle is not None:
                 if len(harnesses) >= MAX_HARNESSES:
                     too_many_harnesses = True
                     current = None
                     in_case_rows = False
                     continue
-                current = Harness(bool(MERKLE_HARNESS.fullmatch(line)))
+                current = Harness(harness_merkle)
                 harnesses.append(current)
                 in_case_rows = False
                 continue
@@ -253,9 +324,10 @@ def run_cargo(commit):
             if current is not None and SECTION_HEADER.fullmatch(line):
                 in_case_rows = False
                 current.in_case_rows = False
+                current.captured_any = True
                 current.captured_open = True
                 current.captured_target = current.merkle and bool(TARGET_SECTION.fullmatch(line))
-                if not current.failures_seen:
+                if not current.failures_seen or current.summary_seen or current.summary_list_seen:
                     current.malformed = True
                 if current.captured_target:
                     if current.target_seen:
@@ -269,26 +341,43 @@ def run_cargo(commit):
                     current.malformed = True
                 continue
 
-            if RUNNING.fullmatch(line):
+            if running := RUNNING.fullmatch(line):
                 in_case_rows = True
                 if current is not None:
-                    if current.running_seen:
+                    if current.running_seen or current.failures_seen or current.summary_seen:
                         current.malformed = True
                     current.running_seen = True
+                    current.running_count = int(running[1])
                     current.in_case_rows = True
             elif line == b"failures:" or line.startswith(b"test result: "):
                 in_case_rows = False
                 if current is not None:
                     current.in_case_rows = False
                     if line == b"failures:":
+                        if current.summary_seen:
+                            current.malformed = True
+                        if current.captured_any:
+                            if current.summary_list_seen:
+                                current.malformed = True
+                            current.summary_list_seen = True
+                        elif current.failures_seen:
+                            current.malformed = True
                         current.failures_seen = True
                 if summary := LIBTEST_SUMMARY.fullmatch(line):
                     if current is not None:
                         if current.summary_seen:
                             current.malformed = True
+                        if summary[1] == b"FAILED" and not current.failures_seen:
+                            current.malformed = True
+                        if current.captured_any and not current.summary_list_seen:
+                            current.malformed = True
                         current.summary_seen = True
                         current.summary_status = summary[1]
+                        current.passed_count = int(summary[2])
                         current.failed_count = int(summary[3])
+                        current.ignored_count = int(summary[4])
+                        current.measured_count = int(summary[5])
+                        current.filtered_count = int(summary[6])
             elif in_case_rows and (test := FAILED_TEST.fullmatch(line)):
                 # Publish only the verified function name. Module text in the
                 # harness output has no independent source binding.
@@ -306,6 +395,10 @@ def run_cargo(commit):
                             current.failed_rows.append(test[1])
                         else:
                             current.rows_truncated = True
+                    if current.merkle and MERKLE_FAILED_ROW.fullmatch(line):
+                        if current.exact_failed_row:
+                            current.malformed = True
+                        current.exact_failed_row = True
         status = cargo.wait()
 
     if current is not None and current.captured_open:
@@ -321,12 +414,31 @@ def run_cargo(commit):
             if harness.summary_status == b"FAILED":
                 if harness.failed_count is None or harness.failed_count < 1:
                     harness.malformed = True
+                if not harness.failures_seen:
+                    harness.malformed = True
             elif harness.summary_status == b"ok":
-                if harness.failed_count != 0:
+                if (
+                    harness.failed_count != 0
+                    or harness.failures_seen
+                    or harness.captured_any
+                    or harness.target_footer_seen
+                ):
                     harness.malformed = True
             else:
                 harness.malformed = True
             if harness.failed_count != len(harness.failed_rows):
+                harness.malformed = True
+            # libtest's declared running count excludes filtered-out tests.
+            if (
+                None in (
+                    harness.running_count, harness.passed_count, harness.failed_count,
+                    harness.ignored_count, harness.measured_count,
+                )
+                or harness.passed_count + harness.failed_count + harness.ignored_count
+                + harness.measured_count != harness.running_count
+            ):
+                harness.malformed = True
+            if harness.captured_any and not harness.summary_list_seen:
                 harness.malformed = True
         if harness.rows_truncated or harness.captured_open:
             harness.malformed = True
@@ -339,7 +451,7 @@ def run_cargo(commit):
         and not stream_truncated
         and not unbound_marker
         and not too_many_harnesses
-        and cargo_test_failed <= 1
+        and not foreign_footer
         and total_failed == 1
         and len(merkle_harnesses) == 1
         and all(not harness.malformed for harness in harnesses)
@@ -349,7 +461,9 @@ def run_cargo(commit):
             harness.summary_status == b"FAILED"
             and harness.failed_count == 1
             and harness.failed_rows == [MERKLE_TEST_BYTES]
+            and harness.exact_failed_row
             and harness.target_seen
+            and harness.target_footer_seen
             and len(harness.markers) == 1
             and failed_tests == {MERKLE_TEST_BYTES}
         ):
