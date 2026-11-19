@@ -85,19 +85,14 @@ class SlotOneReceiveProvenanceSourceTest(unittest.TestCase):
         self.assertIn("let request = receive.request();", self.slot_one)
         self.assertIn("let pairs = receive.pairs();", self.slot_one)
 
-    def test_normal_receive_stays_on_legacy_publish_push(self):
-        self.assertIn("publish::push(", self.receive)
+    def test_normal_receive_selects_private_push_private(self):
+        self.assertIn("publish::push_private(", self.receive)
+        self.assertNotIn("publish::push(", self.receive)
         self.assertNotIn("rotate_slot_one(", self.receive)
-        call = slice_between(
+        self.assertIn(
+            "publish::push_private(&state, &serving, &receive, deadline).await;",
             self.receive_prod,
-            "let published = publish::push(",
-            ")\n    .await;",
         )
-        self.assertIn("receive.actor()", call)
-        self.assertIn("receive.digest()", call)
-        self.assertIn("receive.request()", call)
-        self.assertIn("receive.pairs()", call)
-        self.assertIn("receive.mode()", call)
 
 
 if __name__ == "__main__":

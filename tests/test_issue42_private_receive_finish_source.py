@@ -39,18 +39,19 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         cls.public_attempt = PUBLIC_ATTEMPT.read_text()
         cls.receipt = RECEIPT.read_text()
 
-    def test_receive_consults_m152_before_native_but_keeps_the_legacy_fresh_entry(self):
+    def test_receive_consults_m152_before_native_and_selects_private_fresh_entry(self):
         source = self.receive_prod
         self.assertIn("operation::probe_public(", source)
         self.assertIn("operation::Probe::Finish", source)
         self.assertIn("publish::finish_public_terminal(", source)
         self.assertIn("publish::retire_slot_one(", source)
-        # Fresh identifiers still use the reviewed legacy entry; the private
-        # path only completes an already-existing wrapper.
-        self.assertIn("publish::push(", source)
-        self.assertIn("operation::probe(", source)
-        self.assertLess(source.index("operation::probe_public("), source.index("operation::probe("))
+        # Fresh identifiers are admitted only through the private entry after
+        # native ingestion; the legacy writer is no longer selected.
+        self.assertIn("publish::push_private(", source)
+        self.assertNotIn("publish::push(", source)
+        self.assertNotIn("operation::probe(", source)
         self.assertLess(source.index("operation::probe_public("), source.index("native::run_capture("))
+        self.assertLess(source.index("native::run_capture("), source.index("publish::push_private("))
 
     def test_pending_wrapper_with_terminal_private_is_finish_not_replay(self):
         probe = slice_between(self.operation, "pub(super) async fn probe_public(", "pub(super) fn classify(")
@@ -66,6 +67,43 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("(_, Claim::Replay(terminal)) => Ok(Probe::Replay", probe)
         self.assertNotIn("get_legacy_locked(", probe)
         self.assertNotIn("admit_slot_zero_in_tx(", probe)
+
+    def test_private_fresh_entry_selects_begin_slot_zero_and_never_the_legacy_writer(self):
+        private = slice_between(
+            self.publish,
+            "pub(super) async fn push_private(",
+            "async fn complete_private_probe(",
+        )
+        self.assertIn("operation::probe_public(", private)
+        self.assertIn("begin_slot_zero(", private)
+        self.assertIn("Start::Fresh { plan, _token: token }", private)
+        self.assertIn("publish_pair(state, &plan, planned.pack_id(), pair, deadline)", private)
+        self.assertIn("decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline)", private)
+        self.assertIn("mirror_public_terminal_with_request(state, &public_request, &record, deadline)", private)
+        self.assertIn("PrivatePushOutcome::Terminal", private)
+        self.assertIn("Start::Terminal(_)", private)
+        self.assertNotIn("begin_fresh(", private)
+        self.assertNotIn("\n            begin(\n", private)
+        self.assertNotIn("publish::push(", self.receive_prod)
+        self.assertIn(
+            "publish::push_private(&state, &serving, &receive, deadline).await;",
+            self.receive_prod,
+        )
+
+    def test_known_replay_requires_the_m152_marker_and_has_no_unused_binding(self):
+        probe = slice_between(self.operation, "pub(super) async fn probe_public(", "pub(super) fn classify(")
+        self.assertIn("PublicAttemptFinishLookup::LegacyPath", probe)
+        self.assertIn("lookup_in_tx(", probe)
+        self.assertIn("Claim::Replay(terminal) => Ok(Probe::Replay { terminal, private_id: None })", probe)
+        self.assertNotIn("get_legacy_locked(", probe)
+
+        replay = slice_between(
+            self.publish,
+            "async fn replay_slot_zero_claim(",
+            "/// What one fresh-write transaction decided",
+        )
+        self.assertNotIn("let repository_id = public_request.repository_id;", replay)
+        self.assertIn("lookup_public_private_in_tx(", replay)
 
     def test_finish_lookup_only_relaxes_the_exact_pending_terminal_window(self):
         status = slice_between(self.public_attempt, "fn evaluate_status(", "fn evaluate(snapshot: RawSnapshot")
@@ -90,12 +128,13 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("pending_retirement = Some((evidence, retirement));", finish)
         self.assertLess(finish.index("finish_public_terminal("), finish.index("committed_response("))
 
-        retire = slice_between(source, "if let Some((evidence, retirement)) = pending_retirement {", "let published = publish::push(")
+        retire = slice_between(source, "if let Some((evidence, retirement)) = pending_retirement {", "let published = publish::push_private(")
         self.assertIn("publish::retire_slot_one(&state, &refreshed, &receive, &evidence, &retirement, deadline)", retire)
         self.assertIn("refreshed.gate.repository_id() != repository_id", retire)
         self.assertIn("refreshed.cluster_incarnation != serving.cluster_incarnation", retire)
         self.assertIn("materialize_durable_gateway_receipt(receipt_args(true, Some(retired.private_id)))", retire)
         self.assertIn("committed_response(CommittedResponse", retire)
+        self.assertIn("let published = publish::push_private(&state, &serving, &receive, deadline).await;", source)
         self.assertNotIn("rotate_slot_one(", source)
         self.assertNotIn("SlotOneReceive", source)
 
@@ -130,8 +169,8 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("push_observed_gateway_receipt(args.operation_id", self.receipt)
         self.assertNotIn("receipt.operation_id = durable_operation_id", self.receipt)
         self.assertIn("private_operation_id: private_id", self.receive_prod)
-        self.assertIn("receipt_args(false, None)", self.receive_prod)
-        self.assertIn("receipt_args(true, None)", self.receive_prod)
+        self.assertIn("receipt_args(true, private_id)", self.receive_prod)
+        self.assertIn("receipt_args(false, private_id)", self.receive_prod)
 
     def test_finish_cancellation_fails_closed_without_a_false_ack(self):
         finish_cancel = slice_between(self.receive_prod, "operation::Probe::FinishCancelled", "// Reclaim sweeping")

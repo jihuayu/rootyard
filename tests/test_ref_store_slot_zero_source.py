@@ -108,7 +108,7 @@ class SlotZeroSourceTest(unittest.TestCase):
         positions = [fresh.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
 
-    def test_gateway_private_adapter_is_defined_but_unwired(self):
+    def test_gateway_private_adapter_is_wired_only_through_push_private(self):
         publish = PUBLISH.read_text()
         self.assertIn('reserve_sequence', publish)
         self.assertIn('begin_serving_pending_in_tx', publish)
@@ -118,9 +118,21 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertIn('begin_fresh(', legacy_begin)
         self.assertNotIn('begin_slot_zero(', legacy_begin)
 
-        push = publish.split('pub(super) async fn push(', 1)[1].split('async fn repository_owner(', 1)[0]
-        self.assertNotIn('begin_slot_zero(', push)
-        self.assertNotIn('begin_slot_zero(', RECEIVE.read_text())
+        legacy_push = publish.split('pub(super) async fn push(', 1)[1].split(
+            '/// Select the trusted migration-152 private path', 1
+        )[0]
+        self.assertNotIn('begin_slot_zero(', legacy_push)
+        private_push = publish.split('pub(super) async fn push_private(', 1)[1].split(
+            'async fn complete_private_probe(', 1
+        )[0]
+        self.assertIn('begin_slot_zero(', private_push)
+        self.assertIn('operation::probe_public(', private_push)
+        self.assertNotIn('begin_fresh(', private_push)
+
+        receive = RECEIVE.read_text()
+        self.assertIn('publish::push_private(', receive)
+        self.assertNotIn('publish::push(', receive)
+        self.assertNotIn('operation::probe(', receive)
 
     def test_restore_fence_is_shared_before_lane_and_repository_locks(self):
         markers = [

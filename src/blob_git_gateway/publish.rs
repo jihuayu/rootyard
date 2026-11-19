@@ -25,15 +25,15 @@
 //! pack-pair metadata, and `identity.digest() == parent_digest` still holds for
 //! every A3 receipt and stored registration.
 //!
-//! [`begin_slot_zero`] is the crate-private migration-152 private-mode adapter.
-//! It is deliberately not selected by the live route: the legacy transaction
-//! above remains authoritative until GET/cancel/replay/terminal read paths and
-//! real PostgreSQL qualification are ready. When selected, it keeps the public
-//! UUID and producer digest stable, mints one independent private UUID, and
-//! admits it through [`crate::ref_store::pg::slot_zero`] before any A3/Blob IO.
-//! It never falls back to the legacy fresh transaction after the private mode
-//! has accepted the public identity or when the migration-152 foundation is
-//! absent.
+//! [`begin_slot_zero`] is the crate-private migration-152 private-mode adapter
+//! now selected by [`push_private`] for normal receive writes. It keeps the
+//! public UUID and producer digest stable, mints one independent private UUID,
+//! and admits it through [`crate::ref_store::pg::slot_zero`] before any A3/Blob
+//! IO. A known legacy record is served only through the explicit migration-152
+//! `LegacyPath` marker; an unknown, private refusal, unsupported catalog or
+//! unknown COMMIT never falls back to the legacy fresh transaction. The legacy
+//! [`push`] entry remains source-preserved for its existing tests and explicit
+//! reviewed callers, but the normal receive route no longer selects it.
 use std::{path::PathBuf, time::Instant as StdInstant};
 
 use tokio::time::{Instant, timeout_at};
@@ -125,10 +125,21 @@ impl Pair {
 }
 
 /// Durable result of one push, always rendered from a persisted core terminal.
+/// Source-preserved for the legacy entry; normal receive uses `push_private`.
+#[allow(dead_code)]
 pub(super) enum PushOutcome {
     /// A committed or rejected pack terminal (fresh or an exact replay).
     Terminal(PackCommitTerminal),
     /// A verified migration-138 cancellation tombstone.
+    Cancelled(&'static str),
+}
+
+/// Result of the trusted private M152 normal receive path. The terminal is
+/// always the exact persisted core terminal; `private_id` is `Some` only for a
+/// private attempt and must be used solely to load the durable receipt's
+/// migration-138/139 rows, never as a public header or diagnostic.
+pub(super) enum PrivatePushOutcome {
+    Terminal { terminal: PackCommitTerminal, private_id: Option<Uuid> },
     Cancelled(&'static str),
 }
 
@@ -148,6 +159,10 @@ pub(super) enum Start {
 }
 
 /// Drive the full protected publication for one already-parsed push.
+///
+/// Source-preserved for the reviewed legacy entry and its tests. The normal
+/// receive route selects [`push_private`] and never reaches this writer.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn push(
     state: &BlobGitState,
@@ -265,6 +280,221 @@ pub(super) async fn push(
     }
 }
 
+/// Select the trusted migration-152 private path for one already-authenticated,
+/// already-ingested normal receive.
+///
+/// The same [`VerifiedReceive`] is the only source of the actor, public UUID,
+/// wire digest, parsed request, mode and ordered pairs. A late migration-152
+/// probe resolves any wrapper or explicit `LegacyPath` record that appeared
+/// after the pre-native probe; only an exact `Fresh` reaches
+/// [`begin_slot_zero`]. There is no fallback from an unknown, private refusal,
+/// unsupported catalog or unknown COMMIT into [`begin`]/[`begin_fresh`].
+///
+/// A fresh private admission runs A3/A4 on the private plan, then the reviewed
+/// terminal mirror publishes the exact public wrapper transition before this
+/// returns. A definite stale rejection is completed by at most one reviewed
+/// slot-one retirement from the same receive value; a pending/unknown/faulted
+/// answer is never ACKed or retried.
+pub(super) async fn push_private(
+    state: &BlobGitState,
+    serving: &ServingRepository,
+    verified: &VerifiedReceive<'_>,
+    deadline: Instant,
+) -> Result<PrivatePushOutcome, GatewayError> {
+    if verified.repository_id() != serving.gate.repository_id()
+        || verified.object_format() != serving.gate.object_format()
+    {
+        return Err(GatewayError::Internal("receive provenance differs from its serving realm"));
+    }
+    let mut rebases = 0usize;
+    loop {
+        let baseline =
+            capture_baseline(state, serving.gate.repository_id(), serving.gate.tenant_id(), deadline).await?;
+        if rebases > 0 && !admission_realm_matches_serving(&baseline, serving) {
+            return Err(GatewayError::Conflict("repository authority changed; retry"));
+        }
+        // Resolve any public wrapper or explicit legacy record that appeared
+        // after the pre-native probe. This is the only place the private path
+        // consults a known operation, and it never enters the legacy writer.
+        let probe = operation::probe_public(
+            state,
+            serving,
+            verified.actor(),
+            verified.operation_id(),
+            verified.request(),
+            verified.digest(),
+            verified.mode(),
+            deadline,
+        )
+        .await?;
+        match probe {
+            operation::Probe::Fresh => {}
+            probe => return complete_private_probe(state, serving, verified, probe, deadline).await,
+        }
+        match begin_slot_zero(
+            state,
+            serving,
+            verified.actor(),
+            verified.operation_id(),
+            verified.digest(),
+            verified.request(),
+            verified.pairs(),
+            verified.mode(),
+            &baseline,
+            deadline,
+        )
+        .await?
+        {
+            Start::Rebaseline => {
+                if rebases >= MAX_ADMISSION_REBASES {
+                    return Err(GatewayError::Conflict("repository gate changed during publication admission"));
+                }
+                rebases += 1;
+                if Instant::now() >= deadline {
+                    return Err(GatewayError::Timeout);
+                }
+                continue;
+            }
+            Start::Fresh { plan, _token: token } => {
+                // Test-only rendezvous after the pending private operation is
+                // durable and before A3/A4; absent from non-test builds.
+                #[cfg(test)]
+                state.pause_after_admission(verified.operation_id()).await;
+                let result = async {
+                    for (index, pair) in verified.pairs().iter().enumerate() {
+                        let planned = plan
+                            .packs()
+                            .get(index)
+                            .ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
+                        publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
+                    }
+                    decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline).await
+                }
+                .await;
+                let terminal = match result {
+                    Ok(terminal) => terminal,
+                    Err(error @ GatewayError::Conflict(_)) => {
+                        match authorized(state)?
+                            .reject_superseded_serving(
+                                state.pool(),
+                                &token,
+                                &plan,
+                                verified.actor(),
+                                verified.digest(),
+                                deadline,
+                            )
+                            .await
+                            .map_err(map_authorized)?
+                        {
+                            Some(terminal) => terminal,
+                            None => return Err(error),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                };
+                let private_id = plan.identity().operation_id();
+                let record =
+                    load_terminal_record(state, serving.gate.repository_id(), private_id, deadline).await?;
+                let public_request = public_attempt_request_from_serving(
+                    serving,
+                    verified.actor(),
+                    verified.operation_id(),
+                    verified.digest(),
+                    verified.mode(),
+                    state.store().backend_identity().as_hex().to_owned(),
+                )?;
+                match mirror_public_terminal_with_request(state, &public_request, &record, deadline).await? {
+                    PublicAttemptTerminalOutcome::Mirrored(_) => {
+                        return Ok(PrivatePushOutcome::Terminal { terminal, private_id: Some(private_id) });
+                    }
+                    PublicAttemptTerminalOutcome::RetirementRequired(_) => {
+                        let probe = operation::probe_public(
+                            state,
+                            serving,
+                            verified.actor(),
+                            verified.operation_id(),
+                            verified.request(),
+                            verified.digest(),
+                            verified.mode(),
+                            deadline,
+                        )
+                        .await?;
+                        return complete_private_probe(state, serving, verified, probe, deadline).await;
+                    }
+                }
+            }
+            Start::Terminal(_) => {
+                // A wrapper or explicit legacy record won the race after the
+                // late probe. Re-resolve its exact provenance; never insert.
+                let probe = operation::probe_public(
+                    state,
+                    serving,
+                    verified.actor(),
+                    verified.operation_id(),
+                    verified.request(),
+                    verified.digest(),
+                    verified.mode(),
+                    deadline,
+                )
+                .await?;
+                return complete_private_probe(state, serving, verified, probe, deadline).await;
+            }
+            Start::Cancelled(reason) => return Ok(PrivatePushOutcome::Cancelled(reason)),
+        }
+    }
+}
+
+/// Render the exact private/legacy disposition discovered after native
+/// ingestion. A `Finish` is mirrored before ACK; an eligible retirement runs at
+/// most once from the same receive value. A `Fresh` probe here is a broken
+/// provenance invariant, not a reason to enter a legacy writer.
+async fn complete_private_probe(
+    state: &BlobGitState,
+    serving: &ServingRepository,
+    verified: &VerifiedReceive<'_>,
+    probe: operation::Probe,
+    deadline: Instant,
+) -> Result<PrivatePushOutcome, GatewayError> {
+    match probe {
+        operation::Probe::Fresh => {
+            Err(GatewayError::Internal("private receive probe lost its fresh disposition"))
+        }
+        operation::Probe::Pending => Err(GatewayError::OutcomeUnknown),
+        operation::Probe::Cancelled { reason } => Ok(PrivatePushOutcome::Cancelled(reason)),
+        operation::Probe::Replay { terminal, private_id } => {
+            Ok(PrivatePushOutcome::Terminal { terminal, private_id })
+        }
+        operation::Probe::Finish { terminal, private_id, evidence, record } => {
+            let public_request = public_attempt_request_from_serving(
+                serving,
+                verified.actor(),
+                verified.operation_id(),
+                verified.digest(),
+                verified.mode(),
+                state.store().backend_identity().as_hex().to_owned(),
+            )?;
+            match mirror_public_terminal_with_request(state, &public_request, &record, deadline).await? {
+                PublicAttemptTerminalOutcome::Mirrored(_) => {
+                    Ok(PrivatePushOutcome::Terminal { terminal, private_id: Some(private_id) })
+                }
+                PublicAttemptTerminalOutcome::RetirementRequired(retirement) => {
+                    let retired =
+                        retire_slot_one(state, serving, verified, &evidence, &retirement, deadline).await?;
+                    Ok(PrivatePushOutcome::Terminal {
+                        terminal: retired.terminal,
+                        private_id: Some(retired.private_id),
+                    })
+                }
+            }
+        }
+        operation::Probe::FinishCancelled { reason } => {
+            let _ = reason;
+            Err(GatewayError::Conflict("operation cancellation requires reconciliation"))
+        }
+    }
+}
+
+#[allow(dead_code)] // Legacy push-only helper.
 async fn repository_owner(state: &BlobGitState, repository_id: Uuid, deadline: Instant) -> Result<Uuid, GatewayError> {
     let client = state.pooled(deadline).await?;
     let row =
@@ -307,6 +537,7 @@ fn is_rolled_back_revision_mismatch(error: &PackCommitError) -> bool {
     )
 }
 
+#[allow(dead_code)] // Legacy push-only admission entry.
 #[allow(clippy::too_many_arguments)]
 async fn begin(
     state: &BlobGitState,
@@ -358,7 +589,6 @@ async fn begin(
 /// hold the staged raw pack pairs. This function performs only the short
 /// PostgreSQL preflight/admission; it holds no transaction while reading or
 /// uploading a pair.
-#[allow(dead_code)] // No route selects private mode until the GET/replay/cancel paths are ready.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn begin_slot_zero(
     state: &BlobGitState,
@@ -1129,7 +1359,6 @@ async fn replay_slot_zero_claim(
     request_digest: RequestDigest,
     deadline: Instant,
 ) -> Result<Claim, GatewayError> {
-    let repository_id = public_request.repository_id;
     let evidence =
         match PgRefStore.lookup_public_attempt(tx, public_request, deadline).await.map_err(GatewayError::from)? {
             PublicAttemptLookup::Pending(evidence)
@@ -1146,6 +1375,7 @@ async fn replay_slot_zero_claim(
 }
 
 /// What one fresh-write transaction decided about this operation identity.
+#[allow(dead_code)] // Legacy push-only reservation outcome.
 enum Reserved {
     /// The operation already existed when this transaction re-checked it; the
     /// reservation is rolled back unused and the answer comes from that durable
@@ -1178,6 +1408,7 @@ enum Reserved {
 /// transaction back under the original deadline. The transaction is finished
 /// before any Blob/native work, so no PostgreSQL transaction is held across
 /// provider or native Git IO.
+#[allow(dead_code)] // Legacy push-only fresh transaction.
 #[allow(clippy::too_many_arguments)]
 async fn begin_fresh(
     state: &BlobGitState,
@@ -1326,6 +1557,7 @@ fn start_from_claim(claim: Claim) -> Result<Start, GatewayError> {
     }
 }
 
+#[allow(dead_code)] // Legacy push-only plan builder (also exercised by tests).
 fn build_plan(
     request: &PushRequest,
     pairs: &[Pair],

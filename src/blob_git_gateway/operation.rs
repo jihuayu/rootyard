@@ -91,6 +91,7 @@ pub(super) struct ResolvedPublicPrivate {
 /// attempt is terminal, so the reviewed terminal mirror must first derive
 /// `Mirrored` or `RetirementRequired`. The record is owned by this value; no
 /// private UUID is formatted into a public error or response.
+#[allow(clippy::large_enum_variant)] // Finish carries the exact owned record/evidence once, not a hot path.
 pub(super) enum Probe {
     Fresh,
     Pending,
@@ -166,6 +167,7 @@ fn digest_from_parts(
 /// (`serving::lookup_in_tx`: token, RBAC, repository `ready`, durable binding and
 /// live gate), so a record can never be classified for a repository the caller
 /// may not serve. The local row read itself is [`lookup_in_tx`].
+#[allow(dead_code)] // Legacy probe/begin-only lookup; private receive uses probe_public.
 pub(super) async fn lookup(
     state: &BlobGitState,
     serving: &crate::ref_store::serving::ServingRepository,
@@ -253,6 +255,10 @@ pub(super) async fn lookup_in_tx(
 }
 
 /// Query the immutable operation registry before native ingestion.
+///
+/// Source-preserved for the legacy replay path and its tests. Normal receive
+/// selects [`probe_public`] and never reaches this probe.
+#[allow(dead_code)]
 pub(super) async fn probe(
     state: &BlobGitState,
     serving: &crate::ref_store::serving::ServingRepository,

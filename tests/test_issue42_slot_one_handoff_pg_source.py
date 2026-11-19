@@ -108,9 +108,10 @@ class SlotOneHandoffPostgresSourceTest(unittest.TestCase):
         self.assertNotIn("P0 operation lookup failed: {error:?}", self.retirement)
         self.assertNotIn("public terminal mirror failed: {error:?}", self.retirement)
 
-    def test_receive_stays_on_legacy_publish_push(self):
+    def test_receive_uses_private_fresh_entry_and_keeps_slot_one_indirect(self):
         production_receive = production(self.receive)
-        self.assertIn("publish::push(", production_receive)
+        self.assertIn("publish::push_private(", production_receive)
+        self.assertNotIn("publish::push(", production_receive)
         self.assertNotIn("rotate_slot_one(", production_receive)
         self.assertNotIn("SlotOneReceive", production_receive)
 

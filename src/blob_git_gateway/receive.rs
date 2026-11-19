@@ -28,9 +28,9 @@ use uuid::Uuid;
 use super::{
     error::GatewayError,
     native,
-    operation::{self, Claim},
+    operation,
     protocol::{self, PushRequest},
-    publish::{self, Pair, PushOutcome},
+    publish::{self, Pair, PrivatePushOutcome},
     repo_session::CommittedWriteSessionProof,
     serving::{ServingRepository, lookup},
     session::{authenticate, authorize_write, operation_id, validate_git_protocol},
@@ -236,10 +236,11 @@ async fn receive_pack_authorized(
     };
 
     // Migration-152 public/private probe before any native child or A3/A4 write.
-    // Fresh identifiers continue through the legacy early probe and entry; an
-    // existing private wrapper is resolved only through its exact durable
-    // evidence, and a pending wrapper whose private attempt is already terminal
-    // is finished by the reviewed mirror (never rendered as a false replay).
+    // Fresh identifiers continue to the trusted private admission after native
+    // ingestion. An existing private wrapper is resolved only through its exact
+    // durable evidence, and a pending wrapper whose private attempt is already
+    // terminal is finished by the reviewed mirror (never rendered as a false
+    // replay). The initial `publish::push` legacy writer is no longer selected.
     let mut pending_retirement: Option<(PublicAttemptEvidence, PublicAttemptRetirement)> = None;
     match operation::probe_public(
         &state,
@@ -253,46 +254,7 @@ async fn receive_pack_authorized(
     )
     .await?
     {
-        operation::Probe::Fresh => {
-            match operation::probe(
-                &state,
-                &serving,
-                receive.actor,
-                operation,
-                receive.request(),
-                receive.digest(),
-                deadline,
-            )
-            .await?
-            {
-                Claim::Pending => return Err(GatewayError::OutcomeUnknown),
-                Claim::Cancelled(reason) => {
-                    return terminal_response(
-                        receive.request(),
-                        &cancelled_results(receive.request(), reason),
-                        operation,
-                    );
-                }
-                Claim::Replay(terminal) => {
-                    materialize_durable_gateway_receipt(receipt_args(false, None)).await?;
-                    let results = report_results(receive.request(), &terminal)?;
-                    let body = protocol::report_status(receive.request().wants_report(), &results);
-                    return committed_response(CommittedResponse {
-                        state: &state,
-                        identity: &identity,
-                        owner: &owner,
-                        name,
-                        authorized: &serving,
-                        terminal: &terminal,
-                        body,
-                        operation,
-                        deadline,
-                    })
-                    .await;
-                }
-                Claim::Fresh => {}
-            }
-        }
+        operation::Probe::Fresh => {}
         operation::Probe::Pending => return Err(GatewayError::OutcomeUnknown),
         operation::Probe::Cancelled { reason } => {
             return terminal_response(receive.request(), &cancelled_results(receive.request(), reason), operation);
@@ -497,24 +459,13 @@ async fn receive_pack_authorized(
         };
     }
 
-    let published = publish::push(
-        &state,
-        &serving,
-        receive.actor(),
-        operation,
-        receive.digest(),
-        receive.request(),
-        receive.pairs(),
-        receive.mode(),
-        deadline,
-    )
-    .await;
+    let published = publish::push_private(&state, &serving, &receive, deadline).await;
     match published {
-        // Only the persisted (fresh or replayed) core terminal is rendered as a
-        // Git report-status. Mixed/accepted-subset terminals are replayed
-        // exactly as recorded.
-        Ok(PushOutcome::Terminal(terminal)) => {
-            materialize_durable_gateway_receipt(receipt_args(true, None)).await?;
+        // Only the persisted private/legacy terminal is rendered as a Git
+        // report-status. The private durable id is used only as the receipt
+        // row key; the public operation header stays unchanged.
+        Ok(PrivatePushOutcome::Terminal { terminal, private_id }) => {
+            materialize_durable_gateway_receipt(receipt_args(true, private_id)).await?;
             let results = report_results(receive.request(), &terminal)?;
             let body = protocol::report_status(receive.request().wants_report(), &results);
             committed_response(CommittedResponse {
@@ -530,7 +481,7 @@ async fn receive_pack_authorized(
             })
             .await
         }
-        Ok(PushOutcome::Cancelled(reason)) => {
+        Ok(PrivatePushOutcome::Cancelled(reason)) => {
             let s = state.scratch_root();
             let _ = settle_aborted_gateway_reclaim(
                 state.pool(),
