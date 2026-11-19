@@ -252,10 +252,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         )
         self.assertLess(len(rpc.splitlines()), 495)
         self.assertLess(len((ROOT / "tests" / "paired_raft_backup_support" / "format30_e2e.rs").read_text(encoding="utf-8").splitlines()), 475)
-        self.assertLess(
-            len((ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_startup_gates.rs").read_text(encoding="utf-8").splitlines()),
-            240,
-        )
+        self.assertLess(len((ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_startup_gates.rs").read_text(encoding="utf-8").splitlines()), 240)
 
     def test_fence_hold_caller_auth_cutpoint_reach_and_realm_rehome_contracts(self) -> None:
         def read(name: str) -> str:
@@ -348,48 +345,38 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         require(
             delta10_src,
             (
-                "gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish",
-                "restore_and_boot_format30_with_pre_thaw_hook",
-                "kill_hard_checked",
-                "paired-restore-rebind",
-                "BootThawRefused",
-                "pre_thaw_hook_ran",
+                "gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish", "restore_and_boot_format30_with_pre_thaw_hook",
+                "kill_hard_checked", "paired-restore-rebind", "BootThawRefused", "pre_thaw_hook_ran",
                 "restore_and_boot_format30_with_pre_publish_hook",
             ),
             "gate-10 multi-plan rebind, thaw-failure and pre-publish collision coverage",
         )
-        self.assertIn(
-            "format30_delta10_gates",
-            (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8"),
-            "gate-10 module must be wired into the integration test target",
-        )
+        self.assertIn("format30_delta10_gates", (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8"),
+                      "gate-10 module must be wired into the integration test target")
         require(
             read("format30_pack_consolidate.rs"),
             ("chunk_refs_for_plans", "select_packs_for_rebind_with_limit", "MAX_REBIND_REF_ACK_BYTES", "RepositoryClosureExceedsVerifierBudget"),
             "multi-plan rebind ref/ACK and verifier byte chunking contract",
         )
-        require(
-            read("format30_pg_raft_sync.rs"),
-            ("apply_pg_repo_state_to_raft", "RefPrecondition::Present", "RefTarget::Delete", "MAX_PLAN_REFS"),
-            "delta-exact PG -> Raft replication contract",
-        )
+        require(read("format30_pg_raft_sync.rs"), ("apply_pg_repo_state_to_raft", "RefPrecondition::Present", "RefTarget::Delete", "MAX_PLAN_REFS"),
+                "delta-exact PG -> Raft replication contract")
         require(
             read("mtls_raft.rs"),
             ("sync_cached_state_machine", "resolve_group_epoch(&cmd, &before_sm)", "post-commit snapshot failed"),
             "multi-handle Raft cache sync and per-commit group-epoch resolution contract",
         )
-        require(
-            read("startup_wiring.rs"),
-            ("PairedWriteRaftScopeGuard", "install_paired_write_raft_binding", "mirror_gateway_push_to_paired_raft", "run_serialized_pg_to_raft_step", "tokio::sync::Mutex"),
-            "database-keyed paired write binding contract",
-        )
+        require(read("startup_wiring.rs") + read("startup_wiring_tests.rs"), ("PairedWriteRaftScopeGuard", "install_paired_write_raft_binding", "mirror_gateway_push_to_paired_raft", "run_serialized_pg_to_raft_step",
+                "tokio::sync::Mutex", "lock_owned", "cancelled_caller_keeps_serialization_lock_until_blocking_raft_apply_finishes"), "database-keyed paired write binding contract")
         receive_src = (ROOT / "src" / "blob_git_gateway" / "receive.rs").read_text(encoding="utf-8")
         require(
             receive_src,
             ("check_paired_write_unfrozen", "mirror_gateway_push_to_paired_raft", "GatewayError::OutcomeUnknown"),
             "normal paired Smart-HTTP write-path mirror contract",
         )
-        for gate in ("format30_delta8_gates.rs", "format30_delta10_gates.rs", "format30_luna_fence_hold_gates.rs"):
+        for gate in (
+            "format30_delta8_gates.rs", "format30_delta10_gates.rs", "format30_delta15_gates.rs",
+            "format30_luna_fence_hold_gates.rs",
+        ):
             gate_src = (ROOT / "tests" / "paired_raft_backup_support" / gate).read_text(encoding="utf-8")
             self.assertNotIn("replicate_pg_repo_to_raft_guarded", gate_src, f"{gate} must use the normal paired write path")
             self.assertIn('flavor = "multi_thread"', gate_src, f"{gate} must drive the mirrored write path on a multi-thread runtime")
@@ -398,6 +385,13 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             (ROOT / "tests" / "paired_raft_backup_support" / "format30_e2e.rs").read_text(encoding="utf-8"),
             "the live E2E must prove the normal push path owns the Raft floor",
         )
+        delta15 = ROOT / "tests" / "paired_raft_backup_support" / "format30_delta15_gates.rs"
+        self.assertLess(len(delta15.read_text(encoding="utf-8").splitlines()), 450)
+        require(delta15.read_text(encoding="utf-8"), ("gate15_admitted_over_eight_pairs_restores_and_verifies_end_to_end", "gate15_over_budget_backup_refused_before_publishing_destination"), "gate-15 over-eight-pair and over-budget gates")
+        self.assertIn("format30_delta15_gates", (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8"))
+        budget = fmt30.index("enforce_blob_closure_verifier_budget(&blob_closure.entries)")
+        self.assertTrue(budget < fmt30.index("write_synced(&work_dir.join(COMPLETE_MARKER)") < fmt30.index("fs::rename(&work_dir, req.destination)") and "PartialDirGuard" in fmt30)
+        self.assertLess(read("backup.rs").index("enforce_blob_closure_verifier_budget(&entries)"), read("backup.rs").index("write_synced_file(&work_dir.join(COMPLETE_MARKER)"))
 
     def test_workflow_contract_and_doc_links(self) -> None:
         raw_wf = WORKFLOW.read_bytes()

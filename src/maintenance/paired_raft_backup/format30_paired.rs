@@ -18,7 +18,7 @@ use crate::ref_store::GitObjectFormat;
 use crate::ref_store::core::pack_commit::VERIFIER_MAX_TOTAL_BYTES;
 use crate::ref_store::core::state_machine::{AppliedLogId, RefCasStateMachine};
 
-use super::backup::{reconcile_pg_raft_repositories, stream_sha256_file};
+use super::backup::{PartialDirGuard, reconcile_pg_raft_repositories, stream_sha256_file};
 use super::closure_bind::verify_blob_closure_against_durable_raft;
 use super::durable_freeze_gate::DurableFreezeHandle;
 use super::mtls_raft::MtlsLiveRaftBackend;
@@ -148,6 +148,7 @@ pub async fn create_format30_paired_raft_backup(
         fs::remove_dir_all(&work_dir)?;
     }
     fs::create_dir_all(&work_dir)?;
+    let mut partial_guard = PartialDirGuard::new(work_dir.clone());
 
     // Keep `<db>` at `default_transaction_read_only = on` continuously; run `crate::backup::create`
     // via a dedicated ephemeral backup role (`ALTER ROLE ... IN DATABASE ... SET default_transaction_read_only = off`).
@@ -158,11 +159,7 @@ pub async fn create_format30_paired_raft_backup(
     create_res.map_err(|e| PairedBackupError::Postgres(format!("format 30 backup::create failed: {e:#}")))?;
     cleanup_res?;
     freeze.maybe_inject_fence_fault(1).await?;
-    let fence_res = freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await;
-    if let Err(err) = fence_res {
-        let _ = fs::remove_dir_all(&work_dir);
-        return Err(err);
-    }
+    freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await?;
     crate::backup::check(&fmt30_dir).map_err(|_| PairedBackupError::IncompleteCut("inner format 30 check failed"))?;
 
     let (fmt30_binding, blob_closure) =
@@ -173,6 +170,7 @@ pub async fn create_format30_paired_raft_backup(
         &blob_closure.entries,
         &pg_proof.repositories,
     )?;
+    enforce_blob_closure_verifier_budget(&blob_closure.entries)?;
 
     let mut group_epochs = BTreeMap::from([(req.raft.group_id(), active_cut.group_epoch)]);
     for pc in &peer_cuts {
@@ -222,13 +220,10 @@ pub async fn create_format30_paired_raft_backup(
     write_synced(&m_path, &m_bytes)?;
     let (_, m_hex) = stream_sha256_file(&m_path)?;
     freeze.maybe_inject_fence_fault(2).await?;
-    let fence_res = freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await;
-    if let Err(err) = fence_res {
-        let _ = fs::remove_dir_all(&work_dir);
-        return Err(err);
-    }
+    freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await?;
     write_synced(&work_dir.join(COMPLETE_MARKER), m_hex.as_bytes())?;
     fs::rename(&work_dir, req.destination)?;
+    partial_guard.disarm();
 
     let verified = verify_format30_paired_archive(req.destination, Some(req.store.backend_identity().as_hex()))?;
     freeze.maybe_inject_fence_fault(3).await?;
@@ -256,6 +251,24 @@ pub async fn create_format30_paired_raft_backup(
     }
     .mint()?;
     Ok((manifest, seal_receipt))
+}
+
+/// Refuse any repository Blob closure above the A4 verifier total-byte bound.
+pub(super) fn enforce_blob_closure_verifier_budget(entries: &[BlobArtifactEntry]) -> Result<(), PairedBackupError> {
+    let mut repo_bytes: BTreeMap<Uuid, u64> = BTreeMap::new();
+    for entry in entries {
+        let total = repo_bytes.entry(entry.repository_id).or_default();
+        *total = total.saturating_add(entry.length);
+    }
+    for (&repository_id, &bytes) in &repo_bytes {
+        if bytes > VERIFIER_MAX_TOTAL_BYTES {
+            return Err(PairedBackupError::RepositoryClosureExceedsVerifierBudget {
+                repository_id: Some(repository_id),
+                bound_bytes: VERIFIER_MAX_TOTAL_BYTES,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Independently verify both outer paired manifest/COMPLETE and inner `format 30` (`schema 151`)
@@ -298,19 +311,7 @@ pub fn verify_format30_paired_archive(
     manifest.freeze.require_frozen()?;
     manifest.pg_cutpoint.verify()?;
     manifest.blob_closure.verify()?;
-    let mut repo_bytes: BTreeMap<Uuid, u64> = BTreeMap::new();
-    for entry in &manifest.blob_closure.entries {
-        let total = repo_bytes.entry(entry.repository_id).or_default();
-        *total = total.saturating_add(entry.length);
-    }
-    for (&repository_id, &bytes) in &repo_bytes {
-        if bytes > VERIFIER_MAX_TOTAL_BYTES {
-            return Err(PairedBackupError::RepositoryClosureExceedsVerifierBudget {
-                repository_id: Some(repository_id),
-                bound_bytes: VERIFIER_MAX_TOTAL_BYTES,
-            });
-        }
-    }
+    enforce_blob_closure_verifier_budget(&manifest.blob_closure.entries)?;
     if let Some(exp) = expected_backend_identity
         && manifest.blob_closure.backend_identity != exp
     {

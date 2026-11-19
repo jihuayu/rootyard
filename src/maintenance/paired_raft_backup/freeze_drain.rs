@@ -1,6 +1,5 @@
 //! Three-party write freeze (app, worker, deleter), unknown in-flight drain,
-//! quorum+local WAL backup closure/hold registration, `CloseAuthScope` barriers,
-//! and receipt-gated thaw (#153).
+//! quorum+local WAL backup closure/hold registration, `CloseAuthScope` barriers, and receipt-gated thaw (#153).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -8,6 +7,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::ref_store::contract::{MetadataPinPurpose, RequestDigest};
+use crate::ref_store::core::artifact_hold::contract::MAX_BATCH_ARTIFACTS;
 use crate::ref_store::core::state_machine::{
     AcquireHoldBatchCommand, ApplyResponse, CancelCommand, CloseAuthScopeCommand, CreateSnapshotPinCommand,
     RefCasCommand, RegisterRootCommand, ScopeLifecycle, WireHoldArtifactSpec, WireOperationIdentity,
@@ -50,8 +50,7 @@ pub struct RepoBackupRegistrationSpec {
     pub expected_packs: Vec<ExpectedPackPairSpec>,
 }
 
-/// Coordinates tri-party backup freeze/thaw gated on independent `QuorumCommitReceipt`
-/// + `LocalWalApplyReceipt` state and verified archive sealing receipts.
+/// Coordinates tri-party backup freeze/thaw gated on independent quorum + local apply receipts.
 #[derive(Clone, Debug)]
 pub struct TriPartyBackupCoordinator {
     status: FreezePartyStatus,
@@ -117,8 +116,7 @@ impl TriPartyBackupCoordinator {
         &self.registered_backup_holds
     }
 
-    /// Freeze a metadata-only peer Raft group and close its repository/authority auth scopes
-    /// with full `QuorumCommitReceipt` + `LocalWalApplyReceipt` verification.
+    /// Freeze a metadata-only peer Raft group and close its scopes with full quorum + local apply receipts.
     pub fn freeze_peer_group_and_close(
         &mut self,
         raft: &mut impl DurableRaftBackend,
@@ -138,9 +136,8 @@ impl TriPartyBackupCoordinator {
         self.finalize_barrier(raft, next_status, apply_receipts, close_receipts, Vec::new(), false)
     }
 
-    /// Freeze app, worker, and deleter; drain/settle unknown in-flight operations;
-    /// register durable backup pin+holds+root; close scopes; and verify both
-    /// `QuorumCommitReceipt`s and reopened `LocalWalApplyReceipt` state before committing.
+    /// Freeze app, worker, and deleter; drain/settle unknown in-flight operations; register durable
+    /// backup pin+holds+root; close scopes; and verify both quorum and reopened local WAL state before committing.
     pub fn freeze_drain_and_register(
         &mut self,
         raft: &mut impl DurableRaftBackend,
@@ -203,9 +200,8 @@ impl TriPartyBackupCoordinator {
         self.finalize_barrier(raft, next_status, apply_receipts, close_receipts, holds, true)
     }
 
-    /// Thaw app, worker, and deleter ONLY after verifying the active durable freeze barrier,
-    /// `SealedArchiveReceipt`, on-disk `verify_backup_archive`, durable `quorum_commit_index`,
-    /// and reopened local WAL snapshot preserving active backup holds/roots and closed scopes.
+    /// Thaw app, worker, and deleter ONLY after the durable barrier, `SealedArchiveReceipt`, on-disk
+    /// archive and reopened local WAL hold/root/snapshot state all verify.
     pub fn unfreeze_after_backup(
         &mut self,
         raft: &dyn DurableRaftBackend,
@@ -394,7 +390,7 @@ impl TriPartyBackupCoordinator {
                 slot: slot_i16,
                 artifact_digest: digest.to_owned(),
                 declared_bytes: decl_b,
-                logical_bytes: decl_b,
+                logical_bytes: 512,
             });
         }
         let req_digest =
@@ -422,22 +418,26 @@ impl TriPartyBackupCoordinator {
         pin_rec.verify(Some(gid), Some(&mem))?;
         apply_receipts.push(pin_rec);
 
-        let (hold_rec, _) = raft.commit_and_apply(RefCasCommand::AcquireHoldBatch(AcquireHoldBatchCommand {
-            request_id: Uuid::new_v4(),
-            consume_request_id: Uuid::new_v4(),
-            operation_id: Uuid::new_v4(),
-            repository_id: spec.repository_id,
-            tenant_id: spec.tenant_id,
-            owner_id: spec.owner_id,
-            authority_id: spec.authority_id,
-            authority_generation: spec.authority_generation,
-            purpose: "ref_publication".into(),
-            backend_identity: spec.backend_identity.clone(),
-            expected_gate_digest: gate_digest,
-            artifacts: wire_specs,
-        }))?;
-        hold_rec.verify(Some(gid), Some(&mem))?;
-        apply_receipts.push(hold_rec);
+        for chunk in wire_specs.chunks(MAX_BATCH_ARTIFACTS) {
+            let batch: Vec<WireHoldArtifactSpec> =
+                chunk.iter().enumerate().map(|(i, s)| WireHoldArtifactSpec { slot: i as i16, ..s.clone() }).collect();
+            let (hold_rec, _) = raft.commit_and_apply(RefCasCommand::AcquireHoldBatch(AcquireHoldBatchCommand {
+                request_id: Uuid::new_v4(),
+                consume_request_id: Uuid::new_v4(),
+                operation_id: Uuid::new_v4(),
+                repository_id: spec.repository_id,
+                tenant_id: spec.tenant_id,
+                owner_id: spec.owner_id,
+                authority_id: spec.authority_id,
+                authority_generation: spec.authority_generation,
+                purpose: "ref_publication".into(),
+                backend_identity: spec.backend_identity.clone(),
+                expected_gate_digest: gate_digest.clone(),
+                artifacts: batch,
+            }))?;
+            hold_rec.verify(Some(gid), Some(&mem))?;
+            apply_receipts.push(hold_rec);
+        }
 
         let refs_map = raft.durable_state_machine().read_refs(spec.repository_id);
         let refs_digest = sha256_json_tagged(b"backup-refs", &refs_map)?;

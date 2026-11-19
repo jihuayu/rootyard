@@ -196,6 +196,7 @@ pub async fn create_paired_backup(
     }
 
     verify_blob_closure_against_durable_raft(&snapshot, &req.freeze_barrier.backup_holds, &entries, &pg.repositories)?;
+    super::format30_paired::enforce_blob_closure_verifier_budget(&entries)?;
 
     let blob_closure = BlobClosureManifest {
         backend_identity: backend_hex.clone(),
@@ -276,16 +277,16 @@ pub async fn create_paired_backup(
     Ok((manifest, seal_receipt))
 }
 
-struct PartialDirGuard {
+pub(super) struct PartialDirGuard {
     path: Option<std::path::PathBuf>,
 }
 
 impl PartialDirGuard {
-    fn new(path: std::path::PathBuf) -> Self {
+    pub(super) fn new(path: std::path::PathBuf) -> Self {
         Self { path: Some(path) }
     }
 
-    fn disarm(&mut self) {
+    pub(super) fn disarm(&mut self) {
         self.path = None;
     }
 }

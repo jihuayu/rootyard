@@ -96,7 +96,11 @@ impl LoopbackS3 {
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
                 let (l, _) = (tokio::net::TcpListener::from_std(lis).unwrap(), tx.send(()));
-                let _ = axum::serve(l, axum::Router::new().fallback(handle_s3).with_state(srv)).await;
+                let router = axum::Router::new()
+                    .fallback(handle_s3)
+                    .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+                    .with_state(srv);
+                let _ = axum::serve(l, router).await;
             });
         });
         rx.recv().unwrap();

@@ -83,6 +83,7 @@ pub fn verify_backup_archive(
     manifest.freeze.require_frozen()?;
     manifest.pg_cutpoint.verify()?;
     manifest.blob_closure.verify()?;
+    super::format30_paired::enforce_blob_closure_verifier_budget(&manifest.blob_closure.entries)?;
     if let Some(expected_be) = expected_backend_identity
         && manifest.blob_closure.backend_identity != expected_be
     {
