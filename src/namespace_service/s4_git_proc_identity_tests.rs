@@ -4,6 +4,7 @@
 //! visible until reaped. Capture `(pid, starttime)` only while the fixture is
 //! demonstrably live, then re-read that identity at scratch release.
 
+#[cfg(target_os = "linux")]
 use std::io;
 
 const FIELDS_THROUGH_STARTTIME: usize = 20;
@@ -33,6 +34,7 @@ enum ProcLookup {
     Present(ProcEntry),
 }
 
+#[cfg(target_os = "linux")]
 impl OriginalProcess {
     pub(super) fn state(self) -> ProcState {
         assert_procfs_live();
@@ -40,6 +42,7 @@ impl OriginalProcess {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn capture_pair(leader: i32, descendant: i32) -> (OriginalProcess, OriginalProcess) {
     assert!(leader > 1, "leader pid marker {leader} is not a valid positive process id");
     assert!(descendant > 1, "descendant pid marker {descendant} is not a valid positive process id");
@@ -63,6 +66,7 @@ pub(super) fn capture_pair(leader: i32, descendant: i32) -> (OriginalProcess, Or
     )
 }
 
+#[cfg(target_os = "linux")]
 fn live_entry(pid: i32, role: &str) -> ProcEntry {
     match lookup(pid) {
         ProcLookup::Gone => panic!("{role} {pid} is not visible in procfs"),
@@ -81,15 +85,39 @@ fn classify(original: OriginalProcess, observed: ProcLookup) -> ProcState {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn assert_procfs_live() {
-    let pid = i32::try_from(std::process::id()).expect("test pid fits i32");
-    match lookup(pid) {
-        ProcLookup::Present(entry) if entry.state == ProcState::Live => {}
-        ProcLookup::Present(entry) => panic!("procfs is present but test process {pid} is {:?}", entry.state),
-        ProcLookup::Gone => panic!("procfs is not live: /proc/{pid}/stat is absent"),
-    }
+    assert_procfs_mount();
+    // Read the self entry with the kernel's actual PID. A numeric PID path
+    // existing is not enough, and self must be positively parsed as live
+    // before another PID's ENOENT/ESRCH can mean the original is gone.
+    let pid = unsafe { libc::getpid() };
+    assert!(pid > 1, "test process has invalid pid {pid}");
+    let path = "/proc/self/stat";
+    let stat = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
+    let entry = parse_stat(pid, path, &stat);
+    assert_eq!(entry.state, ProcState::Live, "procfs is present but test process {pid} is {:?}", entry.state);
 }
 
+#[cfg(target_os = "linux")]
+fn assert_procfs_mount() {
+    let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the path is a NUL-terminated literal and statfs writes the buffer
+    // on success; it is only assumed initialized after a zero return.
+    let result = unsafe { libc::statfs(b"/proc\0".as_ptr().cast(), statfs.as_mut_ptr()) };
+    assert_eq!(result, 0, "cannot statfs /proc");
+    // SAFETY: the successful statfs call initialized the buffer.
+    let statfs = unsafe { statfs.assume_init() };
+    assert_eq!(
+        statfs.f_type as u64,
+        libc::PROC_SUPER_MAGIC as u64,
+        "/proc is not a procfs mount"
+    );
+}
+
+/// Callers prove the `/proc` mount and parse `/proc/self/stat` first; only then
+/// may ENOENT/ESRCH for another PID mean that original process is gone.
+#[cfg(target_os = "linux")]
 fn lookup(pid: i32) -> ProcLookup {
     let path = format!("/proc/{pid}/stat");
     let stat = match std::fs::read_to_string(&path) {
@@ -117,7 +145,7 @@ fn parse_stat(pid: i32, path: &str, stat: &str) -> ProcEntry {
     }
     let state = match fields[0] {
         "R" | "S" | "D" | "T" | "t" | "W" | "P" | "I" | "K" => ProcState::Live,
-        "Z" | "X" | "x" => ProcState::Exited,
+        "Z" | "X" => ProcState::Exited,
         other => panic!("unsupported {path} state {other:?}"),
     };
     for (index, field) in fields.iter().enumerate().take(19).skip(1) {
@@ -144,12 +172,14 @@ mod tests {
         assert_eq!(entry.starttime, 9000);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[should_panic(expected = "must be distinct")]
     fn rejects_equal_pid_markers_before_lookup() {
         capture_pair(4242, 4242);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[should_panic(expected = "valid positive")]
     fn rejects_invalid_pid_markers_before_lookup() {
@@ -166,6 +196,19 @@ mod tests {
     #[should_panic(expected = "unsupported")]
     fn rejects_unknown_state() {
         parse_stat(4242, "/proc/4242/stat", &stat(4242, "?", 77, 9000));
+    }
+
+    #[test]
+    fn parses_positive_zombie_and_dead_states_exited() {
+        for state in ["Z", "X"] {
+            assert_eq!(parse_stat(4242, "/proc/4242/stat", &stat(4242, state, 77, 9000)).state, ProcState::Exited);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported")]
+    fn rejects_lowercase_x_state() {
+        parse_stat(4242, "/proc/4242/stat", &stat(4242, "x", 77, 9000));
     }
 
     #[test]
