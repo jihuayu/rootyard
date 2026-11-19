@@ -207,6 +207,16 @@ class BusyWitnessProjectionTest(unittest.TestCase):
         self.assertEqual(
             _project_with([_umount(), _close()], expected=duplicate),
             (UNKNOWN, "completed_before_unmount_entry"))
+        duplicate_id = dict(EXPECTED)
+        duplicate_id["git"] = (EXPECTED["writer"][0], EXPECTED["git"][1])
+        self.assertEqual(
+            _project_with([_umount(), _close()], expected=duplicate_id),
+            (UNKNOWN, "completed_before_unmount_entry"))
+        duplicate_path = dict(EXPECTED)
+        duplicate_path["git"] = (EXPECTED["git"][0], EXPECTED["writer"][1])
+        self.assertEqual(
+            _project_with([_umount(), _close()], expected=duplicate_path),
+            (UNKNOWN, "completed_before_unmount_entry"))
         missing = {"writer": EXPECTED["writer"], "git": EXPECTED["git"]}
         self.assertEqual(
             _project_with([_umount(), _close()], expected=missing),

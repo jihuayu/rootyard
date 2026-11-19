@@ -844,6 +844,10 @@ def _witness_target(record, expected_mounts, owned_mounts):
         expected[label] = identity
     if len(set(expected.values())) != 3:
         return UNKNOWN
+    if len({identity[0] for identity in expected.values()}) != 3:
+        return UNKNOWN
+    if len({identity[1] for identity in expected.values()}) != 3:
+        return UNKNOWN
     owned = set()
     for value in owned_mounts:
         identity = _identity(value)

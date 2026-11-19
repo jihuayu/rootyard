@@ -999,7 +999,10 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                             expected_mounts[label] = (
                                 mount_id,
                                 normal_shutdown.path_tag(row["mountpoint"]))
-                        if len(set(expected_mounts.values())) != 3:
+                        values = list(expected_mounts.values())
+                        if (len(set(values)) != 3
+                                or len({value[0] for value in values}) != 3
+                                or len({value[1] for value in values}) != 3):
                             raise AssertionError(
                                 "witness route mount identities are not distinct")
                         owned_mounts = {
