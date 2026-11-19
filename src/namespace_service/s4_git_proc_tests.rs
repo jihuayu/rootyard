@@ -3,18 +3,17 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(unix)]
-const REVERSE_STAGES: [ReverseGitStage; 10] = [
-    ReverseGitStage::SourceProjection,
-    ReverseGitStage::ProposalVerifyFetch,
-    ReverseGitStage::AncestryIntegrity,
-    ReverseGitStage::SubtreeExportRefUpdate,
-    ReverseGitStage::SubtreeSourceFetch,
-    ReverseGitStage::SubtreeSourceTreeResolve,
-    ReverseGitStage::SubtreeRootListing,
-    ReverseGitStage::SubtreeRootRebuild,
-    ReverseGitStage::CommitSynthesize,
-    ReverseGitStage::PackWriteIndex,
+const REVERSE_STAGES: [(ReverseGitStage, &str); 10] = [
+    (ReverseGitStage::SourceProjection, "source_projection"),
+    (ReverseGitStage::ProposalVerifyFetch, "proposal_verify_fetch"),
+    (ReverseGitStage::AncestryIntegrity, "ancestry_integrity"),
+    (ReverseGitStage::SubtreeExportRefUpdate, "subtree_export_ref_update"),
+    (ReverseGitStage::SubtreeSourceFetch, "subtree_source_fetch"),
+    (ReverseGitStage::SubtreeSourceTreeResolve, "subtree_source_tree_resolve"),
+    (ReverseGitStage::SubtreeRootListing, "subtree_root_listing"),
+    (ReverseGitStage::SubtreeRootRebuild, "subtree_root_rebuild"),
+    (ReverseGitStage::CommitSynthesize, "commit_synthesize"),
+    (ReverseGitStage::PackWriteIndex, "pack_write_index"),
 ];
 
 const SCRIPT: &str = concat!(
@@ -412,19 +411,7 @@ async fn git_proc_spawn_refuses_to_start_child_when_standby_sweeper_fails() {
 
 #[test]
 fn reverse_git_diagnostic_labels_are_closed_and_bounded() {
-    let stages = [
-        (ReverseGitStage::SourceProjection, "source_projection"),
-        (ReverseGitStage::ProposalVerifyFetch, "proposal_verify_fetch"),
-        (ReverseGitStage::AncestryIntegrity, "ancestry_integrity"),
-        (ReverseGitStage::SubtreeExportRefUpdate, "subtree_export_ref_update"),
-        (ReverseGitStage::SubtreeSourceFetch, "subtree_source_fetch"),
-        (ReverseGitStage::SubtreeSourceTreeResolve, "subtree_source_tree_resolve"),
-        (ReverseGitStage::SubtreeRootListing, "subtree_root_listing"),
-        (ReverseGitStage::SubtreeRootRebuild, "subtree_root_rebuild"),
-        (ReverseGitStage::CommitSynthesize, "commit_synthesize"),
-        (ReverseGitStage::PackWriteIndex, "pack_write_index"),
-    ];
-    for (stage, label) in stages {
+    for (stage, label) in REVERSE_STAGES {
         assert_eq!(stage.as_str(), label);
     }
     let outcomes = [
@@ -480,7 +467,7 @@ fn reverse_git_child_outcome_distinguishes_nonzero_signal_and_unknown() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn every_reverse_stage_reaches_closed_runner_diagnostic_and_keeps_public_conflict() {
-    for stage in REVERSE_STAGES {
+    for (stage, _) in REVERSE_STAGES {
         let _ = reverse_diag::take_for_test();
         let mut cmd = base_command(FsPath::new("/bin/sh"));
         cmd.args(["-c", "exit 7"]);
