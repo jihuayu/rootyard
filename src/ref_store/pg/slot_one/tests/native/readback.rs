@@ -5,8 +5,8 @@ use super::{REF_RETRY, REF_SIDE, Retired, SLOT_ZERO_LANE, db, pack};
 use anyhow::{Result, anyhow, bail, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::{
-    CapturedRef, IssuerLane, OperationLookup, OperationRecord, OperationState,
-    core::pack_commit::{PackCommitPlan, PackCommitTerminal},
+    IssuerLane, OperationLookup, OperationRecord, OperationState,
+    core::pack_commit::{CapturedRef, PackCommitPlan, PackCommitTerminal},
     pg::{
         PgRefStore,
         public_attempt::{PublicAttempt, PublicAttemptEvidence, PublicAttemptRequest},

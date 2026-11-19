@@ -15,7 +15,7 @@ use rootyard::blob_git_gateway::slot_one_acceptance_support as acceptance;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::{
     CommitMode, CommitRejectCode, GitObjectFormat, IssuerLane, OperationLookup, OperationState, RefCommitResult,
-    TerminalKind,
+    RefUpdate, TerminalKind,
     core::pack_commit::{
         PackCommitBaseline, PackCommitError, PackCommitPlan, PackCommitTerminal, PackPendingToken, PgAuthorizedCommit,
     },
@@ -224,7 +224,7 @@ async fn admit_slot_zero(
     };
 
     let mut client = db.pool.get().await?;
-    let tx = client.transaction().await?;
+    let tx = tokio_postgres::Client::transaction(&mut client).await?;
     let mut built = None;
     let admission = PgRefStore
         .admit_slot_zero_in_tx(

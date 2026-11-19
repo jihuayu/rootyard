@@ -42,7 +42,7 @@ pub(super) async fn rotate_and_commit(
     let lane = IssuerLane::new(SLOT_ZERO_LANE)?;
 
     let mut client = db.pool.get().await?;
-    let tx = client.transaction().await?;
+    let tx = tokio_postgres::Client::transaction(&mut client).await?;
     let mut built = None;
     let outcome = PgRefStore
         .rotate_slot_one_in_tx(
@@ -162,7 +162,7 @@ pub(super) async fn rotate_and_commit(
 
 async fn replay_rotation(db: &db::Db, rotation: &SlotOneRotationRequest) -> Result<SlotOneRotationReceipt> {
     let mut client = db.pool.get().await?;
-    let tx = client.transaction().await?;
+    let tx = tokio_postgres::Client::transaction(&mut client).await?;
     let outcome = PgRefStore
         .rotate_slot_one_in_tx(
             tx,
