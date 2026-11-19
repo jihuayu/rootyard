@@ -266,7 +266,7 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
         ));
 
         // 3. Arm destructive GC -> staging cleanup now executes version-conditioned S3 DELETE!
-        authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone()))?;
+        authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm.clone())))?;
         let cleaned = reclaim_abandoned_compaction_staging(&authority, &provider, ext, dl).await?;
         assert_eq!(cleaned.deleted_keys.len(), 2);
         assert!(!s3.has_key(&staged_pk_loc));
@@ -306,7 +306,7 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
             2,
             arm.lane.clone(),
         )?;
-        authority.set_gc_mode(GcMode::ArmedDestructive(arm2.clone()))?;
+        authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm2.clone())))?;
         let _ = reconcile_pending_delete_after_restart_fenced(
             &authority,
             &provider,
@@ -351,7 +351,7 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
             3,
             arm.lane.clone(),
         )?;
-        authority.set_gc_mode(GcMode::ArmedDestructive(arm3.clone()))?;
+        authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm3.clone())))?;
         let _ = reconcile_pending_delete_after_restart_fenced(
             &authority,
             &provider,
@@ -398,7 +398,7 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
             4,
             arm.lane,
         )?;
-        authority.set_gc_mode(GcMode::ArmedDestructive(arm4.clone()))?;
+        authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm4.clone())))?;
         let _ = reconcile_pending_delete_after_restart_fenced(
             &authority,
             &provider,

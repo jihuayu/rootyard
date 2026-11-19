@@ -219,14 +219,15 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     project_all_refcas_events(&pool, tenant_id, repo_id, ProjectionRealm::new(history_id, 0, 1)?, &sm).await?;
 
     let armed = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
-    armed.set_gc_mode(GcMode::ArmedDestructive(seal_test_lane_arm(
+    let lane_arm = seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
         test_dist_lane(repo_id, 1, 4, &[], SafeGcObjectFormat::Sha1),
-    )?))?;
+    )?;
+    armed.set_gc_mode(GcMode::ArmedDestructive(Box::new(lane_arm)))?;
     drop(armed);
     unsafe {
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");

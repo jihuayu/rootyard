@@ -198,14 +198,15 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         .execute("UPDATE ref_store_core_refs SET revision = 50 WHERE repository_id = $1", &[&repo_id])
         .await?;
     let armed = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
-    armed.set_gc_mode(GcMode::ArmedDestructive(seal_test_lane_arm(
+    let lane_arm = seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
         test_dist_lane(repo_id, 1, 4, &[], SafeGcObjectFormat::Sha1),
-    )?))?;
+    )?;
+    armed.set_gc_mode(GcMode::ArmedDestructive(Box::new(lane_arm)))?;
     drop(armed);
     unsafe {
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");

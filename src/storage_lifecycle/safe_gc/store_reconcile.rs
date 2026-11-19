@@ -198,7 +198,7 @@ impl DurableSafeGcAuthority {
             }
             s.reader_leases.set_pg_exclusive_barrier_epoch(Some(fence_epoch));
             s.refresh_group_receipts_quiescence()?;
-            s.gc_mode = GcMode::ArmedDestructive(live_arm.clone());
+            s.gc_mode = GcMode::ArmedDestructive(Box::new(live_arm.clone()));
             let Some(ref batch_existing) = s.pending_delete else {
                 return Ok(());
             };

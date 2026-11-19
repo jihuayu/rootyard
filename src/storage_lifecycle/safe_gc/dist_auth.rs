@@ -264,11 +264,12 @@ impl SafeGcRepoTrustConfig {
         tenant_id: Uuid,
         repo_id: Uuid,
         history_id: Uuid,
-        signers: (&SafeGcEd25519Signer, &SafeGcEd25519Signer, &SafeGcEd25519Signer),
-        backup_pubkey_hex: &str,
+        signers: (&SafeGcEd25519Signer, &SafeGcEd25519Signer),
+        external_pubkeys: (&str, &str),
         keyring_dir: &Path,
     ) -> Result<Self, SafeGcError> {
-        validate_ed25519_pubkey_hex(backup_pubkey_hex)?;
+        validate_ed25519_pubkey_hex(external_pubkeys.0)?;
+        validate_ed25519_pubkey_hex(external_pubkeys.1)?;
         if !keyring_dir.is_absolute() {
             return Err(SafeGcError::ArmingRejected("Ref-CAS keyring directory must be absolute"));
         }
@@ -279,14 +280,13 @@ impl SafeGcRepoTrustConfig {
             history_id,
             trusted_arm_pubkey_hex: signers.0.pubkey_hex().to_owned(),
             trusted_quorum_pubkey_hex: Some(signers.1.pubkey_hex().to_owned()),
-            trusted_hold_bridge_pubkey_hex: Some(signers.2.pubkey_hex().to_owned()),
-            trusted_backup_pubkey_hex: Some(backup_pubkey_hex.to_owned()),
+            trusted_hold_bridge_pubkey_hex: Some(external_pubkeys.0.to_owned()),
+            trusted_backup_pubkey_hex: Some(external_pubkeys.1.to_owned()),
             refcas_keyring_dir: Some(keyring_dir.display().to_string()),
         };
         config.validate_identity()?;
         signers.0.write_seed_file(&Self::seed_path(storage_root, repo_id, "arm"))?;
         signers.1.write_seed_file(&Self::seed_path(storage_root, repo_id, "quorum"))?;
-        signers.2.write_seed_file(&Self::seed_path(storage_root, repo_id, "bridge"))?;
         Self::write_config(storage_root, &config)?;
         Ok(config)
     }

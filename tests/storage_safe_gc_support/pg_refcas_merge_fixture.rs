@@ -49,6 +49,9 @@ pub(super) async fn force_scan_and_schedule(
 /// Reusable live authority for a production Ref-CAS merge test: a seeded gate,
 /// the production cutpoint publisher, decision keyring and token scope id.
 pub(super) struct RefCasMergeRig {
+    pub tenant_id: Uuid,
+    pub repo_id: Uuid,
+    pub history_id: Uuid,
     pub backend: InProcessRefCasBackend,
     pub keyring: DecisionGrantKeyring,
     pub token_scope_id: Uuid,
@@ -114,15 +117,12 @@ pub(super) fn build_refcas_merge_rig(
     sm.apply(AppliedLogId { term: 1, index: 1 }, init)?;
     sm.apply(AppliedLogId { term: 1, index: 2 }, seed)?;
     let backend = InProcessRefCasBackend::new(sm).with_safe_gc_cutpoint_publisher(storage_root.to_path_buf(), 0)?;
-    Ok(RefCasMergeRig { backend, keyring, token_scope_id })
+    Ok(RefCasMergeRig { tenant_id, repo_id, history_id, backend, keyring, token_scope_id })
 }
 
 /// Build the production attempt spec + pull snapshot for a fast-forward `base_oid -> head_oid`.
 pub(super) fn build_refcas_merge_attempt(
     rig: &RefCasMergeRig,
-    tenant_id: Uuid,
-    repo_id: Uuid,
-    history_id: Uuid,
     base_oid: &str,
     head_oid: &str,
     candidate_target_oid: &str,
@@ -130,6 +130,9 @@ pub(super) fn build_refcas_merge_attempt(
     sequence: i64,
     scope_id: Uuid,
 ) -> Result<(MergeAttemptSpec, MergePullSnapshot)> {
+    let tenant_id = rig.tenant_id;
+    let repo_id = rig.repo_id;
+    let history_id = rig.history_id;
     let fmt = GitObjectFormat::Sha1;
     let realm = GrantExpectedRealm {
         tenant_id,
@@ -317,18 +320,7 @@ pub(super) async fn production_refcas_pr_merge(
         merged_storage_generation: None,
         version: 1,
     });
-    let (spec, pull) = build_refcas_merge_attempt(
-        &rig,
-        tenant_id,
-        repo_id,
-        history_id,
-        base_oid,
-        main_oid,
-        main_oid,
-        1,
-        1,
-        rig.token_scope_id,
-    )?;
+    let (spec, pull) = build_refcas_merge_attempt(&rig, base_oid, main_oid, main_oid, 1, 1, rig.token_scope_id)?;
     let merge_out = PullRemoteMergeProducer::new(&rig.backend, &merge_store, &rig.keyring)
         .execute_merge(&spec, &pull, true, MergeFaultInjection::None)
         .await?;

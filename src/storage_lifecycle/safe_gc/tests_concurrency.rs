@@ -37,7 +37,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
         let (snap, arm, proof) = seed_fixture(SafeGcObjectFormat::Sha1, false);
         let auth = snap.authority.clone();
         let authority = DurableSafeGcAuthority::in_memory(snap).unwrap();
-        authority.set_gc_mode(GcMode::ArmedDestructive(arm)).unwrap();
+        authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm))).unwrap();
         let backend = Arc::new(RecordingDeleteBackend::default());
         let unfenced = execute_safe_gc_sweep(
             &authority,
@@ -79,7 +79,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
     let auth_eq = snap_eq.authority.clone();
     let authority_eq = DurableSafeGcAuthority::in_memory(snap_eq).unwrap();
     let _ = authority_eq.bump_lease_epoch().unwrap(); // live lease_epoch is now 2
-    authority_eq.set_gc_mode(GcMode::ArmedDestructive(arm_eq)).unwrap();
+    authority_eq.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm_eq))).unwrap();
     let backend_eq = Arc::new(RecordingDeleteBackend::default());
     for bad_lease in [1_u64, 3_u64] {
         let err = execute_safe_gc_sweep_with_external_fence(
@@ -135,7 +135,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
     });
     let auth = snap.authority.clone();
     let authority = DurableSafeGcAuthority::in_memory(snap).unwrap();
-    authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone())).unwrap();
+    authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm.clone()))).unwrap();
     let proof = authority.build_authoritative_deletion_proof(arm, &[]).unwrap();
     let backend = Arc::new(RecordingDeleteBackend::default());
     let res = execute_safe_gc_sweep_with_external_fence(
@@ -176,7 +176,7 @@ async fn dual_pack_idx_lifecycle_live_pg_restart_fence_and_post_rotation_unwedge
     snap.group_receipts[0].receipt_digest = super::proof_digest::compute_group_receipt_digest(&snap.group_receipts[0]);
 
     let authority = DurableSafeGcAuthority::open_with_journal(&journal, Some(snap)).unwrap();
-    authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone())).unwrap();
+    authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm.clone()))).unwrap();
     let proof = authority.build_authoritative_deletion_proof(arm.clone(), &[]).unwrap();
     assert_eq!(proof.candidates.len(), 4);
 
@@ -273,7 +273,7 @@ async fn dual_pack_idx_lifecycle_live_pg_restart_fence_and_post_rotation_unwedge
         arm.lane,
     )
     .unwrap();
-    reopened.set_gc_mode(GcMode::ArmedDestructive(arm2.clone())).unwrap();
+    reopened.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm2.clone()))).unwrap();
 
     let aborted = reconcile_pending_delete_after_restart_fenced(
         &reopened,

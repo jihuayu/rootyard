@@ -5,9 +5,8 @@ use uuid::Uuid;
 
 use crate::ref_store::core::artifact_hold::reconcile_proof::GroupVoterSignatureDto;
 
-use super::super::model::{
-    AuthorityLane, AuthorityRecord, GlobalHoldEntry, GlobalHoldState, SafeGcArmReceipt, SafeGcObjectFormat,
-};
+use super::super::domain::AuthorityRecord;
+use super::super::model::{AuthorityLane, GlobalHoldEntry, GlobalHoldState, SafeGcArmReceipt, SafeGcObjectFormat};
 use super::{
     BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcRepoTrustConfig,
     write_refcas_group_keyring_dir,
@@ -15,6 +14,14 @@ use super::{
 
 pub(crate) fn test_arm_signer() -> SafeGcEd25519Signer {
     SafeGcEd25519Signer::from_seed([0x41; 32]).unwrap()
+}
+
+fn test_hold_bridge_signer() -> SafeGcEd25519Signer {
+    SafeGcEd25519Signer::from_seed([0x42; 32]).unwrap()
+}
+
+fn test_backup_signer() -> SafeGcEd25519Signer {
+    SafeGcEd25519Signer::from_seed([0x43; 32]).unwrap()
 }
 
 fn sha(tag: &str) -> String {
@@ -41,10 +48,16 @@ pub(crate) fn make_test_dist_lane(
         vec![GroupVoterSignatureDto { voter_id: 1, key_id: 0, mac_hex: hex::encode([0x33_u8; 32]) }],
     )
     .unwrap();
-    let bridge =
-        HoldBridgeEvidence::sign(&signer, ref_cas_authority_id, quorum_epoch, raft_commit_index.max(1), holds).unwrap();
+    let bridge = HoldBridgeEvidence::sign(
+        &test_hold_bridge_signer(),
+        ref_cas_authority_id,
+        quorum_epoch,
+        raft_commit_index.max(1),
+        holds,
+    )
+    .unwrap();
     let backup = BackupRootEvidence::sign(
-        &signer,
+        &test_backup_signer(),
         ref_cas_authority_id,
         quorum_epoch,
         1,
@@ -56,9 +69,9 @@ pub(crate) fn make_test_dist_lane(
         ref_cas_authority_id,
         quorum_epoch,
         raft_commit_index,
-        quorum_evidence: quorum,
-        hold_bridge_evidence: bridge,
-        backup_root_evidence: backup,
+        quorum_evidence: Box::new(quorum),
+        hold_bridge_evidence: Box::new(bridge),
+        backup_root_evidence: Box::new(backup),
         async_projection_only: false,
     }
 }
@@ -201,15 +214,10 @@ fn distributed_lane_rejects_async_projection_and_missing_evidence() {
         raft_commit_index: 10,
         quorum_evidence,
         hold_bridge_evidence,
-        backup_root_evidence: BackupRootEvidence::sign(
-            &test_arm_signer(),
-            authority_id,
-            1,
-            1,
-            sha("backup"),
-            vec!["a".repeat(40)],
-        )
-        .unwrap(),
+        backup_root_evidence: Box::new(
+            BackupRootEvidence::sign(&test_backup_signer(), authority_id, 1, 1, sha("backup"), vec!["a".repeat(40)])
+                .unwrap(),
+        ),
         async_projection_only: true,
     };
     assert!(async_only.validate_for_destructive_gc().is_err());
@@ -261,6 +269,34 @@ fn trust_bundle_and_keyring_provisioning_reject_mismatched_identity() {
         &[(1, 0, [0x11; 32]), (2, 0, [0x12; 32]), (3, 0, [0x13; 32])],
     )
     .unwrap();
+    let bridge = test_hold_bridge_signer();
+    let backup = test_backup_signer();
+    let dist_trust = SafeGcRepoTrustConfig::provision_distributed(
+        dir.path(),
+        auth.tenant_id,
+        auth.repo_id,
+        auth.history_id,
+        (&test_arm_signer(), &test_arm_signer()),
+        (bridge.pubkey_hex(), backup.pubkey_hex()),
+        &keyring,
+    )
+    .unwrap();
+    assert!(SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "arm").is_file());
+    assert!(SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "quorum").is_file());
+    assert!(!SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "bridge").exists());
+    assert!(!SafeGcRepoTrustConfig::seed_path(dir.path(), auth.repo_id, "backup").exists());
+    let dist_arm = SafeGcArmReceipt::seal(
+        &test_arm_signer(),
+        auth.tenant_id,
+        auth.repo_id,
+        auth.history_id,
+        auth.incarnation_id,
+        1,
+        true,
+        make_test_dist_lane(auth.repo_id, 1, 10, &sample_holds(), SafeGcObjectFormat::Sha1),
+    )
+    .unwrap();
+    dist_trust.verify_arm_against_trust(&dist_arm).unwrap();
     let verifier =
         crate::ref_store::core::artifact_hold::reconcile_proof::GroupConsensusVerifier::from_keyring_dir(&keyring)
             .unwrap();

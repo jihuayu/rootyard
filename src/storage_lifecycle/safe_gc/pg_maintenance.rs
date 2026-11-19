@@ -369,6 +369,7 @@ async fn run_safe_gc_phases(
     let GcMode::ArmedDestructive(existing_arm) = &snap_post_compact.gc_mode else {
         unreachable!("checked armed destructive above");
     };
+    let existing_arm = existing_arm.as_ref();
     let is_dist = matches!(&existing_arm.lane, AuthorityLane::DistributedRefCas { .. });
     let live_arm = super::pg_maintenance_dist::reseal_worker_arm_receipt(
         &state.storage.root,

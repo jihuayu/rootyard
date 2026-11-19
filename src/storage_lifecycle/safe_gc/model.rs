@@ -64,9 +64,9 @@ pub enum AuthorityLane {
         ref_cas_authority_id: Uuid,
         quorum_epoch: u64,
         raft_commit_index: u64,
-        quorum_evidence: QuorumCommitEvidence,
-        hold_bridge_evidence: HoldBridgeEvidence,
-        backup_root_evidence: BackupRootEvidence,
+        quorum_evidence: Box<QuorumCommitEvidence>,
+        hold_bridge_evidence: Box<HoldBridgeEvidence>,
+        backup_root_evidence: Box<BackupRootEvidence>,
         async_projection_only: bool,
     },
 }
@@ -97,7 +97,7 @@ impl AuthorityLane {
                 *ref_cas_authority_id,
                 *quorum_epoch,
                 *raft_commit_index,
-                (quorum_evidence, hold_bridge_evidence, backup_root_evidence),
+                (quorum_evidence.as_ref(), hold_bridge_evidence.as_ref(), backup_root_evidence.as_ref()),
                 *async_projection_only,
             ),
         }
@@ -142,7 +142,7 @@ impl AuthorityLane {
                 *quorum_epoch,
                 *raft_commit_index,
                 hold_bridge_evidence.bridge_seq,
-                quorum_evidence,
+                quorum_evidence.as_ref(),
                 cursors,
             ),
         }
@@ -171,9 +171,9 @@ impl AuthorityLane {
                 h.update(quorum_epoch.to_be_bytes());
                 h.update(raft_commit_index.to_be_bytes());
                 h.update([u8::from(*async_projection_only)]);
-                quorum_evidence.encode_canonical(h);
-                hold_bridge_evidence.encode_canonical(h);
-                backup_root_evidence.encode_canonical(h);
+                quorum_evidence.as_ref().encode_canonical(h);
+                hold_bridge_evidence.as_ref().encode_canonical(h);
+                backup_root_evidence.as_ref().encode_canonical(h);
             }
         }
     }
@@ -278,7 +278,7 @@ impl SafeGcArmReceipt {
 pub enum GcMode {
     #[default]
     DisabledByDefault,
-    ArmedDestructive(SafeGcArmReceipt),
+    ArmedDestructive(Box<SafeGcArmReceipt>),
 }
 
 impl GcMode {
@@ -287,7 +287,7 @@ impl GcMode {
             Self::DisabledByDefault => Err(SafeGcError::DestructiveGcDisabledByDefault),
             Self::ArmedDestructive(receipt) => {
                 receipt.validate()?;
-                Ok(receipt)
+                Ok(receipt.as_ref())
             }
         }
     }

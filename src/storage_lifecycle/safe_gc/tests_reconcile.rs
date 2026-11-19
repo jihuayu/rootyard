@@ -85,7 +85,7 @@ async fn default_off_blocks_abandoned_staging_deletes_until_explicitly_armed() {
     assert!(backend.deleted.lock().unwrap().is_empty());
 
     // 2. Armed SingleNodePg WITHOUT live PG fence (`None`) fails closed; rotating gc_epoch fences stale ticket!
-    authority.set_gc_mode(GcMode::ArmedDestructive(arm)).unwrap();
+    authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm))).unwrap();
     assert!(matches!(
         reclaim_abandoned_compaction_staging(&authority, &backend, None, dl).await,
         Err(SafeGcError::StaleDeleterFenced(_))
@@ -123,7 +123,7 @@ fn reconciled_sql_and_sm_holds_and_decisions_clear_when_resolved_preserving_manu
     let (snap, arm, _) = seed_fixture(SafeGcObjectFormat::Sha1, false);
     let ret_id = snap.retired_packs[0].pack_id;
     let authority = DurableSafeGcAuthority::in_memory(snap.clone()).unwrap();
-    authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone())).unwrap();
+    authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm.clone()))).unwrap();
     let manual_hold_id = Uuid::new_v4();
     authority
         .upsert_global_hold(GlobalHoldEntry {
@@ -443,7 +443,7 @@ fn cold_reopen_clears_unheld_pg_barrier_and_requires_live_rebind() {
     let path = dir.path().join("journal.json");
     let authority = DurableSafeGcAuthority::open_with_journal(&path, Some(snap)).unwrap();
     let arm = distributed_arm(&auth);
-    authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone())).unwrap();
+    authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm.clone()))).unwrap();
     authority.rebind_pending_delete_live_pg_fence(7, arm.clone()).unwrap();
     let proof = authority.build_authoritative_deletion_proof(arm.clone(), &[]).unwrap();
     let batch_id = Uuid::new_v4();

@@ -370,7 +370,7 @@ async fn real_pg17_scheduler_worker_default_off_staging_restart_fence_and_openda
             reader_barrier_epoch: 1,
         },
     )?;
-    reloaded.set_gc_mode(GcMode::ArmedDestructive(arm))?;
+    reloaded.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm)))?;
     drop(reloaded);
     unsafe {
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");

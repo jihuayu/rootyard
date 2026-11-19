@@ -219,18 +219,8 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
 
     let rig = build_refcas_merge_rig(&state.storage.root, tenant_id, repo_id, history_id, &base_oid)?;
     let producer = PullRemoteMergeProducer::new(&rig.backend, &pg_store, &rig.keyring);
-    let (happy_spec, happy_pull) = build_refcas_merge_attempt(
-        &rig,
-        tenant_id,
-        repo_id,
-        history_id,
-        &base_oid,
-        &main_oid,
-        &main_oid,
-        1,
-        1,
-        rig.token_scope_id,
-    )?;
+    let (happy_spec, happy_pull) =
+        build_refcas_merge_attempt(&rig, &base_oid, &main_oid, &main_oid, 1, 1, rig.token_scope_id)?;
     let committed = producer.execute_merge(&happy_spec, &happy_pull, false, MergeFaultInjection::None).await?;
     ensure!(matches!(committed, MergeAttemptOutcome::Committed(_)), "install→commit must commit");
     assert_eq!(rig.backend.read_ref_oid(repo_id, "refs/heads/main").await?, Some(main_oid.clone()));
@@ -239,31 +229,21 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
     project_all_refcas_events(&pool, tenant_id, repo_id, ProjectionRealm::new(history_id, 0, 1)?, &sm_happy).await?;
 
     let armed = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
-    armed.set_gc_mode(GcMode::ArmedDestructive(seal_test_lane_arm(
+    let lane_arm = seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
         test_dist_lane(repo_id, 1, 4, &[], SafeGcObjectFormat::Sha1),
-    )?))?;
+    )?;
+    armed.set_gc_mode(GcMode::ArmedDestructive(Box::new(lane_arm)))?;
     drop(armed);
     unsafe {
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");
     }
 
-    let (spec_a, pull_a) = build_refcas_merge_attempt(
-        &rig,
-        tenant_id,
-        repo_id,
-        history_id,
-        &main_oid,
-        &cand_oid,
-        &cand_oid,
-        2,
-        2,
-        rig.token_scope_id,
-    )?;
+    let (spec_a, pull_a) = build_refcas_merge_attempt(&rig, &main_oid, &cand_oid, &cand_oid, 2, 2, rig.token_scope_id)?;
     let validated_a = verify_pull_remote_authz_grant(&spec_a, &pull_a, &rig.keyring)?;
     let cancel_identity = validated_a.commit_cmd.commit.request.identity.clone();
     rig.backend.set_abort_after_install_once(true);
@@ -313,18 +293,7 @@ async fn pg17_scheduled_worker_refcas_install_commit_revocation_and_old_oid_reje
         "cancelled operation must resolve as Cancelled"
     );
 
-    let (spec_b, pull_b) = build_refcas_merge_attempt(
-        &rig,
-        tenant_id,
-        repo_id,
-        history_id,
-        &base_oid,
-        &cand_oid,
-        &cand_oid,
-        2,
-        3,
-        Uuid::new_v4(),
-    )?;
+    let (spec_b, pull_b) = build_refcas_merge_attempt(&rig, &base_oid, &cand_oid, &cand_oid, 2, 3, Uuid::new_v4())?;
     let rejected = producer.execute_merge(&spec_b, &pull_b, false, MergeFaultInjection::None).await.unwrap_err();
     ensure!(matches!(rejected, RemoteMergeError::TargetRefMoved { .. }), "stale base must be OldOidMismatch");
     assert_eq!(attempt_state(&pool, repo_id, spec_b.operation_id).await?, "rejected_merge");

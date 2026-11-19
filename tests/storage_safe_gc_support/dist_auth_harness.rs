@@ -20,6 +20,14 @@ pub fn test_arm_signer() -> SafeGcEd25519Signer {
     SafeGcEd25519Signer::from_seed(TEST_ARM_SEED).unwrap()
 }
 
+fn test_hold_bridge_signer() -> SafeGcEd25519Signer {
+    SafeGcEd25519Signer::from_seed([0x42; 32]).unwrap()
+}
+
+fn test_backup_signer() -> SafeGcEd25519Signer {
+    SafeGcEd25519Signer::from_seed([0x43; 32]).unwrap()
+}
+
 pub fn test_dist_lane(
     ref_cas_authority_id: Uuid,
     quorum_epoch: u64,
@@ -43,10 +51,16 @@ pub fn test_dist_lane(
         }],
     )
     .unwrap();
-    let bridge =
-        HoldBridgeEvidence::sign(&signer, ref_cas_authority_id, quorum_epoch, raft_commit_index.max(1), holds).unwrap();
+    let bridge = HoldBridgeEvidence::sign(
+        &test_hold_bridge_signer(),
+        ref_cas_authority_id,
+        quorum_epoch,
+        raft_commit_index.max(1),
+        holds,
+    )
+    .unwrap();
     let backup = BackupRootEvidence::sign(
-        &signer,
+        &test_backup_signer(),
         ref_cas_authority_id,
         quorum_epoch,
         1,
@@ -58,9 +72,9 @@ pub fn test_dist_lane(
         ref_cas_authority_id,
         quorum_epoch,
         raft_commit_index,
-        quorum_evidence: quorum,
-        hold_bridge_evidence: bridge,
-        backup_root_evidence: backup,
+        quorum_evidence: Box::new(quorum),
+        hold_bridge_evidence: Box::new(bridge),
+        backup_root_evidence: Box::new(backup),
         async_projection_only: false,
     }
 }
@@ -102,14 +116,16 @@ pub fn provision_distributed_trust(
     history_id: Uuid,
     keyring_dir: &Path,
 ) -> Result<SafeGcRepoTrustConfig, SafeGcError> {
-    let signer = test_arm_signer();
+    let arm_quorum = test_arm_signer();
+    let bridge = test_hold_bridge_signer();
+    let backup = test_backup_signer();
     SafeGcRepoTrustConfig::provision_distributed(
         storage_root,
         tenant_id,
         repo_id,
         history_id,
-        (&signer, &signer, &signer),
-        signer.pubkey_hex(),
+        (&arm_quorum, &arm_quorum),
+        (bridge.pubkey_hex(), backup.pubkey_hex()),
         keyring_dir,
     )
 }

@@ -23,7 +23,7 @@ use crate::ref_store::core::state_machine::{RefCasLogEntry, RefCasSnapshot, RefC
 use super::{
     SafeGcError,
     dist_auth::{
-        BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcRepoTrustConfig,
+        QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcRepoTrustConfig, compute_holds_digest,
         restore_attested_state_machine, sign_snapshot_with_keyring_dir, verify_attested_snapshot_with_keyring,
     },
     model::{AuthorityLane, GcMode, SafeGcArmReceipt, SourceFreshness},
@@ -346,8 +346,8 @@ pub(super) async fn reconcile_worker_refcas_cut_if_needed<C: GenericClient + Syn
 ) -> Result<(Option<RefCasReconciledCut>, Option<Vec<GroupVoterSignatureDto>>), anyhow::Error> {
     let snap = authority.snapshot();
     let is_armed_dist = matches!(
-        snap.gc_mode,
-        GcMode::ArmedDestructive(SafeGcArmReceipt { lane: AuthorityLane::DistributedRefCas { .. }, .. })
+        &snap.gc_mode,
+        GcMode::ArmedDestructive(arm) if matches!(arm.lane, AuthorityLane::DistributedRefCas { .. })
     );
     let uses_production_authority =
         explicit_source.is_none() || explicit_source.is_some_and(|source| source.is_production_authority_source());
@@ -420,10 +420,10 @@ pub(super) fn reseal_worker_arm_receipt(
             ref_cas_authority_id,
             quorum_epoch,
             raft_commit_index,
-            quorum_evidence,
             hold_bridge_evidence,
             backup_root_evidence,
             async_projection_only,
+            ..
         } => {
             let cut =
                 fresh_cut.ok_or_else(|| anyhow::anyhow!("DistributedRefCas requires fresh RefCasReconciledCut"))?;
@@ -438,17 +438,13 @@ pub(super) fn reseal_worker_arm_receipt(
                     && cut.sm_applied_log_term > 0,
                 "RefCasReconciledCut log coordinate is behind or invalid"
             );
+            let voters = verified_voters
+                .ok_or_else(|| anyhow::anyhow!("DistributedRefCas requires #151 verified voter signatures"))?;
             let quorum_signer = SafeGcEd25519Signer::load_seed_file(&SafeGcRepoTrustConfig::seed_path(
                 storage_root,
                 repo_id,
                 "quorum",
             ))?;
-            let bridge_signer = SafeGcEd25519Signer::load_seed_file(&SafeGcRepoTrustConfig::seed_path(
-                storage_root,
-                repo_id,
-                "bridge",
-            ))?;
-            let voters = verified_voters.unwrap_or_else(|| quorum_evidence.voter_signatures.clone());
             let quorum = QuorumCommitEvidence::sign(
                 &quorum_signer,
                 *ref_cas_authority_id,
@@ -459,21 +455,29 @@ pub(super) fn reseal_worker_arm_receipt(
                 cut.sm_snapshot_checksum.clone(),
                 voters,
             )?;
-            let bridge = HoldBridgeEvidence::sign(
-                &bridge_signer,
-                *ref_cas_authority_id,
-                *quorum_epoch,
-                hold_bridge_evidence.bridge_seq.max(cut.sm_applied_log_index),
-                &snap.global_holds,
-            )?;
+            hold_bridge_evidence.verify(*ref_cas_authority_id, *quorum_epoch)?;
+            ensure!(
+                trust.trusted_hold_bridge_pubkey_hex.as_deref()
+                    == Some(hold_bridge_evidence.bridge_pubkey_hex.as_str()),
+                "#151 hold_bridge_evidence public key not trusted by repository authority"
+            );
+            ensure!(
+                hold_bridge_evidence.active_holds_digest == compute_holds_digest(&snap.global_holds),
+                "#151 hold_bridge_evidence digest disagrees with live global_holds"
+            );
+            ensure!(
+                snap.paired_cursors.pg_applied_seq >= cut.sm_applied_log_index
+                    && snap.paired_cursors.pg_applied_seq >= hold_bridge_evidence.bridge_seq,
+                "paired PG cursor lags RefCasReconciledCut or #151 hold_bridge_evidence"
+            );
             backup_root_evidence.verify(*ref_cas_authority_id, *quorum_epoch)?;
             AuthorityLane::DistributedRefCas {
                 ref_cas_authority_id: *ref_cas_authority_id,
                 quorum_epoch: *quorum_epoch,
                 raft_commit_index: (*raft_commit_index).max(cut.sm_applied_log_index),
-                quorum_evidence: quorum,
-                hold_bridge_evidence: bridge,
-                backup_root_evidence: (*backup_root_evidence).clone(),
+                quorum_evidence: Box::new(quorum),
+                hold_bridge_evidence: hold_bridge_evidence.clone(),
+                backup_root_evidence: backup_root_evidence.clone(),
                 async_projection_only: *async_projection_only,
             }
         }

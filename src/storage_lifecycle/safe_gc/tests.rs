@@ -377,7 +377,10 @@ async fn default_off_gate_and_ttl_or_tampered_arming_fail_closed() {
     assert!(backend.deleted.lock().unwrap().is_empty());
 
     arm.armed_from_cache_or_ttl_only = true;
-    assert!(matches!(authority.set_gc_mode(GcMode::ArmedDestructive(arm)), Err(SafeGcError::ArmingRejected(_))));
+    assert!(matches!(
+        authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm))),
+        Err(SafeGcError::ArmingRejected(_))
+    ));
 }
 
 #[tokio::test]
@@ -399,7 +402,7 @@ async fn proof_and_live_barrier_reject_forged_header_oids_lane_cursor_and_active
 
     // 2. Forged contained_oids: vec![] passes stateless syntax if unreferenced, MUST fail authoritative barrier!
     let authority = DurableSafeGcAuthority::in_memory(snap.clone()).unwrap();
-    authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone())).unwrap();
+    authority.set_gc_mode(GcMode::ArmedDestructive(Box::new(arm.clone()))).unwrap();
     let mut p_forged_oids = base_proof.clone();
     p_forged_oids.candidates[0].contained_oids.clear();
     p_forged_oids.proof_digest = super::proof_digest::compute_proof_digest(&p_forged_oids);
@@ -459,7 +462,7 @@ fn unbounded_install_to_commit_decision_blocks_deletion_and_pins_all_packs() {
     };
     snap.in_flight_decisions.push(pending.clone());
     let authority = DurableSafeGcAuthority::in_memory(snap.clone()).unwrap();
-    let pinned = authority.directly_pinned_pack_ids();
+    let pinned = authority.snapshot().directly_pinned_pack_ids();
     assert!(snap.active_packs.iter().chain(snap.retired_packs.iter()).all(|p| pinned.contains(&p.pack_id)));
 
     proof.in_flight_decisions.push(pending);
