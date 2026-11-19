@@ -1,8 +1,10 @@
 # ADR 004: PostgreSQL deliveries with advisory wake transports
 
 Status: implemented for standalone memory hints, polling workers, and Redis
-Pub/Sub hints. A later [Kafka adapter increment](kafka-wakes.md) adds an isolated
-Kafka profile under the same advisory contract.
+Pub/Sub hints. The standalone `serve-blob` A4 target-audit queue also has an
+explicit opt-in Redis producer/subscriber topology; it is not enabled by the
+generic consumer settings. A later [Kafka adapter increment](kafka-wakes.md)
+adds an isolated Kafka profile under the same advisory contract.
 This is not GitFS multi-writer routing, automatic failover, or storage fencing.
 
 ## Authority and delivery contract
@@ -62,6 +64,9 @@ downgraded.
 | `ROOTYARD_REDIS_URL` | none | Optional feature `state-redis`: `rediss://` remote with ACL in URL, or loopback `redis://` |
 | `ROOTYARD_REDIS_ADDRESS` | none | Legacy loopback address when `state-redis` is off, or compatibility fallback when on |
 | `ROOTYARD_WAKE_CHANNEL` | `rootyard:outbox:v1` | 1–128 ASCII alphanumeric, colon, underscore or hyphen |
+| `ROOTYARD_WORKER_SCOPE` | `generic` | `generic` preserves legacy consumers/projection jobs; `a4-target-audit` selects only the A4 target-audit queue |
+| `ROOTYARD_A4_WAKE_TRANSPORT` | absent (`poll`) | `poll`/`memory` (no remote) or `redis` (requires `state-redis`); read only by `serve-blob` and the A4 worker scope |
+| `ROOTYARD_A4_WAKE_CHANNEL` | `rootyard:a4:pg_refstore_core_commit_audit:v1` | Explicit A4 namespace; validated by the same channel rule |
 
 Example role split (set the database URL using your normal secret mechanism):
 
@@ -70,6 +75,33 @@ ROOTYARD_OUTBOX_WORKER=false rootyard serve
 ROOTYARD_WORKER_CONSUMERS=audit-log rootyard worker
 ROOTYARD_WORKER_CONSUMERS=ref-index rootyard worker
 ```
+
+### Explicit A4 target-audit split
+
+`serve-blob` uses its embedded target-audit worker by default. To split the A4
+producer and subscriber across processes and hosts, select the dedicated A4
+variables on both sides. The generic consumer/wake variables above are ignored
+by this topology; in particular, `ROOTYARD_WORKER_SCOPE=a4-target-audit` never
+scans `ref-index` or runs Ref-CAS projection jobs.
+
+```sh
+ROOTYARD_A4_WAKE_TRANSPORT=redis \
+ROOTYARD_REDIS_URL='rediss://cache-user:secret@cache.internal:6380/0' \
+  rootyard serve-blob
+
+ROOTYARD_WORKER_SCOPE=a4-target-audit \
+ROOTYARD_A4_WAKE_TRANSPORT=redis \
+ROOTYARD_REDIS_URL='rediss://cache-user:secret@cache.internal:6380/0' \
+  rootyard worker
+```
+
+Redis carries only the fixed `v1` hint on the A4 channel, never a claim or event
+body. The producer notifies after the fresh A4 durable commit; publication is a
+separate bounded task and never gates that commit. The subscriber's fixed PG
+ticker remains mandatory: a disconnected, duplicated or lost hint only changes
+scan timing and can never bypass the normal lease, authorization, ref, hold,
+root or terminal checks. The real PG17/Garage/Redis external acceptance is a
+separate gate and is not claimed by these process-role tests.
 
 Each worker scans immediately on startup. A fixed ticker is independent of
 broker activity and is not reset by hints or reconnect attempts. Successful

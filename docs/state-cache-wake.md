@@ -2,9 +2,11 @@
 
 Status: runtime `ServingCache` (`src/cache_wake.rs`, `src/cache_wake/{types,breaker,serving,memory,origin,redis}.rs`)
 and `src/browse/` serving consumers (`src/browse/{cache,cache_models,handlers}.rs`) are
-wired for Issue #111 (keeping #111 open for remaining #110 `blob_git_gateway` /
-`standalone` consumers). Redis remains optional and strictly non-authoritative:
-standalone Memory mode runs by default with zero Redis runtime dependency.
+wired for Issue #111. The standalone `blob_git_gateway` / `serve-blob` A4 path now has
+an explicit opt-in advisory publisher and an A4-only external worker scope; the default
+remains Memory cache + local `Notify` + PostgreSQL target-audit scanning. Redis remains
+optional and strictly non-authoritative: a default build compiles no Redis dependency,
+and no cache or wake value can become delivery authority.
 
 ## Authority boundary
 
@@ -173,7 +175,78 @@ optional `RedisCache` (`ROOTYARD_CACHE_BACKEND=redis` with `state-redis`):
    `get_tree` / `get_blob` resolve their authoritative tip OID at origin before
    keying immutable `TreeListing` / `GitObjectPreview` entries.
 
-Standalone `#110` (`blob_git_gateway` / `standalone`) consumer wiring remains pending.
+## Explicit A4 target-audit wake (`serve-blob` / external worker)
+
+The standalone `blob_git_gateway` producer and its target-audit subscriber can be
+split across processes without changing PostgreSQL authority. This is an explicit,
+default-off topology; `serve-blob` without the A4 variables keeps the in-process
+Memory cache, local `Notify` hints and periodic target-audit scan. The generic
+`ROOTYARD_WAKE_TRANSPORT`, `ROOTYARD_WAKE_CHANNEL` and
+`ROOTYARD_WORKER_CONSUMERS` variables are **not** read by this A4 path, so a
+an A4 worker cannot be broadened to the legacy `ref-index` consumer or Ref-CAS
+projection jobs by them. The generic scope itself is unchanged and keeps its
+existing full `audit-log` scan.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ROOTYARD_A4_WAKE_TRANSPORT` | absent (`poll`) | `poll`/`memory` (no remote), or `redis` (requires `state-redis`) |
+| `ROOTYARD_A4_WAKE_CHANNEL` | `rootyard:a4:pg_refstore_core_commit_audit:v1` | Validated 1–128 ASCII alphanumeric/colon/underscore/hyphen A4 namespace; never a secret or payload |
+| `ROOTYARD_WORKER_SCOPE` | `generic` | On `rootyard worker`/`worker-once`: `generic` or the explicit `a4-target-audit` scope |
+
+Producer (`serve-blob`):
+
+- `ROOTYARD_A4_WAKE_TRANSPORT=redis` selects the existing feature-gated
+  `RedisWake` using `ROOTYARD_REDIS_URL` or the loopback
+  `ROOTYARD_REDIS_ADDRESS`. Without `state-redis`, selecting `redis` fails
+  startup closed; no Redis crate is compiled into the default build.
+- The gateway still calls `Signals::committed()` only after a fresh authorized A4
+  durable transaction, including its audit outbox projection, has committed. The
+  call stores a local and a remote `Notify` permit and does not await Redis. The
+  separate publisher task has its own one-second publish deadline and swallows
+  publish errors into a fixed diagnostic; a slow, disconnected or lost publish
+  cannot delay or alter the acknowledged commit, terminal, refs, holds, roots or
+  outbox rows.
+- The publisher shares the existing dispatch stop token, is cancelled on every
+  listener/worker/signal/barrier exit path and is bounded-awaited during drain.
+
+Subscriber (`rootyard worker` in A4 scope):
+
+- `ROOTYARD_WORKER_SCOPE=a4-target-audit` selects a target-audit-only
+  `Settings`: consumer `audit-log`, `events::TARGET_AUDIT_KIND`,
+  `projection_jobs=false`. `worker-once` uses the same scoped claim helper.
+  It never executes the generic `ref-index` effect or `ref_cas_projection_jobs`.
+- The fixed ticker remains active independently of Redis. A subscription
+  acknowledgment triggers a catch-up scan; reconnect also triggers one. Wrong
+  channel/payload frames disconnect. Duplicate or lost hints may only cause an
+  extra or delayed PostgreSQL scan; they cannot claim, acknowledge, settle or
+  choose a row. Missing/expired state still fails the normal PG lease and
+  authority checks.
+- Redis carries only the existing fixed `v1` hint on the A4 Pub/Sub channel. It
+  contains no repository, operation, ref, token, user, permission, hold, root or
+  event payload, and holds no durable work.
+
+Example role split (endpoint/credentials supplied by the normal secret
+mechanism; use a distinct channel per installation):
+
+```sh
+# Producer and embedded local worker
+ROOTYARD_A4_WAKE_TRANSPORT=redis \
+ROOTYARD_REDIS_URL='rediss://cache-user:secret@cache.internal:6380/0' \
+  rootyard serve-blob
+
+# A4-only external subscriber
+ROOTYARD_WORKER_SCOPE=a4-target-audit \
+ROOTYARD_A4_WAKE_TRANSPORT=redis \
+ROOTYARD_REDIS_URL='rediss://cache-user:secret@cache.internal:6380/0' \
+  rootyard worker
+```
+
+Keep the existing `ROOTYARD_OUTBOX_WORKER=false` + generic `rootyard worker`
+roles separate. The A4 scope is a separate queue/namespace, not a replacement for
+the generic outbox consumers. The real PG17/Garage/Redis A4 acceptance (actual
+serve-blob HTTP/stock Git, exact-once target audit, partition fallback and
+post-heal wake before poll) is a separate gate and is not claimed by the source
+tests in this worktree.
 
 ## Wake compatibility and configuration
 
@@ -211,11 +284,16 @@ entry/byte/TTL bounds, bounded metadata under thousands of replacements/deletes
 and expiry, origin semaphore queue-budget/body-not-polled plus absolute-work-
 deadline/breaker bounds, singleflight coalescing, explicit leader abort with
 follower wake and generation-safe cleanup, URL/TLS policy, channel bounds and
-eviction-policy allowlist. Redis unit tests cover bounded-read length/corruption
-as a miss, cheap pre-encode oversize rejection, whole-deadline permit wait and
-refusal to operate without a validated server contract. Real-Redis contract tests
-are `#[ignore]`d and require a dedicated server with maxmemory + eviction
-configured and CONFIG permission:
+eviction-policy allowlist. `src/dispatch.rs` unit tests cover the explicit A4
+worker scope, the A4-scoped valid channel, the default-off transport selection
+and the no-feature Redis refusal. Source-only Python guards in
+`tests/test_a4_redis_wake.py` and `tests/test_blob_gateway_memory_wake.py` cover
+the producer/subscriber wiring, publisher stop ownership, post-commit trigger
+ordering and the absence of legacy consumer/projection enrollment. Redis unit
+tests cover bounded-read length/corruption as a miss, cheap pre-encode oversize
+rejection, whole-deadline permit wait and refusal to operate without a validated
+server contract. Real-Redis contract tests are `#[ignore]`d and require a
+dedicated server with maxmemory + eviction configured and CONFIG permission:
 
 ```sh
 ROOTYARD_TEST_REDIS_DESTRUCTIVE=owned-fixture \
@@ -237,10 +315,12 @@ blackholed replies/caller abort. The selected report records exact source,
 executable, fixture version and case counts in
 `evidence/state-services/cache-wake/redis-contract.json`.
 
-HA/Sentinel/Cluster, PG failover, production performance, least-privilege
-production ACLs and #110 (`blob_git_gateway`/`standalone`) consumer wiring remain
-pending. This increment keeps #111 open for remaining #110 consumers and never
-makes Redis a hard quota or authority. The default build still needs no Redis.
+HA/Sentinel/Cluster, PG failover, production performance and least-privilege
+production ACLs remain pending. The `serve-blob`/A4 advisory producer and
+subscriber wiring is implemented behind the explicit variables above, but the
+real PG17/Garage/Redis external A4 acceptance remains pending. This increment
+keeps #111 open for that acceptance and never makes Redis a hard quota or
+authority. The default build still needs no Redis.
 
 The full ignored real-Redis suite includes destructive FLUSHALL and CONFIG SET
 checks. Run it only against a disposable, task-owned instance and explicitly set
