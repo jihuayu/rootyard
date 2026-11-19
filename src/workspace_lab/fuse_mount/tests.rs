@@ -2,6 +2,7 @@ use super::*;
 // The owned teardown helpers live in `ownership` with their original
 // privacy; tests reach them through the module, never a production re-export.
 use super::ownership::{mount_id_in, owns_current_mount};
+use fuser::MountOption;
 
 struct NotManaged;
 
@@ -87,6 +88,21 @@ fn mount_handle_offers_a_consuming_joined_teardown_and_a_borrowable_stop() {
     }
     let _: fn(MountHandle) = owning;
     let _: fn(&MountHandle) = borrowed;
+}
+
+#[test]
+fn mount_handle_offers_owner_preserving_typed_teardown_and_quick_stop() {
+    // Compile-time contract only: the registry owner can retry the same
+    // borrowed handle after an actor/unmount/session refusal, while the quick
+    // stop remains a non-blocking shared-borrow operation.
+    fn preserving(handle: &mut MountHandle) -> Result<(), MountTeardownError> {
+        handle.teardown_owned()
+    }
+    fn quick(handle: &MountHandle) {
+        handle.request_stop();
+    }
+    let _: for<'a> fn(&'a mut MountHandle) -> Result<(), MountTeardownError> = preserving;
+    let _: for<'a> fn(&'a MountHandle) = quick;
 }
 
 #[test]
@@ -182,4 +198,60 @@ fn direct_upper_whiteout_rollback_keeps_overlay_reads_and_subsequent_unlinks_con
     assert_eq!(overlay.op_lookup(1, OsStr::new("b.txt")).unwrap_err().raw_os_error(), Some(libc::ENOENT));
     let saved: Vec<String> = serde_json::from_slice(&fs::read(&whiteout_path).unwrap()).unwrap();
     assert_eq!(saved, vec!["a.txt", "b.txt"]);
+}
+
+#[test]
+fn legacy_spawn_api_is_owner_bearing_while_old_public_spawn_is_unchanged() {
+    // Compile-time contract only. The legacy registry uses the owner-bearing
+    // result so a post-spawn identity failure can transfer the live session;
+    // the existing public `spawn` API keeps its `io::Result` signature and
+    // retains (never drops) an unproved owner while mapping the error.
+    fn old_public(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
+        spawn(overlay, mountpoint)
+    }
+    fn owner_bearing(overlay: Overlay, mountpoint: &Path) -> Result<MountHandle, LegacySpawnFailure> {
+        spawn_legacy(overlay, mountpoint)
+    }
+    let _: fn(Overlay, &Path) -> io::Result<MountHandle> = old_public;
+    let _: fn(Overlay, &Path) -> Result<MountHandle, LegacySpawnFailure> = owner_bearing;
+}
+
+#[test]
+fn unproved_identity_is_a_static_failure_category_without_a_path() {
+    let text = MountTeardownError::IdentityUnproved.to_string();
+    assert_eq!(text, "FUSE mount identity was not captured; exact unmount is unproved");
+    assert!(!text.contains('/'), "the ownership failure category must not expose a mount path");
+}
+
+#[test]
+fn typed_teardown_classes_keep_equal_errno_distinct_and_unknown_status_separate() {
+    let identity = MountTeardownError::UnmountIdentity;
+    let busy = MountTeardownError::UnmountBusy(io::Error::from_raw_os_error(libc::EBUSY));
+    assert_eq!(MountTeardownError::IdentityUnproved.class(), MountTeardownClass::IdentityOrProbe);
+    assert_eq!(identity.class(), MountTeardownClass::IdentityOrProbe);
+    assert_eq!(busy.class(), MountTeardownClass::MatchedIdBusy);
+    assert_eq!(
+        MountTeardownError::UnmountProbe(io::Error::from_raw_os_error(libc::EIO)).class(),
+        MountTeardownClass::IdentityOrProbe
+    );
+    assert_eq!(
+        MountTeardownError::UnmountOther(io::Error::from_raw_os_error(libc::EACCES)).class(),
+        MountTeardownClass::OtherUnmount
+    );
+    assert_eq!(MountTeardownError::ActorJoinPanicked.class(), MountTeardownClass::JoinOrState);
+    assert_eq!(MountTeardownError::SessionJoinAlreadyFailed.class(), MountTeardownClass::JoinOrState);
+}
+
+#[test]
+fn classified_teardown_keeps_the_borrowed_owner_contract() {
+    fn classified(handle: &mut MountHandle) -> Result<(), MountTeardownClass> {
+        handle.teardown_owned_classified()
+    }
+    let _: for<'a> fn(&'a mut MountHandle) -> Result<(), MountTeardownClass> = classified;
+}
+
+#[test]
+fn identity_unmount_display_keeps_the_historical_ebusy_text() {
+    let expected = format!("exact FUSE unmount failed: {}", io::Error::from_raw_os_error(libc::EBUSY));
+    assert_eq!(MountTeardownError::UnmountIdentity.to_string(), expected);
 }
