@@ -1,5 +1,9 @@
 """Offline structural and protocol contracts for Issue #85 repository lifecycle."""
+from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
+import json
 from pathlib import Path
 import os
 import re
@@ -7,9 +11,14 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 import urllib.error
 import urllib.request
+import uuid
+
+from tests import repository_lifecycle
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO_ENTRY = ROOT / "src" / "repositories.rs"
@@ -246,6 +255,116 @@ class RepositoryLifecycleContractsTest(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+
+class RepositoryLifecycleRemoteLfsTest(unittest.TestCase):
+    def fixture_environment(self):
+        return {
+            "ROOTYARD_OBJECT_STORE_ENDPOINT": "http://127.0.0.1:3900",
+            "ROOTYARD_OBJECT_STORE_BUCKET": "scratch-fixture",
+            "ROOTYARD_OBJECT_STORE_REGION": "garage",
+            "ROOTYARD_OBJECT_STORE_ACCESS_KEY": "synthetic-id",
+            "ROOTYARD_OBJECT_STORE_SECRET_KEY": "synthetic-secret",
+        }
+
+    def test_remote_lfs_requires_explicit_loopback_fixture(self):
+        fixture = self.fixture_environment()
+        self.assertEqual(
+            repository_lifecycle.remote_tenant_lfs_env(fixture | {"AWS_SESSION_TOKEN": "ambient"}),
+            fixture,
+        )
+        for missing in fixture:
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "explicit object-store"):
+                repository_lifecycle.remote_tenant_lfs_env({k: v for k, v in fixture.items() if k != missing})
+        for origin in ("http://192.0.2.1:3900", "http://127.0.0.1:3900/path", "https://127.0.0.1:3900"):
+            with self.subTest(origin=origin), self.assertRaisesRegex(ValueError, "loopback HTTP"):
+                repository_lifecycle.remote_tenant_lfs_env(fixture | {"ROOTYARD_OBJECT_STORE_ENDPOINT": origin})
+
+    def test_owned_cache_eviction_is_limited_to_the_derived_object(self):
+        payload = b"synthetic lfs bytes"
+        oid = hashlib.sha256(payload).hexdigest()
+        repo, sibling = str(uuid.UUID(int=1)), str(uuid.UUID(int=2))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache, other_cache = (root / "data" / "lfs" / repo_id / oid for repo_id in (repo, sibling))
+            for file in (cache, other_cache):
+                file.parent.mkdir(parents=True)
+                file.write_bytes(payload)
+            repository_lifecycle.verify_owned_lfs_cache(root, repo, payload, evict=True)
+            self.assertFalse(cache.exists())
+            self.assertEqual(other_cache.read_bytes(), payload)
+            with self.assertRaises(FileNotFoundError):
+                repository_lifecycle.verify_owned_lfs_cache(root, repo, payload, evict=True)
+            cache.write_bytes(b"wrong bytes")
+            with self.assertRaisesRegex(ValueError, "bytes do not match"):
+                repository_lifecycle.verify_owned_lfs_cache(root, repo, payload)
+            cache.write_bytes(payload)
+            repository_lifecycle.verify_owned_lfs_cache(root, repo, payload)
+
+    def test_cache_eviction_refuses_symlinks(self):
+        payload = b"synthetic lfs bytes"
+        oid = hashlib.sha256(payload).hexdigest()
+        repo = str(uuid.UUID(int=1))
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            root = scratch / "harness"
+            cache_dir = root / "data" / "lfs" / repo
+            cache_dir.parent.mkdir(parents=True)
+            outside = scratch / "other"
+            outside.mkdir()
+            target = outside / oid
+            target.write_bytes(payload)
+            cache_dir.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(OSError):
+                repository_lifecycle.verify_owned_lfs_cache(root, repo, payload, evict=True)
+            cache_dir.unlink()
+            cache_dir.mkdir()
+            (cache_dir / oid).symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "owned regular file"):
+                repository_lifecycle.verify_owned_lfs_cache(root, repo, payload, evict=True)
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertTrue((cache_dir / oid).is_symlink())
+
+    def test_remote_report_contains_one_fixed_case_and_requires_cleanup(self):
+        fixture = self.fixture_environment()
+        name = repository_lifecycle.REMOTE_TENANT_LFS_CASE
+        for cleanup_failed in (False, True):
+            with self.subTest(cleanup_failed=cleanup_failed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "synthetic-binary"
+                binary.write_bytes(b"fixture artifact")
+                args = SimpleNamespace(binary=binary, report=root / "report.json")
+                harness = Mock()
+                harness.env = {
+                    "AWS_SESSION_TOKEN": "ambient",
+                    "ROOTYARD_OBJECT_STORE_SESSION_TOKEN": "ambient",
+                    "ROOTYARD_DATA_DIR": "scratch",
+                }
+                harness.soft_delete_restore_and_purge_holds.return_value = {name: True}
+                if cleanup_failed:
+                    harness.cleanup.side_effect = RuntimeError("private fixture message")
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    patch.object(repository_lifecycle, "RepositoryLifecycleHarness", return_value=harness),
+                    patch.object(repository_lifecycle.subprocess, "run", return_value=SimpleNamespace(stdout="a" * 40)),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    self.assertEqual(repository_lifecycle.run_remote_tenant_lfs(args, fixture), int(cleanup_failed))
+                harness.setup.assert_called_once()
+                harness.cleanup.assert_called_once()
+                harness.soft_delete_restore_and_purge_holds.assert_called_once()
+                self.assertEqual(harness.env, {"ROOTYARD_DATA_DIR": "scratch"} | fixture)
+                passed = not cleanup_failed
+                report = json.loads(args.report.read_text())
+                self.assertEqual(report, {
+                    "passed": passed,
+                    "cases": [{"name": name, "status": "passed" if passed else "failed", "detail": {name: passed}}],
+                    "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                    "source_head": "a" * 40,
+                })
+                self.assertEqual(json.loads(stdout.getvalue()), report)
+                self.assertNotIn("private fixture message", stderr.getvalue())
 
 
 if __name__ == "__main__":
