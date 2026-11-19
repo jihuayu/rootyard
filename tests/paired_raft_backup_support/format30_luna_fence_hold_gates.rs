@@ -1,12 +1,12 @@
-//! Gate 7: the PostgreSQL SHARE table write fence and every Raft freeze barrier must survive
-//! archive capture *and* receipt publication. A fence dropped at any publication boundary fails
-//! the whole paired backup closed and must never leave a published archive or a thawable barrier
-//! (#153).
+//! Gate 7: the PostgreSQL SHARE table write fence and every Raft freeze barrier must survive archive
+//! capture *and* receipt publication. A fence dropped at any publication boundary fails the whole
+//! paired backup closed and must never leave a published archive or a thawable barrier (#153).
 use std::collections::BTreeMap;
 use std::fs;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, ensure};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -35,10 +35,11 @@ fn durable_attestation_without_wal_digest_is_refused() -> Result<()> {
     let rng = ring::rand::SystemRandom::new();
     let voters: Vec<_> = (1..=3u64)
         .map(|node_id| -> Result<_> {
-            let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)?;
-            let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())?;
+            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| anyhow!("generate ed25519 pkcs8"))?;
+            let keypair =
+                Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|e| anyhow!("parse ed25519 pkcs8: {e}"))?;
             let cert = format!("{node_id:064x}");
-            let pubkey = hex::encode(ring::signature::KeyPair::public_key(&keypair).as_ref());
+            let pubkey = hex::encode(KeyPair::public_key(&keypair).as_ref());
             Ok((node_id, keypair, cert, derive_voter_uuid_bound(1, node_id, &cert, &pubkey), pubkey))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -103,10 +104,7 @@ async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<
     let base_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
     let admin = db::pool(&base_url)?;
     let db_name = format!("gate7_db_{}", &Uuid::new_v4().simple().to_string()[..12]);
-    {
-        let c = admin.get().await?;
-        c.batch_execute(&format!("CREATE DATABASE {db_name}")).await?;
-    }
+    admin.get().await?.batch_execute(&format!("CREATE DATABASE {db_name}")).await?;
     let url = replace_db_in_url(&base_url, &db_name)?;
     let outcome: Result<()> = async {
         let git = find_git_bin()?;
@@ -174,7 +172,6 @@ async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<
         init_volume_dir(&data_dir)?;
         let cfg = make_backup_config(url.clone(), data_dir, git.clone());
         let peers: BTreeMap<i64, MtlsLiveRaftBackend> = BTreeMap::new();
-
         let freeze = {
             let mut c = pool.get().await?;
             let req = DurableFreezeRequest {
@@ -208,7 +205,6 @@ async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<
             "a fence dropped after archive verification must fail receipt publication closed"
         );
         ensure!(!dest_c.exists(), "a pre-receipt fence drop must remove the published destination archive");
-
         // With the fence gone, no later attempt may publish an archive at all.
         let dest_d = dir.path().join("fmt30-fence-hold-d");
         let archived = create_format30_paired_raft_backup(Format30PairedBackupRequest {
@@ -228,7 +224,6 @@ async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<
             "a lost SHARE fence must refuse every later paired backup"
         );
         ensure!(!dest_d.exists(), "a lost SHARE fence must never publish an archive");
-
         let log_id = serde_json::to_value(freeze.active_barrier.barrier_log_id)?;
         let receipt: SealedArchiveReceipt = serde_json::from_value(json!({
             "backup_id": Uuid::new_v4(),
