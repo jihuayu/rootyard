@@ -99,13 +99,9 @@ pub(super) async fn spawn_pass2_scheduled_runtime_child(
     s3_env_pairs: &[(String, Option<std::ffi::OsString>)],
 ) -> Result<ChildOutcome> {
     let out_path = storage_root.join(format!("safe-gc-child-{MODE_PASS2}-{}.json", Uuid::new_v4()));
-    let mut child = tokio::process::Command::from(
-        spawn_command(MODE_PASS2, storage_root, db_url, schema, repo_id, s3_env_pairs)
-            .env(CHILD_SKIP_JOB_ID_ENV, skip_job_id.to_string())
-            .env(CHILD_OUT_JSON_ENV, &out_path),
-    )
-    .spawn()
-    .context("spawn safe-gc pass2 child process")?;
+    let mut std_cmd = spawn_command(MODE_PASS2, storage_root, db_url, schema, repo_id, s3_env_pairs);
+    std_cmd.env(CHILD_SKIP_JOB_ID_ENV, skip_job_id.to_string()).env(CHILD_OUT_JSON_ENV, &out_path);
+    let mut child = tokio::process::Command::from(std_cmd).spawn().context("spawn safe-gc pass2 child process")?;
     let status = child.wait().await.context("wait for safe-gc pass2 child")?;
     ensure!(status.success(), "safe-gc child {MODE_PASS2} exited with {status}");
     let raw = std::fs::read_to_string(&out_path).context("read safe-gc child output JSON")?;

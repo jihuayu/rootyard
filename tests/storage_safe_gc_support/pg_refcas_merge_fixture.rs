@@ -18,9 +18,9 @@ use rootyard::{
         core::{
             contract::CommitMode,
             state_machine::{
-                AppliedLogId, CommitRefsCommand, InitializeGateCommand, RefCasCommand, RefCasStateMachine,
-                RepositoryLane, ScopeLifecycle, SmPackMode, WireCommitRefsRequest, WireDecisionKind,
-                WireDecisionScopeDep, WireDecisionVerdict, WireGateInit,
+                CommitRefsCommand, InitializeGateCommand, RefCasCommand, RefCasStateMachine, RepositoryLane,
+                ScopeLifecycle, SmPackMode, WireCommitRefsRequest, WireDecisionKind, WireDecisionScopeDep,
+                WireDecisionVerdict, WireGateInit,
             },
             types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget, RefUpdate},
         },
