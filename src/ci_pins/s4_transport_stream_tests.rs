@@ -155,8 +155,14 @@ fn assert_slot_free(semaphore: &Arc<Semaphore>) {
     assert!(semaphore.clone().try_acquire_owned().is_ok(), "stream slot leaked after cleanup");
 }
 
-fn axum_io_error(error: axum::Error) -> io::Error {
-    *error.into_inner().downcast::<io::Error>().expect("axum body error must wrap io::Error")
+fn axum_io_kind(error: axum::Error) -> io::ErrorKind {
+    fn find(error: &(dyn std::error::Error + 'static)) -> Option<io::ErrorKind> {
+        if let Some(io_error) = error.downcast_ref::<io::Error>() {
+            return Some(io_error.kind());
+        }
+        std::error::Error::source(error).and_then(find)
+    }
+    find(&error).expect("axum body error must expose an io::Error")
 }
 
 #[tokio::test]
@@ -226,7 +232,7 @@ async fn absolute_deadline_cleans_up_unpolled_body_and_suppresses_queued_chunk()
 
     let mut body = h.body.into_data_stream();
     let error = body.next().await.expect("terminal item").expect_err("queued chunk escaped after deadline");
-    assert_eq!(axum_io_error(error).kind(), io::ErrorKind::TimedOut);
+    assert_eq!(axum_io_kind(error), io::ErrorKind::TimedOut);
     assert!(body.next().await.is_none());
 }
 
@@ -248,7 +254,7 @@ async fn deadline_cleanup_is_not_wedged_by_a_pending_authorization_probe() {
 
     let mut body = h.body.into_data_stream();
     let error = body.next().await.expect("terminal item").expect_err("suspended probe yielded data");
-    assert_eq!(axum_io_error(error).kind(), io::ErrorKind::TimedOut);
+    assert_eq!(axum_io_kind(error), io::ErrorKind::TimedOut);
 }
 
 #[tokio::test]
@@ -321,10 +327,21 @@ async fn body_live_check_denies_final_chunk_after_producer_finished() {
 
     let mut body = h.body.into_data_stream();
     let mut next = Box::pin(body.next());
-    timeout(Duration::from_secs(1), delivery_entered.recv())
-        .await
-        .expect("body live check did not start")
-        .expect("delivery event");
+    let first = timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            biased;
+            item = &mut next => Err(item),
+            entered = delivery_entered.recv() => Ok(entered),
+        }
+    })
+    .await
+    .expect("body live check did not start");
+    match first {
+        Ok(entered) => {
+            entered.expect("delivery event");
+        }
+        Err(item) => panic!("body yielded before its delivery latch: {item:?}"),
+    }
     // The body has dequeued the final chunk and is paused at its hard delivery
     // boundary. With the slot free, the producer reads EOF and finishes.
     timeout(Duration::from_secs(1), h.done)
