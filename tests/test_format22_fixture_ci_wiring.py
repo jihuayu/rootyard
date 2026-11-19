@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import re
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -616,6 +617,78 @@ class ProtocolSuiteCountTest(unittest.TestCase):
                     if re.match(r"^      - ", lines[index])), len(lines))
         return "\n".join(lines[start:end])
 
+    @staticmethod
+    def _canonical_counts(node: ast.AST) -> bool:
+        if not isinstance(node, ast.List):
+            return False
+        try:
+            return ast.literal_eval(node) == [8, 12, 23, 24]
+        except (TypeError, ValueError):
+            return False
+
+    def _suite_counts_gate(self, step: str) -> list[int]:
+        """Validate the checked-in Step11 suite-count binding and verifier."""
+        marker = "python3 - <<'PY'\n"
+        self.assertEqual(step.count(marker), 1, "the step must contain exactly one Python gate")
+        block = step.split(marker, 1)[1]
+        terminator = "\n          PY"
+        self.assertEqual(block.count(terminator), 1, "the Python gate must have one terminator")
+        code = textwrap.dedent(block.split(terminator, 1)[0])
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as error:
+            self.fail(f"the Python gate is not parseable: {error}")
+
+        binding_text = "suite_counts = sorted(int(passed) for _, passed, _, _ in rows)"
+        assertion_text = "assert suite_counts == [8, 12, 23, 24], rows"
+        self.assertEqual(code.count(binding_text), 1,
+                         "exact suite_counts binding missing or duplicated")
+        self.assertEqual(code.count(assertion_text), 1,
+                         "exact suite_counts verifier missing or duplicated")
+
+        assignments = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "suite_counts"
+                    for target in node.targets)
+        ]
+        self.assertEqual(len(assignments), 1, "expected exactly one suite_counts binding")
+        self.assertEqual(ast.get_source_segment(code, assignments[0]), binding_text,
+                         "suite_counts must bind the exact sorted passed counts")
+
+        assertions = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Assert)
+            and any(isinstance(name, ast.Name) and name.id == "suite_counts"
+                    for name in ast.walk(node.test))
+        ]
+        self.assertEqual(len(assertions), 1, "expected exactly one suite_counts verifier")
+        assertion = assertions[0]
+        self.assertEqual(ast.get_source_segment(code, assertion), assertion_text,
+                         "suite_counts verifier must use the exact canonical literal")
+        self.assertLess(assignments[0].lineno, assertion.lineno,
+                        "suite_counts must be bound before it is verified")
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assert) or node is assertion:
+                continue
+            self.assertNotIn("sorted", ast.get_source_segment(code, node.test) or "",
+                             "suite counts must come from the binding, not an inline sorted assertion")
+            for compare in (item for item in ast.walk(node.test)
+                            if isinstance(item, ast.Compare)):
+                for comparator in compare.comparators:
+                    self.assertFalse(self._canonical_counts(comparator),
+                                     "duplicate canonical suite-count verifier")
+
+        self.assertEqual(step.count("issue107-a4-native.json"), 1)
+        self.assertEqual(step.count("'suite_counts': suite_counts,"), 1,
+                         "A4 receipt must use the checked suite_counts binding")
+        self.assertLess(step.index(assertion_text), step.index("issue107-a4-native.json"),
+                        "A4 receipt must follow the suite-count verifier")
+        self.assertIsInstance(assertion.test, ast.Compare)
+        self.assertEqual(len(assertion.test.comparators), 1)
+        return ast.literal_eval(assertion.test.comparators[0])
+
     def test_protocol_suite_counts_match_test_crates(self) -> None:
         # The workflow runs this exact set through `cargo test -- --ignored`;
         # every runtime row must therefore match the static per-crate count.
@@ -627,14 +700,30 @@ class ProtocolSuiteCountTest(unittest.TestCase):
             self.assertIn(f"--test {suite}", step)
         self.assertIn("-- --ignored --test-threads=1", step)
 
-        assertion = re.search(
-            r"assert sorted\(int\(passed\) for _, passed, _, _ in rows\) == (\[[^\]]*\]), rows",
-            step,
-        )
-        self.assertIsNotNone(assertion, "the step has no sorted suite-count assertion")
-        asserted = ast.literal_eval(assertion.group(1))
+        asserted = self._suite_counts_gate(step)
         self.assertEqual(asserted, sorted(counts.values()))
         self.assertEqual(asserted, [8, 12, 23, 24])
+
+    def test_protocol_suite_counts_gate_rejects_forged_forms(self) -> None:
+        step = self._step(PROTOCOL_STEP)
+        binding = "suite_counts = sorted(int(passed) for _, passed, _, _ in rows)"
+        assertion = "assert suite_counts == [8, 12, 23, 24], rows"
+        self.assertEqual(self._suite_counts_gate(step), [8, 12, 23, 24])
+        variants = (
+            step.replace(binding, "suite_counts = list(int(passed) for _, passed, _, _ in rows)", 1),
+            step.replace(binding, "suite_counts = sorted(int(failed) for _, passed, _, _ in rows)", 1),
+            step.replace(assertion, "assert suite_counts == [8, 12, 23, 23], rows", 1),
+            step.replace(binding, "# missing suite_counts binding", 1),
+            step.replace(binding, binding + "\n" + binding, 1),
+            step.replace(assertion, assertion + "\n" + assertion, 1),
+            step.replace(binding, "", 1).replace(
+                assertion,
+                "assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 12, 23, 24], rows",
+                1),
+        )
+        for variant in variants:
+            with self.assertRaises(AssertionError):
+                self._suite_counts_gate(variant)
 
     def test_strip_rust_comments_handles_comments_and_char_literals(self) -> None:
         sample = (
