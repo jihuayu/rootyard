@@ -74,10 +74,11 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
 
     def test_state_holds_only_a_unit_signal_not_event_data(self):
         text = source("src/blob_git_gateway/state.rs")
+        accessors = source("src/blob_git_gateway/state/signals.rs")
         self.assertIn("dispatch: dispatch::Signals", text)
         self.assertIn("dispatch: dispatch::Signals::default()", text)
-        self.assertIn("pub fn with_dispatch", text)
-        self.assertIn("pub(super) fn dispatch(&self)", text)
+        self.assertIn("pub fn with_dispatch", accessors)
+        self.assertIn("pub(in crate::blob_git_gateway) fn dispatch(&self)", accessors)
         signals = source("src/dispatch.rs")
         self.assertIn("#[derive(Clone, Default)]", signals)
         committed = body(signals, "pub fn committed(&self)", "}")
