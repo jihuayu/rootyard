@@ -27,7 +27,7 @@ use super::{
 use crate::{
     db,
     members::models::Role,
-    ref_store::{GitObjectFormat, OperationLookup, PgRefStore},
+    ref_store::{GitObjectFormat, PgRefStore, RefStoreError, pg::LegacyStatusLookup},
 };
 
 /// One page of repositories. A cursor names only the last returned
@@ -327,10 +327,11 @@ async fn get_operation_authorized(
         .await
         .map_err(|_| GatewayError::Timeout)?
         .map_err(|_| GatewayError::Internal("authorization transaction failed"))?;
-    let loaded: Result<(OperationLookup, Option<Role>), GatewayError> = async {
-        // The status route is read-only: keep the migration-152 collision guard
-        // but do not take the migration-138 operation key, so a writer or test
-        // barrier that holds it cannot stall this view.
+    let loaded: Result<(LegacyStatusLookup, Option<Role>), GatewayError> = async {
+        // The status route is read-only: classify the migration-152 wrapper,
+        // private claim and legacy row in one snapshot without taking the
+        // migration-138 operation key, so a writer or test barrier that holds it
+        // cannot stall this view.
         let fresh = crate::ref_store::serving::lookup_in_tx(
             &tx,
             &identity,
@@ -344,13 +345,13 @@ async fn get_operation_authorized(
         .map_err(authority_error)?;
         authorization.ensure_same_realm(&fresh)?;
         let lookup = PgRefStore
-            .get_legacy_read(&tx, repository_id, operation_id, deadline)
+            .get_legacy_status(&tx, repository_id, operation_id, deadline)
             .await
             .map_err(GatewayError::from)?;
         // Distinguish a write intent from its reader: the durable issuer or a
         // *current* repository admin may resolve it. Read access to the
         // repository alone does not expose another actor's write facts.
-        let role = if matches!(lookup, OperationLookup::Known(_)) {
+        let role = if matches!(lookup, LegacyStatusLookup::Legacy(_)) {
             crate::members::rbac::resolve_effective_role(&*tx, repository_id, owner_id, identity.id)
                 .await
                 .map_err(GatewayError::from)?
@@ -365,8 +366,15 @@ async fn get_operation_authorized(
     drop(client);
     let (lookup, role) = loaded?;
     let record = match lookup {
-        OperationLookup::Known(record) => record,
-        OperationLookup::Unknown => return Err(GatewayError::NotFound),
+        LegacyStatusLookup::Legacy(record) => record,
+        // A public wrapper is not a legacy operation. Keep the existing typed
+        // conflict rather than serving it through the legacy view.
+        LegacyStatusLookup::PublicWrapper => return Err(RefStoreError::IdentityConflict.into()),
+        // A private attempt/claimed identifier is indistinguishable from an
+        // unknown public UUID on the legacy status route.
+        LegacyStatusLookup::PrivateIdentifier | LegacyStatusLookup::Unknown => {
+            return Err(GatewayError::NotFound);
+        }
     };
     let issued_by_actor = record.identity().issuer_id() == identity.id;
     let owner_admin = role.is_some_and(|role| role >= Role::Admin);

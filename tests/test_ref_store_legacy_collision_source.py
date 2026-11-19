@@ -4,9 +4,9 @@ This pins the five bff76bee paths against the current later source: reserve,
 begin and cancel take the migration-138 key before probing migration 152;
 external legacy get/replay probes use the guarded lookup; the raw core get
 remains internal; pre-152 catalogs stay independent; the HTTP status read
-keeps the collision guard without taking the operation key; and the receive
-probe still takes that key before its HTTP authorization checks. No database,
-Cargo or service is touched.
+classifies wrapper, private claim and legacy row in one MVCC snapshot without
+taking the operation key; and the receive probe still takes that key before
+its HTTP authorization checks. No database, Cargo or service is touched.
 """
 from pathlib import Path
 import unittest
@@ -60,21 +60,59 @@ class LegacyCollisionSourceTest(unittest.TestCase):
         guarded = slice_between(
             self.pg,
             'pub(crate) async fn get_legacy_locked(',
-            'pub(crate) async fn get_legacy_read(',
+            'pub(crate) async fn get_legacy_status(',
         )
         self.assertLess(guarded.index('bound(tx, deadline)'), guarded.index('refuse_legacy_collision'))
         self.assertLess(guarded.index('refuse_legacy_collision'), guarded.index('self.get_inner('))
-        read = slice_between(self.pg, 'pub(crate) async fn get_legacy_read(', 'async fn get_inner(')
-        self.assertLess(read.index('bound(tx, deadline)'), read.index('refuse_legacy_collision'))
-        self.assertLess(read.index('refuse_legacy_collision'), read.index('self.get_inner('))
-        self.assertNotIn('lock_operation', read)
+
+    def test_legacy_status_uses_one_snapshot_and_exact_pre152_catalog(self):
+        status = slice_between(self.pg, 'pub(crate) async fn get_legacy_status(', 'async fn get_inner(')
+        self.assertEqual(status.count('query_one(LEGACY_STATUS_SNAPSHOT'), 1)
+        self.assertNotIn('refuse_legacy_collision(', status)
+        self.assertNotIn('lock_operation', status)
+        self.assertIn('LEGACY_STATUS_SCHEMA_PROBE', status)
+        self.assertIn('version && !wrapper_relation && !attempt_relation && !binding_function', status)
+        self.assertIn('!version || !wrapper_relation || !attempt_relation || !binding_function', status)
+        self.assertIn('RefStoreError::Unsupported(LEGACY_STATUS_SCHEMA_REQUIRED)', status)
+        self.assertIn('OperationLookup::Known(record) => Ok(LegacyStatusLookup::Legacy(record))', status)
+        self.assertIn('self.get_inner(tx, repository_id, operation_id, deadline)', status)
+        self.assertIn('LEGACY_STATUS_SNAPSHOT', self.pg)
+        sql = slice_between(self.pg, 'const LEGACY_STATUS_SNAPSHOT: &str = "SELECT ', '";')
+        for table in ('ref_store_operations', 'ref_store_public_operations', 'ref_store_private_attempts'):
+            self.assertIn(table, sql)
+        self.assertIn(
+            'o.issuer_id, o.lane, o.sequence, o.request_digest, o.state, o.terminal_result, o.operation_id',
+            sql,
+        )
+        self.assertIn('public_wrapper', sql)
+        self.assertIn('private_claimed', sql)
+        self.assertIn('selected_private', sql)
+        self.assertEqual(sql.count('LEFT JOIN'), 4)
+        self.assertIn('record_from_row(&row, repository_id)', status)
+        probe = slice_between(self.pg, 'const LEGACY_STATUS_SCHEMA_PROBE: &str = "SELECT ', '";')
+        self.assertIn('schema_migrations WHERE version=152', probe)
+        self.assertIn("to_regclass('ref_store_public_operations')", probe)
+        self.assertIn("to_regclass('ref_store_private_attempts')", probe)
+        self.assertIn('rootyard_ref_store_attempt_has_binding', probe)
 
     def test_http_status_read_is_unlocked_and_receive_probe_takes_the_operation_key(self):
-        api = slice_between(self.api, 'let loaded: Result<(OperationLookup, Option<Role>)', 'let _ = tokio::time::timeout_at')
+        api = slice_between(
+            self.api,
+            'let loaded: Result<(LegacyStatusLookup, Option<Role>)',
+            'let _ = tokio::time::timeout_at',
+        )
         self.assertNotIn('lock_operation(', api)
         self.assertNotIn('get_legacy_locked(', api)
-        self.assertLess(api.index('lookup_in_tx('), api.index('get_legacy_read('))
+        self.assertLess(api.index('lookup_in_tx('), api.index('get_legacy_status('))
+        self.assertIn('LegacyStatusLookup::Legacy(_)', api)
         self.assertNotIn('PgRefStore.get(&tx', api)
+        decision = slice_between(self.api, 'let (lookup, role) = loaded?;', 'let issued_by_actor')
+        self.assertIn('LegacyStatusLookup::PrivateIdentifier | LegacyStatusLookup::Unknown', decision)
+        self.assertIn('return Err(GatewayError::NotFound);', decision)
+        self.assertIn(
+            'LegacyStatusLookup::PublicWrapper => return Err(RefStoreError::IdentityConflict.into())',
+            decision,
+        )
 
         lookup = slice_between(self.operation, 'pub(super) async fn lookup(', 'pub(super) async fn lookup_in_tx(')
         self.assertLess(lookup.index('lock_operation('), lookup.index('lookup_in_tx('))
