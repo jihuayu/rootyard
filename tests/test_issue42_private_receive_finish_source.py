@@ -221,6 +221,35 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("receipt_args(true, private_id)", self.receive_prod)
         self.assertIn("receipt_args(false, private_id)", self.receive_prod)
 
+    def test_receipt_rejects_wrong_private_event_and_realm_substitution(self):
+        binding = slice_between(
+            self.receipt,
+            "async fn require_public_private_binding(",
+            "/// Preserve the independently proven legacy-only",
+        )
+        self.assertIn("a.slot = w.current_slot", binding)
+        self.assertIn("current_private != private_id", binding)
+        self.assertIn("wrapper_backend != backend_hex", binding)
+        self.assertIn("rootyard_ref_store_attempt_current_scope(w)", binding)
+        self.assertIn("rootyard_ref_store_verify_public_operation($1,$2)", binding)
+        self.assertIn("private_event != wrapper_event", binding)
+        self.assertIn('"private receipt current attempt substitution"', binding)
+        self.assertIn('"private receipt backend substitution"', binding)
+        self.assertIn('"private receipt event substitution"', binding)
+        self.assertIn('"private receipt realm substitution"', self.receipt)
+        self.assertIn(
+            "require_public_private_binding(", self.receipt
+        )
+        self.assertIn(
+            "reject_private_claim_for_legacy_receipt(", self.receipt
+        )
+        self.assertIn("durable_operation_id = args.private_operation_id.unwrap_or(args.operation_id)", self.receipt)
+        self.assertLess(
+            self.receipt.index("require_public_private_binding("),
+            self.receipt.index("FROM ref_store_operations"),
+            "the public/private binding must be checked before loading the private receipt rows",
+        )
+
     def test_finish_cancellation_fails_closed_without_a_false_ack(self):
         finish_cancel = slice_between(self.receive_prod, "operation::Probe::FinishCancelled", "// Reclaim sweeping")
         self.assertIn('GatewayError::Conflict("operation cancellation requires reconciliation")', finish_cancel)
