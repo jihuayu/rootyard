@@ -366,6 +366,102 @@ TARGETS = {
     },
 }
 
+# The default inventory is the frozen canonical #107 native11 set: 167 real
+# cases.  The #42 manual requalification lane additionally recognizes exactly
+# the two fresh-lane selectors that the #42 work placed in the already-frozen
+# ref_store_operations integration binary.  There is deliberately no wildcard,
+# prefix, target-wide relaxation or automatic adoption: every other target and
+# the normal scope keep the exact 167-name inventory and reject extras.
+NORMAL_SCOPE = "normal"
+ISSUE42_SCOPE = "issue42"
+SCOPE_VERSIONS = {
+    NORMAL_SCOPE: "issue107-native11-normal-v1",
+    ISSUE42_SCOPE: "issue42-native11-requalification-v1",
+}
+SCOPE_EXTENSIONS = {
+    NORMAL_SCOPE: {},
+    ISSUE42_SCOPE: {
+        "ref_store_operations": (
+            ("fresh_lane_wait_probe_requires_the_insert_and_the_creator_as_blocker", False),
+            ("fresh_lane_creation_waits_for_an_uncommitted_creator", True),
+        ),
+    },
+}
+
+
+def scope_names():
+    """Return the two explicit, reviewed inventory scopes."""
+    return tuple(SCOPE_VERSIONS)
+
+
+def scope_version(scope):
+    if scope not in SCOPE_VERSIONS:
+        raise ValueError("unknown inventory scope")
+    return SCOPE_VERSIONS[scope]
+
+
+def _extension(target, scope):
+    if scope not in SCOPE_EXTENSIONS:
+        raise ValueError("unknown inventory scope")
+    if target not in TARGETS:
+        raise ValueError("unknown inventory target")
+    return SCOPE_EXTENSIONS[scope].get(target, ())
+
+
+def case_specs(target, scope=NORMAL_SCOPE):
+    """Exact ordered (name, ignored) pairs for one target and scope."""
+    if target not in TARGETS:
+        raise ValueError("unknown inventory target")
+    base = tuple((name, True) for name in TARGETS[target]["cases"])
+    return base + tuple(_extension(target, scope))
+
+
+def cases(target, scope=NORMAL_SCOPE):
+    """Exact ordered case names for one target and scope."""
+    return tuple(name for name, _ in case_specs(target, scope))
+
+
+LISTING_EXTENSION_TARGETS = frozenset(SCOPE_EXTENSIONS[ISSUE42_SCOPE])
+
+
+def listing_ignored(target, scope=NORMAL_SCOPE):
+    """True when the target's strict listing must use --ignored.
+
+    Only ref_store_operations carries the two known #42 selectors, one of
+    which is regular.  It is always listed unfiltered in both scopes so the
+    normal scope can distinguish the exact original listing from the exact
+    known extension.  Every other target keeps its canonical --ignored
+    listing and exact-set strictness.
+    """
+    if target in LISTING_EXTENSION_TARGETS:
+        return False
+    return all(ignored for _, ignored in case_specs(target, scope))
+
+
+def listing_alternatives(target, scope=NORMAL_SCOPE):
+    """Return the exact accepted name sets for one target and scope.
+
+    Normal scope accepts only the canonical set, plus for the one extension
+    target the canonical set together with exactly both known #42 names.  A
+    partial pair is never an alternative.  The manual scope requires the
+    full extension and never accepts the original-only set.
+    """
+    canonical = cases(target, NORMAL_SCOPE)
+    if scope == NORMAL_SCOPE and target in LISTING_EXTENSION_TARGETS:
+        extended = canonical + tuple(
+            name for name, _ in _extension(target, ISSUE42_SCOPE))
+        return (frozenset(canonical), frozenset(extended))
+    return (frozenset(cases(target, scope)),)
+
+
+def target_expected_count(target, scope=NORMAL_SCOPE):
+    return len(case_specs(target, scope))
+
+
+def expected_count(scope=NORMAL_SCOPE):
+    return sum(target_expected_count(target, scope) for target in TARGET_ORDER)
+
+
 INPUT_GLOBS = (
     "tests/ref_store_*.rs",
     "tests/ref_store_pack_snapshots_support/**/*.rs",

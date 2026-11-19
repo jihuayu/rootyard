@@ -450,7 +450,7 @@ def success_report():
         cases = [{"name": name, "status": "passed"}
                  for name in inventory.TARGETS[target]["cases"]]
         rows.append({"target": target, "passed": True, "cases": cases,
-                     "case_count": len(cases)})
+                     "case_count": len(cases), "test_count": len(cases)})
     total = sum(len(inventory.TARGETS[target]["cases"])
                 for target in inventory.TARGET_ORDER)
     return {
