@@ -134,10 +134,13 @@ pub async fn publish_in_tx(tx: &Transaction<'_>, operation: &OperationRecord, ch
 /// `repository_ref_projection`, which the `pg_refstore` serving predicate
 /// treats as a conflicting legacy authority).
 ///
-/// A different `git_operations` row already owning the same exact
-/// `(repository, storage_generation, sequence)` tuple is a typed namespace
-/// conflict. The caller must roll back the whole core commit rather than ACK
-/// content whose audit delivery was silently dropped.
+/// The unique delivery identity is the exact
+/// `(repository, storage_generation, sequence)` tuple plus the operation UUID.
+/// An unrelated operation at another tuple is harmless history and is
+/// tolerated. A different UUID owning this tuple, or a different payload under
+/// this UUID, is a typed namespace conflict: the caller must roll back the
+/// whole core commit rather than ACK content whose audit delivery was silently
+/// dropped.
 pub async fn publish_core_commit_audit_in_tx(
     tx: &Transaction<'_>,
     operation: &OperationRecord,
@@ -151,23 +154,9 @@ pub async fn publish_core_commit_audit_in_tx(
     if changes.is_empty() {
         return Ok(());
     }
-    // The legacy delivery namespace must contain only this fixed audit kind.
-    // A legacy push/CI/unknown row at any sequence means the repository is not
-    // an isolated fresh `pg_refstore` audit namespace, so fail closed instead
-    // of mixing sequence spaces or letting generic idempotency hide it.
-    let foreign_kind: i64 = tx
-        .query_one(
-            "SELECT count(*) FROM git_operations \
-             WHERE repository_id=$1 AND id<>$2 \
-               AND COALESCE(evidence->>'kind','') <> 'pg_refstore_core_commit_audit'",
-            &[&operation.repository_id, &operation.id],
-        )
-        .await
-        .map_err(crate::ref_store::pg::db_error)?
-        .get(0);
-    if foreign_kind != 0 {
-        return Err(crate::ref_store::contract::RefStoreError::IdentityConflict);
-    }
+    // Only the exact tuple/UUID can conflict. Unrelated history in the same
+    // repository (other generations or sequences) is tolerated and is never
+    // rewritten, renumbered or adopted.
     let existing = tx
         .query_opt(
             "SELECT id,repository_id,storage_generation,sequence,actor_id,token_id,service_principal_id,actor_name,outcome,evidence \
@@ -178,10 +167,10 @@ pub async fn publish_core_commit_audit_in_tx(
         .await
         .map_err(crate::ref_store::pg::db_error)?;
     if let Some(row) = existing {
-        // Only a byte-identical local duplicate of this audit projection may be
-        // confirmed. Any other id, authority scope, sequence, principal,
-        // outcome or evidence is a cross-kind/namespace conflict: fail closed
-        // rather than letting generic `ON CONFLICT` idempotency hide it.
+        // Only a byte-identical local duplicate of this exact tuple/UUID may be
+        // confirmed. A different UUID owning the tuple, a different payload
+        // under the UUID, or any principal/outcome mismatch fails closed rather
+        // than letting generic `ON CONFLICT` idempotency hide it.
         let exact = row.get::<_, Uuid>(0) == operation.id
             && row.get::<_, Uuid>(1) == operation.repository_id
             && row.get::<_, i64>(2) == operation.storage_generation

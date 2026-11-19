@@ -220,8 +220,8 @@ async fn verify_contract(pool: &Pool) -> Result<()> {
 /// It proves the durable half of the association: a fresh core commit's exact
 /// applied refs can be projected into the existing `audit-log` delivery queue
 /// inside the caller transaction, the legacy worker can claim and acknowledge
-/// them, no `ref-index` projection is created, and a pre-existing legacy
-/// sequence is never overwritten (the caller must then not emit a hint).
+/// them, no `ref-index` projection is created, and an exact tuple/UUID
+/// collision fails closed while unrelated historical sequences are tolerated.
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and PostgreSQL schema creation permission"]
 async fn core_commit_audit_bridge_is_scanned_and_acked_by_the_existing_worker() -> Result<()> {
@@ -262,6 +262,19 @@ async fn run_wake_bridge_in_schema(url: &str, schema: &str) -> Result<()> {
         let a = "1".repeat(40);
         let b = "2".repeat(40);
         let zero = "0".repeat(40);
+
+        // Unrelated historical work in the target repository is not an identity
+        // conflict: it lives at another (generation, sequence) and must neither
+        // block nor be rewritten by the audit projection.
+        let history_id = Uuid::new_v4();
+        pool.get()
+            .await?
+            .execute(
+                "INSERT INTO git_operations(id,repository_id,actor_id,token_id,actor_name,sequence,storage_generation,evidence,outcome) \
+                 VALUES($1,$2,$3,$4,'alice',5,1,'{\"kind\":\"legacy_history\"}','recorded')",
+                &[&history_id, &repo, &actor, &token_id],
+            )
+            .await?;
 
         // A legacy operation already owns this sequence. The bridge must decline
         // instead of overwriting it or emitting a wake for an absent job.
@@ -346,6 +359,14 @@ async fn run_wake_bridge_in_schema(url: &str, schema: &str) -> Result<()> {
         let stored: serde_json::Value =
             pool.get().await?.query_one("SELECT evidence FROM git_operations WHERE id=$1", &[&legacy_id]).await?.get(0);
         assert_eq!(stored, serde_json::json!({}));
+        // Unrelated historical work is tolerated and untouched.
+        let history: serde_json::Value = pool
+            .get()
+            .await?
+            .query_one("SELECT evidence FROM git_operations WHERE id=$1", &[&history_id])
+            .await?
+            .get(0);
+        assert_eq!(history, serde_json::json!({"kind":"legacy_history"}));
         println!(
             "PASS core-commit audit-only outbox/replay/worker ack/no ref-index projection/legacy-sequence refusal"
         );
