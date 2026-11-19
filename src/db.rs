@@ -171,12 +171,13 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (148, include_str!("../migrations/148_pando_pitr_authority_fence.sql")),
     (149, include_str!("../migrations/149_ref_cas_event_projection.sql")),
     (150, include_str!("../migrations/150_forge_collaboration.sql")),
+    (151, include_str!("../migrations/151_repository_lifecycle.sql")),
 ];
 
 pub const SCHEMA_VERSIONS: &[i32] = &[
     1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95,
     96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 121, 125, 126, 127, 128, 129, 130,
-    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150,
+    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151,
 ];
 
 /// Runtime roles use a read-only schema check. Migration/backup ownership is
@@ -192,10 +193,52 @@ pub async fn verify_schema(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
+async fn verify_external_runtime_schema(client: &mut tokio_postgres::Client) -> Result<()> {
+    let tx = client.transaction().await?;
+    let granted: bool = tx.query_one("SELECT pg_try_advisory_xact_lock_shared(738390103)", &[]).await?.get(0);
+    if !granted {
+        return Err(crate::backup::BarrierBusy::Serving.into());
+    }
+    crate::backup::ensure_database_available(&tx).await?;
+    let rows = tx.query("SELECT version FROM schema_migrations ORDER BY version", &[]).await?;
+    let installed: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
+    ensure!(
+        installed.as_slice() == SCHEMA_VERSIONS,
+        "database schema differs from this binary; run the migrator before runtime startup"
+    );
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn verify_mirror_client(client: &mut tokio_postgres::Client) -> Result<()> {
+    let tx = client.transaction().await?;
+    let granted: bool = tx.query_one("SELECT pg_try_advisory_xact_lock_shared(738390103)", &[]).await?.get(0);
+    if !granted {
+        return Err(crate::backup::BarrierBusy::Serving.into());
+    }
+    crate::backup::ensure_database_available(&tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Read mirrors never run migrations, so verify the database-global lifecycle
+/// lock and `rootyard.restore_in_progress` marker before opening mirror state.
+pub async fn verify_mirror_database_available(pool: &Pool) -> Result<()> {
+    let mut client = pool.get().await?;
+    verify_mirror_client(&mut client).await
+}
+
 pub async fn prepare_runtime_schema(pool: &Pool) -> Result<()> {
     match std::env::var("ROOTYARD_SCHEMA_MODE").as_deref() {
-        Ok("external") => verify_schema(pool).await,
-        Ok("auto") | Err(_) => migrate(pool).await,
+        Ok("external") => {
+            let mut client = pool.get().await?;
+            verify_external_runtime_schema(&mut client).await
+        }
+        Ok("auto") | Err(_) => {
+            let mut client = pool.get().await?;
+            crate::backup::ensure_database_available(&**client).await?;
+            migrate_client_inner(&mut client, true).await
+        }
         _ => bail!("ROOTYARD_SCHEMA_MODE must be external or auto"),
     }
 }
@@ -212,13 +255,27 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
 /// session-level backup lock. The caller still owns transaction boundaries and
 /// must verify the resulting schema before exposing the database.
 pub(crate) async fn migrate_client(client: &mut tokio_postgres::Client) -> Result<()> {
+    migrate_client_inner(client, false).await
+}
+
+async fn migrate_client_inner(client: &mut tokio_postgres::Client, require_available: bool) -> Result<()> {
     // Unit tests use independent schemas, but the advisory lock below is database-global.
     // Serialize the whole migration transaction in-process so parallel fixtures do not
     // queue on that SQL lock past lock_timeout. The guard lives until this function returns.
     #[cfg(test)]
     let _migration_gate = MIGRATION_GATE.lock().await;
     let tx = client.transaction().await?;
-    tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[]).await?;
+    if require_available {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[]),
+        )
+        .await
+        .context("runtime migration barrier wait exceeded")??;
+        crate::backup::ensure_database_available(&tx).await?;
+    } else {
+        tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[]).await?;
+    }
     // A restored schema already contains migration 001's tables and ledger in
     // the caller's effective schema. Skipping the bootstrap avoids reapplying
     // its table/index definitions; incremental migrations then upgrade in place.

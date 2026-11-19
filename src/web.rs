@@ -45,5 +45,9 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(repository_pages::router())
         .merge(org_admin::routes())
         .merge(collaboration::routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::repositories::alias_middleware::web_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(state, session::middleware))
 }

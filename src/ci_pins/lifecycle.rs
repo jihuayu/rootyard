@@ -36,6 +36,10 @@ pub(super) async fn list_pins_inner(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
+    if super::s4_pin::refstore_repository(&state, &owner, &name).await?.is_some() {
+        let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+        return super::s4_release::list(&state, &actor, &owner, &name, single_job, deadline).await;
+    }
     if owner != actor.username || !db::valid_name(&owner) || !db::valid_name(&name) {
         return Err(Error::not_found());
     }
@@ -138,6 +142,15 @@ pub(super) async fn release_pin_inner(
     }
     let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
+    if super::s4_pin::refstore_repository(&state, &owner, &name).await?.is_some() {
+        let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+        let body = super::s4_models::S4ReleaseBody {
+            job_id: req.job_id,
+            target_oid: req.target_oid.clone(),
+            storage_generation: req.storage_generation,
+        };
+        return super::s4_release::release(&state, &actor, &owner, &name, job, &body, deadline).await;
+    }
     if owner != actor.username || !db::valid_name(&owner) || !db::valid_name(&name) {
         return Err(Error::not_found());
     }
@@ -199,13 +212,14 @@ pub(super) async fn release_pin_inner(
     .ok_or_else(Error::unauthorized)?;
     let locked = tx
         .query_opt(
-            "SELECT state,storage_generation FROM repositories \
+            "SELECT state,storage_generation,deleted_at IS NOT NULL,archived_at IS NOT NULL,transition_state FROM repositories \
              WHERE id=$1 AND owner_id=$2 AND name=$3 FOR SHARE",
             &[&repo.id, &actor.id, &name],
         )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    crate::auth::lifecycle::enforce_availability(&*tx, repo.id, locked.get(2), locked.get(3), locked.get::<_, &str>(4), true).await?;
     let token = tx
         .query_opt(
             "SELECT read_only FROM tokens \

@@ -82,6 +82,7 @@ pub(super) async fn batch_download(
     };
 
     // Phase 2: verify/hydrate ready candidates with zero DB connection held.
+    let remote_store = super::hydration::remote_store(&ctx.state.storage.root).map_err(Error::internal)?;
     let ran_ensure_readable = slots.iter().any(|slot| matches!(slot, DownloadSlot::ReadyCandidate));
     let mut pass_verified: BTreeMap<(String, u64), bool> = BTreeMap::new();
     let mut results = Vec::with_capacity(objects.len());
@@ -101,7 +102,16 @@ pub(super) async fn batch_download(
                 let ready_on_disk = if let Some(&cached) = pass_verified.get(&key) {
                     cached
                 } else {
-                    let ok = storage::ensure_readable(
+                    crate::storage::remote_key_claims::wait_or_clear_delete_claim(
+                        &ctx.state.pool,
+                        remote_store.as_ref(),
+                        tenant_id,
+                        "lfs",
+                        &spec.oid,
+                        ctx.deadline,
+                    )
+                    .await?;
+                    let res = storage::ensure_readable(
                         &ctx.state.storage.root,
                         repo_id,
                         tenant_id,
@@ -111,8 +121,8 @@ pub(super) async fn batch_download(
                     )
                     .await
                     .map_err(Error::internal)?;
-                    pass_verified.insert(key, ok);
-                    ok
+                    pass_verified.insert(key, res);
+                    res
                 };
                 if ready_on_disk {
                     let href = object_href(ctx, &spec.oid, spec.size);

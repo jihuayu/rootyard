@@ -371,9 +371,13 @@ Each request freshly checks the database grant, expiry, cancellation, credential
 revocation, issuer token revocation/read-only status/expiry, owner and repository
 ready state/storage generation. The check is repeated after potentially slow
 object preparation immediately before Git starts. Database failure denies the
-request; no stale authorization cache is used. Revocation affects new admissions,
-not a stream already admitted before the change. No running-stream interruption
-or zero-duration race-free revocation guarantee is claimed.
+request; no stale authorization cache is used. Admitted streams are also
+re-authorized while they run under the configured transfer bound. The bound is
+measured from the committed authority change, not from a deliberately paused
+client resuming its read: buffered transport can make a later client exception
+look slower than the server cutoff. A Git process-group observation is
+independent evidence that the native producer and its descendants stopped. No
+zero-duration, race-free revocation guarantee is claimed.
 
 The controller can POST to `.../ci-checkouts/{job_id}/cancel` or `/revoke`.
 Cancellation creates a permanent tombstone even before issuance, serializing
@@ -614,6 +618,94 @@ a configurable end-to-end revocation bound via
   scope during both `git clone --mirror` and origin LFS fetches and aborts
   without publishing partial snapshots or permitting origin fallback bypass.
 
+### What the configured-bound acceptance measures
+
+`tests/ci_job_checkouts.py` and the standalone `tests/transfer_revocation.py`
+record a typed monotonic trigger interval. For a committed mutation,
+`t_before` is taken immediately before the real revoke/cancel/remove/generation
+operation and `t_after` after its successful commit; one conservative deadline
+`D = t_before + configured_bound` is used for every observation and is never
+reset to the API response time. For a natural grant or token expiry, the
+authoritative PostgreSQL clock is sampled before and after the scenario and the
+expiry is mapped into monotonic time. The earliest mapped expiry is the lower
+bound, an inconsistent clock mapping is rejected, and no `expiry + 0.35 s`
+fresh-clock shortcut is used.
+
+The real transfer is opened with a fixture-owned small `SO_RCVBUF` set before
+connect; the effective `getsockopt` value is recorded but is not treated as a
+payload-capacity proof. A 16/24/32 MiB incompressible payload keeps the fixture
+large, but payload size and any caller-supplied Boolean are never source
+evidence.
+
+For each transport sample the harness matches the complete reversed IPv4
+four-tuples, requires exactly one `ESTABLISHED` row in each direction, verifies
+the service-owned server socket inode and the actual client socket inode, and
+requires the service and fixture to share a network namespace. It parses the
+hexadecimal `/proc/<pid>/net/tcp` timer field and treats `tr==4` as
+`probe0_pending` only. This is not a literal `snd_wnd==0` measurement: Linux
+also uses probe0 / sender SWS avoidance with a small nonzero window and can clear
+the pending timer during the probe transition, so a missing/non-4 sample resets
+the window. Every qualifying sample requires `probe0_pending`, positive server
+TX, and positive client RX with an exactly unchanged RX plateau. The minimum
+continuous qualified interval is 500 ms, with bounded sampling gaps; missing,
+ambiguous, unobservable, reset, or changed samples clear qualification. Time
+spent before the first valid sample does not count. No exact zero-window claim
+is made.
+
+An independent unfinished-source witness is required in the same samples:
+
+- **LFS:** the serving process must hold exactly one readable descriptor for the
+  actual fixture object, matched by `st_dev`, `st_ino`, and `st_size`, with
+  fdinfo position strictly inside the file and unchanged throughout the window.
+  The fixture object may appear during cold setup; after the first body bytes it
+  must remain the same file and descriptor. Copies of expected body bytes,
+  client read counts, payload size, and hardcoded booleans are not source
+  evidence.
+- **Git:** an owned process-group task must be sleeping in an actual
+  `write`/`writev` on fd 1 to a write-only pipe whose read end is owned by the
+  serving process, with the exact supported `pipe_write` wait channel. The
+  implementation enumerates `/proc/<tgid>/task/<tid>`, binds TID/start-time/PGID
+  identity, and supports only pinned Linux x86_64 syscall 1 (write) and 20
+  (writev). It does not guess architecture syscall numbers or TCP_INFO layout.
+  A live process or process group alone is insufficient.
+
+Missing, ambiguous, permission-denied, unsupported-ABI, identity-reuse, source
+progress, or unobservable evidence fails/unproven; it is not reported as a
+product defect or skipped. These are sampled observations, not an atomic
+snapshot or a claim that every instant between samples was stalled.
+
+The healthy read pause is before the mutation and the final qualifying sample
+is taken immediately before the mutation trigger (or shortly before the mapped
+natural expiry). After the trigger the consumer stays paused for a shorter
+interval (the CI starting point is 800 ms at `B=1200`, inside `D`), then drains
+promptly with the remaining absolute deadline and `read1`-style incremental
+reads. A timeout, local close, or harness cancellation is never a pass.
+
+Only confirmed transport truncation (incomplete framing, short
+`Content-Length` EOF, or reset) can be a client observation. A later observation
+does not prove a late server cutoff because buffered bytes can delay visibility.
+For Git, the harness independently captures the actual service-descendant
+process-group leader, start time, and PGID before the trigger, tracks every
+member including non-Git descendants, treats `Z`/`X` as non-running like the
+production quiescence check, and rejects PGID reuse or unobservable `/proc`
+state. The pass rule is exactly `S_upper - E_lower <= B`, with no additive CI
+tolerance. Leak/reap, GC-lock, and staging checks remain separate sanity checks
+and do not reset the bound clock.
+
+Each subcase reports the configured bound, trigger kind and interval (or expiry
+clock bracket), backpressure witness and effective receive buffer, target and
+actual pre/post-trigger pauses, client stop kind/time, Git group quiescence and
+polling gaps, and `configured_bound_proven`. The harness timestamps the body
+reader's actual monotonic resume, not just the planned hold, and derives every
+relative elapsed field from the final validated natural-expiry `E_lower` (the
+initial single-sample bracket is retained only for audit). The same final
+`E_lower` drives the pass booleans and report values; an invalid or inconsistent
+clock mapping fails rather than passing. Existing top-level case IDs and the
+original 17-case inventory are preserved; added report fields are timing
+evidence, not a new runtime qualification. These are harness measurements, not
+a new server telemetry endpoint, and a timed-out or unobservable run remains
+unproven.
+
 ## Live multi-mirror and multi-controller HA qualification
 
 Multi-daemon deployments couple live `rootyard serve` controllers,
@@ -636,7 +728,13 @@ PostgreSQL 17 state:
   and `409` stale attempt fencing (Scenario B), and all-mirrors-down
   simultaneous origin-fallback bursts covering all 5 `X-Rootyard-CI-State`
   outcomes and leak checks (Scenario C) on single-host loopback PG 17 (not a
-  multi-host WAN/power-loss test). Enforced statically by
+  multi-host WAN/power-loss test). Scenario D adds a fresh unlisted live
+  mirror that is alive but not ready for a new target: a first claim returns a
+  genuine `202` `waiting` with no lease or checkout grant, an explicit
+  named-mirror auto-fetch on the same controller/PostgreSQL/storage commits the
+  exact target-OID readiness, and the same durable queued run then claims `200`
+  from that mirror with the persisted `(attempt, lease_generation, grant)`
+  bound to repository/target/storage generation. Enforced statically by
   `tests/test_ci_mirror_ha_contracts.py` and in CI by
   `.github/workflows/ci-mirror-ha.yml`.
 

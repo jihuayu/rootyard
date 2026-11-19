@@ -57,14 +57,16 @@ pub(crate) fn authority_token(storage_backend: &str) -> &'static str {
 
 pub(crate) fn compute_history_incarnation(
     volume_id: Uuid,
+    cluster_incarnation: Uuid,
     repo_id: Uuid,
     authority: &str,
     object_format: &str,
     transition_epoch: i64,
 ) -> Uuid {
     let mut hasher = Sha256::new();
-    hasher.update(b"rootyard:browse:history-incarnation:v1:");
+    hasher.update(b"rootyard:browse:history-incarnation:v2:");
     hasher.update(volume_id.as_bytes());
+    hasher.update(cluster_incarnation.as_bytes());
     hasher.update(repo_id.as_bytes());
     hasher.update([0]);
     hasher.update(authority.as_bytes());
@@ -156,7 +158,8 @@ pub(crate) async fn authorize_and_scope(
         auth::authorize_repo_with_role(&tx, &actor, owner, name, auth::Role::Read, RepoAction::ContentsRead).await?;
     let row = tx
         .query_one(
-            "SELECT storage_generation, storage_backend, object_format, backend_transition_epoch \
+            "SELECT storage_generation, storage_backend, object_format, backend_transition_epoch, \
+                    (SELECT incarnation FROM cluster_authority WHERE singleton = true) AS cluster_incarnation \
              FROM repositories WHERE id = $1",
             &[&access.repo_id],
         )
@@ -166,10 +169,21 @@ pub(crate) async fn authorize_and_scope(
     let storage_backend: &str = row.get("storage_backend");
     let object_format: &str = row.get("object_format");
     let epoch: i64 = row.get("backend_transition_epoch");
+    let cluster_incarnation = row
+        .try_get::<_, Option<Uuid>>("cluster_incarnation")
+        .map_err(Error::internal)?
+        .filter(|incarnation| !incarnation.is_nil())
+        .ok_or_else(|| Error::internal("missing or nil cluster authority incarnation"))?;
     auth::finish_tx(tx, &actor, false).await?;
     let authority = authority_token(storage_backend);
-    let history_incarnation =
-        compute_history_incarnation(state.storage.volume_id, access.repo_id, authority, object_format, epoch);
+    let history_incarnation = compute_history_incarnation(
+        state.storage.volume_id,
+        cluster_incarnation,
+        access.repo_id,
+        authority,
+        object_format,
+        epoch,
+    );
     let environment = cache_environment()?;
     let scope = BrowseRepoScope {
         repo_id: access.repo_id,
@@ -355,7 +369,7 @@ mod tests {
     use super::*;
     use crate::browse::models::{HeadInfo, RefItem};
 
-    fn sample_scope(authority: &'static str, generation: i64, epoch: i64) -> BrowseRepoScope {
+    fn sample_scope(authority: &'static str, generation: i64, epoch: i64, incarnation: Uuid) -> BrowseRepoScope {
         let volume = Uuid::from_u128(10);
         let repo = Uuid::from_u128(20);
         BrowseRepoScope {
@@ -363,7 +377,7 @@ mod tests {
             tenant_id: Uuid::from_u128(30),
             environment: "test".to_owned(),
             authority,
-            history_incarnation: compute_history_incarnation(volume, repo, authority, "sha1", epoch),
+            history_incarnation: compute_history_incarnation(volume, incarnation, repo, authority, "sha1", epoch),
             storage_generation: generation,
         }
     }
@@ -411,14 +425,19 @@ mod tests {
     }
 
     #[test]
-    fn scope_key_changes_with_authority_generation_and_transition_epoch() {
-        let base = sample_scope("gitfs", 1, 0).cache_key(CacheKind::TreeListing, "disc").unwrap();
-        let pando = sample_scope("pando", 1, 0).cache_key(CacheKind::TreeListing, "disc").unwrap();
-        let gen2 = sample_scope("gitfs", 2, 0).cache_key(CacheKind::TreeListing, "disc").unwrap();
-        let epoch1 = sample_scope("gitfs", 1, 1).cache_key(CacheKind::TreeListing, "disc").unwrap();
-        assert_ne!(base, pando);
-        assert_ne!(base, gen2);
-        assert_ne!(base, epoch1);
+    fn scope_key_changes_with_authority_generation_transition_epoch_and_restore() {
+        let incarnation = Uuid::from_u128(40);
+        let key = |authority, generation, epoch, cluster_incarnation| {
+            sample_scope(authority, generation, epoch, cluster_incarnation)
+                .cache_key(CacheKind::TreeListing, "disc")
+                .unwrap()
+        };
+        let base = key("gitfs", 1, 0, incarnation);
+        assert_eq!(base, key("gitfs", 1, 0, incarnation));
+        assert_ne!(base, key("gitfs", 1, 0, Uuid::from_u128(41)));
+        assert_ne!(base, key("pando", 1, 0, incarnation));
+        assert_ne!(base, key("gitfs", 2, 0, incarnation));
+        assert_ne!(base, key("gitfs", 1, 1, incarnation));
         assert_eq!(Error::not_found().0.as_u16(), 404);
         assert!(!is_origin_fault(&Error::not_found()));
         assert!(is_origin_fault(&Error::timeout()));
@@ -428,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_ref_snapshot_hint_replaces_stale_advisory_cache() {
         let cache = ServingCache::standalone_memory().unwrap();
-        let scope = sample_scope("gitfs", 3, 1);
+        let scope = sample_scope("gitfs", 3, 1, Uuid::from_u128(40));
         let key = scope.cache_key(CacheKind::RefSnapshotHint, &hashed_discriminator("refs", &[None, None], Some(50))).unwrap();
         let stale = RefsResponse {
             repository_id: scope.repo_id,

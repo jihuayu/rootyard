@@ -4,8 +4,8 @@ use crate::{
     pulls::models::context_valid,
     webhooks::{
         ci_classification::{
-            CheckoutStateClass, CheckoutTarget, ClassificationInput, classified_error,
-            classified_response, classify_checkout_state, error_with_classification,
+            CheckoutStateClass, CheckoutTarget, ClassificationInput, SnapshotRoute, classified_error,
+            classified_response, classify_checkout_state, error_with_classification, route_from_snapshot,
         },
         ci_controller,
         signing::{constant_time_eq, sha256_hex},
@@ -80,6 +80,27 @@ pub(crate) fn normalize_excluded(raw: Option<Vec<String>>, extra: Option<&str>) 
     Ok(set.into_iter().collect())
 }
 
+/// Lock the exact live repository row before any lease or checkout grant is
+/// minted. Soft delete takes the same row exclusively, so a claim either
+/// commits its grant first or observes `deleted_at` and returns 404.
+async fn lock_claim_repository_tx(
+    tx: &Transaction<'_>,
+    repo: Uuid,
+    owner: &str,
+    name: &str,
+) -> Result<(), Error> {
+    tx.query_opt(
+        "SELECT r.id FROM repositories r JOIN namespaces n ON n.id=r.owner_id \
+         WHERE r.id=$1 AND n.slug=$2 AND r.name=$3 AND r.state='ready' AND r.deleted_at IS NULL \
+         FOR SHARE OF r",
+        &[&repo, &owner, &name],
+    )
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(Error::not_found)?;
+    Ok(())
+}
+
 pub(crate) async fn verify_hook_tx(tx: &Transaction<'_>, hook_id: Uuid, repo: Uuid, headers: &HeaderMap) -> Result<(), Error> {
     let current_hook = tx
         .query_opt(
@@ -102,33 +123,29 @@ pub(crate) async fn verify_hook_tx(tx: &Transaction<'_>, hook_id: Uuid, repo: Uu
     Ok(())
 }
 
+/// Callers hold the 1062026 advisory lock in a preceding statement so this
+/// decision query observes a fresh READ COMMITTED snapshot after any wait.
 pub(crate) async fn choose_checkout_source(
     tx: &Transaction<'_>,
     target: CheckoutTarget<'_>,
     prefer_mirror: bool,
     wait_requested: bool,
 ) -> Result<Result<String, Response>, Error> {
-    if let Some(mirror) = ci_controller::select_ready_mirror(
+    let snapshot = ci_controller::select_ready_mirror(
         &**tx,
         target.repo_id,
         target.storage_generation,
         target.audience,
         target.head_oid,
         target.excluded,
-    )
-    .await?
-    {
-        return Ok(Ok(mirror));
-    }
-    let summary = ci_controller::probe_availability(
-        &**tx,
-        target.repo_id,
-        target.storage_generation,
-        target.audience,
-        target.head_oid,
-        target.excluded,
+        true,
     )
     .await?;
+    let summary = match route_from_snapshot(snapshot.source, snapshot.availability) {
+        SnapshotRoute::Selected(source) => return Ok(Ok(source)),
+        SnapshotRoute::Unavailable(availability) => availability,
+        SnapshotRoute::Inconsistent => return Err(Error::internal("inconsistent checkout snapshot")),
+    };
     let (global, per_repo) = ci_controller::origin_fallback_limits();
     let allow_origin = !prefer_mirror && !target.excluded.iter().any(|s| s == "origin");
     let class = classify_checkout_state(ClassificationInput {
@@ -179,7 +196,7 @@ pub(crate) async fn integration(state: &AppState, owner: &str, name: &str, hook_
     let row = client.query_opt(
         "SELECT r.id,r.owner_id,w.secret,w.active FROM repositories r \
          JOIN namespaces u ON u.id=r.owner_id JOIN forge_webhooks w ON w.repository_id=r.id \
-         WHERE u.slug=$1 AND r.name=$2 AND w.id=$3 AND r.state='ready'",
+         WHERE u.slug=$1 AND r.name=$2 AND w.id=$3 AND r.state='ready' AND r.deleted_at IS NULL",
         &[&owner,&name,&hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let secret: String = row.get(2);
@@ -278,6 +295,11 @@ pub async fn claim(
     // issuer authority under the same policy fence used by revocation before
     // minting the lease and its checkout capability.
     crate::webhooks::trust::lock_policy_tx(&tx, repo).await?;
+    // The early integration lookup is not a fence. Re-lock the exact
+    // repository row here, before the run row and before lease/grant mint, so
+    // soft delete either wins the row first (this returns 404) or waits until
+    // this claim's checkout grant is committed.
+    lock_claim_repository_tx(&tx, repo, &owner, &name).await?;
     if let Err(err) = verify_hook_tx(&tx, hook_id, repo, &headers).await {
         return Ok(error_with_classification(err));
     }

@@ -1,0 +1,145 @@
+//! Trusted configured realm binding for one real Raft Ref-CAS backend.
+
+use uuid::Uuid;
+
+use crate::ref_store::core::types::GitObjectFormat;
+use crate::ref_store::raft_backend::error::RaftBackendError;
+
+const MAX_GROUP_BYTES: usize = 64;
+
+/// Trusted node/factory identity. `group_id`, `authority_id`, and `storage_generation` are not
+/// fields of the Root gate; they are owned by the node factory/storage configuration and are
+/// checked against the backend realm. They are never claimed to be derived from Raft membership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeTrust {
+    group_id: String,
+    authority_id: Uuid,
+    storage_generation: u64,
+}
+
+impl NodeTrust {
+    pub fn new(
+        group_id: impl Into<String>,
+        authority_id: Uuid,
+        storage_generation: u64,
+    ) -> Result<Self, RaftBackendError> {
+        let group_id = group_id.into();
+        validate_group_id(&group_id)?;
+        if authority_id.is_nil() {
+            return Err(RaftBackendError::InvalidConfig("node trust authority_id must be non-nil"));
+        }
+        if storage_generation == 0 {
+            return Err(RaftBackendError::InvalidConfig("node trust storage_generation must be positive"));
+        }
+        Ok(Self { group_id, authority_id, storage_generation })
+    }
+
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    pub fn authority_id(&self) -> Uuid {
+        self.authority_id
+    }
+
+    pub fn storage_generation(&self) -> u64 {
+        self.storage_generation
+    }
+}
+
+/// Immutable trusted realm/authority/storage-generation context owned by a backend.
+///
+/// Every field is private. There is no `Deserialize`, default, or arbitrary-bytes constructor, so
+/// a caller cannot mint a view by presenting an unverified realm object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmBinding {
+    tenant_id: Uuid,
+    group_id: String,
+    authority_id: Uuid,
+    history_id: Uuid,
+    group_epoch: u64,
+    authority_epoch: i64,
+    object_format: GitObjectFormat,
+    storage_generation: u64,
+}
+
+impl RealmBinding {
+    /// Validates one trusted realm binding. All ids are non-nil and epochs are positive.
+    pub fn new(
+        tenant_id: Uuid,
+        group_id: impl Into<String>,
+        authority_id: Uuid,
+        history_id: Uuid,
+        group_epoch: u64,
+        authority_epoch: i64,
+        object_format: GitObjectFormat,
+        storage_generation: u64,
+    ) -> Result<Self, RaftBackendError> {
+        if tenant_id.is_nil() || authority_id.is_nil() || history_id.is_nil() {
+            return Err(RaftBackendError::InvalidConfig("realm ids must be non-nil"));
+        }
+        let group_id = group_id.into();
+        validate_group_id(&group_id)?;
+        if group_epoch == 0 || group_epoch > i64::MAX as u64 {
+            return Err(RaftBackendError::InvalidConfig("group_epoch must be in 1..=i64::MAX"));
+        }
+        if authority_epoch <= 0 {
+            return Err(RaftBackendError::InvalidConfig("authority_epoch must be positive"));
+        }
+        if storage_generation == 0 {
+            return Err(RaftBackendError::InvalidConfig("storage_generation must be positive"));
+        }
+        Ok(Self {
+            tenant_id,
+            group_id,
+            authority_id,
+            history_id,
+            group_epoch,
+            authority_epoch,
+            object_format,
+            storage_generation,
+        })
+    }
+
+    pub fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    pub fn authority_id(&self) -> Uuid {
+        self.authority_id
+    }
+
+    pub fn history_id(&self) -> Uuid {
+        self.history_id
+    }
+
+    pub fn group_epoch(&self) -> u64 {
+        self.group_epoch
+    }
+
+    pub fn authority_epoch(&self) -> i64 {
+        self.authority_epoch
+    }
+
+    pub fn object_format(&self) -> GitObjectFormat {
+        self.object_format
+    }
+
+    pub fn storage_generation(&self) -> u64 {
+        self.storage_generation
+    }
+}
+
+fn validate_group_id(group_id: &str) -> Result<(), RaftBackendError> {
+    if group_id.is_empty() || group_id.len() > MAX_GROUP_BYTES {
+        return Err(RaftBackendError::InvalidConfig("group_id is empty or too long"));
+    }
+    if !group_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+        return Err(RaftBackendError::InvalidConfig("group_id contains unsupported bytes"));
+    }
+    Ok(())
+}

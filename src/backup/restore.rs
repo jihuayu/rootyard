@@ -4,6 +4,40 @@ use super::*;
 mod verify;
 use self::verify::verify;
 
+pub(in crate::backup) struct W8aRestorePlan<'a> {
+    pub sidecar: &'a w8a_paired::W8aPairedSidecarManifest,
+    pub compute_dir: &'a Path,
+}
+
+struct StagingDirGuard {
+    path: PathBuf,
+    published: bool,
+}
+
+impl StagingDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, published: false }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish_to(&mut self, target: &Path) -> Result<()> {
+        publish(&self.path, target)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagingDirGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 /// Archives before format20 never recorded a storage backend. For those the
 /// restored database's own `storage_backend` is the only authority: it must be
 /// a legacy native backend (`gitfs` or `pando`, which own a bare repository;
@@ -64,6 +98,79 @@ pub async fn restore(
     allow_legacy_schema142: bool,
     allow_legacy_schema143: bool,
 ) -> Result<()> {
+    restore_inner(
+        config,
+        source,
+        None,
+        allow_legacy_schema007,
+        allow_legacy_schema130,
+        allow_legacy_schema131,
+        allow_legacy_schema132,
+        allow_legacy_schema133,
+        allow_legacy_schema134,
+        allow_legacy_schema135,
+        allow_legacy_schema136,
+        allow_legacy_schema137,
+        allow_legacy_schema138,
+        allow_legacy_schema139,
+        allow_legacy_schema140,
+        allow_legacy_schema141,
+        allow_legacy_schema142,
+        allow_legacy_schema143,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub(in crate::backup) async fn restore_w8a_paired(
+    config: &Config,
+    source: &Path,
+    plan: W8aRestorePlan<'_>,
+) -> Result<(authority::W8aFenceReceipt, Vec<w8a_paired::W8aRepoFsckReceipt>)> {
+    let outcome = restore_inner(
+        config,
+        source,
+        Some(plan),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .await?;
+    outcome.context("W8-A paired restore completed without fence receipt")
+}
+
+async fn restore_inner(
+    config: &Config,
+    source: &Path,
+    w8a_plan: Option<W8aRestorePlan<'_>>,
+    allow_legacy_schema007: bool,
+    allow_legacy_schema130: bool,
+    allow_legacy_schema131: bool,
+    allow_legacy_schema132: bool,
+    allow_legacy_schema133: bool,
+    allow_legacy_schema134: bool,
+    allow_legacy_schema135: bool,
+    allow_legacy_schema136: bool,
+    allow_legacy_schema137: bool,
+    allow_legacy_schema138: bool,
+    allow_legacy_schema139: bool,
+    allow_legacy_schema140: bool,
+    allow_legacy_schema141: bool,
+    allow_legacy_schema142: bool,
+    allow_legacy_schema143: bool,
+) -> Result<Option<(authority::W8aFenceReceipt, Vec<w8a_paired::W8aRepoFsckReceipt>)>> {
     let started = Instant::now();
     let source = absolute(source, true)?;
     let target = absolute(&config.data_dir, false)?;
@@ -122,9 +229,7 @@ pub async fn restore(
             || manifest.binary_sha256 == hash(&std::env::current_exe()?)?,
         "restore requires the exact backup binary; upgrade separately"
     );
-    // The schema140 opt-in may only ever consume a genuine frozen format16
-    // archive. Re-check the complete source contract here, before any migration
-    // can add the schema141 ledger, even though verify() already validated it.
+    // The schema140 opt-in may only consume a genuine frozen format16 archive.
     if allow_legacy_schema140 {
         ensure!(
             manifest.format == 16
@@ -133,11 +238,8 @@ pub async fn restore(
             "legacy opt-in requires the exact format16/schema140 catalog"
         );
     }
-    // The schema141 opt-in may only ever consume a genuine frozen format17
-    // archive. Re-check the complete source contract here, before any migration
-    // can add the schema142 pack ledger, even though verify() already validated
-    // it. A mixed or incorrect opt-in has already been refused above, so the
-    // current format18 archive never needs this legacy flag.
+    // The schema141 opt-in may only consume a genuine frozen format17 archive;
+    // a mixed or incorrect opt-in was already refused above.
     if allow_legacy_schema141 {
         ensure!(
             manifest.format == 17
@@ -146,11 +248,8 @@ pub async fn restore(
             "legacy opt-in requires the exact format17/schema141 catalog"
         );
     }
-    // The schema142 opt-in may only ever consume a genuine frozen format18
-    // archive produced by the retained A4 producer. Re-check the complete
-    // source contract here, before migration 143 can add the A5 pack-snapshot
-    // binding/history/permanent-usage ledger. A relabelled or mixed archive is
-    // refused by verify() and by this exact frozen-catalog comparison.
+    // The schema142 opt-in may only consume a genuine frozen format18 archive;
+    // verify() and this frozen-catalog comparison refuse a relabelled one.
     if allow_legacy_schema142 {
         ensure!(
             manifest.format == 18
@@ -159,11 +258,8 @@ pub async fn restore(
             "legacy opt-in requires the exact format18/schema142 catalog"
         );
     }
-    // The schema143 opt-in may only ever consume a genuine frozen format19
-    // archive (schema143 = roots/decisions-era predecessor). Re-check the
-    // complete source contract before migration 144 can add the roots,
-    // decisions and protocol tables; a relabelled or mixed archive is refused
-    // by verify() and by this exact frozen-catalog comparison.
+    // The schema143 opt-in may only consume a genuine frozen format19 archive;
+    // verify() and this frozen-catalog comparison refuse a relabelled one.
     if allow_legacy_schema143 {
         ensure!(
             manifest.format == 19
@@ -173,8 +269,7 @@ pub async fn restore(
         );
     }
     let mut client = pg(config).await?;
-    // Real lifecycle barrier shared with serve-blob, regardless of the target
-    // volume: it is held until the restored target is published.
+    // Real lifecycle barrier shared with serve-blob, held until publication.
     let mutex = BackupMutex::acquire(&client).await?;
     ensure_database_available(&client).await?;
     database_scope(&client, true).await?;
@@ -194,20 +289,21 @@ pub async fn restore(
     write_private(&guard, format!("{}\n", manifest.backup_id).as_bytes())?;
     File::open(target.parent().unwrap())?.sync_all()?;
     lifetime::restore_marker(&client, Some(manifest.backup_id)).await?;
-    let staging = target.parent().unwrap().join(format!(".rootyard-restore-{}.partial", Uuid::new_v4()));
+    let staging_path = target.parent().unwrap().join(format!(".rootyard-restore-{}.partial", Uuid::new_v4()));
+    ensure!(!staging_path.exists(), "restore staging collision");
+    let mut staging = StagingDirGuard::new(staging_path);
     let entries = manifest
         .files
         .iter()
         .filter_map(|(n, e)| n.strip_prefix("volume/").map(|n| (n.to_owned(), e.clone())))
         .collect();
-    copy_volume(&source.join("volume"), &staging, &entries)?;
-    let _volume = volume_lock(&staging)?;
-    ensure!(volume_identity(&staging)? == manifest.volume_id, "restored volume identity mismatch");
+    copy_volume(&source.join("volume"), staging.path(), &entries)?;
+    let _volume = volume_lock(staging.path())?;
+    ensure!(volume_identity(staging.path())? == manifest.volume_id, "restored volume identity mismatch");
     let mut repos = manifest.repositories.clone();
-    git_inventory(config, &staging, &mut repos, true).await?;
+    git_inventory(config, staging.path(), &mut repos, true).await?;
     ensure!(repos == manifest.repositories, "restored native refs/HEAD differ from manifest");
-    // An archive is executable SQL. --trust-backup is a required operator choice,
-    // not an assertion that hashes authenticate it. Destination stays isolated.
+    // An archive is executable SQL; --trust-backup is a required operator choice.
     let mut restore = pg_command(config, "pg_restore")?;
     restore
         .args([
@@ -224,21 +320,11 @@ pub async fn restore(
         .arg(source.join("metadata.dump"));
     checked(&mut restore).await?;
     ensure!(schema(&client, manifest.format).await? == manifest.schema_versions, "restored schema mismatch");
-    // The catalog projection ends with SET search_path=pg_catalog. Restore the
-    // target's public application schema before applying the reviewed upgrade.
+    // The catalog projection ends with SET search_path=pg_catalog; restore public first.
     client.batch_execute("SET search_path=public").await?;
-    // Formats 6 through 19 are frozen at schema 130 through 143. Preserve them
-    // for old archives and apply the reviewed Rust migration path only after the
-    // exact frozen catalog and version list have been verified from the restored
-    // dump. Those formats always need their explicit legacy opt-in, so no
-    // restored database can serve the current schema without the reviewed later
-    // migrations (including schema135 metrics index, schema136 token scopes and the
-    // schema137 terminal-admission projection guard, the schema138 RefStore
-    // operation registry, the schema139 RefStore core, the schema140 metadata
-    // snapshot/pin contract, the schema141 global artifact-hold ledger, the
-    // schema142 durable pack-registration/membership foundation and the
-    // schema143 added pack-snapshot binding/history/permanent-usage ledger and
-    // schema144 adds the roots, publication-decision/verdict/quota ledgers and
+    // Formats 6 through 19 are frozen at schema 130 through 143 and always need
+    // their explicit legacy opt-in, so only a re-checked frozen catalog may be
+    // upgraded here (schema144 adds roots, decisions, verdict/quota ledgers and
     // the separate per-repository protocol state).
     if matches!(manifest.format, 6..=19) {
         let mut upgraded = client;
@@ -261,16 +347,14 @@ pub async fn restore(
             "restored LFS metadata differs from backup closure"
         );
     }
-    // Only a genuine format4 archive still at its verified schema007 predates
-    // the schema138 RefStore operation registry, so it has no rows to count.
-    // Every other archive was produced or migrated with that registry.
+    // Only a genuine format4 archive at its verified schema007 predates the
+    // schema138 RefStore registry; every other archive has rows to count.
     let has_ref_store_registry = manifest.format != 4;
     let metadata_repos = repositories(&client, has_ref_store_registry).await?;
     let has_backend = manifest.format >= 20;
     restore_metadata_repositories(&manifest.repositories, metadata_repos, has_backend)?;
-    // A backup can predate cancellation. Never resurrect any previously issued
-    // checkout bearer after restoring old authority; plan and native pins remain
-    // evidence, not permission to mint a credential for the same job again.
+    // A backup can predate cancellation; never resurrect a previously issued
+    // checkout bearer (plan and native pins stay evidence, not permission).
     if manifest.format >= 5 {
         client
             .execute("UPDATE public.ci_checkout_jobs SET revoked=true WHERE plan IS NOT NULL AND NOT revoked", &[])
@@ -334,6 +418,9 @@ pub async fn restore(
             ) == manifest.refstore,
             "restored RefStore rows differ from the archive cut"
         );
+        if let Some(plan) = &w8a_plan {
+            w8a_paired::verify_restored_source_snapshot(&client, plan.sidecar).await.map_err(anyhow::Error::new)?;
+        }
         authority::fence(&client).await?;
         crate::pando_gateway::retention::reset_authority(&mut client).await?;
         let profile = crate::blob_store::config::BlobProfile::from_env()?;
@@ -343,25 +430,41 @@ pub async fn restore(
             transfer.backend_identity_hex() == closure.backend_identity && transfer.provider() == closure.provider,
             "restore target Blob backend identity differs from the archive"
         );
-        // The caller's one absolute restore deadline bounds the restored-source
-        // validation, the ledger reads and every rebuild; it is never restarted.
+        // The caller's one absolute restore deadline bounds every read and rebuild.
         let until = tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600));
         blob_closure::import(&client, &transfer, &manifest.blob_artifacts, &source, until, &mutex).await?;
     }
+    let w8a_outcome = if let Some(plan) = w8a_plan {
+        ensure!(manifest.format == FORMAT_PAIRED, "W8-A paired restore requires format30");
+        let outcome = w8a_paired::finish_guarded_restore(
+            config,
+            &mut client,
+            &mutex,
+            plan.sidecar,
+            &manifest.blob_artifacts,
+            plan.compute_dir,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
+        Some(outcome)
+    } else {
+        None
+    };
     ensure!(!target.exists(), "destination appeared during restore");
-    // Keep the exclusive lifecycle barrier until the restored target is
-    // published, so no serving process can start inside this gap.
+    // Keep the exclusive lifecycle barrier until the target is published.
     mutex.ensure_held(&client).await?;
-    publish(&staging, &target)?;
+    staging.publish_to(&target)?;
     File::open(target.parent().unwrap())?.sync_all()?;
     fs::remove_file(&guard)?;
     File::open(target.parent().unwrap())?.sync_all()?;
     lifetime::restore_marker(&client, None).await?;
     mutex.release(&client).await?;
     drop(client);
-    println!(
-        "{}",
-        serde_json::json!({"backup_id":manifest.backup_id,"restored":true,"started_service":false,"blob_artifacts":manifest.blob_artifacts.len(),"elapsed_seconds":started.elapsed().as_secs_f64(),"unknown_operations":manifest.repositories.iter().map(|r|r.unknown_operations).sum::<i64>()})
-    );
-    Ok(())
+    if w8a_outcome.is_none() {
+        println!(
+            "{}",
+            serde_json::json!({"backup_id":manifest.backup_id,"restored":true,"started_service":false,"blob_artifacts":manifest.blob_artifacts.len(),"elapsed_seconds":started.elapsed().as_secs_f64(),"unknown_operations":manifest.repositories.iter().map(|r|r.unknown_operations).sum::<i64>()})
+        );
+    }
+    Ok(w8a_outcome)
 }

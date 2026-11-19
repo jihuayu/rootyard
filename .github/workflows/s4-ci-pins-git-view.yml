@@ -1,0 +1,123 @@
+name: S4 CI Pins and Namespace GitView Acceptance
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: s4-ci-pins-git-view-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGOFORK_VERSION: 1.101.0
+  CARGOFORK_COMMIT: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b
+
+jobs:
+  s4-ci-pins-git-view:
+    name: S4 CI Pins and GitView (PG17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: rootyard_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rootyard_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://postgres:password@localhost:5432/rootyard_test
+      ROOTYARD_TEST_DATABASE_URL: postgres://postgres:password@localhost:5432/rootyard_test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.99.1 toolchain (rustfmt + clippy)
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+          rustup default 1.99.1
+
+      - name: Cache CargoFork 1.101.0 (64a6ee6a)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/s4-ci-pins-git-view/cargo-fork.json
+
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: s4-ci-pins-git-view-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            s4-ci-pins-git-view-${{ runner.os }}-
+
+      - name: Verify formatting and design docs
+        run: |
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+
+      - name: Run structural and regression contracts
+        run: |
+          python3 -m unittest \
+            tests.test_s4_ci_pins_git_view_contracts \
+            tests.test_namespace_online_contracts \
+            tests.test_ci_mirror_ha_contracts \
+            tests.test_ci_cargo_fork_workflows -v
+
+      - name: Run clippy with -D warnings
+        run: |
+          cargo clippy --locked --all-targets --features pando-lab -- -D warnings
+
+      - name: Run S4 pin and authority unit tests
+        run: |
+          cargo test --locked --lib ci_pins::
+
+      - name: Run namespace view unit tests
+        run: |
+          cargo test --locked --lib namespace_service::
+
+      - name: Run PG17 S4 checkout, revocation and GitView acceptance
+        run: |
+          cargo test --locked --test s4_ci_pins_git_view -- --ignored --test-threads=1
+
+      - name: Upload S4 acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4-ci-pins-git-view-evidence
+          path: test-results/s4-ci-pins-git-view
+          if-no-files-found: error

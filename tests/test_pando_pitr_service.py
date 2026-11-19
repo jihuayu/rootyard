@@ -1,6 +1,8 @@
 """Unit-test wrapper and pure reporting-boundary tests for Pando PITR acceptance (#77)."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+import io
 import json
 import os
 from pathlib import Path
@@ -209,6 +211,32 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         self.assertEqual(report["failure"]["code"], "receipt_schema_not_v2")
         self.assertFalse(report["provenance_unchanged"])
 
+    def test_assertions_outside_live_suite_have_no_stage_marker(self) -> None:
+        fault = mock.Mock(side_effect=AssertionError("outside live suite"))
+        for boundary, patches, suite in (
+            ("preflight", {"_preflight": fault}, None),
+            ("postflight", {"_postflight": fault}, None),
+            ("injected suite", {}, fault),
+        ):
+            with self.subTest(boundary=boundary):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr), mock.patch.multiple(
+                    pando_pitr_service, run_suite=mock.Mock(), **patches
+                ):
+                    report = self.run_acceptance(suite)
+                    pando_pitr_service.run_suite.assert_not_called()
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["failure"], {
+                    "phase": "suite",
+                    "code": "suite_failed",
+                    "exception_class": "AssertionError",
+                })
+                self.assertEqual(
+                    self.report_path.read_text(encoding="utf-8"),
+                    json.dumps(report, indent=2) + "\n",
+                )
+
     def test_false_or_missing_mandatory_case_cannot_pass(self) -> None:
         for missing in (False, True):
             with self.subTest(missing=missing):
@@ -297,6 +325,81 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
             )
         self.assertIn("--harness tests/pando_pitr_service.py", manifest)
         self.assertIn("--harness tests/test_pando_pitr_service.py", manifest)
+
+
+class PandoPitrStageDiagnosticTest(unittest.TestCase):
+    def test_marker_uses_the_stage_of_the_escaping_assertion(self) -> None:
+        startup_error = AssertionError("fake startup detail")
+        cleanup_error = AssertionError("fake cleanup detail")
+        for cleanup_failure, stage, expected_error in (
+            (None, "startup_fail_closed", startup_error),
+            (cleanup_error, "cleanup", cleanup_error),
+        ):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "suite"
+                root.mkdir()
+                operations = mock.Mock()
+                operations.s3.endpoint = "fake-s3"
+                operations.vault.endpoint = "fake-vault"
+                operations.run_cmd.side_effect = startup_error
+                operations.vault.close.side_effect = cleanup_failure
+                admin_url = "postgresql://fixture.invalid/example"
+                stderr = io.StringIO()
+                with (
+                    redirect_stderr(stderr),
+                    mock.patch.dict(os.environ, {"ROOTYARD_TEST_DATABASE_URL": admin_url}, clear=True),
+                    mock.patch.object(tempfile, "mkdtemp", return_value=str(root)),
+                    mock.patch.multiple(
+                        pando_pitr_service,
+                        TrackingLoopbackS3=mock.Mock(return_value=operations.s3),
+                        TrackingLoopbackVaultTransit=mock.Mock(return_value=operations.vault),
+                        sql_query=operations.sql_query,
+                        run_cmd=operations.run_cmd,
+                    ),
+                    self.assertRaises(AssertionError) as raised,
+                ):
+                    pando_pitr_service.run_suite("fake-rootyard")
+                self.assertIs(raised.exception, expected_error)
+                self.assertEqual(stderr.getvalue(), f"pando PITR live assertion stage ({stage})\n")
+                self.assertEqual(operations.run_cmd.call_args.args[0], ["fake-rootyard", "migrate"])
+                cleanup_calls = [mock.call.vault.close()]
+                if cleanup_failure is None:
+                    create_source, create_clone = operations.sql_query.call_args_list[:2]
+                    source_db = create_source.args[1].split('"')[1]
+                    clone_db = create_clone.args[1].split('"')[1]
+                    cleanup_calls.extend([
+                        mock.call.s3.close(),
+                        mock.call.sql_query(admin_url, f'DROP DATABASE IF EXISTS "{clone_db}" WITH (FORCE);'),
+                        mock.call.sql_query(admin_url, f'DROP DATABASE IF EXISTS "{source_db}" WITH (FORCE);'),
+                    ])
+                self.assertEqual(operations.mock_calls[3:], cleanup_calls)
+                self.assertEqual(root.exists(), cleanup_failure is not None)
+
+    def test_marker_flush_failure_preserves_the_original_assertion(self) -> None:
+        original = AssertionError("fake setup detail")
+        stderr = mock.Mock(wraps=io.StringIO())
+        stderr.flush.side_effect = OSError("fake stderr failure")
+        with (
+            redirect_stderr(stderr),
+            mock.patch.object(pando_pitr_service, "_run_live_suite", side_effect=original),
+            self.assertRaises(AssertionError) as raised,
+        ):
+            pando_pitr_service.run_suite("fake-rootyard")
+        self.assertIs(raised.exception, original)
+        stderr.flush.assert_called_once_with()
+        self.assertEqual(stderr.getvalue(), "pando PITR live assertion stage (setup)\n")
+
+    def test_non_assertion_has_no_stage_marker(self) -> None:
+        original = RuntimeError("fake suite detail")
+        stderr = io.StringIO()
+        with (
+            redirect_stderr(stderr),
+            mock.patch.object(pando_pitr_service, "_run_live_suite", side_effect=original),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            pando_pitr_service.run_suite("fake-rootyard")
+        self.assertIs(raised.exception, original)
+        self.assertEqual(stderr.getvalue(), "")
 
 
 class PandoPitrServiceTest(unittest.TestCase):

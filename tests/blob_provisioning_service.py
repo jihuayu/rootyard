@@ -29,16 +29,41 @@ Second, independent checkpoint (selected together by default, or alone):
   completes, forces the abandoned transaction to roll back, and proves the
   retry converges on one ready authority.
 
+Refusal checkpoint (selected together by default, or alone):
+
+* the real service is restarted against a fresh, unused Blob root prefix, which
+  is a distinct physical backend identity. A create for an existing bound
+  repository is refused at the production conflict boundary and the catalog,
+  serving intent, readiness and core gate are unchanged;
+* a fixture-owned, unserved legacy ``gitfs`` repository row is the old storage
+  format. The same create path refuses it explicitly instead of adopting or
+  upgrading it; no binding, gate or protocol row appears, the row is not served,
+  and a separately created real ready authority is unchanged.
+
+Startup-refusal checkpoint (selected together by default, or alone):
+
+* the public ``serve`` CLI is given the owned Git and data context but no
+  ``DATABASE_URL``; it must exit from configuration before any listener or
+  fallback starts;
+* the public ``serve-blob`` CLI keeps the owned, migrated PostgreSQL schema but
+  loses its explicit Blob endpoint; the production Blob profile has no local or
+  in-memory fallback and must exit before any listener starts.
+
+Both startup cases compare only a closed fixed reason, keep no raw stderr in the
+report, and reuse only the harness-owned process group and temporary root.
+
 No SQL inserts a ready repository, binding, gate, protocol row, ref, object or
-ACK. The only fixture SQL writes are a temporary barrier table, a deferred
-constraint trigger and its function in the random schema this run owns; they are
-dropped in a bounded ``finally`` block. Reports contain no DSN, token, S3
-credential, raw server stderr or environment dump.
+ACK. SQL writes only the temporary barrier table/trigger/function in the random
+schema this run owns, plus one unserved legacy ``gitfs`` repository row in the
+old-format case; both are dropped with the schema. Reports contain no DSN,
+token, S3 credential, raw server stderr or environment dump.
 """
 import argparse
 import concurrent.futures
+import enum
 import http.client
 import json
+import linecache
 import os
 from pathlib import Path
 import random
@@ -61,21 +86,37 @@ CASES = (
     "create_retry_and_service_restart_preserve_head_and_authority",
     "lost_create_ack_proxy_retry_resolves_one_authority",
     "deferred_commit_barrier_kill_rolls_back_and_retry_converges",
+    "backend_identity_conflict_is_explicit_and_preserves_authority",
+    "unsupported_legacy_repository_format_is_explicitly_refused",
+    "missing_database_url_is_explicit_refusal_without_listener",
+    "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
 )
 
 FIRST_CHECKPOINT = CASES[:4]
-SECOND_CHECKPOINT = CASES[4:]
+SECOND_CHECKPOINT = CASES[4:5]
+REFUSAL_CHECKPOINT = CASES[5:7]
+STARTUP_CHECKPOINT = CASES[7:]
+MAX_STARTUP_LOG_BYTES = 64 * 1024
+# Only these fixed, credential-free literals may be projected from child
+# startup output. Anything else is a test failure, never report evidence.
+STARTUP_REFUSAL_REASONS = (
+    "DATABASE_URL is required",
+    "invalid Blob profile",
+)
 
 LIMITATIONS = [
     "Loopback HTTP, one PostgreSQL 17 server and one fixture-owned S3 provider; no Raft, multi-host, HA or physical durability claim.",
     "The retry/restart case kills only this harness's serve-blob process group; it does not claim kernel or power-loss behavior.",
     "The deferred-commit case uses a fixture-owned PostgreSQL deferred constraint trigger, a transaction-scoped advisory barrier and a process SIGKILL; the service's existing 5s statement timeout bounds that window, and the harness kills immediately after observing the barrier. It does not claim PostgreSQL crash recovery.",
     "The ACK-loss case is one real loopback proxy that reads a committed backend 201 and then closes the client connection; it is not exhaustive transport fault injection.",
-    "No SQL creates a ready repository, binding, gate, protocol row, ref, object or acknowledgment. SQL reads authority state and writes only the temporary barrier in this run's random schema.",
+    "The backend-identity case restarts the real service against a fresh, unused Blob root prefix and performs no Blob write under that conflicting mapping; it does not claim provider failover or data migration.",
+    "The legacy-format case inserts one unserved provisioning/gitfs repository row in this run's random schema. It is negative fixture metadata, not a ready authority; no old binary, migration, import or upgrade path is executed, and the schema cleanup removes the row.",
+    "No SQL creates a ready repository, binding, gate, protocol row, ref, object or acknowledgment. SQL reads authority state and writes only the temporary barrier and the single unserved legacy fixture row in this run's random schema.",
     "The temporary barrier trigger/function/table are dropped in a bounded finally block; transaction-scoped advisory locks are released by PostgreSQL on commit/abort.",
     "Concurrency is a small bounded request group on one process, not a scalability benchmark.",
     "The harness sets the existing ROOTYARD_MAX_CONCURRENT_GIT knob to 8 so the half-ready read probe can run while one create is blocked; it is not a capacity claim.",
     "SHA-256 Git operations require the Root-supplied trusted Git to support that object format.",
+    "The startup-refusal cases remove only local configuration from a fresh owned child; they do not simulate a PostgreSQL server outage, external Raft authority, network failure or provider unavailability.",
 ]
 
 
@@ -94,6 +135,187 @@ def quote_literal(value):
 def sha256_hex(value):
     text = str(value)
     return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def closed_startup_reason(raw):
+    """Project only one fixed startup-refusal literal from bounded stderr bytes.
+
+    The caller reads at most ``MAX_STARTUP_LOG_BYTES``. This function never
+    returns, formats or appends arbitrary child text: an unknown, duplicated or
+    oversized signal is a fixed test failure.
+    """
+    if type(raw) is not bytes or len(raw) > MAX_STARTUP_LOG_BYTES:
+        raise AssertionError("startup refusal output is not bounded bytes")
+    prefix = b"Error: "
+    lines = [line for line in raw.splitlines() if line.startswith(prefix)]
+    known = {reason.encode("ascii") for reason in STARTUP_REFUSAL_REASONS}
+    if len(lines) != 1 or lines[0][len(prefix):] not in known:
+        raise AssertionError("startup refusal did not emit exactly one known fixed reason")
+    return lines[0][len(prefix):].decode("ascii")
+
+
+class BackendIdentityConflictPhase(enum.Enum):
+    """Closed, finite failure projection for the backend-identity conflict case."""
+
+    initial_create = "initial_create"
+    authority_before = "authority_before"
+    stop_original = "stop_original"
+    start_conflicting = "start_conflicting"
+    conflicting_create = "conflicting_create"
+    authority_after_refusal = "authority_after_refusal"
+    conflicting_lookup = "conflicting_lookup"
+    stop_conflicting = "stop_conflicting"
+    start_restored = "start_restored"
+    authority_after_restore = "authority_after_restore"
+    restored_read = "restored_read"
+    restored_git = "restored_git"
+
+
+# Only these exact exception classes may appear in the diagnostic. Anything
+# else is projected as the bounded literal "unknown". Table lookups use the
+# exact runtime type, never a string/repr/args inspection of the exception.
+_PHASE_EXCEPTION_CLASSES = {
+    AssertionError: "AssertionError",
+    RuntimeError: "RuntimeError",
+    ValueError: "ValueError",
+    TypeError: "TypeError",
+    KeyError: "KeyError",
+    OSError: "OSError",
+    TimeoutError: "TimeoutError",
+    ConnectionError: "ConnectionError",
+    ConnectionResetError: "ConnectionResetError",
+    BrokenPipeError: "BrokenPipeError",
+    json.JSONDecodeError: "JSONDecodeError",
+    http.client.HTTPException: "HTTPException",
+    http.client.RemoteDisconnected: "RemoteDisconnected",
+}
+_CLOSED_EXCEPTION_LABELS = frozenset(_PHASE_EXCEPTION_CLASSES.values()) | {"unknown"}
+
+
+def _closed_phase_exception_class(error):
+    """Project the runtime type through the closed allowlist, else ``unknown``."""
+    return _PHASE_EXCEPTION_CLASSES.get(type(error), "unknown")
+
+
+def _validated_startup_fields(startup_stage, exit_status):
+    """Revalidate the two closed startup labels at serialization time."""
+    stage = (startup_stage if type(startup_stage) is str
+             and startup_stage in serving.STARTUP_STAGES else "other")
+    status = (exit_status if type(exit_status) is str
+              and exit_status in serving.EXIT_STATUSES else "not_applicable")
+    if stage != "child_exit":
+        status = "not_applicable"
+    elif status == "not_applicable":
+        status = "other_exit"
+    return stage, status
+
+
+class BackendIdentityConflictPhaseError(Exception):
+    """Safe, closed phase/class projection for one failed checkpoint.
+
+    The original exception object, value, arguments, message, traceback and
+    chain are deliberately not stored. ``__str__`` is therefore safe for the
+    inherited ``Harness.case``/``redact`` projector, which persists only it.
+    """
+
+    def __init__(self, phase, exception_class, source_line=None, startup_projection=None):
+        if not isinstance(phase, BackendIdentityConflictPhase):
+            raise TypeError("phase is not a closed backend-identity projection")
+        if exception_class not in _CLOSED_EXCEPTION_LABELS:
+            raise ValueError("exception class is outside the closed allowlist")
+        if source_line is not None and (
+                not isinstance(source_line, int) or isinstance(source_line, bool) or source_line < 1):
+            raise ValueError("source line must be a positive integer or None")
+        self.phase = phase
+        self.exception_class = exception_class
+        self.source_line = source_line
+        self.startup_stage = None
+        self.exit_status = None
+        if startup_projection is not None:
+            if type(startup_projection) is serving.StartupProjection:
+                stage, status = startup_projection.safe_fields()
+            else:
+                stage, status = "other", "not_applicable"
+            self.startup_stage, self.exit_status = _validated_startup_fields(stage, status)
+        super().__init__(phase.value, exception_class)
+
+    def __str__(self):
+        diagnostic = self.diagnostic()
+        source_line = diagnostic.get("source_line", "unknown")
+        text = ("backend-identity-conflict phase=" + diagnostic["phase"]
+                + " class=" + diagnostic["exception_class"]
+                + " source_line=" + str(source_line))
+        if "startup_stage" in diagnostic:
+            text += (" startup_stage=" + diagnostic["startup_stage"]
+                     + " exit_status=" + diagnostic["exit_status"])
+        return text
+
+    def diagnostic(self):
+        """Transient structured view; never contains the raw exception."""
+        diagnostic = {
+            "case": "backend_identity_conflict_is_explicit_and_preserves_authority",
+            "phase": self.phase.value,
+            "exception_class": self.exception_class,
+        }
+        source_line = _validated_phase_source_line(self.source_line)
+        if source_line is not None:
+            diagnostic["source_line"] = source_line
+        if self.startup_stage is not None or self.exit_status is not None:
+            stage, status = _validated_startup_fields(self.startup_stage, self.exit_status)
+            diagnostic["startup_stage"] = stage
+            diagnostic["exit_status"] = status
+        return diagnostic
+
+
+class _BackendIdentityConflictPhaseContext:
+    def __init__(self, phase, source_line, startup_projection=None):
+        self.phase = phase
+        self.source_line = source_line
+        self.startup_projection = startup_projection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb):
+        if exc is None or not isinstance(exc, Exception):
+            return False
+        if isinstance(exc, BackendIdentityConflictPhaseError):
+            return False
+        projection = self.startup_projection
+        if (type(projection) is not serving.StartupProjection
+                or projection.failed is not True or projection.touched is not True):
+            projection = None
+        raise BackendIdentityConflictPhaseError(
+            self.phase, _closed_phase_exception_class(exc), self.source_line,
+            startup_projection=projection) from None
+
+
+def _source_line_is_phase_wrapper(source_line):
+    """Whether one line number is this exact file's phase-wrapper call."""
+    try:
+        path = Path(__file__).resolve()
+        line = linecache.getline(str(path), source_line)
+    except Exception:
+        return False
+    return "_backend_identity_conflict_phase(" in line
+
+
+def _validated_phase_source_line(source_line):
+    if not isinstance(source_line, int) or isinstance(source_line, bool) or source_line < 1:
+        return None
+    return source_line if _source_line_is_phase_wrapper(source_line) else None
+
+
+def _phase_source_line(frame):
+    """Return this file's wrapper line, and only when it is actually there."""
+    try:
+        path = Path(frame.f_code.co_filename).resolve()
+        if path != Path(__file__).resolve():
+            return None
+        source_line = frame.f_lineno
+    except Exception:
+        return None
+    return _validated_phase_source_line(source_line)
 
 
 class AckLossProxy:
@@ -209,6 +431,99 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         self.env["ROOTYARD_MAX_CONCURRENT_GIT"] = "8"
         self.barrier_key = None
         self.barrier_schema = '"' + self.schema + '"'
+
+    def conflicting_blob_identity_overrides(self, identity=None):
+        """One unused child segment selects a different physical Blob identity.
+
+        ``BlobBackendIdentity`` includes the configured root prefix, so this is
+        a real distinct backend mapping without changing the provider, bucket,
+        credentials or any shared object. The child is one production-valid
+        segment: a short label plus the complete 32-hex UUID, comfortably below
+        ``MAX_NAMESPACE_BYTES`` (48). The value stays out of the report.
+        """
+        identity = uuid.uuid4() if identity is None else identity
+        prefix = self.env.get("ROOTYARD_BLOB_ROOT", "").strip("/")
+        root = (prefix + "/" if prefix else "") + "conflict-" + identity.hex
+        return {"ROOTYARD_BLOB_ROOT": root}
+
+    def _backend_identity_conflict_phase(self, phase):
+        """Project exactly one existing stage onto the closed phase enum."""
+        projection = (serving.StartupProjection()
+                      if phase is BackendIdentityConflictPhase.start_conflicting else None)
+        return _BackendIdentityConflictPhaseContext(
+            phase, _phase_source_line(sys._getframe(1)), projection)
+
+    def _listener_absent(self, bind):
+        """Prove the owned loopback bind accepts no connection after refusal."""
+        host, separator, port = bind.rpartition(":")
+        assert separator and host == "127.0.0.1" and port.isdigit(), "bind is not the owned loopback form"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1.0)
+            try:
+                probe.connect((host, int(port)))
+            except OSError:
+                return True
+        return False
+
+    def _startup_refusal(self, label, command, unset, reason):
+        """Run one fresh owned CLI child and retain only a closed fixed reason.
+
+        The child receives the harness's legitimate Git/PG context except for
+        the explicitly removed keys. ``StartupProjection`` proves it exited
+        during startup; this method then consumes the already-retained bounded
+        child log only to compare one literal from ``STARTUP_REFUSAL_REASONS``.
+        The raw log, exception, argv, environment and path never enter the case
+        result or the report.
+        """
+        assert reason in STARTUP_REFUSAL_REASONS, "expected reason is outside the closed set"
+        if self.proc is not None:
+            try:
+                self.stop(hard=True)
+            except Exception:
+                raise AssertionError(label + ": previous owned service cleanup failed") from None
+        bind = self.env["ROOTYARD_BIND"]
+        data = self.root / ("startup-refusal-" + label + "-data")
+        scratch = self.root / ("startup-refusal-" + label + "-scratch")
+        projection = serving.StartupProjection()
+        try:
+            try:
+                self.start(overrides={"ROOTYARD_DATA_DIR": str(data),
+                                      "ROOTYARD_SCRATCH_DIR": str(scratch)},
+                           label=label, startup_projection=projection,
+                           command=command, unset=unset)
+            except Exception:
+                pass
+            else:
+                raise AssertionError(label + ": startup refusal became ready or stayed alive")
+        finally:
+            if self.proc is not None:
+                try:
+                    self.stop(hard=True)
+                except Exception:
+                    raise AssertionError(label + ": refused child cleanup failed") from None
+        stage, exit_status = projection.safe_fields()
+        assert projection.failed is True and projection.touched is True, (
+            label + ": startup refusal outcome was not observed")
+        assert stage == "child_exit", label + ": startup refusal did not exit during startup"
+        assert exit_status == "exited_1", label + ": startup refusal exit status was not 1"
+        assert self.proc is None, label + ": refused child was not reaped"
+        assert self._listener_absent(bind), label + ": startup refusal left the owned bind listening"
+        assert not data.exists(), label + ": startup refusal created the owned data directory"
+        assert not scratch.exists(), label + ": startup refusal created the owned scratch directory"
+        path = getattr(self, "log_path", None)
+        assert path is not None, label + ": startup refusal log path was not retained"
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(MAX_STARTUP_LOG_BYTES + 1)
+        except OSError:
+            raise AssertionError(label + ": startup refusal log could not be read") from None
+        assert len(raw) <= MAX_STARTUP_LOG_BYTES, label + ": startup refusal output exceeded its bound"
+        actual = closed_startup_reason(raw)
+        assert actual == reason, label + ": startup refusal fixed reason mismatch"
+        return {"entrypoint": command[0], "startup_stage": stage,
+                "exit_status": exit_status, "reason": actual,
+                "listener_absent": True, "data_dir_absent": True,
+                "scratch_dir_absent": True}
 
     # -- native Git helpers -------------------------------------------------
     def push_and_clone(self, repo, label, object_format="sha1", files=None):
@@ -381,6 +696,39 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
             " || '|' || (SELECT count(*) FROM ref_store_core_protocol_repos p JOIN repositories r ON r.id=p.repository_id"
             " WHERE r.owner_id=" + owner + " AND r.name=" + name + ")::text",
             "authority counts for " + expected_name)
+
+    def insert_unserved_legacy_gitfs_repository(self, expected_name):
+        """Create only the old-format metadata the provision path must refuse.
+
+        This is the pre-migration-145 ``gitfs`` storage format in its explicitly
+        unserved ``provisioning`` state. It deliberately has no serving
+        binding, core gate, protocol realm, ref, object or ACK; the production
+        service must not adopt or upgrade it.
+        """
+        owner_id = str(uuid.UUID(str(self.alice["user_id"])))
+        repository_id = str(uuid.uuid4())
+        self.bounded_sql(
+            "INSERT INTO repositories(id,owner_id,name,state,storage_backend,object_format)"
+            " VALUES(" + quote_literal(repository_id) + "," + quote_literal(owner_id) + ","
+            + quote_literal(expected_name) + ",'provisioning','gitfs','sha1')")
+        return repository_id
+
+    def legacy_repository_snapshot(self, expected_name):
+        """Read-only old-format fixture observation; never mints authority."""
+        owner = quote_literal(str(uuid.UUID(str(self.alice["user_id"]))))
+        name = quote_literal(expected_name)
+        counts = self.authority_count_for_name(expected_name)
+        assert counts == "1|0|0|0", "legacy fixture is not one unserved repository row: " + counts
+        row = self.one(
+            "SELECT id::text || '|' || owner_id::text || '|' || name || '|' || state || '|' || storage_backend"
+            " || '|' || object_format || '|' || transition_state FROM repositories"
+            " WHERE owner_id=" + owner + " AND name=" + name,
+            "legacy fixture repository row")
+        fields = row.split("|")
+        assert len(fields) == 7, row
+        assert fields[3] == "provisioning" and fields[4] == "gitfs" and fields[5] == "sha1"
+        assert fields[6] == "stable", row
+        return {"counts": counts, "repository": row}
 
     # -- fixture-owned deferred COMMIT barrier ------------------------------
     def install_deferred_barrier(self, expected_name, owner_id, key):
@@ -750,6 +1098,147 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
                 "client_result": type(thread_error["value"]).__name__,
                 "retry_status": status, "authority": facts, "ack_oid": oid, "clone_fsck": True}
 
+    def backend_identity_conflict_is_explicit_and_preserves_authority(self):
+        name = "backend-identity-conflict"
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.initial_create):
+            repo, created_status = self.create(name, self.alice)
+            assert created_status in (201, 202)
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.authority_before):
+            before = self.authority(repo, name)
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.stop_original):
+            original_pid = self.proc.pid
+            # Stop cleanly so the owned data-volume lock is released before the
+            # same real binary is restarted with another Blob identity.
+            self.stop(hard=False)
+        conflicting_pid = None
+        refusal_status = None
+        refusal_error = None
+        lookup_status = None
+        lookup_error = None
+        try:
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.start_conflicting) as phase:
+                self.start(overrides=self.conflicting_blob_identity_overrides(),
+                           label="conflicting-blob-identity",
+                           startup_projection=phase.startup_projection)
+                conflicting_pid = self.proc.pid
+                assert conflicting_pid != original_pid
+            # This is the same real create request on the same bound name. The
+            # production check compares the stored binding identity with the
+            # identity of the store this process actually opened.
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.conflicting_create):
+                refusal_status, refusal_raw = self.post_create(
+                    {"owner": "alice", "name": name, "object_format": "sha1"}, attempts=1)
+                assert refusal_status == 409, (
+                    "conflicting Blob backend create was not explicitly refused: " + str(refusal_status))
+                refusal = json.loads(refusal_raw)
+                # The gateway collapses every provisioning 409 into this fixed,
+                # closed literal (src/blob_git_gateway/error.rs); it never echoes a
+                # backend digest or SQL text.
+                assert refusal == {"error": "repository state changed; retry"}, refusal
+                refusal_error = refusal["error"]
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.authority_after_refusal):
+                after_refusal = self.authority(repo, name)
+                assert after_refusal == before, "backend-identity refusal changed the durable authority"
+            # The same binding cannot be served by the conflicting backend
+            # either. This is a closed "not ready" lookup refusal, not a 200.
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.conflicting_lookup):
+                lookup_status, lookup_raw, _ = self.get_repo_status("alice", name)
+                assert lookup_status == 409, (
+                    "bound repository was served under a different Blob backend: " + str(lookup_status))
+                lookup = json.loads(lookup_raw)
+                assert lookup == {"error": "repository is not ready"}, lookup
+                lookup_error = lookup["error"]
+        finally:
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.stop_conflicting):
+                self.stop(hard=True)
+        # Restore the original backend and prove the durable authority and real
+        # Git serving path still work; the refusal was not a partial deletion.
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.start_restored):
+            self.start(label="after-backend-identity-conflict")
+            assert self.proc.pid != conflicting_pid
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.authority_after_restore):
+            after_restart = self.authority(repo, name)
+            assert after_restart == before, "authority changed after restoring the original Blob backend"
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.restored_read):
+            got = json.loads(self.expect("/api/repos/alice/" + name, 200, token=self.alice))
+            assert got["id"] == repo["id"] and got["state"] == "ready", got
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.restored_git):
+            oid = self.push_and_clone(repo, name)
+            return {"repository_id": repo["id"],
+                    "conflicting_backend_service_restarted": True,
+                    "refusal_status": refusal_status, "refusal_error": refusal_error,
+                    "lookup_status": lookup_status, "lookup_error": lookup_error,
+                    "authority_counts": before["counts"], "gate_revision": before["gate_revision"],
+                    "authority_unchanged": True, "original_backend_restored": True,
+                    "restored_status": 200, "ack_oid": oid, "clone_fsck": True}
+
+    def unsupported_legacy_repository_format_is_explicitly_refused(self):
+        legacy_name = "legacy-gitfs-format"
+        control_name = "legacy-format-control"
+        # A real ready authority from the real create API is the unchanged
+        # control. No ready fixture is inserted by SQL.
+        control, control_status = self.create(control_name, self.alice)
+        assert control_status in (201, 202)
+        control_before = self.authority(control, control_name)
+        legacy_id = self.insert_unserved_legacy_gitfs_repository(legacy_name)
+        legacy_before = self.legacy_repository_snapshot(legacy_name)
+        # The same authenticated create path must classify the old `gitfs`
+        # row as unsupported before it creates a binding/gate/protocol realm.
+        refusal_status, refusal_raw = self.post_create(
+            {"owner": "alice", "name": legacy_name, "object_format": "sha1"}, attempts=1)
+        assert refusal_status == 409, (
+            "legacy repository format create was not explicitly refused: " + str(refusal_status))
+        refusal = json.loads(refusal_raw)
+        # src/ref_store/serving.rs refuses the foreign backend explicitly; the
+        # gateway maps that 409 to this fixed closed literal, never SQL text.
+        assert refusal == {"error": "repository state changed; retry"}, refusal
+        legacy_after = self.legacy_repository_snapshot(legacy_name)
+        assert legacy_after == legacy_before, "legacy format refusal changed the fixture row"
+        after_refusal = self.authority(control, control_name)
+        assert after_refusal == control_before, "legacy format refusal changed a real ready authority"
+        # No half-ready serving state is visible: the old row is not served and
+        # is absent from the ready catalog list. The shared authorization
+        # boundary refuses an unserved provisioning row with a closed 409 before
+        # any serving lookup can run.
+        lookup_status, lookup_raw, _ = self.get_repo_status("alice", legacy_name)
+        assert lookup_status == 409, "legacy fixture was served with status " + str(lookup_status)
+        lookup = json.loads(lookup_raw)
+        assert lookup == {"error": "repository is not ready"}, lookup
+        listed = self.listed_repos()
+        legacy_listed = any(item.get("name") == legacy_name for item in listed)
+        assert not legacy_listed, "legacy fixture appeared in the ready catalog list"
+        control_got = json.loads(self.expect("/api/repos/alice/" + control_name, 200, token=self.alice))
+        assert control_got["id"] == control["id"] and control_got["state"] == "ready", control_got
+        oid = self.push_and_clone(control, control_name)
+        return {"legacy_fixture_repository_id": legacy_id,
+                "legacy_repository_state": "provisioning",
+                "legacy_storage_backend": "gitfs",
+                "legacy_object_format": "sha1",
+                "legacy_authority_counts": legacy_before["counts"],
+                "refusal_status": refusal_status, "refusal_error": refusal["error"],
+                "lookup_status": lookup_status, "lookup_error": lookup["error"],
+                "legacy_listed": legacy_listed,
+                "legacy_row_unchanged": True, "control_authority_unchanged": True,
+                "control_repository_id": control["id"],
+                "control_ack_oid": oid, "clone_fsck": True}
+
+    def missing_database_url_is_explicit_refusal_without_listener(self):
+        # The default public `serve` entrypoint needs the owned Git/data context
+        # but no database. src/config.rs refuses the absent URL before Storage
+        # opens the volume or main.rs binds the listener.
+        return self._startup_refusal(
+            "missing-database-url", ("serve",), ("DATABASE_URL",),
+            "DATABASE_URL is required")
+
+    def missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback(self):
+        # The explicit public `serve-blob` entrypoint keeps the owned, migrated
+        # PostgreSQL URL. Removing only the explicit Blob endpoint must fail in
+        # src/blob_store/config.rs; the legacy ROOTYARD_OBJECT_STORE_* selector
+        # is not a fallback for the standalone Blob profile.
+        return self._startup_refusal(
+            "missing-blob-endpoint", ("serve-blob",), ("ROOTYARD_BLOB_ENDPOINT",),
+            "invalid Blob profile")
+
 
 def report_result(harness, profile, blob_profile, selected, success, hashes):
     errors = []
@@ -781,6 +1270,7 @@ def report_result(harness, profile, blob_profile, selected, success, hashes):
         "git_sha256": profile.git_sha256,
         "blob_profile": blob_profile,
         "checkpoints": {"first": list(FIRST_CHECKPOINT), "second": list(SECOND_CHECKPOINT),
+                        "refusal": list(REFUSAL_CHECKPOINT), "startup": list(STARTUP_CHECKPOINT),
                         "selected": list(selected)},
         "expected_cases": list(selected),
         "case_count": len(harness.results),
@@ -802,7 +1292,7 @@ def main(argv=None):
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--case", action="append", choices=CASES, default=[],
-                        help="run only this case (repeatable); the second checkpoint may be run alone")
+                        help="run only this case (repeatable); any checkpoint may be run alone")
     args = parser.parse_args(argv)
     selected = [name for name in CASES if not args.case or name in args.case]
     try:

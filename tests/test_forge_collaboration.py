@@ -5,8 +5,12 @@ import json
 import os
 import re
 import subprocess
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import schema_baseline  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -59,11 +63,15 @@ class ForgeCollaborationContractTests(unittest.TestCase):
 
         cat_rs = (ROOT / "src" / "backup" / "catalog.rs").read_text(encoding="utf-8")
         verify_rs = (ROOT / "src" / "backup" / "restore" / "verify.rs").read_text(encoding="utf-8")
-        self.assertIn("const FORMAT: u32 = 27;", cat_rs)
-        self.assertIn("const FORMAT_PAIRED: u32 = 28;", cat_rs)
+        self.assertIn(f"const FORMAT: u32 = {schema_baseline.CURRENT_BACKUP_FORMAT};", cat_rs)
+        self.assertIn(f"const FORMAT_PAIRED: u32 = {schema_baseline.CURRENT_BLOB_BACKUP_FORMAT};", cat_rs)
         for snap_name in ("150_catalog.json", "150_restored_catalog.json", "150_upgraded_catalog.json"):
             self.assertIn(snap_name, cat_rs, f"{snap_name} missing from backup catalog")
-        self.assertIn("4..=28", verify_rs, "format 28 range missing from restore verifier")
+        self.assertIn(
+            f"4..={schema_baseline.CURRENT_BLOB_BACKUP_FORMAT}",
+            verify_rs,
+            "current blob backup format range missing from restore verifier",
+        )
 
     def test_module_boundaries_line_caps_zero_mod_rs_and_no_allow(self) -> None:
         for domain in ("forge", "pulls", "web"):
