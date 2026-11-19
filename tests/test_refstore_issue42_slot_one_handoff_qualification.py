@@ -301,5 +301,105 @@ class ManifestValidationTests(unittest.TestCase):
             str(raised.exception), "manifest_case_complete_inconsistent")
 
 
+class WorkflowWiringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (
+            ROOT / ".github" / "workflows"
+            / "refstore-protocol-acceptance.yml").read_text()
+
+    def step(self, marker):
+        start = self.text.index(marker)
+        end = self.text.index("\n      - name:", start + len(marker))
+        return self.text[start:end]
+
+    def handoff(self):
+        return self.step(
+            '"Replay the two reviewed #42 slot-one handoff qualification cases')
+
+    def test_handoff_gate_is_scoped_to_its_own_exact_manual_ref(self):
+        step = self.handoff()
+        self.assertEqual(step.count("github.ref"), 1)
+        self.assertIn("workflow_dispatch", step)
+        self.assertIn("success()", step)
+        self.assertIn("ISSUE42_SLOT_ONE_HANDOFF_MANUAL_REF", step)
+        self.assertEqual(self.text.count(HANDOFF_REF), 2)
+        self.assertEqual(self.text.count(LEGACY_REF), 1)
+        self.assertEqual(
+            self.text.count(
+                "refs/heads/codex/goal-issue42-first-lane-qualification-20261119"),
+            0)
+
+    def test_shell_guard_is_byte_exact_and_bash_case_sensitive(self):
+        run = self.handoff().split("run: |", 1)[1]
+        self.assertIn(
+            '[ "${GITHUB_EVENT_NAME:-}" != \'workflow_dispatch\' ]', run)
+        self.assertIn(
+            '[ "${GITHUB_REF:-}" != \'' + HANDOFF_REF + '\' ]', run)
+        self.assertNotIn("GITHUB_REF^^", run)
+        self.assertNotIn("GITHUB_REF,,", run)
+        self.assertNotIn(" tr ", run)
+        self.assertLess(run.index("set -euo pipefail"), run.index("GITHUB_REF"))
+        self.assertLess(run.index("GITHUB_REF"), run.index("evidence="))
+
+    def test_handoff_step_runs_after_legacy_and_before_cleanup(self):
+        legacy = self.text.index(
+            '"Replay exactly one #42 slot-one rotation case')
+        handoff = self.text.index(
+            '"Replay the two reviewed #42 slot-one handoff qualification cases')
+        cleanup = self.text.index(
+            '"Drop only the run-owned #174 foundation database"')
+        self.assertLess(legacy, handoff)
+        self.assertLess(handoff, cleanup)
+
+    def test_handoff_step_reuses_preflight_and_dedicated_owned_scope(self):
+        step = self.handoff()
+        self.assertIn(
+            "scripts/refstore_issue42_slot_one_handoff_qualification.py", step)
+        for required in (
+                '--lib "$lib"', '--receipt "$receipt"',
+                '--preflight "$evidence/preflight.json"',
+                '--expected-commit "$GITHUB_SHA"',
+                '--report-dir "$evidence"', '--timeout 600',
+                '--stdout-limit 16384',
+                'export ROOTYARD_TEST_GIT="$(command -v git)"',
+                'export ROOTYARD_BLOB_ROOT="session174-slot-one-handoff-'
+                '$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"',
+                'ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES: \'1\'',
+                'ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB: \'1\''):
+            self.assertIn(required, step)
+        expected = (
+            'expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}'
+            '_a${GITHUB_RUN_ATTEMPT}"')
+        self.assertIn(expected, step)
+        self.assertIn('if [ "$SESSION174_DATABASE" != "$expected" ]', step)
+        self.assertIn(
+            'export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/'
+            '$SESSION174_DATABASE"', step)
+        for forbidden in ("PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD",
+                          "ROOTYARD_TEST_DATABASE_OVERRIDE", " tee ",
+                          "set -x", "cat \"$evidence"):
+            self.assertNotIn(forbidden, step)
+        self.assertIn("timeout-minutes: 25", step)
+
+    def test_handoff_reports_are_collected_and_legacy_is_unchanged(self):
+        collection = self.step('"Collect #174 acceptance evidence"')
+        for name in ("slot-one-handoff-qualification.json",
+                     "slot-one-handoff-fresh.json",
+                     "slot-one-handoff-replay.json",
+                     "slot-one-rotation.json"):
+            self.assertIn(name, collection)
+        default_step = self.step('"Exercise the #174 HTTP foundation cases')
+        legacy_step = self.step('"Replay exactly one #42 slot-one rotation case')
+        for forbidden in qualification.CASES:
+            self.assertNotIn(forbidden, default_step)
+            self.assertNotIn(forbidden, legacy_step)
+        self.assertEqual(
+            self.text.count("ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1"), 1)
+        self.assertEqual(
+            self.text.count(
+                "ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES: '1'"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
