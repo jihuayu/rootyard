@@ -296,6 +296,9 @@ async fn case(db: &Pool, gateway_pool: &Pool, gateway_application_name: &str) ->
     let baseline = capture_baseline(&state, repository_id, serving.gate.tenant_id(), deadline())
         .await
         .map_err(|error| anyhow!("initial baseline capture refused: {error:?}"))?;
+    // Keep the numeric pre-admission revision independent of the returned plan
+    // so the later plan-vs-baseline and persisted-gate checks are not tautological.
+    let baseline_revision = baseline.gate().revision();
 
     let public_id = Uuid::new_v4();
     let creator_operation = Uuid::new_v4();
@@ -415,8 +418,12 @@ async fn case(db: &Pool, gateway_pool: &Pool, gateway_application_name: &str) ->
             Ok(_) => return Err(anyhow!("gateway admission did not return a fresh pending plan")),
             Err(error) => return Err(anyhow!("gateway admission was refused: {error:?}")),
         };
+        ensure!(
+            plan.identity().issuer_id() == owner.identity.id,
+            "the returned plan issuer differs from the fixture actor"
+        );
 
-        assert_natural_admission(db, public_id, producer, plan.as_ref(), &serving, owner.identity.id, backend_identity)
+        assert_natural_admission(db, public_id, producer, plan.as_ref(), &serving, backend_identity, baseline_revision)
             .await?;
         let natural_counts = ledger_effect_counts(db, repository_id).await?;
         ensure!(
@@ -510,15 +517,15 @@ async fn case(db: &Pool, gateway_pool: &Pool, gateway_application_name: &str) ->
     .await;
 
     let mut cleanup = Vec::new();
-    if let Some(handle) = waiter.as_mut() {
-        if let Err(error) = abort_worker(handle).await {
-            cleanup.push(format!("gateway waiter abort/join: {error:#}"));
-        }
+    if let Some(handle) = waiter.as_mut()
+        && let Err(error) = abort_worker(handle).await
+    {
+        cleanup.push(format!("gateway waiter abort/join: {error:#}"));
     }
-    if let Some(owned) = lane_tx.take() {
-        if let Err(error) = rollback_bounded(owned).await {
-            cleanup.push(format!("lane creator rollback: {error:#}"));
-        }
+    if let Some(owned) = lane_tx.take()
+        && let Err(error) = rollback_bounded(owned).await
+    {
+        cleanup.push(format!("lane creator rollback: {error:#}"));
     }
 
     match outcome {
@@ -715,11 +722,11 @@ async fn assert_natural_admission(
     producer: RequestDigest,
     plan: &PackCommitPlan,
     serving: &ServingRepository,
-    issuer_id: Uuid,
     backend_identity: &str,
+    baseline_revision: i64,
 ) -> Result<()> {
     let repository_id = plan.repository_id();
-    let baseline_revision = plan.expected().revision();
+    let issuer_id = plan.identity().issuer_id();
     let client = checkout(pool, "natural admission witness").await?;
     let row = timeout(
         WAIT,
