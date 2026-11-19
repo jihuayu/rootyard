@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    builder::{CloneKitPublicationStore, RetentionPinGuard, RetentionPinLedger},
+    builder::{CloneKitPublicationStore, CloneKitReadLease, RetentionPinGuard, RetentionPinLedger},
     grants::{
         CloneKitAuthorityOracle, DependencyVerificationReceipt, GrantVerificationContext, SignedCloneKitGrant,
         verify_grant, verify_tree_dependencies,
@@ -299,6 +299,16 @@ fn fallback_error(reason: FallbackReason) -> CloneKitError {
     }
 }
 
+/// Release any selected local generation lease before an awaited Stock Git fallback starts.
+pub(super) fn release_lease_before_fallback(
+    loaded: Option<(CloneKitManifest, Option<CloneKitReadLease>)>,
+    reason: FallbackReason,
+    allow_fallback: bool,
+) -> Result<FallbackReason, CloneKitError> {
+    drop(loaded);
+    if allow_fallback { Ok(reason) } else { Err(fallback_error(reason)) }
+}
+
 /// Execute an authenticated CI checkout using CloneKit when opted-in and valid, else explicit policy fallback.
 pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOutcome, CloneKitError> {
     let started = Instant::now();
@@ -338,11 +348,8 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
         },
     };
     if let Err(reason) = evaluate_manifest_fallback(loaded.as_ref().map(|(manifest, _)| manifest), req)? {
-        return if allow_fallback {
-            run_stock_git_checkout(req, work_repo, lease, CheckoutStrategy::StockGitFallback { reason }).await
-        } else {
-            Err(fallback_error(reason))
-        };
+        let reason = release_lease_before_fallback(loaded, reason, allow_fallback)?;
+        return run_stock_git_checkout(req, work_repo, lease, CheckoutStrategy::StockGitFallback { reason }).await;
     }
 
     let (manifest, read_lease) = loaded.ok_or(CloneKitError::MissingKit)?;

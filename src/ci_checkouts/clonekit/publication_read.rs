@@ -25,14 +25,14 @@ impl CloneKitPublicationStore {
             }
             Ok(_) => {}
         }
-        let lease = read_lease::acquire_shared(&self.repo_dir(repo_id), repo_id)?;
+        let lock = read_lease::acquire_shared(&self.repo_dir(repo_id), repo_id)?;
         let Some(manifest) = self.read_current_locked(repo_id)? else {
             return Err(CloneKitError::CorruptArtifact(
                 "current pointer vanished while acquiring the read lease".into(),
             ));
         };
-        read_lease::verify_generation(&self.version_dir(repo_id, manifest.kit_generation), &manifest)?;
-        Ok(Some(LeasedCloneKitManifest::new(manifest, lease)))
+        let generation = read_lease::verify_generation(&self.version_dir(repo_id, manifest.kit_generation), &manifest)?;
+        Ok(Some(LeasedCloneKitManifest::new(manifest, lock.bind(generation))))
     }
 
     /// Acquire a shared read lease for an exact caller-supplied generation and verify it.
@@ -44,8 +44,8 @@ impl CloneKitPublicationStore {
         if manifest.repository_id != repo_id {
             return Err(CloneKitError::CorruptArtifact("read lease repository identity mismatch".into()));
         }
-        let lease = read_lease::acquire_shared(&self.repo_dir(repo_id), repo_id)?;
-        read_lease::verify_generation(&self.version_dir(repo_id, manifest.kit_generation), manifest)?;
-        Ok(lease)
+        let lock = read_lease::acquire_shared(&self.repo_dir(repo_id), repo_id)?;
+        let generation = read_lease::verify_generation(&self.version_dir(repo_id, manifest.kit_generation), manifest)?;
+        Ok(lock.bind(generation))
     }
 }
