@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
     && useradd --uid 10001 --gid rootyard --no-create-home rootyard \
     && mkdir -p /var/lib/rootyard && chown rootyard:rootyard /var/lib/rootyard
 COPY --from=build /build/target/release/rootyard /usr/local/bin/rootyard
+COPY --from=build /build/target/release/rootyard-safe-gc-voter /usr/local/bin/rootyard-safe-gc-voter
 ENV ROOTYARD_DATA_DIR=/var/lib/rootyard ROOTYARD_BIND=0.0.0.0:8080
 USER 10001:10001
 EXPOSE 8080

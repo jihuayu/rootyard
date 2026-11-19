@@ -1,6 +1,6 @@
 //! Shared Ed25519, trust-provisioning and distributed-lane helpers for Safe GC integration tests (#122).
 
-use std::path::Path;
+use std::{path::Path, sync::Mutex};
 
 use rootyard::ref_store::core::state_machine::{
     AppliedLogId, InitializeGateCommand, NoopCommand, RefCasCommand, RefCasSnapshot, RefCasStateMachine,
@@ -9,7 +9,7 @@ use rootyard::ref_store::core::state_machine::{
 use rootyard::ref_store::core::types::GitObjectFormat;
 use rootyard::storage_lifecycle::safe_gc::{
     BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcError,
-    SafeGcRepoTrustConfig, TrustedConsensusVoter, VoterCutpointClaims,
+    SafeGcRepoTrustConfig, SafeGcVoterClientAuth, TrustedConsensusVoter, VoterCutpointClaims,
     dist_auth::{QuorumCommitSeal, sign_single_voter_cutpoint_attestation},
     model::GlobalHoldEntry,
     model::SafeGcObjectFormat,
@@ -19,6 +19,18 @@ use uuid::Uuid;
 
 pub const TEST_ARM_SEED: [u8; 32] = [0x41; 32];
 pub const TEST_VOTER_SEEDS: [[u8; 32]; 3] = [[0x71; 32], [0x72; 32], [0x73; 32]];
+
+static LIVE_VOTER_AUTH: Mutex<Option<SafeGcVoterClientAuth>> = Mutex::new(None);
+
+/// Publish the live cluster's mTLS + `0600` Bearer credentials for the next trust provisioning.
+pub fn publish_live_voter_auth(auth: SafeGcVoterClientAuth) {
+    *LIVE_VOTER_AUTH.lock().unwrap_or_else(|err| err.into_inner()) = Some(auth);
+}
+
+/// Return the published live voter credentials, if any cluster has started in this process.
+pub fn live_voter_auth() -> Option<SafeGcVoterClientAuth> {
+    LIVE_VOTER_AUTH.lock().unwrap_or_else(|err| err.into_inner()).clone()
+}
 
 pub fn test_arm_signer() -> SafeGcEd25519Signer {
     SafeGcEd25519Signer::from_seed(TEST_ARM_SEED).unwrap()
@@ -42,7 +54,7 @@ pub fn test_trusted_voters() -> Vec<TrustedConsensusVoter> {
             voter_id,
             key_id: 1,
             ed25519_pubkey_hex: voter_signer(voter_id).pubkey_hex().to_owned(),
-            endpoint_url: format!("http://127.0.0.1:{}/", 18_100 + voter_id),
+            endpoint_url: format!("https://127.0.0.1:{}/", 18_100 + voter_id),
         })
         .collect()
 }
@@ -204,7 +216,7 @@ pub fn provision_distributed_trust(
 ) -> Result<SafeGcRepoTrustConfig, SafeGcError> {
     let bridge = test_hold_bridge_signer();
     let backup = test_backup_signer();
-    SafeGcRepoTrustConfig::provision_distributed(
+    let mut config = SafeGcRepoTrustConfig::provision_distributed(
         storage_root,
         tenant_id,
         repo_id,
@@ -213,7 +225,11 @@ pub fn provision_distributed_trust(
         quorum_threshold,
         trusted_voters,
         (bridge.pubkey_hex(), backup.pubkey_hex()),
-    )
+    )?;
+    if let Some(auth) = live_voter_auth() {
+        config.bind_voter_client_auth(storage_root, auth)?;
+    }
+    Ok(config)
 }
 
 /// Prove the worker volume holds no external voter/quorum/bridge/backup private material.
@@ -265,6 +281,7 @@ pub fn rewrite_legacy_distributed_bundle(
     let object = trust.as_object_mut().unwrap();
     object.remove("quorum_threshold");
     object.remove("trusted_consensus_voters");
+    object.remove("voter_client_auth");
     object.insert("trusted_quorum_pubkey_hex".into(), serde_json::json!("1".repeat(64)));
     object.insert("refcas_keyring_dir".into(), serde_json::json!("/var/lib/rootyard/refcas-keyring"));
     std::fs::write(

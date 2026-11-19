@@ -46,7 +46,7 @@ pub(crate) fn test_trusted_voters() -> Vec<TrustedConsensusVoter> {
             voter_id,
             key_id: 1,
             ed25519_pubkey_hex: voter_signer(voter_id).pubkey_hex().to_owned(),
-            endpoint_url: format!("http://127.0.0.1:{}/", 18_100 + voter_id),
+            endpoint_url: format!("https://127.0.0.1:{}/", 18_100 + voter_id),
         })
         .collect()
 }
@@ -61,6 +61,7 @@ pub(crate) fn test_trust_config(auth: &AuthorityRecord) -> SafeGcRepoTrustConfig
         trusted_hold_bridge_pubkey_hex: Some(test_hold_bridge_signer().pubkey_hex().to_owned()),
         trusted_backup_pubkey_hex: Some(test_backup_signer().pubkey_hex().to_owned()),
         trusted_consensus_voters: test_trusted_voters(),
+        voter_client_auth: None,
     }
 }
 

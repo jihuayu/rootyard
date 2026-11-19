@@ -37,6 +37,8 @@ pub use keyring::{
     verify_single_voter_cutpoint_attestation,
 };
 
+pub use super::voter_service::SafeGcVoterClientAuth;
+
 const SEED_BYTES: usize = 32;
 /// Hard ceiling for the repository trust document stored on the worker volume.
 const MAX_TRUST_DOCUMENT_BYTES: usize = 64 * 1024;
@@ -91,7 +93,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), SafeGcError> {
     Ok(())
 }
 
-fn read_private_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, SafeGcError> {
+pub(super) fn read_private_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, SafeGcError> {
     let meta = fs::metadata(path).map_err(io_error)?;
     if !meta.is_file() || meta.len() > max_bytes as u64 {
         return Err(SafeGcError::ArmingRejected("safe-gc private file missing or over its size bound"));
@@ -204,6 +206,8 @@ pub struct SafeGcRepoTrustConfig {
     pub trusted_backup_pubkey_hex: Option<String>,
     #[serde(default)]
     pub trusted_consensus_voters: Vec<TrustedConsensusVoter>,
+    #[serde(default)]
+    pub voter_client_auth: Option<SafeGcVoterClientAuth>,
 }
 
 impl SafeGcRepoTrustConfig {
@@ -244,6 +248,7 @@ impl SafeGcRepoTrustConfig {
             trusted_hold_bridge_pubkey_hex: None,
             trusted_backup_pubkey_hex: None,
             trusted_consensus_voters: Vec::new(),
+            voter_client_auth: None,
         };
         config.validate_identity()?;
         arm_signer.write_seed_file(&Self::seed_path(storage_root, repo_id, "arm"))?;
@@ -271,6 +276,7 @@ impl SafeGcRepoTrustConfig {
             trusted_hold_bridge_pubkey_hex: Some(external_pubkeys.0.to_owned()),
             trusted_backup_pubkey_hex: Some(external_pubkeys.1.to_owned()),
             trusted_consensus_voters,
+            voter_client_auth: None,
         };
         config.validate_identity()?;
         for kind in ["quorum", "bridge", "backup"] {

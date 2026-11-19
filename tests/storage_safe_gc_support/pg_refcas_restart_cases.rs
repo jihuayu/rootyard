@@ -324,3 +324,5 @@ async fn pg17_distributed_refcas_sigkill_recovery_requires_new_pg_fence_and_resu
 
 #[path = "pg_refcas_migration_cases.rs"]
 mod pg_refcas_migration_cases;
+#[path = "pg_refcas_voter_auth_cases.rs"]
+mod pg_refcas_voter_auth_cases;

@@ -1,4 +1,5 @@
-//! Real PG17 + live Raft migration of a legacy `DistributedRefCas` journal to deployed voter re-arm (#122).
+//! Real PG17 + live Raft hard-`SIGKILL` migration of a legacy `DistributedRefCas` journal to deployed
+//! voter re-arm on the production committed writer (#122).
 
 use std::{
     sync::{Arc, atomic::Ordering},
@@ -33,7 +34,7 @@ use super::super::{
         assert_worker_volume_has_no_external_signing_keys, provision_distributed_trust,
         rewrite_legacy_distributed_bundle, seal_test_lane_arm, test_arm_signer, test_dist_lane,
     },
-    isolated_pg_pool_with_schema,
+    isolated_pg_pool_with_schema, pg_child_worker,
     pg_refcas_merge_fixture::{build_refcas_merge_rig, force_scan_and_schedule, production_refcas_pr_merge},
     provision_pg_refstore_repo,
     raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin, resolve_voter_bin},
@@ -52,15 +53,18 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
         );
         return Ok(());
     };
+    let db = db_url.as_str();
     let Some(node_bin) = resolve_raft_node_bin()? else { return Ok(()) };
     let Some(_voter_bin) = resolve_voter_bin()? else { return Ok(()) };
 
     let s3 = LoopbackS3::shared();
+    let envs = s3.env_pairs();
     let (blob_store, provider) = s3.open_store_and_provider()?;
-    let (pool, _schema) = isolated_pg_pool_with_schema(&db_url).await?;
+    let (pool, schema) = isolated_pg_pool_with_schema(db).await?;
     let (tenant_id, repo_id, history_id) = provision_pg_refstore_repo(&pool, &blob_store).await?;
     let dir = TempDir::new()?;
-    let cfg = app_config(dir.path(), db_url.clone());
+    let root = dir.path();
+    let cfg = app_config(root, db.to_owned());
     let state = Arc::new(AppState {
         mirror_primary: None,
         dispatch: dispatch::Signals::default(),
@@ -79,7 +83,7 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
     let journal = safe_gc_journal_path(&state.storage.root, repo_id);
     let dl = Instant::now() + Duration::from_secs(60);
 
-    let git_repo = dir.path().join("src.git");
+    let git_repo = root.join("src.git");
     std::fs::create_dir_all(&git_repo)?;
     git_cmd(&git_repo, &["init", "--object-format=sha1", "--initial-branch=main"], None)?;
     std::fs::write(git_repo.join("main.txt"), b"refcas-base")?;
@@ -89,8 +93,7 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
     std::fs::write(git_repo.join("main.txt"), b"refcas-main")?;
     git_cmd(&git_repo, &["commit", "-am", "main"], None)?;
     let (p_main, p_main_rec, i_main, i_main_rec, main_oid, oids_main) =
-        build_pack_via_opendal(&provider, &git_repo, &dir.path().join("sm"), "HEAD", (tenant_id, repo_id, 1), dl)
-            .await?;
+        build_pack_via_opendal(&provider, &git_repo, &root.join("sm"), "HEAD", (tenant_id, repo_id, 1), dl).await?;
     ensure!(main_oid != base_oid, "fast-forward feature commit must advance main");
     git_cmd(&git_repo, &["checkout", "--orphan", "orphan"], None)?;
     git_cmd(&git_repo, &["read-tree", "--empty"], None)?;
@@ -99,8 +102,7 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
     git_cmd(&git_repo, &["add", "."], None)?;
     git_cmd(&git_repo, &["commit", "-m", "orphan"], None)?;
     let (p_orph, p_orph_rec, i_orph, i_orph_rec, _orph_oid, oids_orph) =
-        build_pack_via_opendal(&provider, &git_repo, &dir.path().join("so"), "HEAD", (tenant_id, repo_id, 1), dl)
-            .await?;
+        build_pack_via_opendal(&provider, &git_repo, &root.join("so"), "HEAD", (tenant_id, repo_id, 1), dl).await?;
 
     let rig = build_refcas_merge_rig(Arc::clone(&cluster), tenant_id, repo_id, history_id, &base_oid).await?;
     let auth_rec = AuthorityRecord {
@@ -136,10 +138,10 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
 
     let policy = test_policy();
     unsafe {
-        for (k, v) in s3.env_pairs() {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
+        for (key, value) in &envs {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
             }
         }
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "false");
@@ -171,23 +173,34 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
     unsafe {
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");
     }
-    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
 
-    let pass1 = run_claimed_safe_gc_once_with_fault(
+    // Step 1: crash after the durable `begin_delete_batch` checkpoint but before the first delete.
+    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
+    let crashed = run_claimed_safe_gc_once_with_fault(
         &state,
         &policy,
         Uuid::new_v4(),
         None,
-        DeleteFaultHook::SimulateCrashAfterDeletes(1),
+        DeleteFaultHook::SimulateCrashAfterDeletes(0),
     )
     .await?
-    .context("pass1 simulated crash")?;
-    ensure!(pass1.kind == "pando_tombstone_delete" && pass1.state == "failed", "pass1 must crash mid-delete");
+    .context("zero-delete simulated crash")?;
+    ensure!(
+        crashed.kind == "pando_tombstone_delete" && crashed.state == "failed",
+        "the zero-delete pass must persist the batch and fail closed"
+    );
     let inspected = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
-    let batch = inspected.snapshot().pending_delete.clone().context("pass1 pending_delete batch")?;
-    assert_eq!((batch.deleted_keys.len(), batch.pending_keys.len()), (1, 3));
+    let batch = inspected.snapshot().pending_delete.clone().context("crash pending_delete batch")?;
+    assert!(batch.deleted_keys.is_empty(), "the zero-delete crash must not delete a locator");
+    assert_eq!(batch.pending_keys.len(), 4);
     drop(inspected);
+    let retired = [p_main.clone(), i_main.clone(), p_orph.clone(), i_orph.clone()];
+    assert!(
+        retired.iter().all(|locator| s3.has_key(locator)),
+        "the zero-delete crash must keep every retired locator in the provider"
+    );
 
+    // Step 2: rotate the deployed trust doc and journal back to the exact legacy shape.
     rewrite_legacy_distributed_bundle(&state.storage.root, repo_id, &journal)?;
     let err = DurableSafeGcAuthority::open_with_journal(&journal, None).unwrap_err();
     assert!(matches!(
@@ -196,58 +209,95 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
             "legacy DistributedRefCas journal snapshot requires explicit migration and safe re-arm"
         )
     ));
-    let (_trust, report) = SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal(
-        &state.storage.root,
-        &journal,
-        repo_id,
-        2,
-        trusted_voters,
-    )?;
+
+    // Step 3: the legacy volume is released, then a cold runtime must delete nothing at all.
+    drop(state);
+    pool.get()
+        .await?
+        .execute("UPDATE storage_maintenance_repo_state SET last_scan_at = NULL WHERE repository_id = $1", &[&repo_id])
+        .await?;
+    let deletes_before_cold = s3.state.delete_requests.load(Ordering::SeqCst);
+    let cold = pg_child_worker::spawn_cold_runtime_no_delete_child(root, db, &schema, repo_id, &envs).await?;
+    assert_ne!(cold, std::process::id(), "the cold probe must run in a separate OS process");
+    assert_eq!(
+        s3.state.delete_requests.load(Ordering::SeqCst),
+        deletes_before_cold,
+        "a legacy-volume cold runtime must not delete without a voter quorum"
+    );
+    assert!(retired.iter().all(|locator| s3.has_key(locator)), "the legacy cold runtime must keep every locator");
+
+    // Step 4: migrate trust + journal under the deployed voters and bind the mTLS Bearer boundary.
+    let (mut trust, report) =
+        SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal(root, &journal, repo_id, 2, trusted_voters)?;
+    let auth = cluster.lock().await.voter_client_auth();
+    trust.bind_voter_client_auth(root, auth)?;
     assert!(report.journal_migrated && report.disarmed_for_voter_rearm);
     assert_eq!(report.preserved_pending_batch_id, Some(batch.batch_id));
-    assert_eq!(report.preserved_deleted_keys, batch.deleted_keys);
+    assert!(report.preserved_deleted_keys.is_empty());
     assert_eq!(report.preserved_pending_keys, batch.pending_keys);
-    assert_worker_volume_has_no_external_signing_keys(&state.storage.root, repo_id);
+    assert_worker_volume_has_no_external_signing_keys(root, repo_id);
 
-    assert_eq!(scheduler::schedule_once(&state, &policy).await?, 0, "disarmed policy must schedule nothing");
-    let deletes_before = s3.state.delete_requests.load(Ordering::SeqCst);
-    assert!(worker::run_once(&state, &policy, Uuid::new_v4()).await?.is_none());
-    assert_eq!(s3.state.delete_requests.load(Ordering::SeqCst), deletes_before);
+    // Step 5: a migrated but still disarmed volume must keep refusing every delete.
+    pool.get()
+        .await?
+        .execute("UPDATE storage_maintenance_repo_state SET last_scan_at = NULL WHERE repository_id = $1", &[&repo_id])
+        .await?;
+    let deletes_after_migration = s3.state.delete_requests.load(Ordering::SeqCst);
+    let pid2 = pg_child_worker::spawn_cold_runtime_no_delete_child(root, db, &schema, repo_id, &envs).await?;
+    assert_ne!(pid2, cold, "each cold probe must run in its own OS process");
+    assert_eq!(
+        s3.state.delete_requests.load(Ordering::SeqCst),
+        deletes_after_migration,
+        "a migrated but disarmed volume must not delete"
+    );
 
+    // Step 6: a 1-of-3 voter quorum must fail closed; a 2-of-3 quorum re-arms and preserves the batch.
     cluster.lock().await.set_voter_enabled(2, false);
-    let failed =
-        SafeGcRepoTrustConfig::rearm_distributed_from_voters(&state.storage.root, &journal, repo_id, None).await;
+    let failed = SafeGcRepoTrustConfig::rearm_distributed_from_voters(root, &journal, repo_id, None).await;
     assert!(matches!(failed, Err(SafeGcError::DistributedPrereqsMissing(_))));
     cluster.lock().await.set_voter_enabled(2, true);
-    let arm =
-        SafeGcRepoTrustConfig::rearm_distributed_from_voters(&state.storage.root, &journal, repo_id, None).await?;
+    let arm = SafeGcRepoTrustConfig::rearm_distributed_from_voters(root, &journal, repo_id, None).await?;
     assert!(matches!(&arm.lane, AuthorityLane::DistributedRefCas { .. }));
     let rearmed = DurableSafeGcAuthority::open_with_journal(&journal, None)?.snapshot();
     assert!(matches!(&rearmed.gc_mode, GcMode::ArmedDestructive(_)));
     let preserved = rearmed.pending_delete.as_ref().context("re-arm must preserve pending delete")?;
-    assert_eq!(&preserved.batch_id, &batch.batch_id);
-    assert_eq!(&preserved.deleted_keys, &batch.deleted_keys);
-    assert_eq!(&preserved.pending_keys, &batch.pending_keys);
+    assert_eq!(preserved.batch_id, batch.batch_id);
+    assert!(preserved.deleted_keys.is_empty());
+    assert_eq!(preserved.pending_keys, batch.pending_keys);
 
-    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
-    let resumed = worker::run_once(&state, &policy, Uuid::new_v4()).await?.context("resume pending delete")?;
-    assert_eq!((resumed.kind.as_str(), resumed.state.as_str()), ("pando_tombstone_delete", "succeeded"));
+    // Step 7: the deployed voter process is hard-killed after exactly one delete.
+    let c1 = pg_child_worker::spawn_pass1_sigkill_child(root, db, &schema, repo_id, &envs, &pool).await?;
+    assert_ne!(c1.pid, std::process::id(), "the SIGKILLed pass must run in a separate OS process");
+    assert_eq!(retired.iter().filter(|locator| !s3.has_key(locator)).count(), 1, "exactly one delete before SIGKILL");
+    assert_eq!(retired.iter().filter(|locator| s3.has_key(locator)).count(), 3, "three locators must survive SIGKILL");
+    let interrupted = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
+    let killed = interrupted.snapshot().pending_delete.clone().context("SIGKILL pending_delete batch")?;
+    assert_eq!((killed.deleted_keys.len(), killed.pending_keys.len()), (1, 3));
+    drop(interrupted);
+
+    // Step 8: a fresh OS process reaps the stale lease and finishes the preserved batch.
+    let skip = c1.job_id;
+    let c2 = pg_child_worker::spawn_pass2_scheduled_runtime_child(root, db, &schema, repo_id, skip, &envs).await?;
+    assert_ne!(c2.pid, c1.pid, "each pass must run in its own OS process");
+    assert_ne!(c2.job_id, c1.job_id, "the recovery pass must claim a brand-new maintenance job");
+    assert_eq!(c2.result["authority_lane"], "distributed_refcas");
+    assert_eq!(c2.result["deleted_keys"].as_array().unwrap().len(), 3);
     let final_snap = DurableSafeGcAuthority::open_with_journal(&journal, None)?.snapshot();
     assert!(final_snap.pending_delete.is_none() && final_snap.retired_packs.is_empty());
     assert!(final_snap.completed_batches.contains_key(&batch.batch_id));
-    for loc in [&p_main, &i_main, &p_orph, &i_orph] {
-        assert!(!s3.has_key(loc), "retired locator must be deleted");
+    for locator in &retired {
+        assert!(!s3.has_key(locator), "retired locator must be deleted");
     }
     assert!(s3.has_key(&rep_pack_loc) && s3.has_key(&rep_idx_loc), "replacement pack must survive");
 
-    let verify_dir = dir.path().join("verify-pg-migration");
+    let verify_dir = root.join("verify-pg-migration");
     let (pk_dst, ix_dst) = (verify_dir.join("objects/pack/surv.pack"), verify_dir.join("objects/pack/surv.idx"));
     std::fs::create_dir_all(pk_dst.parent().unwrap())?;
     git_cmd(&verify_dir, &["init", "--bare", "--object-format=sha1"], None)?;
     let dl_final = Instant::now() + Duration::from_secs(30);
     blob_store.get_to_file(&rep_pack_loc, &pk_dst, dl_final).await?;
     blob_store.get_to_file(&rep_idx_loc, &ix_dst, dl_final).await?;
-    git_cmd(&verify_dir, &["update-ref", "refs/heads/main", &main_oid], None)?;
+    git_cmd(&verify_dir, &["update-ref", "refs/heads/main", main_oid.as_str()], None)?;
     git_cmd(&verify_dir, &["fsck", "--full", "--strict"], None)?;
     unsafe {
         std::env::remove_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE);

@@ -6,7 +6,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{
-    MAX_TRUST_DOCUMENT_BYTES, SafeGcError, SafeGcRepoTrustConfig, TrustedConsensusVoter, io_error, read_private_file,
+    MAX_TRUST_DOCUMENT_BYTES, SafeGcError, SafeGcRepoTrustConfig, SafeGcVoterClientAuth, TrustedConsensusVoter,
+    io_error, read_private_file,
 };
 
 const LEGACY_TRUST_REJECTED: &str =
@@ -41,6 +42,7 @@ impl From<LegacySafeGcRepoTrustConfig> for SafeGcRepoTrustConfig {
             trusted_hold_bridge_pubkey_hex: legacy.trusted_hold_bridge_pubkey_hex,
             trusted_backup_pubkey_hex: legacy.trusted_backup_pubkey_hex,
             trusted_consensus_voters: Vec::new(),
+            voter_client_auth: None,
         }
     }
 }
@@ -120,6 +122,7 @@ pub(super) fn prepare_migrated_trust(
         trusted_hold_bridge_pubkey_hex: pinned.trusted_hold_bridge_pubkey_hex,
         trusted_backup_pubkey_hex: pinned.trusted_backup_pubkey_hex,
         trusted_consensus_voters,
+        voter_client_auth: pinned.voter_client_auth,
     };
     config.validate_identity()?;
     Ok(config)
@@ -147,5 +150,16 @@ impl SafeGcRepoTrustConfig {
         let config = prepare_migrated_trust(storage_root, repo_id, quorum_threshold, trusted_consensus_voters)?;
         commit_migrated_trust(storage_root, &config)?;
         Ok(config)
+    }
+
+    /// Bind the pinned mTLS + `0600` Bearer client auth and persist the migrated trust document.
+    pub fn bind_voter_client_auth(
+        &mut self,
+        storage_root: &Path,
+        auth: SafeGcVoterClientAuth,
+    ) -> Result<(), SafeGcError> {
+        auth.validate()?;
+        self.voter_client_auth = Some(auth);
+        Self::write_config(storage_root, self)
     }
 }

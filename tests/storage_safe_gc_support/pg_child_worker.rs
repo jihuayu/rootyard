@@ -29,6 +29,7 @@ const CHILD_OUT_JSON_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_OUT_JSON";
 const ENV_BLOB_SAFE_GC_DESTRUCTIVE: &str = "ROOTYARD_BLOB_SAFE_GC_DESTRUCTIVE";
 const MODE_PASS1: &str = "pass1_sigkill_after_one_delete";
 const MODE_PASS2: &str = "pass2_scheduled_runtime";
+const MODE_PROBE_NO_DELETE: &str = "probe_cold_runtime_no_delete";
 const FENCE_BUSY: &str = "another physical GC holds the repository fence";
 const ENTRYPOINT: &str = "pg_child_worker::child_process_entrypoint";
 
@@ -113,6 +114,26 @@ pub(super) async fn spawn_pass2_scheduled_runtime_child(
     })
 }
 
+/// Spawn a cold scheduled runtime that must refuse every delete without a live voter quorum.
+pub(super) async fn spawn_cold_runtime_no_delete_child(
+    storage_root: &Path,
+    db_url: &str,
+    schema: &str,
+    repo_id: Uuid,
+    s3_env_pairs: &[(String, Option<std::ffi::OsString>)],
+) -> Result<u32> {
+    let out_path = storage_root.join(format!("safe-gc-child-{MODE_PROBE_NO_DELETE}-{}.json", Uuid::new_v4()));
+    let mut std_cmd = spawn_command(MODE_PROBE_NO_DELETE, storage_root, db_url, schema, repo_id, s3_env_pairs);
+    std_cmd.env(CHILD_OUT_JSON_ENV, &out_path);
+    let mut child = tokio::process::Command::from(std_cmd).spawn().context("spawn safe-gc cold runtime child")?;
+    let status = child.wait().await.context("wait for safe-gc cold runtime child")?;
+    ensure!(status.success(), "safe-gc child {MODE_PROBE_NO_DELETE} exited with {status}");
+    let raw = std::fs::read_to_string(&out_path).context("read safe-gc cold runtime output JSON")?;
+    let value: Value = serde_json::from_str(&raw).context("parse safe-gc cold runtime output JSON")?;
+    let pid = u32::try_from(value["pid"].as_u64().context("cold child pid")?).context("cold child pid overflow")?;
+    Ok(pid)
+}
+
 /// The exactly-one `running` `pg_refstore` job and its live PG fence owner, with no manual SQL.
 async fn running_job_id(pool: &deadpool_postgres::Pool, repo_id: Uuid) -> Result<Uuid> {
     let row = pool
@@ -174,7 +195,7 @@ fn child_process_entrypoint() {
         return;
     };
     match mode.as_str() {
-        MODE_PASS1 | MODE_PASS2 => run_child(&mode).expect("safe-gc child process"),
+        MODE_PASS1 | MODE_PASS2 | MODE_PROBE_NO_DELETE => run_child(&mode).expect("safe-gc child process"),
         other => panic!("unknown safe-gc child mode {other}"),
     }
 }
@@ -285,6 +306,33 @@ fn run_child(mode: &str) -> Result<()> {
                         break serde_json::json!({"pid": std::process::id(), "job_id": job_id, "result": result});
                     }
                 }
+            }
+            MODE_PROBE_NO_DELETE => {
+                unsafe {
+                    std::env::set_var("ROOTYARD_STORAGE_MAINTENANCE", "true");
+                    std::env::set_var("ROOTYARD_STORAGE_MAINTENANCE_POLL_SECONDS", "1");
+                    std::env::set_var("ROOTYARD_STORAGE_SCAN_PERIOD_SECONDS", "1");
+                    std::env::set_var("ROOTYARD_STORAGE_MAINTENANCE_LEASE_SECONDS", "5");
+                    std::env::set_var("ROOTYARD_STORAGE_MAINTENANCE_QUIESCENCE_SECONDS", "2");
+                    std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");
+                }
+                let stop = CancellationToken::new();
+                let run_task = tokio::spawn(rootyard::storage_lifecycle::run(Arc::clone(&state), stop.clone()));
+                tokio::time::sleep(Duration::from_millis(2_200)).await;
+                stop.cancel();
+                let _ = run_task.await;
+                let succeeded: i64 = pool
+                    .get()
+                    .await?
+                    .query_one(
+                        "SELECT count(*) FROM storage_maintenance_jobs \
+                         WHERE repository_id = $1 AND kind = 'pando_tombstone_delete' AND state = 'succeeded'",
+                        &[&repo_id],
+                    )
+                    .await?
+                    .get(0);
+                ensure!(succeeded == 0, "cold runtime deleted {succeeded} objects without a live voter quorum");
+                serde_json::json!({"pid": std::process::id(), "deleted_jobs": succeeded})
             }
             other => bail!("unknown safe-gc child mode {other}"),
         };

@@ -1,5 +1,4 @@
-//! Safe destructive Blob GC and two-phase read-back compaction (#122): disabled by default and
-//! requiring explicit arming, quiescence, `#184` eligibility, a complete [`DeletionProof`], and provider fences.
+//! Safe destructive Blob GC and two-phase read-back compaction (#122): default-off, armed, quiesced, proof-gated.
 
 #[path = "safe_gc/anti_aba.rs"]
 pub mod anti_aba;
@@ -54,14 +53,16 @@ mod tests_concurrency;
 mod tests_reconcile;
 #[path = "safe_gc/voter_service.rs"]
 pub mod voter_service;
+#[path = "safe_gc/voter_writer.rs"]
+pub mod voter_writer;
 
 pub use anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey};
 pub use compaction::{SafeGcCompactionRequest, SafeGcCompactionResult, execute_two_phase_compaction};
 pub use dist_auth::{
     BackupRootEvidence, HoldBridgeEvidence, JournalMigrationReport, LegacyQuorumCommitEvidence, QuorumCommitEvidence,
-    SafeGcEd25519Signer, SafeGcRepoTrustConfig, TrustedConsensusVoter, VoterCutpointAttestation, VoterCutpointClaims,
-    VoterCutpointSignature, fetch_quorum_cutpoint_from_voters, sign_single_voter_cutpoint_attestation,
-    verify_quorum_voter_attestations, verify_single_voter_cutpoint_attestation,
+    SafeGcEd25519Signer, SafeGcRepoTrustConfig, SafeGcVoterClientAuth, TrustedConsensusVoter, VoterCutpointAttestation,
+    VoterCutpointClaims, VoterCutpointSignature, fetch_quorum_cutpoint_from_voters,
+    sign_single_voter_cutpoint_attestation, verify_quorum_voter_attestations, verify_single_voter_cutpoint_attestation,
 };
 pub use domain::{
     ActiveDeleteFence, AuthorityRecord, BlobStoreReadbackBackend, CasCompactionPublish, CompactionPublishResult,
@@ -73,7 +74,7 @@ pub use executor::{
     DeleteFaultHook, PostTicketDriftFault, SafeGcSweepRequest, execute_safe_gc_sweep,
     execute_safe_gc_sweep_with_external_fence, quarantine_abandoned_staging_without_delete,
     reclaim_abandoned_compaction_staging, reconcile_pending_delete_after_restart,
-    reconcile_pending_delete_after_restart_fenced,
+    reconcile_pending_delete_after_restart_fenced, reconcile_pending_delete_after_restart_fenced_with_fault,
 };
 pub use model::{
     AuthorityLane, CandidatePackTarget, DecisionKind, DecisionState, GcMode, GlobalHoldEntry, GlobalHoldState,
@@ -95,3 +96,4 @@ pub use quiescence::{ActiveReaderLease, ReaderLeaseRegistry, ReaderQuiescenceObs
 pub use refcas_cut::{RefCasReconciledCut, reconcile_refcas_cut_with_pg};
 pub use store::{DurableSafeGcAuthority, SafeGcRepoSnapshot, ServingPackRecord};
 pub use voter_service::{SafeGcVoterReadyReceipt, SafeGcVoterServiceConfig, serve_safe_gc_voter};
+pub use voter_writer::SafeGcRaftCommitWriter;

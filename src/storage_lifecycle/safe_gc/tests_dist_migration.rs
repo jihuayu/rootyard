@@ -212,6 +212,10 @@ fn voter_service_config_validates_bounds_and_rejects_unknown_fields() {
         ca_cert_pem: PathBuf::from("ca.crt"),
         client_cert_pem: PathBuf::from("v1.crt"),
         client_key_pem: PathBuf::from("v1.key"),
+        listener_ca_cert_pem: PathBuf::from("ca.crt"),
+        listener_server_cert_pem: PathBuf::from("vs1.crt"),
+        listener_server_key_pem: PathBuf::from("vs1.key"),
+        listener_auth_token_path: PathBuf::from("voter-auth.token"),
         rpc_timeout_ms: 5_000,
     };
     config.validate().unwrap();

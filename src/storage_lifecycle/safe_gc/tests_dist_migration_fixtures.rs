@@ -70,7 +70,7 @@ pub(super) fn voters() -> Vec<TrustedConsensusVoter> {
             voter_id: index as u64 + 1,
             key_id: 1,
             ed25519_pubkey_hex: SafeGcEd25519Signer::from_seed([byte; 32]).unwrap().pubkey_hex().to_owned(),
-            endpoint_url: format!("http://127.0.0.1:{}/", 18_101 + index),
+            endpoint_url: format!("https://127.0.0.1:{}/", 18_101 + index),
         })
         .collect()
 }

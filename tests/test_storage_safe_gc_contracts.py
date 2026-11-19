@@ -52,6 +52,8 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_migration_fixtures.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_reconcile.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_service.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_tls.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_writer.rs",
     ROOT / "src" / "bin" / "rootyard-safe-gc-voter.rs",
     ROOT / "tests" / "storage_safe_gc.rs",
     ROOT / "tests" / "storage_safe_gc_maintenance.rs",
@@ -61,6 +63,7 @@ RUST_FILES = [
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_merge_fixture.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_migration_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_restart_cases.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_voter_auth_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_lifecycle_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "raft_voter_cluster.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "raft_merge_backend.rs",
@@ -105,6 +108,8 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             "dist_keyring.rs",
             "dist_trust_migration.rs",
             "voter_service.rs",
+            "voter_tls.rs",
+            "voter_writer.rs",
         ):
             src = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / name).read_text(encoding="utf-8")
             for m in re.finditer(r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*pub struct (\w+)", src):
@@ -229,6 +234,43 @@ class StorageSafeGcContractsTest(unittest.TestCase):
         self.assertNotIn("FsSealedRefCasCutpointSource", capture)
         self.assertIn("fetch_quorum_cutpoint_from_voters", capture)
 
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(
+            "COPY --from=build /build/target/release/rootyard-safe-gc-voter "
+            "/usr/local/bin/rootyard-safe-gc-voter",
+            dockerfile,
+        )
+        writer = (
+            ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_writer.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pub struct SafeGcRaftCommitWriter", writer)
+        self.assertIn("KvGet", writer)
+        self.assertIn("SafeGcRaftCommitWriter", live_voters)
+        self.assertNotIn("async fn kv_put", live_voters)
+        transport = (
+            ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_tls.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("WebPkiClientVerifier", transport)
+        self.assertIn("constant_time_bearer_eq", transport)
+        self.assertIn("voter_client_auth", auth)
+        self.assertIn('starts_with("https://")', keyring)
+        self.assertIn("parse_slot_log_id", voter_service)
+        self.assertNotIn(".unwrap_or(slot)", voter_service)
+        self.assertNotIn(".unwrap_or(1)", voter_service)
+        self.assertIn("reconcile_pending_delete_after_restart_fenced_with_fault", maintenance)
+        self.assertIn("spawn_cold_runtime_no_delete_child", child)
+        migration_cases = (
+            ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_migration_cases.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("spawn_pass1_sigkill_child", migration_cases)
+        self.assertIn("spawn_pass2_scheduled_runtime_child", migration_cases)
+        self.assertIn("migrate_legacy_trust_and_journal", migration_cases)
+        voter_auth_cases = (
+            ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_voter_auth_cases.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("request_voter_https", voter_auth_cases)
+        self.assertIn("foreign_voter_client_auth", voter_auth_cases)
+
     def test_workflow_and_doc_contracts(self) -> None:
         wf_raw = WORKFLOW.read_bytes()
         self.assertNotIn(b"\r\n", wf_raw)
@@ -251,6 +293,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
                 "tests/storage_safe_gc_maintenance.rs",
                 "scripts/eval_storage_safe_gc.py",
                 "docs/storage-safe-gc.md",
+                "Dockerfile",
             ):
                 self.assertIn(req, paths)
 

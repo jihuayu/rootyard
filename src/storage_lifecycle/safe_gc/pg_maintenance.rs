@@ -28,7 +28,7 @@ use super::{
     executor::{
         DeleteFaultHook, SafeGcSweepRequest, execute_safe_gc_sweep_with_external_fence,
         quarantine_abandoned_staging_without_delete, reclaim_abandoned_compaction_staging,
-        reconcile_pending_delete_after_restart_fenced,
+        reconcile_pending_delete_after_restart_fenced_with_fault,
     },
     model::{AuthorityLane, GcMode},
     pg_reconcile::reconcile_pg_refstore_authority,
@@ -316,7 +316,7 @@ async fn run_safe_gc_phases(
     flags: (bool, u64),
     barriers: (&crate::storage::read_leases::Lease, &fence::Fence),
     refcas_source: Option<&dyn super::pg_maintenance_dist::RefCasCutpointSource>,
-    sweep_fault: DeleteFaultHook,
+    mut sweep_fault: DeleteFaultHook,
 ) -> Result<Value> {
     let (destructive_env, fence_epoch) = flags;
     let (lease, pg_fence) = barriers;
@@ -425,22 +425,26 @@ async fn run_safe_gc_phases(
     let snap_rec = authority.snapshot();
     let prior_deleted: BTreeSet<String> =
         snap_rec.pending_delete.as_ref().map(|b| b.deleted_keys.iter().cloned().collect()).unwrap_or_default();
-    if let Some(rep) = reconcile_pending_delete_after_restart_fenced(
-        &authority,
-        &provider,
-        snap_rec.authority.incarnation_id,
-        snap_rec.authority.incarnation_epoch,
-        snap_rec.authority.lease_epoch,
-        Some(&ext_guard),
-        deadline,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("reconcile_pending_delete_after_restart_fenced: {e}"))?
-    {
-        // Report only keys completed by this invocation; the checkpoint's earlier deletions
-        // belong to the interrupted pass that is being resumed.
-        deleted_keys.extend(rep.deleted_keys.into_iter().filter(|k| !prior_deleted.contains(k)));
-        already_absent_keys.extend(rep.already_absent_keys);
+    if snap_rec.pending_delete.is_some() {
+        let pending_fault = std::mem::replace(&mut sweep_fault, DeleteFaultHook::None);
+        let deleter =
+            (snap_rec.authority.incarnation_id, snap_rec.authority.incarnation_epoch, snap_rec.authority.lease_epoch);
+        let resumed = reconcile_pending_delete_after_restart_fenced_with_fault(
+            &authority,
+            &provider,
+            deleter,
+            Some(&ext_guard),
+            pending_fault,
+            deadline,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("reconcile pending delete after restart: {e}"))?;
+        if let Some(rep) = resumed {
+            // Report only keys completed by this invocation; the checkpoint's earlier deletions
+            // belong to the interrupted pass that is being resumed.
+            deleted_keys.extend(rep.deleted_keys.into_iter().filter(|k| !prior_deleted.contains(k)));
+            already_absent_keys.extend(rep.already_absent_keys);
+        }
     }
 
     let snap_after = authority.snapshot();

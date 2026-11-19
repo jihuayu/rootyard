@@ -135,6 +135,27 @@ pub async fn reconcile_pending_delete_after_restart_fenced(
     external_check: Option<ExternalFenceCheck<'_>>,
     deadline: Instant,
 ) -> Result<Option<DeleteExecutionReport>, SafeGcError> {
+    reconcile_pending_delete_after_restart_fenced_with_fault(
+        authority,
+        backend,
+        (deleter_incarnation_id, deleter_incarnation_epoch, deleter_lease_epoch),
+        external_check,
+        DeleteFaultHook::None,
+        deadline,
+    )
+    .await
+}
+
+/// Restart reconciliation that also threads one fault hook into the resumed pending batch.
+pub async fn reconcile_pending_delete_after_restart_fenced_with_fault(
+    authority: &DurableSafeGcAuthority,
+    backend: &dyn SafeGcDeleteBackend,
+    deleter: (Uuid, u64, u64),
+    external_check: Option<ExternalFenceCheck<'_>>,
+    fault: DeleteFaultHook,
+    deadline: Instant,
+) -> Result<Option<DeleteExecutionReport>, SafeGcError> {
+    let (deleter_incarnation_id, deleter_incarnation_epoch, deleter_lease_epoch) = deleter;
     let snap = authority.snapshot();
     let Some(batch) = snap.pending_delete.clone() else {
         return Ok(None);
@@ -179,7 +200,7 @@ pub async fn reconcile_pending_delete_after_restart_fenced(
             deadline,
         },
         batch,
-        DeleteFaultHook::None,
+        fault,
     )
     .await?;
     Ok(Some(report))

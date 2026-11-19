@@ -1,4 +1,4 @@
-//! Deployed mTLS Raft-replica cutpoint voter daemon (`rootyard-safe-gc-voter`, #122).
+//! Deployed mTLS HTTPS Raft-replica cutpoint voter daemon (`rootyard-safe-gc-voter`, #122).
 //!
 //! Each voter process binds exactly one local `raft-node` replica, replays its committed
 //! `pm/*` entries, and signs one Ed25519 cutpoint attestation over the exact snapshot bytes.
@@ -11,13 +11,6 @@ use std::{
     time::Duration,
 };
 
-use axum::{
-    Json, Router,
-    extract::{Path as AxumPath, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,6 +22,11 @@ use crate::ref_store::core::state_machine::{
 };
 
 use super::{SafeGcEd25519Signer, SafeGcError, VoterCutpointClaims, sign_single_voter_cutpoint_attestation};
+
+#[path = "voter_tls.rs"]
+pub mod tls;
+
+pub use tls::SafeGcVoterClientAuth;
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -68,6 +66,10 @@ pub struct SafeGcVoterServiceConfig {
     pub ca_cert_pem: PathBuf,
     pub client_cert_pem: PathBuf,
     pub client_key_pem: PathBuf,
+    pub listener_ca_cert_pem: PathBuf,
+    pub listener_server_cert_pem: PathBuf,
+    pub listener_server_key_pem: PathBuf,
+    pub listener_auth_token_path: PathBuf,
     #[serde(default = "default_voter_rpc_timeout_ms")]
     pub rpc_timeout_ms: u64,
 }
@@ -86,11 +88,20 @@ impl SafeGcVoterServiceConfig {
         {
             return Err(SafeGcError::ArmingRejected("safe-gc voter addresses must be non-empty"));
         }
+        let listener_paths = [
+            &self.listener_ca_cert_pem,
+            &self.listener_server_cert_pem,
+            &self.listener_server_key_pem,
+            &self.listener_auth_token_path,
+        ];
+        if listener_paths.iter().any(|path| path.as_os_str().is_empty()) {
+            return Err(SafeGcError::ArmingRejected("safe-gc voter listener mTLS paths must be non-empty"));
+        }
         Ok(())
     }
 }
 
-/// Readiness receipt atomically written when `serve_safe_gc_voter` binds its listener.
+/// Readiness receipt atomically written when `serve_safe_gc_voter` binds its HTTPS listener.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafeGcVoterReadyReceipt {
@@ -176,6 +187,55 @@ async fn inspect_value(endpoint: &MtlsReplicaEndpoint, key: &str) -> Result<Opti
     Ok(response.pointer("/KvValue/value").and_then(Value::as_str).map(str::to_owned))
 }
 
+/// Strictly parse the committed `pm/head` slot; `None` is an empty replica and anything malformed fails closed.
+pub fn parse_pm_head_slot(raw_head: Option<&str>) -> Result<u64, SafeGcError> {
+    match raw_head {
+        None => Ok(0),
+        Some(raw) => {
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(SafeGcError::Serialization("raft-node pm/head is malformed".into()));
+            }
+            raw.parse::<u64>().map_err(|_| SafeGcError::Serialization("raft-node pm/head is malformed".into()))
+        }
+    }
+}
+
+fn parse_pm_digit(raw: Option<&str>, field: &'static str) -> Result<u64, SafeGcError> {
+    let Some(raw) = raw else {
+        return Err(SafeGcError::Serialization(format!("raft-node pm {field} is missing")));
+    };
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SafeGcError::Serialization(format!("raft-node pm {field} is malformed")));
+    }
+    raw.parse::<u64>().map_err(|_| SafeGcError::Serialization(format!("raft-node pm {field} is malformed")))
+}
+
+/// Strictly parse one committed `pm/{slot}` log coordinate; any regression fails closed.
+pub fn parse_slot_log_id(
+    slot: u64,
+    raw_index: Option<&str>,
+    raw_term: Option<&str>,
+    prev: Option<AppliedLogId>,
+) -> Result<AppliedLogId, SafeGcError> {
+    if slot == 0 {
+        return Err(SafeGcError::Serialization("raft-node pm slot must be non-zero".into()));
+    }
+    let index = parse_pm_digit(raw_index, "index")?;
+    let term = parse_pm_digit(raw_term, "term")?;
+    if index == 0 || term == 0 {
+        return Err(SafeGcError::Serialization("raft-node pm log coordinates must be non-zero".into()));
+    }
+    if let Some(prev_id) = prev {
+        if index <= prev_id.index {
+            return Err(SafeGcError::Serialization("raft-node pm log index regressed".into()));
+        }
+        if term < prev_id.term {
+            return Err(SafeGcError::Serialization("raft-node pm log term regressed".into()));
+        }
+    }
+    Ok(AppliedLogId { term, index })
+}
+
 /// Replayed committed state plus the exact Raft commands that produced it.
 pub struct ReplicaReplay {
     pub sm: RefCasStateMachine,
@@ -185,24 +245,20 @@ pub struct ReplicaReplay {
 
 /// Replay every committed `pm/*` entry from one voter's own replica, in slot order.
 pub async fn replay_raft_replica(endpoint: &MtlsReplicaEndpoint) -> Result<ReplicaReplay, SafeGcError> {
-    let head = inspect_value(endpoint, "pm/head").await?.unwrap_or_else(|| "0".to_owned());
-    let n: u64 = head.parse().map_err(|_| SafeGcError::Serialization("raft-node pm/head is not a slot".into()))?;
-    let (mut sm, mut entries, mut last) = (RefCasStateMachine::new(), Vec::new(), None);
+    let head = inspect_value(endpoint, "pm/head").await?;
+    let n = parse_pm_head_slot(head.as_deref())?;
+    let (mut sm, mut entries, mut last, mut prev) = (RefCasStateMachine::new(), Vec::new(), None, None);
     for slot in 1..=n {
         let raw = inspect_value(endpoint, &format!("pm/{slot:08}"))
             .await?
             .ok_or_else(|| SafeGcError::Serialization(format!("raft-node pm/{slot:08} is missing")))?;
         let command: RefCasCommand = serde_json::from_str(&raw).map_err(json_error)?;
-        let index = inspect_value(endpoint, &format!("pm/{slot:08}/idx"))
-            .await?
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(slot);
-        let term = inspect_value(endpoint, &format!("pm/{slot:08}/term"))
-            .await?
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(1);
-        last = Some(sm.apply(AppliedLogId { term, index }, command.clone()));
-        entries.push((index, command));
+        let index = inspect_value(endpoint, &format!("pm/{slot:08}/idx")).await?;
+        let term = inspect_value(endpoint, &format!("pm/{slot:08}/term")).await?;
+        let applied = parse_slot_log_id(slot, index.as_deref(), term.as_deref(), prev)?;
+        last = Some(sm.apply(applied, command.clone()));
+        entries.push((applied.index, command));
+        prev = Some(applied);
     }
     Ok(ReplicaReplay { sm, entries, last })
 }
@@ -228,37 +284,45 @@ struct VoterState {
     replica: MtlsReplicaEndpoint,
 }
 
-fn service_failure(err: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
-    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": err.to_string() })))
+type VoterHttpResponse = (u16, &'static str, Vec<u8>);
+
+fn error_body(err: impl std::fmt::Display) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "error": err.to_string() })).unwrap_or_else(|_| br#"{"error":"internal"}"#.to_vec())
 }
 
-async fn voter_health(State(state): State<Arc<VoterState>>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "voter_id": state.config.voter_id,
-            "key_id": state.config.key_id,
-            "group_id": state.config.group_id,
-            "pubkey_hex": state.signer.pubkey_hex(),
-        })),
-    )
+fn voter_error(err: impl std::fmt::Display) -> VoterHttpResponse {
+    (503, "Service Unavailable", error_body(err))
 }
 
-async fn voter_cutpoint(
-    State(state): State<Arc<VoterState>>,
-    AxumPath(repo_id): AxumPath<Uuid>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let replay = replay_raft_replica(&state.replica).await.map_err(service_failure)?;
-    let snapshot: RefCasSnapshot = replay.sm.snapshot().map_err(service_failure)?;
+fn voter_health_bytes(state: &VoterState) -> Vec<u8> {
+    let health = json!({
+        "ok": true,
+        "voter_id": state.config.voter_id,
+        "key_id": state.config.key_id,
+        "group_id": state.config.group_id,
+        "pubkey_hex": state.signer.pubkey_hex(),
+    });
+    serde_json::to_vec(&health).unwrap_or_else(|_| br#"{"ok":false}"#.to_vec())
+}
+
+async fn voter_cutpoint(state: &VoterState, repo_id: Uuid) -> VoterHttpResponse {
+    let replay = match replay_raft_replica(&state.replica).await {
+        Ok(replay) => replay,
+        Err(err) => return voter_error(err),
+    };
+    let snapshot: RefCasSnapshot = match replay.sm.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(err) => return voter_error(err),
+    };
     let Some(applied) = replay.sm.last_applied() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "voter has no committed Raft entry" }))));
+        return (503, "Service Unavailable", error_body("voter has no committed Raft entry"));
     };
     let Some(gate) = snapshot.body.gates.iter().find(|gate| gate.repository_id == repo_id) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "committed snapshot has no gate for the repository" })),
-        ));
+        return (404, "Not Found", error_body("committed snapshot has no gate for the repository"));
+    };
+    let digest = match compute_raft_commit_digest(&replay.entries) {
+        Ok(digest) => digest,
+        Err(err) => return voter_error(err),
     };
     let claims = VoterCutpointClaims {
         voter_id: state.config.voter_id,
@@ -269,13 +333,16 @@ async fn voter_cutpoint(
         authority_epoch: gate.authority_epoch,
         raft_term: applied.term,
         committed_log_index: applied.index,
-        raft_commit_digest_hex: compute_raft_commit_digest(&replay.entries).map_err(service_failure)?,
+        raft_commit_digest_hex: digest,
     };
-    let attestation =
-        sign_single_voter_cutpoint_attestation(&state.signer, &claims, &snapshot).map_err(service_failure)?;
-    let value = serde_json::to_value(&attestation)
-        .map_err(|err| service_failure(SafeGcError::Serialization(err.to_string())))?;
-    Ok(Json(value))
+    let attestation = match sign_single_voter_cutpoint_attestation(&state.signer, &claims, &snapshot) {
+        Ok(attestation) => attestation,
+        Err(err) => return voter_error(err),
+    };
+    match serde_json::to_vec(&attestation) {
+        Ok(body) => (200, "OK", body),
+        Err(err) => voter_error(SafeGcError::Serialization(err.to_string())),
+    }
 }
 
 fn write_ready_receipt(path: &Path, receipt: &SafeGcVoterReadyReceipt) -> Result<(), SafeGcError> {
@@ -288,7 +355,7 @@ fn write_ready_receipt(path: &Path, receipt: &SafeGcVoterReadyReceipt) -> Result
     std::fs::rename(&tmp, path).map_err(io_error)
 }
 
-async fn voter_shutdown_signal() {
+pub(super) async fn voter_shutdown_signal() {
     #[cfg(unix)]
     {
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
@@ -308,7 +375,7 @@ async fn voter_shutdown_signal() {
     }
 }
 
-/// Bind the voter HTTP listener, publish its readiness receipt, and serve until shutdown.
+/// Bind the voter mTLS HTTPS listener, publish its readiness receipt, and serve until shutdown.
 pub async fn serve_safe_gc_voter(
     config: SafeGcVoterServiceConfig,
     ready_file: Option<&Path>,
@@ -322,6 +389,12 @@ pub async fn serve_safe_gc_voter(
         tls_config,
         timeout: Duration::from_millis(config.rpc_timeout_ms),
     };
+    let auth_token = tls::load_private_bearer_token(&config.listener_auth_token_path)?;
+    let server_config = tls::build_mtls_server_config(
+        &config.listener_ca_cert_pem,
+        &config.listener_server_cert_pem,
+        &config.listener_server_key_pem,
+    )?;
     let sock_addr: SocketAddr = config
         .bind_addr
         .parse()
@@ -337,16 +410,37 @@ pub async fn serve_safe_gc_voter(
         key_id: config.key_id,
         group_id: config.group_id,
         bind_addr: local_addr.to_string(),
-        endpoint_url: format!("http://{local_addr}"),
+        endpoint_url: format!("https://{local_addr}"),
         pubkey_hex: signer.pubkey_hex().to_owned(),
     };
     if let Some(path) = ready_file {
         write_ready_receipt(path, &receipt)?;
     }
     let state = Arc::new(VoterState { config: Arc::new(config), signer, replica });
-    let app = Router::new()
-        .route("/healthz", get(voter_health))
-        .route("/v1/safe-gc/cutpoint/{repo_id}", get(voter_cutpoint))
-        .with_state(state);
-    axum::serve(listener, app).with_graceful_shutdown(voter_shutdown_signal()).await.map_err(io_error)
+    tls::serve_mtls_https_voter(listener, state, auth_token, server_config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_pm_head_slot, parse_slot_log_id};
+
+    #[test]
+    fn pm_head_and_slot_coordinates_fail_closed() {
+        assert_eq!(parse_pm_head_slot(None).unwrap(), 0);
+        assert_eq!(parse_pm_head_slot(Some("12")).unwrap(), 12);
+        for malformed in ["", " 1", "1 ", "01x", "-1", "x"] {
+            assert!(parse_pm_head_slot(Some(malformed)).is_err(), "pm/head {malformed:?} must be rejected");
+        }
+        let first = parse_slot_log_id(1, Some("1"), Some("1"), None).unwrap();
+        assert_eq!((first.term, first.index), (1, 1));
+        assert!(parse_slot_log_id(1, None, Some("1"), None).is_err());
+        assert!(parse_slot_log_id(1, Some("1"), None, None).is_err());
+        assert!(parse_slot_log_id(1, Some("abc"), Some("1"), None).is_err());
+        assert!(parse_slot_log_id(0, Some("1"), Some("1"), None).is_err());
+        assert!(parse_slot_log_id(1, Some("0"), Some("1"), None).is_err());
+        assert!(parse_slot_log_id(1, Some("1"), Some("0"), None).is_err());
+        assert!(parse_slot_log_id(2, Some("1"), Some("2"), Some(first)).is_err());
+        assert!(parse_slot_log_id(2, Some("2"), Some("0"), Some(first)).is_err());
+        assert!(parse_slot_log_id(2, Some("2"), Some("1"), Some(first)).is_ok());
+    }
 }

@@ -4,7 +4,7 @@
 //! [`VoterCutpointAttestation`] over the exact committed `RefCasSnapshot` bytes it replayed
 //! from its own Raft replica, and the worker only aggregates pinned public-key signatures.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,6 +13,10 @@ use uuid::Uuid;
 use crate::ref_store::core::state_machine::{AppliedLogId, RefCasSnapshot, RefCasStateMachine};
 
 use super::super::model::{encode_len_bytes, validate_sha256_hex};
+use super::super::voter_service::{
+    build_mtls_client_config,
+    tls::{load_private_bearer_token, request_voter_https},
+};
 use super::{SafeGcEd25519Signer, SafeGcError, validate_ed25519_pubkey_hex, verify_ed25519_domain};
 
 /// Canonical domain separating independent voter cutpoint transcripts from every other digest.
@@ -119,10 +123,10 @@ pub fn validate_trusted_voter(voter: &TrustedConsensusVoter, arm_pubkey_hex: &st
     let endpoint = voter.endpoint_url.as_bytes();
     if endpoint.is_empty()
         || endpoint.len() > MAX_VOTER_ENDPOINT_BYTES
-        || !(voter.endpoint_url.starts_with("http://") || voter.endpoint_url.starts_with("https://"))
+        || !voter.endpoint_url.starts_with("https://")
         || endpoint.iter().any(|b| b.is_ascii_whitespace() || *b == 0)
     {
-        return Err(rejected("trusted consensus voter endpoint_url must be an absolute http(s) URL"));
+        return Err(rejected("trusted consensus voter endpoint_url must be an https:// mTLS URL"));
     }
     Ok(())
 }
@@ -376,22 +380,25 @@ pub async fn fetch_quorum_cutpoint_from_voters(
     if repo_id.is_nil() {
         return Err(missing("Ref-CAS voter quorum fetch requires a non-nil repository id"));
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .map_err(|_| missing("Ref-CAS independent voter HTTP client unavailable"))?;
+    let auth = trust.voter_client_auth.as_ref();
+    let message = "Ref-CAS independent voter mTLS + Bearer client auth is not configured";
+    let client_auth = auth.ok_or(SafeGcError::DistributedPrereqsMissing(message))?;
+    client_auth.validate()?;
+    let _ = load_private_bearer_token(&client_auth.auth_token_path)?;
+    let _ =
+        build_mtls_client_config(&client_auth.ca_cert_pem, &client_auth.client_cert_pem, &client_auth.client_key_pem)?;
     let mut requests = Vec::with_capacity(trust.trusted_consensus_voters.len());
     for voter in &trust.trusted_consensus_voters {
         validate_trusted_voter(voter, &trust.trusted_arm_pubkey_hex)?;
-        let url = format!("{}/v1/safe-gc/cutpoint/{}", voter.endpoint_url.trim_end_matches('/'), repo_id);
-        let client = client.clone();
+        let path = format!("/v1/safe-gc/cutpoint/{repo_id}");
         requests.push(async move {
-            let response = client.get(url).send().await.ok()?;
-            if !response.status().is_success() {
+            let timeout = Duration::from_secs(5);
+            let fetched = request_voter_https(&voter.endpoint_url, &path, client_auth, None, timeout).await;
+            let (status, body) = fetched.ok()?;
+            if status != 200 {
                 return None;
             }
-            response.json::<VoterCutpointAttestation>().await.ok()
+            serde_json::from_slice::<VoterCutpointAttestation>(&body).ok()
         });
     }
     let attestations: Vec<VoterCutpointAttestation> =
