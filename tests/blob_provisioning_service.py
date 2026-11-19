@@ -40,6 +40,18 @@ Refusal checkpoint (selected together by default, or alone):
   upgrading it; no binding, gate or protocol row appears, the row is not served,
   and a separately created real ready authority is unchanged.
 
+Startup-refusal checkpoint (selected together by default, or alone):
+
+* the public ``serve`` CLI is given the owned Git and data context but no
+  ``DATABASE_URL``; it must exit from configuration before any listener or
+  fallback starts;
+* the public ``serve-blob`` CLI keeps the owned, migrated PostgreSQL schema but
+  loses its explicit Blob endpoint; the production Blob profile has no local or
+  in-memory fallback and must exit before any listener starts.
+
+Both startup cases compare only a closed fixed reason, keep no raw stderr in the
+report, and reuse only the harness-owned process group and temporary root.
+
 No SQL inserts a ready repository, binding, gate, protocol row, ref, object or
 ACK. SQL writes only the temporary barrier table/trigger/function in the random
 schema this run owns, plus one unserved legacy ``gitfs`` repository row in the
@@ -76,11 +88,21 @@ CASES = (
     "deferred_commit_barrier_kill_rolls_back_and_retry_converges",
     "backend_identity_conflict_is_explicit_and_preserves_authority",
     "unsupported_legacy_repository_format_is_explicitly_refused",
+    "missing_database_url_is_explicit_refusal_without_listener",
+    "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
 )
 
 FIRST_CHECKPOINT = CASES[:4]
 SECOND_CHECKPOINT = CASES[4:5]
-REFUSAL_CHECKPOINT = CASES[5:]
+REFUSAL_CHECKPOINT = CASES[5:7]
+STARTUP_CHECKPOINT = CASES[7:]
+MAX_STARTUP_LOG_BYTES = 64 * 1024
+# Only these fixed, credential-free literals may be projected from child
+# startup output. Anything else is a test failure, never report evidence.
+STARTUP_REFUSAL_REASONS = (
+    "DATABASE_URL is required",
+    "invalid Blob profile",
+)
 
 LIMITATIONS = [
     "Loopback HTTP, one PostgreSQL 17 server and one fixture-owned S3 provider; no Raft, multi-host, HA or physical durability claim.",
@@ -94,6 +116,7 @@ LIMITATIONS = [
     "Concurrency is a small bounded request group on one process, not a scalability benchmark.",
     "The harness sets the existing ROOTYARD_MAX_CONCURRENT_GIT knob to 8 so the half-ready read probe can run while one create is blocked; it is not a capacity claim.",
     "SHA-256 Git operations require the Root-supplied trusted Git to support that object format.",
+    "The startup-refusal cases remove only local configuration from a fresh owned child; they do not simulate a PostgreSQL server outage, external Raft authority, network failure or provider unavailability.",
 ]
 
 
@@ -112,6 +135,23 @@ def quote_literal(value):
 def sha256_hex(value):
     text = str(value)
     return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def closed_startup_reason(raw):
+    """Project only one fixed startup-refusal literal from bounded stderr bytes.
+
+    The caller reads at most ``MAX_STARTUP_LOG_BYTES``. This function never
+    returns, formats or appends arbitrary child text: an unknown, duplicated or
+    oversized signal is a fixed test failure.
+    """
+    if type(raw) is not bytes or len(raw) > MAX_STARTUP_LOG_BYTES:
+        raise AssertionError("startup refusal output is not bounded bytes")
+    prefix = b"Error: "
+    lines = [line for line in raw.splitlines() if line.startswith(prefix)]
+    known = {reason.encode("ascii") for reason in STARTUP_REFUSAL_REASONS}
+    if len(lines) != 1 or lines[0][len(prefix):] not in known:
+        raise AssertionError("startup refusal did not emit exactly one known fixed reason")
+    return lines[0][len(prefix):].decode("ascii")
 
 
 class BackendIdentityConflictPhase(enum.Enum):
@@ -412,6 +452,78 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
                       if phase is BackendIdentityConflictPhase.start_conflicting else None)
         return _BackendIdentityConflictPhaseContext(
             phase, _phase_source_line(sys._getframe(1)), projection)
+
+    def _listener_absent(self, bind):
+        """Prove the owned loopback bind accepts no connection after refusal."""
+        host, separator, port = bind.rpartition(":")
+        assert separator and host == "127.0.0.1" and port.isdigit(), "bind is not the owned loopback form"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1.0)
+            try:
+                probe.connect((host, int(port)))
+            except OSError:
+                return True
+        return False
+
+    def _startup_refusal(self, label, command, unset, reason):
+        """Run one fresh owned CLI child and retain only a closed fixed reason.
+
+        The child receives the harness's legitimate Git/PG context except for
+        the explicitly removed keys. ``StartupProjection`` proves it exited
+        during startup; this method then consumes the already-retained bounded
+        child log only to compare one literal from ``STARTUP_REFUSAL_REASONS``.
+        The raw log, exception, argv, environment and path never enter the case
+        result or the report.
+        """
+        assert reason in STARTUP_REFUSAL_REASONS, "expected reason is outside the closed set"
+        if self.proc is not None:
+            try:
+                self.stop(hard=True)
+            except Exception:
+                raise AssertionError(label + ": previous owned service cleanup failed") from None
+        bind = self.env["ROOTYARD_BIND"]
+        data = self.root / ("startup-refusal-" + label + "-data")
+        scratch = self.root / ("startup-refusal-" + label + "-scratch")
+        projection = serving.StartupProjection()
+        try:
+            try:
+                self.start(overrides={"ROOTYARD_DATA_DIR": str(data),
+                                      "ROOTYARD_SCRATCH_DIR": str(scratch)},
+                           label=label, startup_projection=projection,
+                           command=command, unset=unset)
+            except Exception:
+                pass
+            else:
+                raise AssertionError(label + ": startup refusal became ready or stayed alive")
+        finally:
+            if self.proc is not None:
+                try:
+                    self.stop(hard=True)
+                except Exception:
+                    raise AssertionError(label + ": refused child cleanup failed") from None
+        stage, exit_status = projection.safe_fields()
+        assert projection.failed is True and projection.touched is True, (
+            label + ": startup refusal outcome was not observed")
+        assert stage == "child_exit", label + ": startup refusal did not exit during startup"
+        assert exit_status == "exited_1", label + ": startup refusal exit status was not 1"
+        assert self.proc is None, label + ": refused child was not reaped"
+        assert self._listener_absent(bind), label + ": startup refusal left the owned bind listening"
+        assert not data.exists(), label + ": startup refusal created the owned data directory"
+        assert not scratch.exists(), label + ": startup refusal created the owned scratch directory"
+        path = getattr(self, "log_path", None)
+        assert path is not None, label + ": startup refusal log path was not retained"
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(MAX_STARTUP_LOG_BYTES + 1)
+        except OSError:
+            raise AssertionError(label + ": startup refusal log could not be read") from None
+        assert len(raw) <= MAX_STARTUP_LOG_BYTES, label + ": startup refusal output exceeded its bound"
+        actual = closed_startup_reason(raw)
+        assert actual == reason, label + ": startup refusal fixed reason mismatch"
+        return {"entrypoint": command[0], "startup_stage": stage,
+                "exit_status": exit_status, "reason": actual,
+                "listener_absent": True, "data_dir_absent": True,
+                "scratch_dir_absent": True}
 
     # -- native Git helpers -------------------------------------------------
     def push_and_clone(self, repo, label, object_format="sha1", files=None):
@@ -1110,6 +1222,23 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
                 "control_repository_id": control["id"],
                 "control_ack_oid": oid, "clone_fsck": True}
 
+    def missing_database_url_is_explicit_refusal_without_listener(self):
+        # The default public `serve` entrypoint needs the owned Git/data context
+        # but no database. src/config.rs refuses the absent URL before Storage
+        # opens the volume or main.rs binds the listener.
+        return self._startup_refusal(
+            "missing-database-url", ("serve",), ("DATABASE_URL",),
+            "DATABASE_URL is required")
+
+    def missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback(self):
+        # The explicit public `serve-blob` entrypoint keeps the owned, migrated
+        # PostgreSQL URL. Removing only the explicit Blob endpoint must fail in
+        # src/blob_store/config.rs; the legacy ROOTYARD_OBJECT_STORE_* selector
+        # is not a fallback for the standalone Blob profile.
+        return self._startup_refusal(
+            "missing-blob-endpoint", ("serve-blob",), ("ROOTYARD_BLOB_ENDPOINT",),
+            "invalid Blob profile")
+
 
 def report_result(harness, profile, blob_profile, selected, success, hashes):
     errors = []
@@ -1141,7 +1270,8 @@ def report_result(harness, profile, blob_profile, selected, success, hashes):
         "git_sha256": profile.git_sha256,
         "blob_profile": blob_profile,
         "checkpoints": {"first": list(FIRST_CHECKPOINT), "second": list(SECOND_CHECKPOINT),
-                        "refusal": list(REFUSAL_CHECKPOINT), "selected": list(selected)},
+                        "refusal": list(REFUSAL_CHECKPOINT), "startup": list(STARTUP_CHECKPOINT),
+                        "selected": list(selected)},
         "expected_cases": list(selected),
         "case_count": len(harness.results),
         "expected_count": len(selected),
@@ -1162,7 +1292,7 @@ def main(argv=None):
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--case", action="append", choices=CASES, default=[],
-                        help="run only this case (repeatable); the second checkpoint may be run alone")
+                        help="run only this case (repeatable); any checkpoint may be run alone")
     args = parser.parse_args(argv)
     selected = [name for name in CASES if not args.case or name in args.case]
     try:

@@ -5,11 +5,14 @@ crash-recoverable ownership transfer against the real binary and PostgreSQL."""
 import argparse
 import base64
 import concurrent.futures
+import contextlib
 from contextlib import ExitStack
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import stat
 import subprocess
@@ -110,6 +113,104 @@ class RepositoryLifecycleHarness(BrowserHarness):
         for k, v in raw_headers:
             lowered[k.lower()] = v
         return status, data, lowered
+
+    @contextlib.contextmanager
+    def held_table_share_lock(self, table, application_name="rootyard-fixture-rekey-gate"):
+        """Hold SHARE on one fixture-private table in an owned psql session.
+
+        SHARE is compatible with the transfer path's reads and SELECT FOR SHARE,
+        but conflicts with the rekey transaction's first DELETE (ROW EXCLUSIVE).
+        The fixture session is the only owner of this lock. Cleanup rolls back
+        or terminates only this exact tagged backend, even on assertion errors.
+        """
+        env = {**self.env, "PGAPPNAME": application_name}
+        proc = subprocess.Popen(
+            ["psql", "--dbname", self.db, "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        pid = None
+        pending = b""
+
+        def backend_gone() -> bool:
+            if pid is None:
+                return True
+            try:
+                return self.sql(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    f"WHERE pid={pid} AND application_name={quote(application_name)}"
+                ) == "0"
+            except Exception:
+                return False
+
+        try:
+            proc.stdin.write(
+                f"BEGIN; LOCK TABLE {table} IN SHARE MODE; "
+                "SELECT 'ready|' || pg_backend_pid();\n".encode()
+            )
+            proc.stdin.flush()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and pid is None:
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    if line.strip().startswith(b"ready|"):
+                        pid = int(line.strip().split(b"|", 1)[1])
+                        break
+                if pid is not None or proc.poll() is not None:
+                    break
+                ready, _, _ = select.select(
+                    [proc.stdout], [], [], max(0.0, deadline - time.monotonic())
+                )
+                if not ready:
+                    break
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                pending += chunk
+            if pid is None:
+                raise AssertionError("fixture table-SHARE session did not become ready")
+            yield pid
+        finally:
+            if pid is not None:
+                try:
+                    proc.stdin.write(b"ROLLBACK;\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if pid is not None:
+                    try:
+                        self.sql(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            f"WHERE pid={pid} AND application_name={quote(application_name)}"
+                        )
+                    except Exception:
+                        pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if pid is not None:
+                release_deadline = time.monotonic() + 5.0
+                while time.monotonic() < release_deadline and not backend_gone():
+                    time.sleep(0.01)
+                assert backend_gone(), "fixture table-SHARE backend survived bounded release"
+            try:
+                proc.communicate(timeout=1)
+            except Exception:
+                pass
 
     def push_file(self, owner, repo, work_dir, filename, content, branch, message, token):
         if not work_dir.exists():
@@ -603,38 +704,227 @@ class RepositoryLifecycleHarness(BrowserHarness):
         assert self.expect(f"/git/dest-org/gamma.git/info/lfs/objects/{gamma_lfs_oid}/{len(gamma_lfs)}", 200, token=self.alice) == gamma_lfs
         assert self.doc("/api/repos/dest-org/gamma/transfer", 200, token=self.alice)["state"] == "completed"
 
-        # Crash/restart recovery simulation: seed an interrupted in-flight org -> personal transfer on restart.
+        # Legacy/GitFS storage only: prepare_transfer rejects pg_refstore, so this
+        # proves the supported transfer path, not a pg_refstore transfer contract.
         rec = self.create_repository({"owner": "dest-org", "name": "recover-me"}, token=self.alice)
+        self.expect(
+            "/api/repos/dest-org/recover-me/collaborators/bob",
+            201,
+            token=self.alice,
+            method="PUT",
+            body={"role": "read"},
+        )
         rec_work = self.root / "recover-work"
-        self.push_file("dest-org", "recover-me", rec_work, "state.txt", "before crash\n", "main", "seed recover", self.alice)
+        rec_oid = self.push_file(
+            "dest-org", "recover-me", rec_work, "state.txt", "before crash\n", "main", "seed recover", self.alice
+        )
         lc_r = self.doc("/api/repos/dest-org/recover-me/lifecycle", 200, token=self.alice)
 
-        self.stop(hard=True)
-        xfer_id = str(uuid.uuid4())
-        self.sql(
-            "INSERT INTO repository_transfers "
-            "(id, repository_id, from_owner_id, to_owner_id, from_name, to_name, "
-            " initiated_by, state, expected_version, revoke_collaborators, keep_alias, copied_objects) "
-            f"VALUES ({quote(xfer_id)}, {quote(rec['id'])}, {quote(org['id'])}, {quote(self.alice['user_id'])}, "
-            "'recover-me', 'recover-me', "
-            f"{quote(self.alice['user_id'])}, 'rekeying_db', {lc_r['version']}, true, true, '[]'::jsonb)"
-        )
-        self.start()
+        # Drive the real authorized org -> personal POST. SHARE on the
+        # fixture-private team-member table is compatible with every earlier
+        # transfer read (including SELECT FOR SHARE in authorization) but
+        # conflicts with the rekey transaction's first write, so the request
+        # must park inside phase_rekey_db_with_pool at its DELETE.
+        gate_app = "rootyard-fixture-rekey-gate"
+        dispatch = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = None
+        xfer_id = None
+        blocked_pid = None
+        requester_disconnect = None
+        initial_epoch = None
+        try:
+            with self.held_table_share_lock("repository_team_members", gate_app) as gate_pid:
+                try:
+                    future = dispatch.submit(
+                        self.raw_http,
+                        "/api/repos/dest-org/recover-me/transfer",
+                        token=self.alice,
+                        method="POST",
+                        body={
+                            "new_owner": "alice",
+                            "expected_version": lc_r["version"],
+                            "revoke_collaborators": True,
+                        },
+                        extra_headers={"Idempotency-Key": "xfer-recover-org-to-personal"},
+                    )
+                    block_deadline = time.monotonic() + 10.0
+                    # One read-only statement detects the exact blocked service
+                    # backend and proves the same repository's committed durable
+                    # transfer row, phase, lease, and original owner/version in
+                    # one snapshot. This keeps the crash inside the service's 3s
+                    # lock_timeout window.
+                    block_query = (
+                        "SELECT a.pid::text || '|' || t.id::text || '|' || t.state "
+                        "|| '|' || t.from_owner_id::text || '|' || t.to_owner_id::text "
+                        "|| '|' || t.expected_version::text "
+                        "|| '|' || (t.lease_until > clock_timestamp())::text || '|' || t.lease_epoch::text "
+                        "|| '|' || r.owner_id::text || '|' || r.version::text "
+                        "|| '|' || (SELECT count(*) FROM repository_transfers a2 "
+                        "WHERE a2.repository_id=t.repository_id "
+                        "AND a2.state NOT IN ('completed','rolled_back','failed'))::text "
+                        "FROM pg_stat_activity a "
+                        "JOIN repository_transfers t ON "
+                        f"t.repository_id={quote(rec['id'])} "
+                        "AND t.state NOT IN ('completed','rolled_back','failed') "
+                        "JOIN repositories r ON r.id=t.repository_id "
+                        "WHERE a.state='active' AND a.wait_event_type='Lock' AND a.wait_event='relation' "
+                        "AND a.application_name='rootyard' "
+                        f"AND {gate_pid} = ANY(pg_blocking_pids(a.pid)) AND a.pid <> {gate_pid} "
+                        "AND a.query LIKE 'DELETE FROM repository_team_members WHERE repository_id = $1%' "
+                        "ORDER BY a.pid"
+                    )
+                    while time.monotonic() < block_deadline:
+                        rows = [row for row in self.sql(block_query).splitlines() if row]
+                        if len(rows) > 1:
+                            raise AssertionError("multiple rootyard backends or transfer rows parked on gate")
+                        if rows:
+                            fields = rows[0].split("|")
+                            assert len(fields) == 11, rows[0]
+                            blocked_pid = int(fields[0])
+                            xfer_id = fields[1]
+                            assert fields[2] == "rekeying_db", rows[0]
+                            assert fields[3] == org["id"] and fields[4] == self.alice["user_id"], rows[0]
+                            assert fields[5] == str(lc_r["version"]) and fields[6] == "true", rows[0]
+                            initial_epoch = int(fields[7])
+                            assert fields[8] == org["id"] and fields[9] == str(lc_r["version"]), rows[0]
+                            assert fields[10] == "1", "active transfer count is not one"
+                            break
+                        if future.done():
+                            status, _, _ = future.result()
+                            raise AssertionError(f"transfer finished before phase_rekey_db gate: {status}")
+                        time.sleep(0.01)
+                    assert blocked_pid is not None and xfer_id is not None, (
+                        "transfer never parked at phase_rekey_db DELETE with durable rekeying_db row"
+                    )
 
-        deadline = time.monotonic() + 20
-        recovered_view = None
-        while time.monotonic() < deadline:
-            st, body, _ = self.http("/api/repos/alice/recover-me/transfer", token=self.alice)
-            if st == 200:
-                recovered_view = json.loads(body)
-                if recovered_view["state"] == "completed":
-                    break
+                    self.stop(hard=True)
+                    try:
+                        future.result(timeout=15)
+                    except concurrent.futures.TimeoutError:
+                        raise AssertionError("requester stayed connected after owned SIGKILL") from None
+                    except Exception as exc:
+                        assert isinstance(exc, (OSError, http.client.HTTPException)), type(exc).__name__
+                        requester_disconnect = type(exc).__name__
+                    else:
+                        raise AssertionError("requester completed despite owned SIGKILL")
+
+                    wait_deadline = time.monotonic() + 10.0
+                    backend_state = None
+                    while time.monotonic() < wait_deadline:
+                        backend_state = self.sql(
+                            "SELECT count(*)::text || '|' || "
+                            "coalesce(sum(CASE WHEN wait_event_type='Lock' AND wait_event='relation' "
+                            f"AND {gate_pid} = ANY(pg_blocking_pids(pid)) THEN 1 ELSE 0 END), 0)::text "
+                            f"FROM pg_stat_activity WHERE pid={blocked_pid}"
+                        )
+                        if backend_state == "0|0":
+                            break
+                        time.sleep(0.01)
+                    assert backend_state == "0|0", "killed rootyard backend still waits on the fixture gate"
+                finally:
+                    if self.proc is not None:
+                        self.stop(hard=True)
+        finally:
+            if future is not None:
+                try:
+                    future.result(timeout=10)
+                except BaseException:
+                    pass
+            dispatch.shutdown(wait=True)
+
+        assert xfer_id is not None
+        assert requester_disconnect is not None
+
+        # Wait for the killed process's real lease to expire under PostgreSQL's
+        # clock. No transfer or lease row is injected, mutated, or shortened.
+        lease_deadline = time.monotonic() + 75.0
+        before_restart = None
+        while time.monotonic() < lease_deadline:
+            before_restart = self.sql(
+                "SELECT (clock_timestamp() >= t.lease_until)::text || '|' || t.state "
+                "|| '|' || r.owner_id::text || '|' || r.version::text "
+                "FROM repository_transfers t JOIN repositories r ON r.id=t.repository_id "
+                f"WHERE t.id={quote(xfer_id)}"
+            )
+            if before_restart.split("|", 1)[0] == "true":
+                break
             time.sleep(0.25)
-        assert recovered_view and recovered_view["state"] == "completed", recovered_view
-        assert self.sql(f"SELECT owner_id FROM repositories WHERE id = {quote(rec['id'])}") == self.alice["user_id"]
+        assert before_restart is not None and before_restart.split("|", 1)[0] == "true", (
+            "actual transfer lease did not expire under the PostgreSQL clock"
+        )
+        assert before_restart.split("|")[1:] == ["rekeying_db", org["id"], str(lc_r["version"])], before_restart
+
+        self.start()
+        recovery_deadline = time.monotonic() + 30.0
+        recovered = None
+        while time.monotonic() < recovery_deadline:
+            recovered = self.sql(
+                "SELECT state || '|' || lease_epoch::text FROM repository_transfers "
+                f"WHERE id={quote(xfer_id)}"
+            )
+            if recovered.startswith("completed|"):
+                break
+            time.sleep(0.1)
+        assert recovered == f"completed|{initial_epoch + 1}", recovered
+
+        owner_version = self.sql(
+            "SELECT owner_id::text || '|' || version::text FROM repositories "
+            f"WHERE id={quote(rec['id'])}"
+        )
+        assert owner_version == f"{self.alice['user_id']}|{lc_r['version'] + 1}", owner_version
+        assert self.sql(
+            "SELECT count(*) FROM repositories "
+            f"WHERE owner_id={quote(self.alice['user_id'])} AND name='recover-me'"
+        ) == "1", "destination owner does not have exactly one repository row"
+        assert self.sql(
+            "SELECT count(*) FROM repositories "
+            f"WHERE owner_id={quote(org['id'])} AND name='recover-me'"
+        ) == "0", "old organization still has a repository row"
+        assert self.sql(
+            "SELECT count(*) FROM repository_aliases WHERE repository_id="
+            f"{quote(rec['id'])}"
+        ) == "1", "old origin alias count is not one"
+        assert self.sql(
+            "SELECT count(*) FROM repository_transfers WHERE repository_id="
+            f"{quote(rec['id'])}"
+        ) == "1", "durable transfer row count is not one"
+        assert self.sql(
+            "SELECT count(*) FROM repository_audit_log WHERE repository_id="
+            f"{quote(rec['id'])} AND action='repository.transfer_started'"
+        ) == "1", "transfer_started event count is not one"
+        assert self.sql(
+            "SELECT count(*) FROM repository_audit_log WHERE repository_id="
+            f"{quote(rec['id'])} AND action='repository.transferred'"
+        ) == "1", "transferred event count is not one"
+        assert self.sql(
+            "SELECT count(*) FROM repository_collaborators WHERE repository_id="
+            f"{quote(rec['id'])}"
+        ) == "0", "revoked collaborator rows remain"
+        assert self.sql(
+            "SELECT count(*) FROM repository_team_members WHERE repository_id="
+            f"{quote(rec['id'])}"
+        ) == "0", "revoked team-member rows remain"
+
+        recovered_view = self.doc("/api/repos/alice/recover-me/transfer", 200, token=self.alice)
+        assert recovered_view["transfer_id"] == xfer_id, recovered_view
+        assert recovered_view["state"] == "completed", recovered_view
+        assert recovered_view["version"] == lc_r["version"] + 1, recovered_view
         st_rec, _, hdr_rec = self.raw_http("/api/repos/dest-org/recover-me", token=self.alice)
         assert st_rec == 308 and hdr_rec.get("location") == "/api/repos/alice/recover-me", (st_rec, hdr_rec)
-        return {"transferred_repo": gamma["id"], "recovered_transfer_id": xfer_id}
+        assert self.raw_http("/api/repos/dest-org/recover-me", token=self.bob)[0] == 404
+        assert self.raw_http("/api/repos/alice/recover-me", token=self.bob)[0] == 404
+
+        recover_clone = self.root / "recover-after-crash"
+        self.git("clone", self.base + "/git/alice/recover-me.git", str(recover_clone), token=self.alice)
+        assert (recover_clone / "state.txt").read_text() == "before crash\n"
+        assert self.git("rev-parse", "HEAD", cwd=recover_clone).stdout.decode().strip() == rec_oid
+        return {
+            "transferred_repo": gamma["id"],
+            "recovered_transfer_id": xfer_id,
+            "crash_gate": "repository_team_members_share",
+            "storage_contract": "legacy_gitfs",
+            "version_delta": 1,
+        }
 
     def issue_scoped_token(self, owner_token, name, grants, read_only=False):
         st, raw, _ = self.http(
