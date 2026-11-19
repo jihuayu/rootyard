@@ -744,6 +744,30 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
         revision_after == revision_before + 1,
         "the gate moved {revision_before}->{revision_after}, not exactly one winner revision"
     );
+    let (winner_event_revision, winner_event_outcome) = core_event(db, repository_id, winner_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the winning public operation has no current wrapper event"))?;
+    ensure!(
+        winner_event_outcome == "committed",
+        "the winning wrapper event is {winner_event_outcome}, not committed"
+    );
+    ensure!(
+        winner_event_revision == revision_before + 1,
+        "the winning wrapper event revision is {winner_event_revision}, not {}",
+        revision_before + 1
+    );
+    let (loser_event_revision, loser_event_outcome) = core_event(db, repository_id, loser_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the losing public operation has no current wrapper event"))?;
+    ensure!(
+        loser_event_outcome == "rejected",
+        "the losing wrapper event is {loser_event_outcome}, not rejected"
+    );
+    ensure!(
+        loser_event_revision == revision_before + 1,
+        "the losing wrapper event revision is {loser_event_revision}, not {}",
+        revision_before + 1
+    );
     let durable_main = durable_main(db, repository_id).await?;
     ensure!(durable_main == first_new, "durable main is {durable_main}, not the winning commit {first_new}");
 
@@ -866,27 +890,170 @@ async fn durable_ref(db: &Db, repository_id: Uuid, ref_name: &str) -> Result<Opt
     Ok(row.map(|row| row.get(0)))
 }
 
-async fn operation_row(db: &Db, repository_id: Uuid, operation: Uuid) -> Result<Option<(String, Option<Value>)>> {
-    let row = db
-        .pool
-        .get()
-        .await?
+/// Resolve one public header UUID through the immutable migration-152 wrapper
+/// and its current private attempt, then read the exact private operation and
+/// matching positive event/terminal. The public identifier is never used as a
+/// direct `ref_store_operations` key here.
+async fn operation_row(db: &Db, repository_id: Uuid, public_operation: Uuid) -> Result<Option<(String, Option<Value>)>> {
+    let client = db.pool.get().await?;
+    let wrapper = client
         .query_opt(
-            "SELECT state, terminal_result FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
-            &[&repository_id, &operation],
+            "SELECT w.issuer_id, w.state, w.event_id, a.private_id, a.plan_digest
+               FROM ref_store_public_operations w
+               JOIN ref_store_private_attempts a
+                 ON a.repository_id = w.repository_id
+                AND a.public_id = w.public_id
+                AND a.slot = w.current_slot
+              WHERE w.repository_id = $1 AND w.public_id = $2",
+            &[&repository_id, &public_operation],
         )
         .await?;
-    Ok(row.map(|row| (row.get(0), row.get(1))))
+    let Some(wrapper) = wrapper else {
+        // A wrapper without the current attempt join is wrapper-only fake
+        // evidence, not an absent operation.
+        let wrapper_only: bool = client
+            .query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM ref_store_public_operations
+                      WHERE repository_id = $1 AND public_id = $2
+                 )",
+                &[&repository_id, &public_operation],
+            )
+            .await?
+            .get(0);
+        if wrapper_only {
+            return Err(anyhow!(
+                "public wrapper {public_operation} has no current private attempt"
+            ));
+        }
+        // No wrapper is only valid before admission. Any direct legacy or
+        // private alias evidence for this public id means the route fell back
+        // or selected the wrong identity.
+        let fallback: bool = client
+            .query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM ref_store_operations
+                      WHERE repository_id = $1 AND operation_id = $2
+                 ) OR EXISTS(
+                     SELECT 1 FROM ref_store_cancellations
+                      WHERE repository_id = $1 AND operation_id = $2
+                 ) OR EXISTS(
+                     SELECT 1 FROM ref_store_private_attempts
+                      WHERE repository_id = $1 AND private_id = $2
+                 ) OR EXISTS(
+                     SELECT 1 FROM ref_store_private_attempts
+                      WHERE repository_id = $1 AND public_id = $2
+                 )",
+                &[&repository_id, &public_operation],
+            )
+            .await?
+            .get(0);
+        if fallback {
+            return Err(anyhow!(
+                "public operation {public_operation} has legacy/private evidence without a current wrapper"
+            ));
+        }
+        return Ok(None);
+    };
+    let wrapper_issuer: Uuid = wrapper.get(0);
+    let wrapper_state: String = wrapper.get(1);
+    let wrapper_event: Option<Uuid> = wrapper.get(2);
+    let private_id: Uuid = wrapper.get(3);
+    let plan_digest: String = wrapper.get(4);
+
+    // Reuse the reviewed migration-152 wrapper/attempt/event verifier before
+    // accepting wrapper-only or mixed evidence. A pending wrapper with a
+    // pending current attempt is valid for the explicit pause assertion; any
+    // terminal/event mismatch raises and is mapped to a fixed test refusal.
+    client
+        .query_one(
+            "SELECT rootyard_ref_store_verify_public_operation($1,$2)",
+            &[&repository_id, &public_operation],
+        )
+        .await
+        .map_err(|_| anyhow!("public wrapper {public_operation} failed exact wrapper evidence verification"))?;
+
+    let row = client
+        .query_opt(
+            "SELECT o.operation_id, o.issuer_id, o.request_digest, o.state, o.terminal_result,
+                    e.event_id, e.payload
+               FROM ref_store_operations o
+               LEFT JOIN ref_store_core_events e
+                 ON e.repository_id = o.repository_id AND e.operation_id = o.operation_id
+              WHERE o.repository_id = $1 AND o.operation_id = $2",
+            &[&repository_id, &private_id],
+        )
+        .await?
+        .ok_or_else(|| anyhow!("public wrapper {public_operation} has no exact private operation"))?;
+    let operation_id: Uuid = row.get(0);
+    let operation_issuer: Uuid = row.get(1);
+    let operation_digest: String = row.get(2);
+    let operation_state: String = row.get(3);
+    let terminal: Option<Value> = row.get(4);
+    let private_event: Option<Uuid> = row.get(5);
+    let event_payload: Option<Value> = row.get(6);
+
+    if operation_id != private_id
+        || operation_issuer != wrapper_issuer
+        || operation_digest != plan_digest
+        || operation_state != wrapper_state
+    {
+        return Err(anyhow!(
+            "public wrapper {public_operation} does not match its exact private identity/state"
+        ));
+    }
+    match wrapper_state.as_str() {
+        "pending" => {
+            if wrapper_event.is_some() || private_event.is_some() || terminal.is_some() || event_payload.is_some() {
+                return Err(anyhow!(
+                    "pending public wrapper {public_operation} carries terminal/event evidence"
+                ));
+            }
+        }
+        "committed" | "rejected" => {
+            let wrapper_event =
+                wrapper_event.ok_or_else(|| anyhow!("terminal public wrapper {public_operation} has no event"))?;
+            if private_event != Some(wrapper_event) {
+                return Err(anyhow!("public wrapper {public_operation} event differs from its private event"));
+            }
+            let terminal = terminal
+                .as_ref()
+                .ok_or_else(|| anyhow!("terminal private operation {private_id} has no terminal"))?;
+            if event_payload.as_ref() != Some(terminal) {
+                return Err(anyhow!(
+                    "public wrapper {public_operation} event payload differs from its private terminal"
+                ));
+            }
+        }
+        "cancelled" => {
+            return Err(anyhow!(
+                "public wrapper {public_operation} is cancelled; the race witness accepts no cancellation"
+            ));
+        }
+        _ => return Err(anyhow!("public wrapper {public_operation} has unknown state {wrapper_state}")),
+    }
+    Ok(Some((operation_state, terminal)))
 }
 
-async fn core_event(db: &Db, repository_id: Uuid, operation: Uuid) -> Result<Option<(i64, String)>> {
+async fn core_event(db: &Db, repository_id: Uuid, public_operation: Uuid) -> Result<Option<(i64, String)>> {
     let row = db
         .pool
         .get()
         .await?
         .query_opt(
-            "SELECT revision, outcome FROM ref_store_core_events WHERE repository_id=$1 AND operation_id=$2",
-            &[&repository_id, &operation],
+            "SELECT e.revision, e.outcome
+               FROM ref_store_public_operations w
+               JOIN ref_store_private_attempts a
+                 ON a.repository_id = w.repository_id
+                AND a.public_id = w.public_id
+                AND a.slot = w.current_slot
+               JOIN ref_store_core_events e
+                 ON e.repository_id = a.repository_id
+                AND e.operation_id = a.private_id
+              WHERE w.repository_id = $1 AND w.public_id = $2
+                AND w.state IN ('committed', 'rejected')
+                AND w.event_id = e.event_id",
+            &[&repository_id, &public_operation],
         )
         .await?;
     Ok(row.map(|row| (row.get(0), row.get(1))))
