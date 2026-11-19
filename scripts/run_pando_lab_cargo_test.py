@@ -113,6 +113,10 @@ LIBTEST_SUMMARY = re.compile(
 )
 CARGO_TEST_FAILED = re.compile(rb"error: test failed(?:, to rerun pass `[^`]+`)?")
 MERKLE_FAILED_ROW = re.compile(rb"test " + re.escape(MERKLE_TEST_BYTES) + rb" \.\.\. FAILED")
+# libtest prints the final failures list as exactly four spaces plus the
+# root-level test name. Blank lines are ignored; any other nonblank row is
+# foreign or duplicate material and suppresses the marker.
+FINAL_FAILED_ROW = re.compile(rb"    " + re.escape(MERKLE_TEST_BYTES))
 # CargoFork cli_args() adds "-p <pkg> " only when needs_spec_flag(ws) is true;
 # Packages::Default requires more than one default member. The rootyard manifest
 # has one default package, so it emits the first exact form. The second is the
@@ -160,6 +164,8 @@ class Harness:
         self.target_seen = False
         self.captured_open = False
         self.captured_target = False
+        self.in_final_list = False
+        self.final_list_exact = False
         self.markers = []
         self.target_footer_seen = False
         self.malformed = False
@@ -187,9 +193,11 @@ def classify_harness(line):
     """Return None for non-banners, False for foreign harnesses, True for target."""
     if DOC_HARNESS.fullmatch(line):
         return False
-    if match := UNIT_HARNESS.fullmatch(line):
-        source, executable = match[1], match[2]
-    elif match := TEST_HARNESS.fullmatch(line):
+    if UNIT_HARNESS.fullmatch(line):
+        # Unit-style banners remain harness boundaries, but only the pinned
+        # integration TEST_HARNESS form can own the watcher marker.
+        return False
+    if match := TEST_HARNESS.fullmatch(line):
         source, executable = match[1], match[2]
     else:
         return None
@@ -335,6 +343,22 @@ def run_cargo(commit):
                     current.target_seen = True
                 continue
 
+            if current is not None and current.in_final_list:
+                if line.startswith(b"test result: "):
+                    current.in_final_list = False
+                elif not line.strip():
+                    continue
+                else:
+                    if MARKER_PREFIX in line:
+                        unbound_marker = True
+                        current.malformed = True
+                    if current.merkle:
+                        if FINAL_FAILED_ROW.fullmatch(line) and not current.final_list_exact:
+                            current.final_list_exact = True
+                        else:
+                            current.malformed = True
+                    continue
+
             if MARKER_PREFIX in line:
                 unbound_marker = True
                 if current is not None:
@@ -360,6 +384,7 @@ def run_cargo(commit):
                             if current.summary_list_seen:
                                 current.malformed = True
                             current.summary_list_seen = True
+                            current.in_final_list = True
                         elif current.failures_seen:
                             current.malformed = True
                         current.failures_seen = True
@@ -440,7 +465,7 @@ def run_cargo(commit):
                 harness.malformed = True
             if harness.captured_any and not harness.summary_list_seen:
                 harness.malformed = True
-        if harness.rows_truncated or harness.captured_open:
+        if harness.rows_truncated or harness.captured_open or harness.in_final_list:
             harness.malformed = True
 
     total_failed = sum(harness.failed_count or 0 for harness in harnesses)
@@ -464,6 +489,7 @@ def run_cargo(commit):
             and harness.exact_failed_row
             and harness.target_seen
             and harness.target_footer_seen
+            and harness.final_list_exact
             and len(harness.markers) == 1
             and failed_tests == {MERKLE_TEST_BYTES}
         ):

@@ -1,5 +1,6 @@
 """Exercise the CI wrapper with a fake Cargo executable and local Git only."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -307,7 +308,8 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
     def merkle_harness_output(
         self, body, *, summary_failed=1, summary_passed=1, running_count=2,
-        include_summary=True, extra="", filtered_out=0,
+        include_summary=True, extra="", filtered_out=0, unit=False,
+        final_header=True, final_list=None,
         footer="error: test failed, to rerun pass `--test workspace_merkle_sync`",
         failed_row=None, source="tests/workspace_merkle_sync.rs",
         executable="target/debug/build/rootyard/0e80d81c87db4057/out/workspace_merkle_sync-0123456789abcdef",
@@ -318,19 +320,61 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             f"0 ignored; 0 measured; {filtered_out} filtered out; finished in 0.01s\n\n"
             if include_summary else ""
         )
+        if final_header:
+            rows = f"    {MERKLE_TEST}\n" if final_list is None else final_list
+            final_block = "failures:\n" + rows
+            if final_block and not final_block.endswith("\n"):
+                final_block += "\n"
+            final_block += "\n"
+        else:
+            final_block = ""
+        banner = "unittests " if unit else ""
         footer_line = f"{footer}\n" if footer else ""
         return (
-            f"     Running {source} ({executable})\n\n"
+            f"     Running {banner}{source} ({executable})\n\n"
             f"running {running_count} tests\n"
             f"{failed_row}\n"
             f"test {KNOWN_TESTS[0]} ... ok\n\n"
             f"failures:\n\n"
             f"---- {MERKLE_TEST} stdout ----\n"
             f"{body}\n\n"
-            f"failures:\n"
-            f"    {MERKLE_TEST}\n\n"
-            f"{extra}{summary}{footer_line}"
+            f"{final_block}{extra}{summary}{footer_line}"
         )
+
+    def test_named_merkle_case_rejects_unit_banner_impersonation(self):
+        marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
+        spec = importlib.util.spec_from_file_location("pando_lab_cargo_gate", WRAPPER)
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        unit = (
+            b"     Running unittests tests/workspace_merkle_sync.rs "
+            b"(target/debug/build/rootyard/0e80d81c87db4057/out/"
+            b"workspace_merkle_sync-0123456789abcdef)"
+        )
+        integration = unit.replace(b"Running unittests ", b"Running ", 1)
+        self.assertIs(gate.classify_harness(unit), False)
+        self.assertIs(gate.classify_harness(integration), True)
+        output = self.merkle_harness_output(marker, unit=True)
+        self.run_output(output, 101, "test", names=(MERKLE_TEST,))
+
+    def test_named_merkle_case_rejects_invalid_final_failure_lists(self):
+        marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
+        cases = {
+            "blank list": {"final_list": ""},
+            "missing list": {"final_header": False},
+            "foreign list": {"final_list": "    valid_but_unknown_name\n"},
+            "duplicate exact list": {
+                "final_list": f"    {MERKLE_TEST}\n    {MERKLE_TEST}\n",
+            },
+            "second foreign list": {
+                "final_list": f"    {MERKLE_TEST}\n    valid_but_unknown_name\n",
+            },
+            "wrong indentation": {"final_list": f"  {MERKLE_TEST}\n"},
+        }
+        for context, options in cases.items():
+            with self.subTest(context=context):
+                output = self.merkle_harness_output(marker, **options)
+                self.run_output(output, 101, "test", names=(MERKLE_TEST,))
 
     def test_named_merkle_case_rejects_unbound_or_malformed_checkpoints(self):
         marker = "rootyard-merkle-checkpoint stage=base_capture class=not_quiescent"
