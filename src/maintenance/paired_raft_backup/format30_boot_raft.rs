@@ -52,6 +52,7 @@ pub(super) fn boot_active_and_peer_mtls_raft_incarnation(
     manifest: &Format30PairedManifest,
     inc: &NewIncarnationAuthority,
     boot_freeze: &DurableRaftFreezeRecord,
+    rebound_packs: &BTreeMap<Uuid, Vec<ExpectedPackPairSpec>>,
     active_raft: &mut MtlsLiveRaftBackend,
     peer_rafts: &mut BTreeMap<i64, MtlsLiveRaftBackend>,
 ) -> Result<usize, PairedBackupError> {
@@ -60,7 +61,8 @@ pub(super) fn boot_active_and_peer_mtls_raft_incarnation(
     let coord = TriPartyBackupCoordinator::new(inc.new_deleter_epoch.saturating_sub(1), 0);
     let mut git_verified_refs = 0usize;
     for repo in &manifest.pg_cutpoint.repositories {
-        let (pairs, expected_packs) = repo_pack_pairs(fmt30_dir, manifest, repo.repository_id)?;
+        let (pairs, archive_packs) = repo_pack_pairs(fmt30_dir, manifest, repo.repository_id)?;
+        let expected_packs = rebound_packs.get(&repo.repository_id).cloned().unwrap_or(archive_packs);
         let rw = work_dir.join(repo.repository_id.to_string());
         git_verified_refs += verify_bare_repo_from_blobs(&rw, repo.object_format, &repo.refs, &pairs, &rw.join("cl"))?;
         replay_repo_onto_booted_raft(active_raft, repo, inc)?;

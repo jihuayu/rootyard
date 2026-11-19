@@ -206,6 +206,8 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
     };
     let wrong_san = caller_base(grp.pki.wrong_san_cert.clone(), grp.pki.wrong_san_key.clone());
     let wrong_san = build_mtls_client_config(&wrong_san)?;
+    let unpinned_base = caller_base(grp.pki.unpinned_client_cert.clone(), grp.pki.unpinned_client_key.clone());
+    let unpinned = build_mtls_client_config(&unpinned_base)?;
     let attest_commit = json!({ "AttestCommit": {
         "group_id": grp.group_id,
         "group_epoch": local_epoch,
@@ -213,12 +215,16 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
         "min_raft_index": 1u64,
         "command_sha256": "a".repeat(64),
     }});
-    for request in [json!({ "Identity": {} }), attest_commit, probe.clone()] {
-        let (refused, _) = mtls_rpc_call(&wrong_san, &endpoint, 1, &request, Duration::from_secs(6))?;
-        ensure!(
-            refused.get("Identity").is_none() && refused.get("Attestation").is_none() && refused.get("Error").is_some(),
-            "a wrong caller SAN must be refused for every RPC verb"
-        );
+    for unauthorized in [&wrong_san, &unpinned] {
+        for request in [json!({ "Identity": {} }), attest_commit.clone(), probe.clone()] {
+            let (refused, _) = mtls_rpc_call(unauthorized, &endpoint, 1, &request, Duration::from_secs(6))?;
+            ensure!(
+                refused.get("Identity").is_none()
+                    && refused.get("Attestation").is_none()
+                    && refused.get("Error").is_some(),
+                "an unauthorized caller leaf must be refused for every RPC verb"
+            );
+        }
     }
     let rogue_ca = caller_base(grp.pki.rogue_client_cert.clone(), grp.pki.rogue_client_key.clone());
     let rogue_ca = build_mtls_client_config(&rogue_ca)?;

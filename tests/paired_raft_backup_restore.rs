@@ -6,6 +6,8 @@ pub mod fixture;
 pub mod format30_e2e;
 #[path = "paired_raft_backup_support/format30_helpers.rs"]
 pub mod format30_helpers;
+#[path = "paired_raft_backup_support/format30_ledger_gates.rs"]
+pub mod format30_ledger_gates;
 #[path = "paired_raft_backup_support/format30_luna_fence_hold_gates.rs"]
 pub mod format30_luna_fence_hold_gates;
 #[path = "paired_raft_backup_support/format30_luna_gates.rs"]

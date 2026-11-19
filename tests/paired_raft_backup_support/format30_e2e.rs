@@ -129,6 +129,8 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         )?;
         let specs = load_pg_repo_backup_specs(&**src_pool.get().await?).await?;
         ensure!(specs.len() == 1 && specs[0].expected_packs.len() == 2);
+        let pre_ledger =
+            super::format30_ledger_gates::capture_pre_backup_ledger_proof(&src_pool, repo_id, &gate).await?;
         let src_authority_id = specs[0].authority_id;
         let mut peer_rafts = BTreeMap::from([(2i64, raft2)]);
         let freeze_handle = {
@@ -326,9 +328,19 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         );
         ensure!(inc.new_cluster_incarnation != manifest.pg_cutpoint.source_cluster_incarnation);
         ensure!(inc.new_history_incarnation != gate.history_incarnation());
-        ensure!(s3.state.objects.lock().unwrap().len() == 4, "all 4 Blob objects rebuilt from format 30 archive");
+        ensure!(
+            s3.state.objects.lock().unwrap().len() == 8,
+            "4 restored archive blobs + 4 canonical R_new A3/A4 blobs"
+        );
         ensure!(booted_raft1.read_incarnation_record()?.as_ref() == Some(inc));
         let dst_pool = db::pool(&dst_url)?;
+        super::format30_ledger_gates::verify_post_restore_ledger_immutability_and_denials(
+            &dst_pool,
+            &store,
+            &pre_ledger,
+            inc,
+        )
+        .await?;
         {
             let dc = dst_pool.get().await?;
             let d_ok = dticket(
@@ -381,6 +393,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         let post_oid =
             String::from_utf8(run_git_cli(&git, &dst_clone, &["rev-parse", "HEAD"]).stdout)?.trim().to_owned();
         ensure!(run_git_cli(&git, &dst_clone, &["push", "origin", "HEAD:refs/heads/main"]).status.success());
+        super::format30_ledger_gates::verify_post_push_new_realm_ledger(&dst_pool, &pre_ledger, inc).await?;
         dst_gw_jh.abort();
         let _ = dst_gw_jh.await;
         let (cur_snap, _) = booted_raft1.durable_state()?;

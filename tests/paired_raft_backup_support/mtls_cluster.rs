@@ -58,6 +58,8 @@ pub struct MtlsGroupPki {
     pub ca_cert: PathBuf,
     pub client_cert: PathBuf,
     pub client_key: PathBuf,
+    pub unpinned_client_cert: PathBuf,
+    pub unpinned_client_key: PathBuf,
     pub wrong_san_cert: PathBuf,
     pub wrong_san_key: PathBuf,
     pub rogue_ca_cert: PathBuf,
@@ -145,6 +147,7 @@ impl MtlsGroupPki {
             Ok((r.join(crt), r.join(key)))
         };
         let (client_cert, client_key) = sign("ca", "client", "raft-client.refcas.internal")?;
+        let (unpinned_client_cert, unpinned_client_key) = sign("ca", "unpinned-cli", "raft-client.refcas.internal")?;
         let (wrong_san_cert, wrong_san_key) = sign("ca", "wrong-san", "unauthorized-caller.internal")?;
         let (rogue_client_cert, rogue_client_key) = sign("rogue", "rogue-cli", "raft-client.refcas.internal")?;
         let mut node_paths = BTreeMap::new();
@@ -156,6 +159,8 @@ impl MtlsGroupPki {
             rogue_ca_cert: r.join("rogue.crt"),
             client_cert,
             client_key,
+            unpinned_client_cert,
+            unpinned_client_key,
             wrong_san_cert,
             wrong_san_key,
             rogue_client_cert,

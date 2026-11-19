@@ -366,17 +366,19 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         rehome = MOD_DIR / "format30_realm_rehome.rs"
         self.assertTrue(rehome.exists(), "restored A3/A4 realm re-home module is missing")
         rehome_src = rehome.read_text(encoding="utf-8")
-        self.assertLess(len(rehome_src.splitlines()), 280)
-        require(
-            rehome_src,
-            ("rehome_restored_repositories_realm", "artifact_hold_requests", "ref_store_core_pack_history",
-             "AcquireAck", "ConsumeAck", "PackRegistrationAck", "consume_digest"),
-            "restored realm re-home contract",
-        )
+        self.assertLess(len(rehome_src.splitlines()), 480)
+        require(rehome_src, ("rehome_restored_repositories_realm", "rebind_restored_repositories_in_new_realm", "PgPackCommit", "PgArtifactHoldStore", "ProtectedUploader", "PackVerifier", "PackRegistrationRequest", "commit_verified_pending"), "restored realm re-home contract")
+        for statement in ("UPDATE public.artifact_hold_requests", "UPDATE public.artifact_hold_consume_receipts", "UPDATE public.ref_store_core_pack_publications", "UPDATE public.ref_store_core_pack_history"):
+            self.assertNotIn(statement, rehome_src, "historical A3/A4 ledger rows must stay immutable")
         self.assertIn("rehome_restored_repositories_realm", read("format30_boot.rs"), "boot must re-home the realm")
         luna = (ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_startup_gates.rs")
-        require(luna.read_text(encoding="utf-8"),
-                ("min_committed_index", "durable_sqlite_sha256", "wrong_san_cert", "rogue_client_cert"), "gate-6")
+        require(luna.read_text(encoding="utf-8"), ("min_committed_index", "durable_sqlite_sha256", "wrong_san_cert", "rogue_client_cert", "unpinned_client_cert"), "gate-6")
+        ledger = ROOT / "tests" / "paired_raft_backup_support" / "format30_ledger_gates.rs"
+        self.assertTrue(ledger.exists(), "A3/A4 ledger gate module is missing")
+        ledger_src = ledger.read_text(encoding="utf-8")
+        self.assertLess(len(ledger_src.splitlines()), 300)
+        self.assertIn("format30_ledger_gates", (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8"), "A3/A4 ledger gate module must be wired")
+        require(ledger_src, ("capture_pre_backup_ledger_proof", "verify_post_restore_ledger_immutability_and_denials", "verify_post_push_new_realm_ledger", "HistoryIncarnationMismatch", "RegistrationConflict"), "A3/A4 ledger immutability and denial contract")
         hold = ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_fence_hold_gates.rs"
         self.assertTrue(hold.exists(), "gate-7 fence-hold test module is missing")
         hold_src = hold.read_text(encoding="utf-8")

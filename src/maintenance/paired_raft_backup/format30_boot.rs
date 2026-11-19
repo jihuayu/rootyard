@@ -14,6 +14,10 @@ use crate::config::Config;
 use super::admission_guard::IncarnationAdmissionGuard;
 use super::format30_boot_raft::{boot_active_and_peer_mtls_raft_incarnation, boot_record};
 use super::format30_paired::{FORMAT30_SUBDIR, Format30PairedManifest, verify_format30_paired_archive};
+use super::format30_realm_rehome::{
+    RestoredRepoCapture, capture_restored_repositories_for_rebind, rebind_restored_repositories_in_new_realm,
+    rehome_restored_repositories_realm,
+};
 use super::mtls_raft::MtlsLiveRaftBackend;
 use super::pg_cutpoint::{pg_err, sync_restored_pg_projection_cursors};
 use super::pg_freeze_settings::{
@@ -81,7 +85,11 @@ pub async fn restore_and_boot_format30_new_incarnation(
     set_pg_database_read_only(&dst_client, true).await?;
     terminate_and_await_other_pg_sessions(&dst_client, Duration::from_secs(5)).await?;
 
-    let inc = install_new_incarnation_on_restored_schema151(&mut dst_client, &manifest).await?;
+    let captured_repos = capture_restored_repositories_for_rebind(&dst_client, &fmt30_dir, &manifest).await?;
+    let inc = install_new_incarnation_on_restored_schema151(&mut dst_client, &manifest, &captured_repos).await?;
+    let rebound_packs =
+        rebind_restored_repositories_in_new_realm(&mut dst_client, dst_config, target_store, &inc, &captured_repos)
+            .await?;
     let boot_freeze = boot_record(&manifest, &inc, true, Uuid::new_v4(), None)?;
     let git_verified_refs = boot_active_and_peer_mtls_raft_incarnation(
         &fmt30_dir,
@@ -89,6 +97,7 @@ pub async fn restore_and_boot_format30_new_incarnation(
         &manifest,
         &inc,
         &boot_freeze,
+        &rebound_packs,
         booted_active_raft,
         booted_peer_rafts,
     )?;
@@ -142,6 +151,7 @@ pub async fn restore_and_boot_format30_new_incarnation(
 async fn install_new_incarnation_on_restored_schema151(
     client: &mut Client,
     manifest: &Format30PairedManifest,
+    captured_repos: &[RestoredRepoCapture],
 ) -> Result<NewIncarnationAuthority, PairedBackupError> {
     let gate_auth_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.authority_epoch).max().unwrap_or(1).max(1);
     let active_grp_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.group_epoch).max().unwrap_or(1).max(1);
@@ -239,13 +249,7 @@ async fn install_new_incarnation_on_restored_schema151(
             .map_err(pg_err)?;
         }
     }
-    super::format30_realm_rehome::rehome_restored_repositories_realm(
-        &tx,
-        new_history_inc,
-        actual_auth_e,
-        new_grp_epoch,
-    )
-    .await?;
+    rehome_restored_repositories_realm(&tx, captured_repos, new_history_inc, actual_auth_e, new_grp_epoch).await?;
     tx.batch_execute(
         "SET LOCAL session_replication_role = DEFAULT; \
          DELETE FROM public.ref_store_core_serving_reads; \
