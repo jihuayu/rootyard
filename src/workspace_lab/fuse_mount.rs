@@ -202,7 +202,6 @@ pub(crate) enum MountTeardownError {
 }
 
 impl MountTeardownError {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn class(&self) -> MountTeardownClass {
         match self {
             Self::IdentityUnproved | Self::UnmountProbe(_) | Self::UnmountIdentity => {
@@ -292,8 +291,10 @@ impl MountHandle {
     ///
     /// This is the non-consuming half: it neither joins the actor nor waits for
     /// the kernel session thread. Callers that own the handle and are about to
-    /// exit (the helper teardown, unmount, cancel and publish-failure paths)
-    /// must use [`MountHandle::shutdown_and_join`] instead.
+    /// exit must use [`MountHandle::teardown_owned_classified`] for normal
+    /// shutdown or [`MountHandle::shutdown_and_join`] for explicit
+    /// unmount/cancel/publish-failure paths. Neither may drop a live owner
+    /// before its teardown completes.
     pub fn request_stop(&self) {
         self.dispatcher.request_stop();
     }
@@ -368,7 +369,6 @@ impl MountHandle {
     /// and session join as [`MountHandle::teardown_owned`], and returns only the
     /// private failure class. The live handle remains owned by the caller on
     /// every error so the helper can fail-stop before any Drop.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn teardown_owned_classified(&mut self) -> Result<(), MountTeardownClass> {
         self.teardown_owned().map_err(|error| error.class())
     }
@@ -393,10 +393,11 @@ impl MountHandle {
     /// `AutoUnmount` remains the crash path (SIGKILL closes the last descriptor
     /// and the monitor socket).
     ///
-    /// A refused unmount is never papered over: this helper-facing wrapper is
-    /// fail-closed and panics with the typed teardown error. Helper callers and
-    /// the independent shutdown watchdog therefore exit non-zero instead of
-    /// claiming a graceful teardown. The owner-preserving registry path uses
+    /// A refused unmount is never papered over: this consuming wrapper is
+    /// fail-closed and panics for explicit unmount/abort and the other existing
+    /// callers. The normal-shutdown path uses
+    /// [`MountHandle::teardown_owned_classified`] to fail-stop with a reserved
+    /// nonzero code before Drop; the owner-preserving registry path uses
     /// [`MountHandle::teardown_owned`] directly and retains the handle instead.
     pub fn shutdown_and_join(mut self) {
         if let Err(error) = self.teardown_owned() {

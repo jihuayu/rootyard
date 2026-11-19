@@ -583,15 +583,19 @@ fn helper_teardown_outcome(failures: &[HelperTeardownFailure]) -> HelperShutdown
     fn rank(outcome: HelperShutdownOutcome) -> u8 {
         match outcome {
             HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101) => 0,
-            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1) => 1,
-            HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill) => 2,
-            HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm) => 3,
-            HelperShutdownOutcome::ChildExited(ChildExitClass::Other) => 4,
-            HelperShutdownOutcome::ChildMissing => 5,
-            HelperShutdownOutcome::ChildReapDeadline => 6,
-            HelperShutdownOutcome::ChildReapError => 7,
-            HelperShutdownOutcome::Timeout => 8,
-            HelperShutdownOutcome::Other => 9,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode102) => 1,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode103) => 2,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode104) => 3,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode105) => 4,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1) => 5,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill) => 6,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm) => 7,
+            HelperShutdownOutcome::ChildExited(ChildExitClass::Other) => 8,
+            HelperShutdownOutcome::ChildMissing => 9,
+            HelperShutdownOutcome::ChildReapDeadline => 10,
+            HelperShutdownOutcome::ChildReapError => 11,
+            HelperShutdownOutcome::Timeout => 12,
+            HelperShutdownOutcome::Other => 13,
         }
     }
     failures
@@ -607,6 +611,18 @@ fn helper_teardown_clause(outcome: HelperShutdownOutcome) -> Option<&'static str
     match outcome {
         HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101) => {
             Some("workspace FUSE helper child exited with code 101")
+        }
+        HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode102) => {
+            Some("workspace FUSE helper child exited with code 102")
+        }
+        HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode103) => {
+            Some("workspace FUSE helper child exited with code 103")
+        }
+        HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode104) => {
+            Some("workspace FUSE helper child exited with code 104")
+        }
+        HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode105) => {
+            Some("workspace FUSE helper child exited with code 105")
         }
         HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1) => {
             Some("workspace FUSE helper child exited with code 1")
@@ -942,9 +958,29 @@ mod tests {
             helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm), "SIGTERM"),
             helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill), "SIGKILL"),
             helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1), "code 1"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode105), "code 105"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode104), "code 104"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode103), "code 103"),
+            helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode102), "code 102"),
             helper_failure(HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101), "code 101"),
         ];
         assert_eq!(helper_teardown_outcome(&all), HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101));
+        assert_eq!(
+            helper_teardown_outcome(&all[..13]),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode102)
+        );
+        assert_eq!(
+            helper_teardown_outcome(&all[..12]),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode103)
+        );
+        assert_eq!(
+            helper_teardown_outcome(&all[..11]),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode104)
+        );
+        assert_eq!(
+            helper_teardown_outcome(&all[..10]),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode105)
+        );
         assert_eq!(helper_teardown_outcome(&all[..9]), HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1));
         assert_eq!(helper_teardown_outcome(&all[..8]), HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill));
         assert_eq!(helper_teardown_outcome(&all[..7]), HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm));
@@ -963,6 +999,22 @@ mod tests {
             (
                 HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101),
                 "workspace FUSE helper child exited with code 101",
+            ),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode102),
+                "workspace FUSE helper child exited with code 102",
+            ),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode103),
+                "workspace FUSE helper child exited with code 103",
+            ),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode104),
+                "workspace FUSE helper child exited with code 104",
+            ),
+            (
+                HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode105),
+                "workspace FUSE helper child exited with code 105",
             ),
             (
                 HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1),
@@ -1012,6 +1064,10 @@ mod tests {
             HelperShutdownOutcome::ChildReapDeadline,
             HelperShutdownOutcome::ChildMissing,
             HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode101),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode102),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode103),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode104),
+            HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode105),
             HelperShutdownOutcome::ChildExited(ChildExitClass::ExitCode1),
             HelperShutdownOutcome::ChildExited(ChildExitClass::SignalKill),
             HelperShutdownOutcome::ChildExited(ChildExitClass::SignalTerm),

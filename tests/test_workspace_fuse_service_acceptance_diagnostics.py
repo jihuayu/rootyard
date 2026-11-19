@@ -256,6 +256,18 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
                 "HTTP 503: workspace FUSE helper child exited with code 101"),
              "helper_child_exit_101"),
             (capture + helper + (
+                "HTTP 503: workspace FUSE helper child exited with code 102"),
+             "helper_child_exit_102"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child exited with code 103"),
+             "helper_child_exit_103"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child exited with code 104"),
+             "helper_child_exit_104"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child exited with code 105"),
+             "helper_child_exit_105"),
+            (capture + helper + (
                 "HTTP 503: workspace FUSE helper child exited with code 1"),
              "helper_child_exit_1"),
             (capture + helper + (
@@ -301,6 +313,12 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             project_shutdown_outcome(
                 _terminal(mixed, "Error: service cleanup incomplete: ")),
             SHUTDOWN_OUTCOME_MULTIPLE)
+        unknown_child_status = (
+            capture + helper
+            + "HTTP 503: workspace FUSE helper child exited with code 2")
+        self.assertEqual(
+            project_shutdown_outcome(_terminal(unknown_child_status)),
+            SHUTDOWN_OUTCOME_UNKNOWN)
         mixed_child_exit = (
             capture + helper
             + "HTTP 503: workspace FUSE helper child exited unsuccessfully"

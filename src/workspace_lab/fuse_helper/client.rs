@@ -116,6 +116,14 @@ pub(crate) enum ChildExitClass {
     /// Exact nonzero exit code 101. This is the helper's existing panic-family
     /// fail-stop entry, but the label does not assert a particular cause.
     ExitCode101,
+    /// Exact nonzero exit code 102: normal-shutdown identity/probe refusal.
+    ExitCode102,
+    /// Exact nonzero exit code 103: matched-ID unmount syscall returned EBUSY.
+    ExitCode103,
+    /// Exact nonzero exit code 104: matched-ID unmount returned another error.
+    ExitCode104,
+    /// Exact nonzero exit code 105: actor/session join or owner-state failure.
+    ExitCode105,
     /// Exact nonzero exit code 1 (the helper's generic fail-stop entry).
     ExitCode1,
     /// Exact SIGKILL. The parent's bounded reaper is the only current sender;
@@ -337,6 +345,10 @@ where
 fn child_exit_class(kind: ExitKind) -> ChildExitClass {
     match kind {
         ExitKind::Code(101) => ChildExitClass::ExitCode101,
+        ExitKind::Code(102) => ChildExitClass::ExitCode102,
+        ExitKind::Code(103) => ChildExitClass::ExitCode103,
+        ExitKind::Code(104) => ChildExitClass::ExitCode104,
+        ExitKind::Code(105) => ChildExitClass::ExitCode105,
         ExitKind::Code(1) => ChildExitClass::ExitCode1,
         ExitKind::Signal(libc::SIGKILL) => ChildExitClass::SignalKill,
         ExitKind::Signal(libc::SIGTERM) => ChildExitClass::SignalTerm,
@@ -1422,6 +1434,10 @@ mod tests {
     #[test]
     fn child_exit_class_is_sealed_to_the_known_status_shapes() {
         assert_eq!(child_exit_class(ExitKind::Code(101)), ChildExitClass::ExitCode101);
+        assert_eq!(child_exit_class(ExitKind::Code(102)), ChildExitClass::ExitCode102);
+        assert_eq!(child_exit_class(ExitKind::Code(103)), ChildExitClass::ExitCode103);
+        assert_eq!(child_exit_class(ExitKind::Code(104)), ChildExitClass::ExitCode104);
+        assert_eq!(child_exit_class(ExitKind::Code(105)), ChildExitClass::ExitCode105);
         assert_eq!(child_exit_class(ExitKind::Code(1)), ChildExitClass::ExitCode1);
         assert_eq!(child_exit_class(ExitKind::Signal(libc::SIGKILL)), ChildExitClass::SignalKill);
         assert_eq!(child_exit_class(ExitKind::Signal(libc::SIGTERM)), ChildExitClass::SignalTerm);
