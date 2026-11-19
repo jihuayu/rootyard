@@ -26,6 +26,19 @@ CASE = (
     "slot_one_rotation_replays_identical_wire_command_on_real_a3_a4_a5"
 )
 
+SLOW_BODY_CASE = (
+    "blob_git_gateway::admission_race_acceptance::slow_body::"
+    "slow_body_distinct_refs_overlap_and_both_commit"
+)
+SLOW_BODY_SCHEMA = "rootyard/refstore-issue42-stock-slow-body-checkpoint/v1"
+SLOW_BODY_REF = (
+    "refs/heads/codex/goal-issue42-stock-slow-body-qualification-20261119"
+)
+SLOW_BODY_REPORT = (
+    "test-results/refstore/session174-foundation/"
+    "slow-body-distinct-refs.json"
+)
+
 
 def selected_output(status="ok", name=CASE, summary=None):
     if summary is None:
@@ -343,6 +356,155 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_report_is_collected_with_existing_174_evidence(self):
         step = self.step('"Collect #174 acceptance evidence"')
         self.assertIn("slot-one-rotation.json", step)
+
+
+class SlowBodyWorkflowTests(unittest.TestCase):
+    """Pure wiring regression for the one approved stock slow-body gate."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (
+            ROOT / ".github" / "workflows"
+            / "refstore-protocol-acceptance.yml").read_text()
+
+    def step(self, marker):
+        start = self.text.index(marker)
+        end = self.text.index("\n      - name:", start + len(marker))
+        return self.text[start:end]
+
+    def test_gate_is_once_on_the_exact_stock_slow_body_ref(self):
+        self.assertEqual(self.text.count(SLOW_BODY_REF), 2)
+        step = self.step('"Replay exactly one #42 stock slow-body witness')
+        self.assertEqual(step.count("github.ref"), 1)
+        self.assertIn("workflow_dispatch", step)
+        self.assertIn("success()", step)
+        self.assertNotIn("github.event.inputs", step)
+
+    def test_shell_gate_is_byte_exact_and_before_any_env_or_action(self):
+        step = self.step('"Replay exactly one #42 stock slow-body witness')
+        run = step.split("run: |", 1)[1]
+        self.assertIn(
+            '[ "${GITHUB_EVENT_NAME:-}" != \'workflow_dispatch\' ]',
+            run)
+        self.assertIn(
+            '[ "${GITHUB_REF:-}" != \'' + SLOW_BODY_REF + '\' ]',
+            run)
+        self.assertLess(
+            run.index("set -euo pipefail"), run.index("${GITHUB_REF:-}"))
+        gate = run.index("${GITHUB_REF:-}")
+        self.assertLess(gate, run.index("evidence="))
+        self.assertLess(gate, run.index("SESSION174_DATABASE"))
+        self.assertLess(gate, run.index("set -a"))
+        self.assertLess(gate, run.index('. "$object_env"'))
+
+    def test_selector_is_literal_exact_once_and_not_input_configurable(self):
+        step = self.step('"Replay exactly one #42 stock slow-body witness')
+        self.assertEqual(self.text.count(SLOW_BODY_CASE), 1)
+        self.assertEqual(step.count(SLOW_BODY_CASE), 1)
+        self.assertIn('--case "' + SLOW_BODY_CASE + '"', step)
+        self.assertIn(
+            '--report-schema "' + SLOW_BODY_SCHEMA + '"', step)
+        self.assertIn(
+            '--lib-alias-label "preflighted-#174-libtest"', step)
+        self.assertIn('--report "' + SLOW_BODY_REPORT + '"', step)
+        for required in ('--lib "$lib"', '--receipt "$receipt"',
+                         '--preflight "$evidence/preflight.json"',
+                         '--workspace "$GITHUB_WORKSPACE"',
+                         '--expected-commit "$GITHUB_SHA"',
+                         '--timeout 600', '--stdout-limit 16384'):
+            self.assertIn(required, step)
+        self.assertNotIn("github.event.inputs", step)
+        self.assertNotIn("tee ", step)
+
+    def test_owned_database_and_garage_fixture_are_checked_first(self):
+        step = self.step('"Replay exactly one #42 stock slow-body witness')
+        self.assertIn(
+            "SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}",
+            step)
+        self.assertIn(
+            'expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}'
+            '_a${GITHUB_RUN_ATTEMPT}"', step)
+        for required in (
+            '"$GITHUB_RUN_ID" in \'\'|*[!0-9]*)',
+            '"$GITHUB_RUN_ATTEMPT" in \'\'|*[!0-9]*)',
+            'if [ "$SESSION174_DATABASE" != "$expected" ]',
+            "''|*[!a-z0-9_]*|postgres|rootyard_protocol|template*",
+            'if [ "${#SESSION174_DATABASE}" -gt 63 ]',
+            'ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1',
+            '.rootyard-owned-fixture',
+            'kind=rootyard-owned-garage-fixture',
+            'output_env=$object_env',
+            'stat -c %a "$object_env"',
+            '"600"',
+            'export ROOTYARD_BLOB_ROOT="session174-slow-body-'
+            '$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"',
+        ):
+            self.assertIn(required, step)
+        self.assertNotIn("ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES", step)
+        sentinel = step.index(".rootyard-owned-fixture")
+        self.assertLess(sentinel, step.index("set -a"))
+        self.assertLess(
+            step.index("set -a"),
+            step.index("ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1"))
+
+    def test_preflight_owns_the_format22_public_migration(self):
+        foundation = self.step('"Exercise the #174 HTTP foundation cases')
+        self.assertIn("subprocess.run([cli, 'migrate']", foundation)
+        self.assertIn(
+            "to_regclass('public.cluster_authority')", foundation)
+        step = self.step('"Replay exactly one #42 stock slow-body witness')
+        self.assertIn("payload.get('cli_receipt')", step)
+        self.assertIn("payload.get('cluster_authority')", step)
+
+    def test_scope_and_protected_artifact_are_disjoint(self):
+        step = self.step('"Replay exactly one #42 stock slow-body witness')
+        for marker in (
+            '"Exercise the #174 HTTP foundation cases',
+            '"Replay exactly one #42 slot-one rotation case',
+            '"Replay the two reviewed #42 slot-one handoff qualification cases',
+        ):
+            other = self.step(marker)
+            self.assertNotIn(SLOW_BODY_CASE, other)
+            self.assertNotIn(SLOW_BODY_REPORT, other)
+        handoff = self.text.index(
+            '"Replay the two reviewed #42 slot-one handoff qualification cases')
+        slow_body = self.text.index(
+            '"Replay exactly one #42 stock slow-body witness')
+        cleanup = self.text.index(
+            '"Drop only the run-owned #174 foundation database"')
+        self.assertLess(handoff, slow_body)
+        self.assertLess(slow_body, cleanup)
+        collector = self.step('"Collect #174 acceptance evidence')
+        self.assertNotIn(SLOW_BODY_REPORT, collector)
+        self.assertIn("path: |\n            test-results/refstore/",
+                      self.text)
+        self.assertIn(
+            'python3 - "$evidence/preflight.json" "$GITHUB_SHA"', step)
+        self.assertIn("public.cluster_authority", step)
+        self.assertIn("payload.get('cli_receipt')", step)
+        self.assertIn('mkdir -p "$(dirname "$report")"', step)
+
+    def test_closed_report_schema_rechecks_for_the_actual_case(self):
+        source = attestation()
+        source["schema"] = SLOW_BODY_SCHEMA
+        source["case"] = SLOW_BODY_CASE
+        report = checkpoint.make_report(
+            source, projection(), 0, "exited",
+            schema=SLOW_BODY_SCHEMA, case=SLOW_BODY_CASE)
+        self.assertEqual(
+            checkpoint.validate_report(
+                report, schema=SLOW_BODY_SCHEMA, case=SLOW_BODY_CASE),
+            report)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "slow-body-distinct-refs.json"
+            checkpoint.write_report(path, report)
+            self.assertEqual(
+                checkpoint.recheck_report(
+                    path, schema=SLOW_BODY_SCHEMA, case=SLOW_BODY_CASE),
+                report)
+        with self.assertRaises(checkpoint.CheckpointError) as raised:
+            checkpoint.validate_report(report)
+        self.assertEqual(str(raised.exception), "report_schema")
 
 
 if __name__ == "__main__":

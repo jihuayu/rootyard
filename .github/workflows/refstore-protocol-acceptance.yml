@@ -2579,6 +2579,111 @@ jobs:
             --report-dir "$evidence" \
             --timeout 600 \
             --stdout-limit 16384
+      - name: "Replay exactly one #42 stock slow-body witness on the owned #174 scope"
+        # One gate only: the manually dispatched stock slow-body ref. Every other
+        # PR/push and the existing first-lane/slot-one manual paths are unchanged.
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/goal-issue42-stock-slow-body-qualification-20261119' }}
+        timeout-minutes: 15
+        shell: bash
+        env:
+          SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME:-}" != 'workflow_dispatch' ] ||
+             [ "${GITHUB_REF:-}" != 'refs/heads/codex/goal-issue42-stock-slow-body-qualification-20261119' ]; then
+            echo "refusing to run outside the exact stock slow-body manual ref" >&2
+            exit 1
+          fi
+          evidence="$RUNNER_TEMP/session174-foundation"
+          lib="${ROOTYARD_174_LIB_ALIAS:-}"
+          receipt="${ROOTYARD_174_LIB_ALIAS_RECEIPT:-}"
+          report="test-results/refstore/session174-foundation/slow-body-distinct-refs.json"
+          if [ -z "$lib" ] || [ -z "$receipt" ]; then
+            echo "missing preflighted #174 libtest aliases" >&2
+            exit 1
+          fi
+          if [ ! -s "$evidence/preflight.json" ]; then
+            echo "missing preflighted #174 evidence" >&2
+            exit 1
+          fi
+          if [ -z "${SESSION174_DATABASE:-}" ]; then
+            echo "missing owned #174 database" >&2
+            exit 1
+          fi
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"
+          if [ "$SESSION174_DATABASE" != "$expected" ]; then echo "refusing to run on a database not owned by this run" >&2; exit 1; fi
+          case "$SESSION174_DATABASE" in ''|*[!a-z0-9_]*|postgres|rootyard_protocol|template*)
+            echo "refusing to run on a shared or unsafe database" >&2
+            exit 1
+            ;;
+          esac
+          if [ "${#SESSION174_DATABASE}" -gt 63 ]; then echo "owned database name exceeds 63 bytes" >&2; exit 1; fi
+          object_env="$RUNNER_TEMP/refstore-object-store.env"
+          sentinel="$RUNNER_TEMP/refstore-garage/.rootyard-owned-fixture"
+          if [ ! -s "$object_env" ] || [ -L "$object_env" ]; then
+            echo "missing or unsafe owned object-store env" >&2
+            exit 1
+          fi
+          if [ "$(stat -c %a "$object_env")" != "600" ]; then
+            echo "owned object-store env mode is not 600" >&2
+            exit 1
+          fi
+          if [ ! -f "$sentinel" ] || [ -L "$sentinel" ]; then
+            echo "missing or unsafe owned Garage sentinel" >&2
+            exit 1
+          fi
+          if ! grep -qx 'kind=rootyard-owned-garage-fixture' "$sentinel" ||
+             ! grep -Fxq "uid=$(id -u)" "$sentinel" ||
+             ! grep -Fxq "output_env=$object_env" "$sentinel"; then
+            echo "owned Garage sentinel does not match this job fixture" >&2
+            exit 1
+          fi
+          python3 - "$evidence/preflight.json" "$GITHUB_SHA" <<'PY'
+          import json
+          import sys
+
+          try:
+              payload = json.loads(open(sys.argv[1], encoding='utf-8').read())
+          except (OSError, ValueError, UnicodeDecodeError) as error:
+              raise SystemExit('slow-body preflight evidence is not readable JSON') from error
+          if not isinstance(payload, dict) or payload.get('passed') is not True:
+              raise SystemExit('slow-body preflight did not pass')
+          if payload.get('head') != sys.argv[2]:
+              raise SystemExit('slow-body preflight head differs from GITHUB_SHA')
+          if not isinstance(payload.get('cli_receipt'), dict):
+              raise SystemExit('slow-body preflight has no CLI receipt')
+          if payload.get('cluster_authority') != 'public.cluster_authority':
+              raise SystemExit('slow-body preflight lacks public.cluster_authority')
+          PY
+          set -a
+          . "$object_env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="session174-slow-body-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          export ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1
+          export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
+          export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
+          mkdir -p "$(dirname "$report")"
+          python3 scripts/refstore_issue42_slot_one_checkpoint.py \
+            --lib "$lib" \
+            --receipt "$receipt" \
+            --preflight "$evidence/preflight.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --expected-commit "$GITHUB_SHA" \
+            --case "blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit" \
+            --report-schema "rootyard/refstore-issue42-stock-slow-body-checkpoint/v1" \
+            --lib-alias-label "preflighted-#174-libtest" \
+            --report "test-results/refstore/session174-foundation/slow-body-distinct-refs.json" \
+            --timeout 600 \
+            --stdout-limit 16384
       - name: "Drop only the run-owned #174 foundation database"
         if: always()
         timeout-minutes: 5
