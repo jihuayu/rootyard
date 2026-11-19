@@ -71,6 +71,11 @@ opendal = { version = "=0.57.0", default-features = false, features = ["services
 # Pinned Apache upstream S3 error parser, patched to the exact vendored crate.
 # The local shim adds only `parse_error_response`; protocol code is untouched.
 opendal-service-s3 = { version = "=0.57.0", default-features = false }
+# Issue #175 real Raft Ref-CAS backend. The isolated crate keeps its own [workspace] and lock;
+# the Root crate depends on it as a normal path dependency (never the reverse, so no cycle).
+rootyard-refcas-log = { path = "crates/refcas-log" }
+# Exact pin shared with rootyard-refcas-log for the real openraft adapter signatures.
+openraft = { version = "=0.9.26", features = ["serde", "storage-v2"] }
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
@@ -95,6 +100,9 @@ zeroize = "1.9"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only certificate generation for the in-process 3-node mTLS integration fixture. Same exact
+# pin already used by rootyard-refcas-log's dev-dependencies; no production feature is added.
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 # Test-only: the in-process `memory` service backs IO lifecycle unit tests
 # (`cfg(test)` constructors only). Production keeps the strict remote profile and
 # never compiles or accepts `memory`; features are additive, no extra crate is
