@@ -2,8 +2,9 @@
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import threading
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import a4_redis_wake_partition as a4
@@ -237,6 +238,19 @@ class ReportTest(unittest.TestCase):
         )])
         self.assertNotIn("private", repr(report))
 
+    def test_worker_startup_failure_reports_closed_unavailable(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private worker log")
+        harness.case_stage = "worker_startup"
+        harness.worker_startup_code = "unavailable"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case",
+            stage="worker_startup", worker_startup="unavailable",
+        )])
+        self.assertNotIn("private", repr(report))
+
     def test_worker_startup_failure_rejects_unknown_or_missing_code(self):
         harness = self.factory.return_value
         harness.run_case.side_effect = RuntimeError("private worker log")
@@ -393,8 +407,9 @@ class WorkerStartupTest(unittest.TestCase):
         proc.returncode = exit_code if exit_code is not None else 0
         harness.workers = [(proc, Mock())]
         harness.subscriber_count = Mock(return_value=subscriber)
-        harness.relay = Mock()
-        harness.relay.counts.return_value = SimpleNamespace(active=relay_active)
+        harness.relay = self._relay(failed=False)
+        if relay_active:
+            harness.relay.sessions[object()] = ()
         harness.assert_claim = Mock()
         harness.assert_operation = Mock()
         harness.settle_worker = Mock()
@@ -422,6 +437,40 @@ class WorkerStartupTest(unittest.TestCase):
                 with self.assertRaises(Exception):
                     harness.start_external_worker({"id": "repo"}, "operation", "oid")
                 self.assertEqual(harness.worker_startup_code, expected)
+
+    def _relay(self, failed=False):
+        relay = object.__new__(a4.RedisPartitionRelay)
+        relay.lock = threading.Lock()
+        relay.failed = failed
+        relay.forwarded = relay.refused = 0
+        relay.sessions = {}
+        return relay
+
+    def test_subscribe_attribution_uses_real_relay_health_and_counts(self):
+        harness = self._harness(exit_code=None, subscriber=0, relay_active=0)
+        harness.relay = self._relay(failed=False)
+        harness.until.side_effect = AssertionError("private worker log")
+        with self.assertRaises(AssertionError):
+            harness.start_external_worker({"id": "repo"}, "operation", "oid")
+        self.assertEqual(harness.worker_startup_code, "subscribe")
+
+        harness = self._harness(exit_code=None, subscriber=1, relay_active=0)
+        harness.relay = self._relay(failed=True)
+        harness.until.side_effect = AssertionError("private worker log")
+        with self.assertRaises(AssertionError):
+            harness.start_external_worker({"id": "repo"}, "operation", "oid")
+        self.assertEqual(harness.worker_startup_code, "relay")
+        with self.assertRaises(AssertionError):
+            harness.relay.counts()
+
+        harness = self._harness(exit_code=None, subscriber=1, relay_active=0)
+        harness.relay = self._relay(failed=False)
+        harness.relay.lock = MagicMock()
+        harness.relay.lock.__enter__.side_effect = RuntimeError("private worker log")
+        harness.until.side_effect = AssertionError("private worker log")
+        with self.assertRaises(AssertionError):
+            harness.start_external_worker({"id": "repo"}, "operation", "oid")
+        self.assertEqual(harness.worker_startup_code, "unavailable")
 
     def test_worker_startup_classifies_claim_binding_idle_and_success(self):
         for name, expected in (

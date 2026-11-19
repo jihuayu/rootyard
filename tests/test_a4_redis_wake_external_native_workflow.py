@@ -274,6 +274,11 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
             {"name": a4.CASE, "status": "failed", "stage": "worker_startup"}, observations
         )
         self.assertEqual(missing["worker_startup"], "unavailable")
+        closed = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "worker_startup",
+             "worker_startup": "unavailable"}, observations
+        )
+        self.assertEqual(closed["worker_startup"], "unavailable")
         for bad_code in ("private/worker/log", "", 7, ["catch_up"], {"code": "claim"}):
             with self.subTest(code=bad_code):
                 rejected = self.case_evidence(

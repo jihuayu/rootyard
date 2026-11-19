@@ -102,6 +102,7 @@ WORKER_STARTUP_CODES = (
     "claim",
     "durable_binding",
     "settle_idle",
+    "unavailable",
 )
 REPORT_KIND = "rootyard/a4-redis-wake-external-acceptance"
 WORKER_NAME = "rootyard_a4_redis_wake_worker"
@@ -650,10 +651,29 @@ class A4RedisWakeHarness(BlobOnlyHarness):
             code = self._worker_failure_code("subscribe")
             if code == "subscribe":
                 try:
-                    if self.subscriber_count() == 1 and self.relay.counts().active == 0:
-                        code = "relay"
+                    relay_failed = self.relay.failure()
                 except Exception:
-                    pass
+                    code = "unavailable"
+                else:
+                    if relay_failed:
+                        code = "relay"
+                    else:
+                        try:
+                            counts = self.relay.counts()
+                        except AssertionError:
+                            code = "relay"
+                        except Exception:
+                            code = "unavailable"
+                        else:
+                            try:
+                                subscriber = self.subscriber_count()
+                            except Exception:
+                                code = "unavailable"
+                            else:
+                                if subscriber == 1 and counts.active == 0:
+                                    code = "relay"
+                                else:
+                                    code = "subscribe"
             self.worker_startup_code = code
             raise
         try:
