@@ -32,6 +32,8 @@ class SourceBindingTest(unittest.TestCase):
         self.assertIn('ROOTYARD_A4_WAKE_TRANSPORT="redis"', script)
         self.assertIn('ROOTYARD_WORKER_SCOPE="a4-target-audit"', script)
         self.assertIn('"rootyard:a4:test:" + self.schema', script)
+        self.assertIn("require_postgres_17", script)
+        self.assertIn("SHOW server_version_num", script)
 
 
 class HealthyTimingTest(unittest.TestCase):
@@ -88,6 +90,31 @@ class HealthyTimingTest(unittest.TestCase):
                 harness.healthy_push(None, {"id": "repo"}, 20)
 
 
+class PostgresVersionTest(unittest.TestCase):
+    def test_only_postgres_17_is_accepted(self):
+        for value in (170000, 170004, 179999):
+            self.assertEqual(a4.postgres_major(value), 17)
+            self.assertEqual(a4.require_postgres_17(value), 17)
+        for value in (0, 9999, 100000, 160000, 160004, 180000, 180001):
+            with self.subTest(value=value):
+                with self.assertRaises(a4.ProfileError):
+                    a4.require_postgres_17(value)
+
+    def test_lookup_is_bounded_parsed_and_redacted(self):
+        ok = SimpleNamespace(returncode=0, stdout="170004\n", stderr="")
+        with patch.object(a4.subprocess, "run", return_value=ok):
+            self.assertEqual(a4.postgres_server_version_num("/usr/bin/psql", "postgresql://fixture@127.0.0.1/db"), 170004)
+        failed = SimpleNamespace(returncode=1, stdout="", stderr="private-dsn-value")
+        with patch.object(a4.subprocess, "run", return_value=failed):
+            with self.assertRaises(a4.ProfileError) as caught:
+                a4.postgres_server_version_num("/usr/bin/psql", "postgresql://fixture:private@127.0.0.1/db")
+        self.assertNotIn("private", str(caught.exception))
+        malformed = SimpleNamespace(returncode=0, stdout="not-a-number\n", stderr="")
+        with patch.object(a4.subprocess, "run", return_value=malformed):
+            with self.assertRaises(a4.ProfileError):
+                a4.postgres_server_version_num("/usr/bin/psql", "postgresql://fixture@127.0.0.1/db")
+
+
 class ReportTest(unittest.TestCase):
     def setUp(self):
         self.args = SimpleNamespace(binary="binary", expect_commit="b" * 40, git=None, keep=False, report=None)
@@ -104,6 +131,8 @@ class ReportTest(unittest.TestCase):
             profile=Mock(),
             blob_profile={},
             harness_sha256="a" * 64,
+            postgres_major=17,
+            postgres_server_version_num=170004,
         )
         self.prepare = self.enterContext(patch.object(a4, "preflight", return_value=self.prepared))
         self.build = self.enterContext(patch.object(a4, "build_binding", return_value=self.binding))
@@ -117,6 +146,8 @@ class ReportTest(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual(report["kind"], a4.REPORT_KIND)
         self.assertEqual(report["expected_cases"], [a4.CASE])
+        self.assertEqual(report["postgres_major"], 17)
+        self.assertEqual(report["postgres_server_version_num"], 170004)
         self.assertEqual(report["cases"], [dict(
             name=a4.CASE,
             status="passed",
@@ -182,10 +213,24 @@ class PreflightTest(unittest.TestCase):
         with patch.object(a4.sys, "platform", "linux"):
             with patch.dict(a4.os.environ, env, clear=True):
                 with patch.object(a4.shutil, "which", return_value="/usr/bin/psql"):
-                    with patch.object(a4.CrossProcessHarness, "resolve_redis", return_value=None):
-                        with patch.object(a4, "build_binding") as build:
-                            with self.assertRaises(a4.ProfileError):
-                                a4.preflight(args)
+                    with patch.object(a4, "postgres_server_version_num", return_value=170000):
+                        with patch.object(a4.CrossProcessHarness, "resolve_redis", return_value=None):
+                            with patch.object(a4, "build_binding") as build:
+                                with self.assertRaises(a4.ProfileError):
+                                    a4.preflight(args)
+        build.assert_not_called()
+
+    def test_unsupported_postgres_fails_before_binding_or_fixture(self):
+        args = SimpleNamespace(binary="binary", expect_commit="b" * 40, git=None)
+        env = {"ROOTYARD_TEST_DATABASE_URL": "postgresql://fixture@127.0.0.1/synthetic"}
+        with patch.object(a4.sys, "platform", "linux"):
+            with patch.dict(a4.os.environ, env, clear=True):
+                with patch.object(a4.shutil, "which", return_value="/usr/bin/psql"):
+                    with patch.object(a4, "postgres_server_version_num", return_value=160000):
+                        with patch.object(a4.CrossProcessHarness, "resolve_redis", return_value="redis"):
+                            with patch.object(a4, "build_binding") as build:
+                                with self.assertRaisesRegex(a4.ProfileError, "PostgreSQL 17"):
+                                    a4.preflight(args)
         build.assert_not_called()
 
 

@@ -353,8 +353,11 @@ production ACLs remain pending. The `serve-blob`/A4 advisory producer and
 subscriber wiring is implemented behind the explicit variables above, but the
 real PG17/Garage/Redis external A4 acceptance remains pending: the opt-in entry
 point is `tests/a4_redis_wake_partition.py` with pure tests in
-`tests/test_a4_redis_wake_partition.py`, but no native PASSED report is claimed
-in this worktree. This increment keeps #111 open for that run and never makes
+`tests/test_a4_redis_wake_partition.py`. Its preflight reads the owned loopback
+fixture's `server_version_num` through the trusted existing `psql` and rejects
+any major other than 17 before effects; the report carries closed
+`postgres_major`/`postgres_server_version_num` evidence. No native PASSED report
+is claimed in this worktree. This increment keeps #111 open for that run and never makes
 Redis a hard quota or authority. The default build still needs no Redis.
 
 The full ignored real-Redis suite includes destructive FLUSHALL and CONFIG SET

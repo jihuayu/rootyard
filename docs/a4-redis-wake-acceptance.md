@@ -49,6 +49,13 @@ startup, and the A4 channel must not alias the configured generic wake channel o
 its default. A transport outage after valid startup remains advisory and the PG
 ticker continues.
 
+Preflight also uses the trusted existing `psql` executable against the owned
+loopback fixture to read `server_version_num` and requires PostgreSQL major 17
+before the fixture schema, repository or any effect is created. Unsupported
+server versions fail closed with a fixed diagnostic; the raw server string, DSN
+and stderr are not echoed. The report carries closed integer evidence
+`postgres_major: 17` and `postgres_server_version_num`.
+
 The binary must carry the existing attested `state-redis` build receipt whose
 `features.enabled` is exactly `["state-redis"]` and whose source commit/tree
 matches the clean current checkout. It is the same receipt contract used by the
@@ -197,8 +204,9 @@ fixed hint counter, subscriber count and relay forwarding.
 `write_report` helper. The report kind is exactly
 `rootyard/a4-redis-wake-external-acceptance`; the case name is exactly
 `real_a4_redis_wake_external_pg_fallback`. The report carries `source_head`,
-`source_tree`, `source_inputs_sha256`, `binary_sha256`, `build_receipt_sha256`
-and the acceptance harness SHA-256, plus the fixed limitations list. It never
+`source_tree`, `source_inputs_sha256`, `binary_sha256`, `build_receipt_sha256`,
+`postgres_major`, `postgres_server_version_num` and the acceptance harness
+SHA-256, plus the fixed limitations list. It never
 contains a DSN, token, Redis URL, S3 credential or exception body. Failure stages
 are fixed labels (`preflight`, `fixture`, `case`, `receipt_changed`, `cleanup`)
 and `owned_cleanup_completed` appears only after a successful owned cleanup. If

@@ -620,6 +620,43 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         )
 
 
+def postgres_major(server_version_num):
+    if type(server_version_num) is not int or server_version_num < 10000:
+        raise ProfileError("PostgreSQL server version unavailable")
+    return server_version_num // 10000
+
+
+def require_postgres_17(server_version_num):
+    major = postgres_major(server_version_num)
+    if major != 17:
+        raise ProfileError("PostgreSQL 17 is required")
+    return major
+
+
+def postgres_server_version_num(psql_path, database_url):
+    env = os.environ.copy()
+    env.pop("PGAPPNAME", None)
+    try:
+        result = subprocess.run(
+            [psql_path, "--dbname", database_url, "-X", "-A", "-t", "-w", "-v", "ON_ERROR_STOP=1",
+             "-c", "SHOW server_version_num"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ProfileError("PostgreSQL server version unavailable") from None
+    if result.returncode != 0:
+        raise ProfileError("PostgreSQL server version unavailable")
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        raise ProfileError("PostgreSQL server version unavailable") from None
+
+
 def preflight(args):
     env = os.environ.copy()
     need(__debug__, "A4 acceptance requires assertions")
@@ -630,7 +667,10 @@ def preflight(args):
     need(database.scheme in ("postgresql", "postgres"), "test database must be PostgreSQL")
     need(database.hostname in ("127.0.0.1", "::1", "localhost"), "test database must be loopback")
     need(not database.query, "test database URL must not carry a query")
-    need(shutil.which("psql"), "psql is required")
+    psql = shutil.which("psql")
+    need(psql, "psql is required")
+    server_version_num = postgres_server_version_num(psql, env["ROOTYARD_TEST_DATABASE_URL"])
+    postgres_major_value = require_postgres_17(server_version_num)
     redis_binary = CrossProcessHarness.resolve_redis()
     need(redis_binary, "ROOTYARD_TEST_REDIS_SERVER or redis-server is required; Redis coverage is mandatory")
     binding = build_binding(args.binary, args.expect_commit)
@@ -642,10 +682,12 @@ def preflight(args):
         profile=profile,
         blob_profile=blob_profile,
         harness_sha256=sha256_file(Path(__file__)),
+        postgres_server_version_num=server_version_num,
+        postgres_major=postgres_major_value,
     )
 
 
-def result_report(binding, case, passed, harness_sha256=None):
+def result_report(binding, case, passed, harness_sha256=None, postgres_major=None, postgres_server_version_num=None):
     report = dict(
         kind=REPORT_KIND,
         qualification_kind="clean-candidate" if binding.get("source_head") else "unbound",
@@ -663,6 +705,10 @@ def result_report(binding, case, passed, harness_sha256=None):
     )
     if harness_sha256:
         report["harness_sha256"] = harness_sha256
+    if postgres_major is not None:
+        report["postgres_major"] = postgres_major
+    if postgres_server_version_num is not None:
+        report["postgres_server_version_num"] = postgres_server_version_num
     return report
 
 
@@ -671,6 +717,8 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None):
     binding = {}
     harness = None
     harness_sha256 = None
+    postgres_major_value = None
+    postgres_server_version_num_value = None
     primary = "preflight"
     cleanup_error = None
     detail = None
@@ -678,6 +726,8 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None):
         prepared = prepare(args)
         binding = prepared.binding
         harness_sha256 = prepared.harness_sha256
+        postgres_server_version_num_value = getattr(prepared, "postgres_server_version_num", None)
+        postgres_major_value = require_postgres_17(postgres_server_version_num_value)
         primary = "fixture"
         harness = (harness_type or A4RedisWakeHarness)(
             args, prepared.profile, prepared.blob_profile, prepared.redis_binary
@@ -704,7 +754,14 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None):
         case = dict(name=CASE, status="failed", error=primary or cleanup_error)
         if primary is not None and cleanup_error is not None:
             case["cleanup_error"] = cleanup_error
-    return result_report(binding, case, passed, harness_sha256)
+    return result_report(
+        binding,
+        case,
+        passed,
+        harness_sha256,
+        postgres_major_value,
+        postgres_server_version_num_value,
+    )
 
 
 def main(argv=None):
@@ -734,6 +791,8 @@ def main(argv=None):
                 dict(name=CASE, status="failed", error="report_write"),
                 False,
                 report.get("harness_sha256"),
+                report.get("postgres_major"),
+                report.get("postgres_server_version_num"),
             )
     finally:
         signal.signal(signal.SIGTERM, previous)
