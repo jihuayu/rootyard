@@ -29,8 +29,8 @@ use super::{
     error::GatewayError,
     repo_session::SessionTokens,
 };
-use crate::{blob_store::opendal::BlobStore, cache_wake::ServingCache};
-
+use crate::{blob_store::opendal::BlobStore, cache_wake::ServingCache, dispatch};
+mod signals;
 tokio::task_local! {
     pub(super) static REQUEST_DEADLINE: Instant;
 }
@@ -52,6 +52,7 @@ pub struct BlobGitState {
     /// Advisory, non-authoritative payload cache. It is absent by default and
     /// carries no refs, auth, sessions, holds, roots or durable bytes.
     cache: Option<Arc<ServingCache>>,
+    dispatch: dispatch::Signals,
     packfile_offload: Option<Arc<crate::browse::packfile_uri::GatewayPackfileOffload>>,
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
@@ -85,6 +86,7 @@ impl BlobGitState {
             workspace: Arc::new(AtomicU64::new(0)),
             sessions: None,
             cache: None,
+            dispatch: dispatch::Signals::default(),
             packfile_offload: None,
             #[cfg(test)]
             admission_pause: None,
@@ -114,7 +116,6 @@ impl BlobGitState {
     pub(super) fn cache(&self) -> Option<&Arc<ServingCache>> {
         self.cache.as_ref()
     }
-
     /// Attach optional Smart-HTTP v2 `packfile-uris` offload runtime (#185).
     /// Absent (`None`) by default so gateway behavior stays strictly inline unless enabled.
     pub fn with_packfile_offload(mut self, offload: Arc<crate::browse::packfile_uri::GatewayPackfileOffload>) -> Self {

@@ -134,6 +134,7 @@ pub async fn sync_outbox_events(
             "SELECT e.event_id, e.operation_id, e.storage_generation, e.ref_name, e.old_oid, e.new_oid \
              FROM outbox_events e JOIN git_operations o ON o.id = e.operation_id \
              WHERE e.repository_id=$1 AND o.outcome <> 'unknown' AND e.ref_name NOT LIKE 'refs/rootyard-ci/%' \
+               AND COALESCE(o.evidence->>'kind','') <> 'pg_refstore_core_commit_audit' \
                AND EXISTS ( \
                  SELECT 1 FROM forge_webhooks w \
                  WHERE w.repository_id=e.repository_id AND w.active=true AND w.events ? 'push' \
@@ -206,6 +207,7 @@ pub(crate) async fn sync_outbox_events_bounded(
              JOIN forge_webhooks w ON w.repository_id = e.repository_id \
                AND w.tenant_id = $1 AND w.active = true AND w.events ? 'push' \
              WHERE e.repository_id = $2 AND o.outcome <> 'unknown' \
+               AND COALESCE(o.evidence->>'kind','') <> 'pg_refstore_core_commit_audit' \
                AND e.ref_name <> 'refs/rootyard-ci' \
                AND e.ref_name NOT LIKE 'refs/rootyard-ci/%' \
                AND NOT EXISTS (SELECT 1 FROM forge_webhook_deliveries d \
@@ -259,13 +261,18 @@ pub(crate) async fn sync_outbox_events_bounded(
     }
 }
 
-fn trusted_callback_target(input:&CiCallbackInput)
-    ->Result<(Uuid,Uuid,String,i64,i64,i64),Error>{
-    let (Some(run_id),Some(job_id),Some(base_oid),Some(generation),Some(pull_number),Some(attempt)) =
-        (input.ci_run_id,input.ci_job_id,input.base_oid.clone(),input.lease_generation,
-         input.pull_number,input.attempt)
-        else { return Err(Error::bad_request()); };
-    Ok((run_id,job_id,base_oid,generation,pull_number,attempt))
+fn trusted_callback_target(input: &CiCallbackInput) -> Result<(Uuid, Uuid, String, i64, i64, i64), Error> {
+    let (Some(run_id), Some(job_id), Some(base_oid), Some(generation), Some(pull_number), Some(attempt)) = (
+        input.ci_run_id,
+        input.ci_job_id,
+        input.base_oid.clone(),
+        input.lease_generation,
+        input.pull_number,
+        input.attempt,
+    ) else {
+        return Err(Error::bad_request());
+    };
+    Ok((run_id, job_id, base_oid, generation, pull_number, attempt))
 }
 
 /// HMAC-authenticated, idempotent CI callback ingestion. The HTTP admission and

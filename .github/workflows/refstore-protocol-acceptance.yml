@@ -153,15 +153,44 @@ jobs:
             --test ref_store_packs --test ref_store_materialized_reads \
             -- --ignored --test-threads=1 2>&1 | tee test-results/refstore/native.log
           python3 - <<'PY'
-          import json, pathlib, re
-          log = pathlib.Path('test-results/refstore/native.log').read_text()
+          import hashlib, json, os, pathlib, re, subprocess
+          log_path = pathlib.Path('test-results/refstore/native.log')
+          raw_log = log_path.read_bytes()
+          log = raw_log.decode()
           rows = re.findall(r'test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;', log)
           assert len(rows) == 4, rows
           assert all(state == 'ok' and failed == ignored == '0' for state, _, failed, ignored in rows), rows
-          assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 12, 23, 23], rows
+          suite_counts = sorted(int(passed) for _, passed, _, _ in rows)
+          assert suite_counts == [8, 12, 23, 24], rows
+          a4_name = 'decision_subset_support::cases_f::a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit'
+          a4_prefix = f'test {a4_name} ...'
+          a4_ok = f'{a4_prefix} ok'
+          a4_rows = [line for line in log.splitlines() if a4_prefix in line]
+          assert len(a4_rows) == 1, 'A4 exact row missing, duplicated, or ambiguous'
+          assert a4_rows[0] == a4_ok, 'A4 row is not exactly ok'
+          source_head = os.environ.get('GITHUB_SHA', '')
+          assert re.fullmatch(r'[0-9a-f]{40}', source_head), 'GITHUB_SHA must be 40-hex'
+          checkout_head = subprocess.check_output(
+              ['git', 'rev-parse', 'HEAD'],
+              cwd=os.environ['GITHUB_WORKSPACE'], text=True).strip()
+          assert checkout_head == source_head, 'GITHUB_SHA is not checkout HEAD'
+          checkout_tree = subprocess.check_output(
+              ['git', 'rev-parse', 'HEAD^{tree}'],
+              cwd=os.environ['GITHUB_WORKSPACE'], text=True).strip()
+          assert re.fullmatch(r'[0-9a-f]{40}', checkout_tree), 'checkout tree must be 40-hex'
           pathlib.Path('test-results/refstore/native.json').write_text(json.dumps({
               'passed': True, 'suite_counts': [int(row[1]) for row in rows],
               'ignored': 0, 'external_blob_backup': False, 'serving_cutover': False,
+          }, indent=2) + '\n')
+          pathlib.Path('test-results/refstore/issue107-a4-native.json').write_text(json.dumps({
+              'version': 1, 'issue': 318, 'suite': 'ref_store_decision_subset',
+              'case': a4_name, 'status': 'passed', 'passed': True, 'row': a4_ok,
+              'source_head': source_head, 'checkout_head': checkout_head,
+              'checkout_tree': checkout_tree,
+              'native_log': str(log_path),
+              'native_log_sha256': hashlib.sha256(raw_log).hexdigest(),
+              'suite_counts': suite_counts,
+              'ignored': 0,
           }, indent=2) + '\n')
           PY
       - name: "Create the run-owned #174 foundation database"
@@ -556,6 +585,7 @@ jobs:
           done
           python3 scripts/issue107_native11_runner.py \
             --source-head "$GITHUB_SHA" --source-root "$GITHUB_WORKSPACE" \
+            --allow-known-a4-extra \
             "${target_args[@]}" "${receipt_args[@]}" \
             --report test-results/refstore/issue107-native11.json
           python3 - "$GITHUB_SHA" test-results/refstore/issue107-native11.json <<'PY'
