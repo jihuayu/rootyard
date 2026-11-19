@@ -10,13 +10,15 @@
 //!
 //! # Trusted input
 //!
-//! [`SlotOneHandoff::from_verified_slot_zero`] accepts the exact
+//! [`SlotOneReceive::from_verified_slot_zero`] accepts the exact
 //! [`PublicAttemptRetirement`] selected by the terminal mirror plus the verified
-//! current-slot-zero evidence that names the same event. It checks the slot,
-//! state, event id/revision, absence of a retired attempt and the recomputable
-//! slot-zero proof before constructing the adapter input. A malformed or merely
-//! conflicting non-retirement answer is an internal/typed refusal, never a
-//! broad [`GatewayError::Conflict`] that could silently become a new push.
+//! current-slot-zero evidence that names the same event. It binds that
+//! retirement to the already-authenticated actor, parsed wire request and
+//! ordered staged pair metadata, then checks the slot, state, event
+//! id/revision, absence of a retired attempt and the recomputable slot-zero
+//! proof. A malformed or merely conflicting non-retirement answer is an
+//! internal/typed refusal, never a broad [`GatewayError::Conflict`] that could
+//! silently become a new push.
 //!
 //! # Transaction and lock order
 //!
@@ -86,23 +88,25 @@ use crate::blob_git_gateway::{
 /// The one gateway savepoint that owns the whole slot-one rotation call.
 const GATEWAY_SLOT_ONE_SAVEPOINT: &str = "rootyard_gateway_slot_one_handoff";
 
-/// Exact trusted stale-slot-zero retirement paired with the immutable producer
-/// identity it belongs to.
-///
-/// Fields are private so a caller cannot pair a retirement with a different
-/// public UUID, wire digest, mode or realm. The only constructor validates the
-/// verified current-slot-zero evidence and recomputes its proof.
+/// One immutable receive input: the authenticated original actor, the parsed
+/// wire request, the ordered staged pair metadata and the exact durable public
+/// retirement tuple. The rotation cannot receive alternate copies of these
+/// values, so its plan is necessarily built from the bytes that were parsed and
+/// staged for this request.
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
-#[derive(Clone, Eq, PartialEq)]
-pub(super) struct SlotOneHandoff {
+pub(super) struct SlotOneReceive<'a> {
+    actor: &'a Identity,
+    request: &'a PushRequest,
+    pairs: &'a [Pair],
     public: PublicAttemptRequest,
     retirement: PublicAttemptRetirement,
 }
 
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
-impl SlotOneHandoff {
-    /// Build the exact handoff input from a verified public attempt and the
-    /// retirement returned for its current slot-zero stale rejection.
+impl<'a> SlotOneReceive<'a> {
+    /// Build the exact receive context from the authenticated actor, parsed
+    /// request, ordered staged pairs, verified public attempt and selected
+    /// retirement.
     ///
     /// The evidence must be the current slot-zero attempt in `Rejected` state
     /// and the retirement must name that attempt's exact migration-139 event.
@@ -110,11 +114,13 @@ impl SlotOneHandoff {
     /// captured baseline as the original push; its public UUID, producer wire
     /// digest and commit mode are unchanged. The retired private UUID is only
     /// used to recompute the slot-zero proof and is never copied into the new
-    /// request.
+    /// request. No PG access, hashing or plan construction happens here.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_verified_slot_zero(
         serving: &ServingRepository,
-        actor: &Identity,
+        actor: &'a Identity,
+        request: &'a PushRequest,
+        pairs: &'a [Pair],
         public_id: Uuid,
         wire_digest: RequestDigest,
         mode: CommitMode,
@@ -154,20 +160,40 @@ impl SlotOneHandoff {
         if proof != current.proof_digest {
             return Err(GatewayError::Internal("slot one handoff slot-zero proof differs from the durable evidence"));
         }
-        Ok(Self { public, retirement: retirement.clone() })
+        Ok(Self { actor, request, pairs, public, retirement: retirement.clone() })
     }
 
-    /// The unchanged public request this handoff will rotate.
+    /// The unchanged public request this context will rotate.
     #[allow(dead_code)]
     pub(super) fn public(&self) -> &PublicAttemptRequest {
         &self.public
     }
+
+    /// The authenticated original actor bound to this receive.
+    #[allow(dead_code)]
+    pub(super) fn actor(&self) -> &Identity {
+        self.actor
+    }
+
+    /// The exact parsed wire request this receive admitted.
+    #[allow(dead_code)]
+    pub(super) fn request(&self) -> &PushRequest {
+        self.request
+    }
+
+    /// The exact ordered staged pair metadata this receive checked.
+    #[allow(dead_code)]
+    pub(super) fn pairs(&self) -> &[Pair] {
+        self.pairs
+    }
 }
 
-impl fmt::Debug for SlotOneHandoff {
+impl fmt::Debug for SlotOneReceive<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Do not render the actor, staged paths, raw backend or private attempt;
+        // the public request already redacts its own identity fields.
         formatter
-            .debug_struct("SlotOneHandoff")
+            .debug_struct("SlotOneReceive")
             .field("public", &self.public)
             .field("retirement", &self.retirement)
             .finish()
@@ -195,15 +221,6 @@ impl SlotOneAdmission {
             Self::Fresh { receipt, .. } | Self::Replayed(receipt) => receipt,
         }
     }
-
-    /// Split the fresh plan from its receipt. A replay returns `Err(self)` so a
-    /// caller cannot stage or publish bytes under a plan that was never built.
-    pub(super) fn into_fresh(self) -> Result<(Box<PackCommitPlan>, SlotOneRotationReceipt), Self> {
-        match self {
-            Self::Fresh { plan, receipt } => Ok((plan, receipt)),
-            replay @ Self::Replayed(_) => Err(replay),
-        }
-    }
 }
 
 impl fmt::Debug for SlotOneAdmission {
@@ -222,23 +239,25 @@ impl fmt::Debug for SlotOneAdmission {
 /// Rotate one exact slot-zero stale rejection into a fresh slot-one pending
 /// operation and acknowledge only the outer `COMMIT`.
 ///
-/// The caller has already captured `baseline` from the same serving realm and
-/// holds the staged original pack/index files. This adapter does not capture a
-/// baseline, choose a retirement, retry a stale plan, upload A3 bytes, run A4 or
-/// render HTTP. Those remain explicit reviewed callers above it.
+/// `receive` is the only source for the authenticated actor, parsed request,
+/// ordered staged pair metadata and public retirement tuple; `baseline` is the
+/// separately refreshed capture from the same serving realm. This adapter does
+/// not capture a baseline, choose a retirement, retry a stale plan, upload A3
+/// bytes, run A4 or render HTTP. Those remain explicit reviewed callers above
+/// it.
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn rotate_slot_one(
     state: &BlobGitState,
     serving: &ServingRepository,
-    actor: &Identity,
-    handoff: SlotOneHandoff,
-    request: &PushRequest,
-    pairs: &[Pair],
+    receive: &SlotOneReceive<'_>,
     baseline: &PackCommitBaseline,
     deadline: Instant,
 ) -> Result<SlotOneAdmission, GatewayError> {
-    let public = handoff.public.clone();
+    let public = receive.public.clone();
+    let actor = receive.actor;
+    let request = receive.request;
+    let pairs = receive.pairs;
     let repository_id = public.repository_id;
     if !actor_matches(actor, &public) {
         return Err(GatewayError::Internal("slot one actor differs from its public identity"));
@@ -261,7 +280,7 @@ pub(super) async fn rotate_slot_one(
         }
     };
 
-    let rotation = SlotOneRotationRequest { public: public.clone(), retirement: handoff.retirement.clone() };
+    let rotation = SlotOneRotationRequest { public: public.clone(), retirement: receive.retirement.clone() };
     let mut built = None;
     // Keep the rotation future and its owned savepoint in this block so no
     // result temporary outlives the borrow of the deadpool transaction.
@@ -470,15 +489,6 @@ fn validate_fresh_receipt(
         || receipt.base_revision != plan.expected().revision()
         || receipt.plan_digest != *plan.parent_digest()
         || receipt.wire_digest != public.wire_digest
-        || identity.issuer_id() != public.issuer_id
-        || plan.repository_id() != public.repository_id
-        || plan.tenant_id() != public.admission_owner_id
-        || plan.owner_id() != public.admission_owner_id
-        || plan.object_format() != public.object_format
-        || plan.history_incarnation() != public.history_incarnation
-        || plan.authority_epoch() != public.authority_epoch
-        || plan.group_epoch() != public.group_epoch
-        || plan.commit_mode() != public.request_mode
     {
         return Err(GatewayError::Internal("slot one rotation receipt differs from its fresh plan"));
     }
@@ -554,7 +564,10 @@ impl fmt::Debug for Redacted {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use crate::{
+        blob_git_gateway::protocol::PushCommand,
         db::Repository,
         ref_store::{
             GitObjectFormat, IssuerLane,
@@ -647,6 +660,32 @@ mod tests {
         PublicAttemptEvidence { public_id: public.public_id, current, retired: None }
     }
 
+    fn wire_request() -> PushRequest {
+        PushRequest {
+            commands: vec![
+                PushCommand { old: "1".repeat(40), new: "2".repeat(40), name: "refs/heads/main".to_owned() },
+                PushCommand { old: "3".repeat(40), new: "4".repeat(40), name: "refs/heads/side".to_owned() },
+            ],
+            capabilities: vec!["report-status".to_owned()],
+        }
+    }
+
+    fn staged_pair(name: &str, pack_digit: char, idx_digit: char) -> Pair {
+        Pair {
+            pack: PathBuf::from(format!("/staged/{name}.pack")),
+            idx: PathBuf::from(format!("/staged/{name}.idx")),
+            pack_id: Uuid::new_v4(),
+            pack_sha: pack_digit.to_string().repeat(64),
+            pack_len: 101,
+            idx_sha: idx_digit.to_string().repeat(64),
+            idx_len: 37,
+        }
+    }
+
+    fn staged_pairs() -> Vec<Pair> {
+        vec![staged_pair("first", 'a', 'b'), staged_pair("second", 'c', 'd')]
+    }
+
     fn retirement(event_id: Uuid, event_revision: i64) -> PublicAttemptRetirement {
         PublicAttemptRetirement { event_id, event_revision }
     }
@@ -660,13 +699,17 @@ mod tests {
         let private_id = Uuid::new_v4();
         let event_id = Uuid::new_v4();
         let digest = RequestDigest::of("slot-one-handoff-request", &[b"wire"]);
+        let request = wire_request();
+        let pairs = staged_pairs();
         let public = public_request(&serving, &actor, public_id, digest, &baseline);
         let evidence = rejected_evidence(&public, private_id, event_id, 6, 7);
         let retirement = retirement(event_id, 7);
 
-        let handoff = SlotOneHandoff::from_verified_slot_zero(
+        let receive = SlotOneReceive::from_verified_slot_zero(
             &serving,
             &actor,
+            &request,
+            &pairs,
             public_id,
             digest,
             CommitMode::AcceptedSubset,
@@ -677,16 +720,30 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(handoff.public().public_id, public_id);
-        assert_eq!(handoff.public().wire_digest, digest);
-        assert_eq!(handoff.public().request_mode, CommitMode::AcceptedSubset);
-        assert_eq!(handoff.public().admission_owner_id, serving.gate.tenant_id());
-        assert!(!format!("{handoff:?}").contains(&private_id.to_string()));
-        assert!(!format!("{handoff:?}").contains(&event_id.to_string()));
+        assert_eq!(receive.public().public_id, public_id);
+        assert_eq!(receive.public().wire_digest, digest);
+        assert_eq!(receive.public().request_mode, CommitMode::AcceptedSubset);
+        assert_eq!(receive.public().admission_owner_id, serving.gate.tenant_id());
+        assert!(std::ptr::eq(receive.actor(), &actor));
+        assert!(std::ptr::eq(receive.request(), &request));
+        assert_eq!(receive.pairs().as_ptr(), pairs.as_ptr());
+        assert_eq!(receive.request().commands, request.commands);
+        assert_eq!(receive.pairs().len(), pairs.len());
+        for (observed, expected) in receive.pairs().iter().zip(&pairs) {
+            assert_eq!(observed.pack, expected.pack);
+            assert_eq!(observed.idx, expected.idx);
+            assert_eq!(observed.pack_sha, expected.pack_sha);
+            assert_eq!(observed.pack_len, expected.pack_len);
+            assert_eq!(observed.idx_sha, expected.idx_sha);
+            assert_eq!(observed.idx_len, expected.idx_len);
+        }
+        assert_eq!(receive.retirement, retirement);
+        assert!(!format!("{receive:?}").contains(&private_id.to_string()));
+        assert!(!format!("{receive:?}").contains(&event_id.to_string()));
     }
 
     #[test]
-    fn only_the_exact_current_slot_zero_rejection_is_a_handoff_input() {
+    fn only_the_exact_current_slot_zero_rejection_is_a_receive_input() {
         let serving = serving();
         let actor = actor();
         let baseline = baseline(&serving);
@@ -694,6 +751,8 @@ mod tests {
         let private_id = Uuid::new_v4();
         let event_id = Uuid::new_v4();
         let digest = RequestDigest::of("slot-one-handoff-invalid", &[b"wire"]);
+        let request = wire_request();
+        let pairs = staged_pairs();
         let public = public_request(&serving, &actor, public_id, digest, &baseline);
         let valid = rejected_evidence(&public, private_id, event_id, 6, 7);
         let valid_retirement = retirement(event_id, 7);
@@ -733,9 +792,11 @@ mod tests {
         ];
 
         for (label, evidence, retirement) in cases {
-            let error = SlotOneHandoff::from_verified_slot_zero(
+            let error = SlotOneReceive::from_verified_slot_zero(
                 &serving,
                 &actor,
+                &request,
+                &pairs,
                 public_id,
                 digest,
                 CommitMode::AcceptedSubset,
@@ -813,6 +874,39 @@ mod tests {
         assert_ne!(fresh, retired);
         assert_eq!(fresh, slot_one_pack_id(private_id, &sha));
         assert_eq!(fresh, crate::blob_git_gateway::native::derived_uuid("pack-id", private_id, sha.as_bytes()));
+    }
+
+    #[test]
+    fn source_keeps_the_receive_context_as_the_only_plan_input() {
+        let source = include_str!("slot_one.rs");
+        let signature = source
+            .split("pub(super) async fn rotate_slot_one(")
+            .nth(1)
+            .expect("rotation function")
+            .split(") -> Result<SlotOneAdmission, GatewayError>")
+            .next()
+            .expect("rotation signature");
+        assert!(signature.contains("receive: &SlotOneReceive<'_>"));
+        assert!(!signature.contains("actor: &Identity"));
+        assert!(!signature.contains("request: &PushRequest"));
+        assert!(!signature.contains("pairs: &[Pair]"));
+        assert!(source.contains("let actor = receive.actor;"));
+        assert!(source.contains("let request = receive.request;"));
+        assert!(source.contains("let pairs = receive.pairs;"));
+        assert!(source.contains("build_slot_one_plan(request, pairs, &public, baseline, preview)?"));
+        assert!(!source.contains(&["into_", "fresh"].concat()));
+        let replay = source
+            .split("if receipt.replayed {")
+            .nth(1)
+            .expect("replay branch")
+            .split("let Some(plan) = built else")
+            .next()
+            .expect("replay branch end");
+        assert!(replay.contains("commit_bounded(savepoint, deadline, repository_id, Some(public.public_id))"));
+        assert!(replay.contains("let replay_auth = live_serving_in_tx(&tx, state, serving, actor, deadline).await;"));
+        assert!(replay.contains("rollback_deadpool_bounded(tx, deadline)"));
+        let production = source.split("#[cfg(test)]").next().expect("production source");
+        assert_eq!(production.matches("live_serving_in_tx(&tx, state, serving, actor, deadline).await").count(), 2);
     }
 
     #[test]
