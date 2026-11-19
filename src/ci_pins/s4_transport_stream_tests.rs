@@ -155,6 +155,10 @@ fn assert_slot_free(semaphore: &Arc<Semaphore>) {
     assert!(semaphore.clone().try_acquire_owned().is_ok(), "stream slot leaked after cleanup");
 }
 
+fn axum_io_error(error: axum::Error) -> io::Error {
+    *error.into_inner().downcast::<io::Error>().expect("axum body error must wrap io::Error")
+}
+
 #[tokio::test]
 async fn healthy_producer_preserves_exact_chunks_and_success() {
     let (h, auth, _checks) = live_harness(Instant::now() + Duration::from_secs(30), PackExit::Success);
@@ -222,7 +226,7 @@ async fn absolute_deadline_cleans_up_unpolled_body_and_suppresses_queued_chunk()
 
     let mut body = h.body.into_data_stream();
     let error = body.next().await.expect("terminal item").expect_err("queued chunk escaped after deadline");
-    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(axum_io_error(error).kind(), io::ErrorKind::TimedOut);
     assert!(body.next().await.is_none());
 }
 
@@ -244,7 +248,7 @@ async fn deadline_cleanup_is_not_wedged_by_a_pending_authorization_probe() {
 
     let mut body = h.body.into_data_stream();
     let error = body.next().await.expect("terminal item").expect_err("suspended probe yielded data");
-    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(axum_io_error(error).kind(), io::ErrorKind::TimedOut);
 }
 
 #[tokio::test]

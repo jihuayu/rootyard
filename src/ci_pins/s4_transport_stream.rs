@@ -22,7 +22,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ChildStdout},
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::ChildStdout,
     sync::{
         mpsc::{self, error::TrySendError},
         oneshot::{self, error::TryRecvError},
@@ -198,18 +199,18 @@ async fn run_producer<O, F>(
     let mut clean = false;
 
     macro_rules! recheck {
-        () => {
+        ($label:lifetime) => {
             match live_check(&mut check, deadline, data.closed()).await {
                 CheckOutcome::Live => {}
                 CheckOutcome::Revoked => {
                     failure = Some(revoked_error());
-                    break 'producer;
+                    break $label;
                 }
                 CheckOutcome::TimedOut => {
                     failure = Some(timeout_error());
-                    break 'producer;
+                    break $label;
                 }
-                CheckOutcome::Closed => break 'producer,
+                CheckOutcome::Closed => break $label,
             }
         };
     }
@@ -223,7 +224,7 @@ async fn run_producer<O, F>(
             Err(TrySendError::Full(())) => {
                 // The body is not consuming: prove authority before waiting,
                 // then keep proving it even while delivery is blocked.
-                recheck!();
+                recheck!('producer);
                 loop {
                     tokio::select! {
                         biased;
@@ -232,7 +233,7 @@ async fn run_producer<O, F>(
                             failure = Some(timeout_error());
                             break 'producer;
                         }
-                        _ = ticker.tick() => recheck!(),
+                        _ = ticker.tick() => recheck!('producer),
                         reserved = data.reserve() => match reserved {
                             Ok(permit) => break permit,
                             Err(_) => break 'producer,
@@ -250,7 +251,7 @@ async fn run_producer<O, F>(
                     failure = Some(timeout_error());
                     break 'producer;
                 }
-                _ = ticker.tick() => recheck!(),
+                _ = ticker.tick() => recheck!('producer),
                 read = owner.read(&mut buffer) => break read,
             }
         };
