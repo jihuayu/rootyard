@@ -61,7 +61,7 @@ use uuid::Uuid;
 use crate::{
     db::Identity,
     ref_store::{
-        CommitMode, OperationIdentity, OperationState, PgRefStore, RequestDigest,
+        OperationIdentity, OperationState, PgRefStore,
         core::{
             RealmExpectation,
             pack_commit::{
@@ -581,7 +581,7 @@ mod tests {
     use crate::{
         db::Repository,
         ref_store::{
-            GitObjectFormat,
+            CommitMode, GitObjectFormat, RequestDigest,
             core::{
                 contract::CoreGate,
                 pack_commit::{PackCommitBaseline, PackMode},

@@ -799,7 +799,20 @@ mod tests {
         let digest = RequestDigest::of("receive-provenance-wire", &[b"body"]);
         let operation = Uuid::new_v4();
         let pairs = staged_pairs();
-        let verified = verified_receive(&actor, &serving, operation, request.clone(), mode, digest, pairs.clone());
+        let expected_pairs = pairs
+            .iter()
+            .map(|pair| {
+                (
+                    pair.pack.clone(),
+                    pair.idx.clone(),
+                    pair.pack_sha.clone(),
+                    pair.pack_len,
+                    pair.idx_sha.clone(),
+                    pair.idx_len,
+                )
+            })
+            .collect::<Vec<_>>();
+        let verified = verified_receive(&actor, &serving, operation, request.clone(), mode, digest, pairs);
 
         assert!(std::ptr::eq(verified.actor(), &actor));
         assert_eq!(verified.operation_id(), operation);
@@ -808,14 +821,16 @@ mod tests {
         assert_eq!(verified.request(), &request);
         assert_eq!(verified.mode(), CommitMode::Atomic);
         assert_eq!(verified.digest(), digest);
-        assert_eq!(verified.pairs().len(), pairs.len());
-        for (observed, expected) in verified.pairs().iter().zip(&pairs) {
-            assert_eq!(observed.pack, expected.pack);
-            assert_eq!(observed.idx, expected.idx);
-            assert_eq!(observed.pack_sha, expected.pack_sha);
-            assert_eq!(observed.pack_len, expected.pack_len);
-            assert_eq!(observed.idx_sha, expected.idx_sha);
-            assert_eq!(observed.idx_len, expected.idx_len);
+        assert_eq!(verified.pairs().len(), expected_pairs.len());
+        for (observed, (pack, idx, pack_sha, pack_len, idx_sha, idx_len)) in
+            verified.pairs().iter().zip(&expected_pairs)
+        {
+            assert_eq!(observed.pack, *pack);
+            assert_eq!(observed.idx, *idx);
+            assert_eq!(observed.pack_sha, *pack_sha);
+            assert_eq!(observed.pack_len, *pack_len);
+            assert_eq!(observed.idx_sha, *idx_sha);
+            assert_eq!(observed.idx_len, *idx_len);
         }
     }
 
@@ -835,7 +850,7 @@ mod tests {
         let digest = RequestDigest::of("receive-provenance-handoff", &[b"body"]);
         let operation = Uuid::new_v4();
         let pairs = staged_pairs();
-        let verified = verified_receive(&actor, &serving, operation, request.clone(), mode, digest, pairs.clone());
+        let verified = verified_receive(&actor, &serving, operation, request.clone(), mode, digest, pairs);
         let baseline = baseline(&serving);
         let public = public_request(&serving, &actor, operation, digest, mode);
         let private_id = Uuid::new_v4();
@@ -944,7 +959,7 @@ mod tests {
 
     #[test]
     fn handoff_refuses_receive_provenance_from_another_repository() {
-        let serving = serving();
+        let original = serving();
         let other = serving();
         let actor = Identity {
             id: Uuid::new_v4(),
@@ -958,7 +973,7 @@ mod tests {
         let mode = mode_for(&request);
         let digest = RequestDigest::of("receive-provenance-foreign", &[b"body"]);
         let operation = Uuid::new_v4();
-        let verified = verified_receive(&actor, &serving, operation, request, mode, digest, staged_pairs());
+        let verified = verified_receive(&actor, &original, operation, request, mode, digest, staged_pairs());
         let other_baseline = baseline(&other);
         let public = public_request(&other, &actor, operation, digest, mode);
         let event_id = Uuid::new_v4();
