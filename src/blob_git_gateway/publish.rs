@@ -418,6 +418,15 @@ pub(super) async fn begin_slot_zero(
     }
 }
 
+/// Read-only classification made under the public/operation locks before any
+/// lane or authority lock. It only selects the lock order; the authenticated
+/// lookup below makes the final decision.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SlotZeroRoute {
+    Replay,
+    Fresh,
+}
+
 /// What the authenticated public preflight found for this public UUID.
 enum SlotZeroPreflight {
     /// No wrapper, private claim or legacy operation exists. The typed request
@@ -429,20 +438,23 @@ enum SlotZeroPreflight {
 
 /// One authenticated, lock-ordered public preflight in the caller's transaction.
 ///
-/// Order is fixed: migration-152 public/attempt locks, the migration-138
-/// operation key, the expected issuer-lane pre-lock, live serving authority
-/// (token/role/scope/restore/realm/binding/backend), then the read-only public
-/// lookup. The lane pre-lock is the slot-zero order-sensitive step: it is held
-/// before the repository/binding/gate reads and advances no sequence. The fresh
-/// restore/realm must equal the already authorized baseline; a moved authority
-/// is a conflict, never a silently adopted realm.
+/// Order is fixed and enforced under the public/attempt and migration-138
+/// operation locks: a read-only public precheck; for an exact `Unknown`, the
+/// issuer lane is locked or its zero row created; then live serving authority
+/// (token/role/scope/restore/realm/binding/backend) and the final public lookup.
+/// A known replay never locks or creates the lane, so an exhausted lane cannot
+/// overflow and no allocation is observable. The fresh lane is held before any
+/// repository/binding/gate read and advances no sequence; the slot-zero
+/// coordinator previews/advances it later. A moved restore/realm is a conflict,
+/// never a silently adopted realm.
 ///
-/// Exits are closed: `Unknown` keeps this transaction for fresh admission;
-/// wrapper evidence resolves in this transaction then rolls back; a claim rolls
-/// back; `PrivateIdentifier` is a conflict; `LegacyPath` is the only branch that
-/// calls the older legacy lookup and only under the already-held operation key;
-/// mixed/corrupt evidence returns a typed error. No branch falls through to the
-/// legacy fresh writer.
+/// Exits are closed: only the fresh precheck may become fresh after
+/// authentication, and then keeps this transaction for admission; a replay
+/// precheck that becomes `Unknown` returns its precheck error; wrapper evidence
+/// resolves in this transaction then rolls back; `PrivateIdentifier` is a
+/// conflict; `LegacyPath` is the only branch that calls the older legacy lookup
+/// and only under the already-held operation key; mixed/corrupt evidence returns
+/// a typed error. No branch falls through to the legacy fresh writer.
 #[allow(clippy::too_many_arguments)]
 async fn slot_zero_public_preflight(
     tx: &deadpool_postgres::Transaction<'_>,
@@ -461,13 +473,33 @@ async fn slot_zero_public_preflight(
     crate::ref_store::pg::lock_operation(&**tx, repository_id, public_request.public_id, deadline)
         .await
         .map_err(GatewayError::from)?;
-    // The lane pre-lock precedes the repository/binding/gate locks taken by the
-    // authenticated lookup and by the slot-zero coordinator. It locks only an
-    // existing lane row and never computes `+1`, inserts a missing lane or
-    // advances a sequence, so a verified replay cannot overflow or enter the
-    // allocation path. Fresh admission allocates later in this same
-    // transaction, before its repository/gate writes. Any refusal rolls back.
-    PgRefStore.lock_expected_lane(&**tx, repository_id, actor.id, lane, deadline).await.map_err(GatewayError::from)?;
+
+    // Classify under the public/operation locks before touching any lane or
+    // authority lock. A wrapper/private/legacy hit, or a malformed/restore
+    // mismatch, is a known replay route and must stay read-only. Only an exact
+    // `Unknown` may create/lock the lane before repository/binding locks.
+    let preliminary = PgRefStore.lookup_public_attempt(&**tx, public_request, deadline).await;
+    let (route, precheck_error) = match preliminary {
+        Ok(PublicAttemptLookup::Unknown) => (SlotZeroRoute::Fresh, None),
+        Ok(_) => (SlotZeroRoute::Replay, None),
+        Err(error) => (SlotZeroRoute::Replay, Some(GatewayError::from(error))),
+    };
+
+    if route == SlotZeroRoute::Fresh {
+        // Strict order for an authorized fresh attempt: public/operation locks
+        // are held, then the lane is locked or its zero row is created. The
+        // helper never computes `+1`, so a replay never reaches it and cannot
+        // overflow an exhausted lane. A concurrent first insert is waited out by
+        // ON CONFLICT before any repository/binding read.
+        PgRefStore
+            .lock_or_create_expected_lane(&**tx, repository_id, actor.id, lane, deadline)
+            .await
+            .map_err(GatewayError::from)?;
+    }
+
+    // Authorization and the live restore/realm fence still run in this same
+    // transaction. On a fresh route the lane is already held; on replay no lane
+    // or sequence effect exists to leak if this refuses.
     let fresh = crate::ref_store::serving::lookup_in_tx(
         tx,
         actor,
@@ -488,8 +520,20 @@ async fn slot_zero_public_preflight(
         return Err(GatewayError::Conflict("repository authority changed; retry"));
     }
 
-    match PgRefStore.lookup_public_attempt(&**tx, public_request, deadline).await.map_err(GatewayError::from)? {
-        PublicAttemptLookup::Unknown => Ok(SlotZeroPreflight::Fresh(public_request.clone())),
+    // Final lookup after authentication (and, for fresh, after the lane lock)
+    // supplies the exact restore-scoped evidence. A replay route can never
+    // become fresh here; a fresh route that resolves to a known/malformed result
+    // rolls back the provisionally created lane with the outer transaction.
+    let final_lookup =
+        PgRefStore.lookup_public_attempt(&**tx, public_request, deadline).await.map_err(GatewayError::from)?;
+
+    match final_lookup {
+        PublicAttemptLookup::Unknown if route == SlotZeroRoute::Fresh => {
+            Ok(SlotZeroPreflight::Fresh(public_request.clone()))
+        }
+        PublicAttemptLookup::Unknown => Err(precheck_error.unwrap_or(GatewayError::Internal(
+            "replay route resolved to an unknown public operation after authentication",
+        ))),
         PublicAttemptLookup::PrivateIdentifier => {
             Err(GatewayError::Conflict("operation identifier is already a private attempt"))
         }
