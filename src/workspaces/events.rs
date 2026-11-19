@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use uuid::Uuid;
 
+const PAGE_LIMIT: i64 = 100;
+
 async fn batch(state: &AppState, id: Uuid, after: i64) -> Result<(i64, Vec<Value>), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     // One statement gives the replay and its durable watermark the same snapshot.
@@ -19,9 +21,9 @@ async fn batch(state: &AppState, id: Uuid, after: i64) -> Result<(i64, Vec<Value
              SELECT snapshot.revision,ev.revision,ev.kind,ev.payload \
              FROM snapshot LEFT JOIN LATERAL ( \
                  SELECT revision,kind,payload FROM workspace_events \
-                 WHERE workspace_id=$1 AND revision>$2 ORDER BY revision LIMIT 100 \
-             ) ev ON true",
-            &[&id, &after],
+                 WHERE workspace_id=$1 AND revision>$2 ORDER BY revision LIMIT $3 \
+             ) ev ON true ORDER BY ev.revision",
+            &[&id, &after, &PAGE_LIMIT],
         )
         .await
         .map_err(Error::internal)?;
@@ -63,7 +65,12 @@ fn gap(after: i64, snapshot_revision: i64, events: &[Value]) -> bool {
         }
         expected = revision.saturating_add(1);
     }
-    events.is_empty() && after < snapshot_revision
+    let ended_at = events.last().and_then(|event| event["revision"].as_i64()).unwrap_or(after);
+    (events.len() as i64) < PAGE_LIMIT && ended_at < snapshot_revision
+}
+
+fn resync_event(snapshot_revision: i64) -> Event {
+    Event::default().event("RESYNC_REQUIRED").data(json!({"snapshot_revision":snapshot_revision}).to_string())
 }
 
 pub async fn list(
@@ -106,9 +113,12 @@ pub async fn stream(
             if service::authorized(&state,&headers,id,Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await.is_err() { break; }
             match batch(&state,id,after).await {
                 Ok((snapshot_revision,events)) => {
-                    if after > snapshot_revision { break; }
+                    if after > snapshot_revision {
+                        yield Ok(resync_event(snapshot_revision));
+                        break;
+                    }
                     if gap(after,snapshot_revision,&events) {
-                        yield Ok(Event::default().event("RESYNC_REQUIRED").data(json!({"snapshot_revision":snapshot_revision}).to_string()));
+                        yield Ok(resync_event(snapshot_revision));
                         break;
                     }
                     for item in events {
