@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 const BUCKET: &str = "w8a-paired-bucket";
 const REGION: &str = "garage";
@@ -16,8 +17,23 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 static SHARED: OnceLock<LoopbackS3> = OnceLock::new();
 
 #[derive(Default)]
+struct PauseArm {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct Intercept {
+    gets_since_arm: usize,
+    corrupt_at: Option<usize>,
+    pause_at: Option<usize>,
+    pause: Option<PauseArm>,
+}
+
+#[derive(Default)]
 struct S3State {
     objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    intercept: Mutex<Intercept>,
 }
 
 pub struct LoopbackS3 {
@@ -66,7 +82,36 @@ impl LoopbackS3 {
 
     pub fn clear(&self) {
         self.state.objects.lock().unwrap().clear();
+        self.clear_intercepts();
     }
+
+    pub fn clear_intercepts(&self) {
+        *self.state.intercept.lock().unwrap() = Intercept::default();
+    }
+
+    pub fn arm_corrupt_get_at(&self, at: usize) {
+        let mut intercept = self.state.intercept.lock().unwrap();
+        intercept.gets_since_arm = 0;
+        intercept.corrupt_at = Some(at);
+        intercept.pause_at = None;
+        intercept.pause = None;
+    }
+
+    pub fn arm_pause_get_at(&self, at: usize) -> PausedGet {
+        let paused = PausedGet { entered: Arc::new(Notify::new()), release: Arc::new(Notify::new()) };
+        let mut intercept = self.state.intercept.lock().unwrap();
+        intercept.gets_since_arm = 0;
+        intercept.corrupt_at = None;
+        intercept.pause_at = Some(at);
+        intercept.pause = Some(PauseArm { entered: Arc::clone(&paused.entered), release: Arc::clone(&paused.release) });
+        paused
+    }
+}
+
+#[derive(Clone)]
+pub struct PausedGet {
+    pub entered: Arc<Notify>,
+    pub release: Arc<Notify>,
 }
 
 /// Serializes every process-environment mutation in this suite and restores the
@@ -90,11 +135,18 @@ impl EnvGuard {
         Self { _lock: lock, saved }
     }
 
-    pub fn update(&mut self, key: &'static str, value: &str) {
+    pub fn set_opt(&mut self, key: &'static str, next: Option<&str>) {
         if !self.saved.iter().any(|(saved, _)| *saved == key) {
             self.saved.push((key, std::env::var(key).ok()));
         }
-        unsafe { std::env::set_var(key, value) };
+        match next {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    pub fn update(&mut self, key: &'static str, value: &str) {
+        self.set_opt(key, Some(value));
     }
 }
 
@@ -193,8 +245,42 @@ async fn handle(
             )
         }
         Method::GET => {
+            let (corrupt, paused) = {
+                let mut intercept = state.intercept.lock().unwrap();
+                intercept.gets_since_arm += 1;
+                let at = intercept.gets_since_arm;
+                let corrupt = intercept.corrupt_at == Some(at);
+                let paused = if intercept.pause_at == Some(at) {
+                    intercept.pause.as_ref().map(|pause| (Arc::clone(&pause.entered), Arc::clone(&pause.release)))
+                } else {
+                    None
+                };
+                (corrupt, paused)
+            };
+            if let Some((entered, release)) = paused {
+                let notified = release.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                entered.notify_one();
+                notified.await;
+                return error(StatusCode::NOT_FOUND, "NoSuchKey");
+            }
             let stored = state.objects.lock().unwrap().get(&full).cloned();
-            let Some(stored) = stored else { return error(StatusCode::NOT_FOUND, "NoSuchKey") };
+            let Some(mut stored) = stored else { return error(StatusCode::NOT_FOUND, "NoSuchKey") };
+            if corrupt {
+                if let Some(first) = stored.first_mut() {
+                    *first ^= 0xff;
+                } else {
+                    stored.push(0xff);
+                }
+                let len = stored.len();
+                return response(
+                    StatusCode::OK,
+                    Some(len),
+                    &[("content-type", "application/octet-stream")],
+                    Body::from(stored),
+                );
+            }
             let tag = etag(&stored);
             if let Some(raw) = headers.get(header::RANGE).and_then(|value| value.to_str().ok()) {
                 let Some((start, end)) = range(raw, stored.len()) else {

@@ -11,19 +11,22 @@ use uuid::Uuid;
 
 mod create;
 mod deleter_fence;
+mod fsck;
 mod manifest_key_ref;
 mod restore;
 #[cfg(test)]
 mod tests;
 
 pub use super::authority::{W8aFenceReceipt, fence_w8a_fresh_incarnation};
-pub use create::{W8aCreateReceipt, W8aRepoFsckReceipt, create};
+pub use create::{W8aCreateReceipt, create};
 pub use deleter_fence::{DeleterAdmissionReceipt, admit_deleter_epoch, ensure_destructive_gc_disabled};
+pub use fsck::W8aRepoFsckReceipt;
 pub use manifest_key_ref::{
     KEY_CANARY_DOMAIN, KEY_DIGEST_DOMAIN, MANIFEST_SEAL_DOMAIN, W8A_FORMAT_VERSION, W8aKeyReference,
     W8aPairedSidecarManifest, capture_key_reference, verify_key_reference,
 };
 pub use restore::{W8aRestoreReceipt, check, restore};
+pub(super) use restore::{finish_guarded_restore, verify_restored_source_snapshot};
 
 /// Fail-closed W8-A refusals. Every variant carries only non-secret, bounded
 /// diagnostic text (repository ids, epochs, counts and reasons).

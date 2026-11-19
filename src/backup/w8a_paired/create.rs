@@ -1,21 +1,18 @@
 //! Single-node W8-A paired backup creation.
 //!
 //! Preflight proves the source is one stable, PG RefStore serving incarnation
-//! with no raft projection rows, captures non-secret source identities, then
-//! drops the read-only connection and delegates the frozen format30 archive to
-//! the shared offline backup. Only after that inner archive verifies does this
+//! with no raft projection rows and captures the non-secret source authority
+//! identity inside the shared `RepeatableRead` + `SHARE`-locked
+//! `pg_export_snapshot()` transaction (never on a separate pre-snapshot
+//! connection). Only after that inner format30 archive verifies does this
 //! module add the W8-A sidecar and complete marker; publication is atomic.
 use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::path::Path;
-use std::process::Output;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::blob_store::archive::ArchiveTransfer;
 use crate::config::Config;
 use crate::storage_lifecycle::models::Policy;
 
@@ -47,11 +44,33 @@ pub struct W8aCreateReceipt {
     pub sidecar: W8aPairedSidecarManifest,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SourceIdentity {
-    cluster_incarnation: Uuid,
-    storage_authority_id: Uuid,
-    storage_authority_epoch: i64,
+struct StagingW8aGuard {
+    path: PathBuf,
+    published: bool,
+}
+
+impl StagingW8aGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, published: false }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish_to(&mut self, destination: &Path) -> W8aResult<()> {
+        super::super::publish(&self.path, destination).map_err(backup_error)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagingW8aGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 pub async fn create(config: &Config, destination: &Path) -> W8aResult<W8aCreateReceipt> {
@@ -70,34 +89,35 @@ pub async fn create(config: &Config, destination: &Path) -> W8aResult<W8aCreateR
         .map_err(|error| W8aError::BackupFailed(format!("destination: {error:#}")))?;
     let policy = Policy::from_env().map_err(|error| W8aError::BackupFailed(format!("policy: {error:#}")))?;
     ensure_destructive_gc_disabled(&policy)?;
-    let source = read_source(config).await?;
-    let staging = target
+    let staging_path = target
         .parent()
         .context("destination has no parent")
         .map_err(backup_error)?
         .join(format!(".rootyard-w8a-{}.partial", w8a_backup_id.simple()));
-    if staging.exists() {
+    if staging_path.exists() {
         return Err(W8aError::BackupFailed("staging directory already exists".into()));
     }
-    super::super::private_dir(&staging).map_err(backup_error)?;
-    let result = build(config, &staging, &target, w8a_backup_id, source).await;
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(&staging);
-    }
-    result
+    super::super::private_dir(&staging_path).map_err(backup_error)?;
+    let mut staging = StagingW8aGuard::new(staging_path);
+    build(config, &mut staging, &target, w8a_backup_id).await
 }
 
 async fn build(
     config: &Config,
-    staging: &Path,
+    staging: &mut StagingW8aGuard,
     target: &Path,
     w8a_backup_id: Uuid,
-    source: SourceIdentity,
 ) -> W8aResult<W8aCreateReceipt> {
-    let inner = staging.join("format30");
-    super::super::create(config, &inner)
-        .await
-        .map_err(|error| W8aError::BackupFailed(format!("inner format30 backup: {error:#}")))?;
+    let inner = staging.path().join("format30");
+    let source = super::super::snapshot::create_with_source_check(config, &inner, |src| {
+        ensure_clean_source(src.total_repositories, src.served_repositories, src.raft_cursors, src.raft_operations)
+            .map_err(anyhow::Error::new)
+    })
+    .await
+    .map_err(|error| match error.downcast::<W8aError>() {
+        Ok(typed) => typed,
+        Err(other) => W8aError::BackupFailed(format!("inner format30 backup: {other:#}")),
+    })?;
     super::super::check(&inner)
         .map_err(|error| W8aError::BackupFailed(format!("inner format30 archive: {error:#}")))?;
     let raw = std::fs::read(inner.join("manifest.json"))
@@ -178,13 +198,13 @@ async fn build(
         manifest_seal_sha256: String::new(),
     }
     .seal()?;
-    let sidecar_path = staging.join(SIDECAR);
+    let sidecar_path = staging.path().join(SIDECAR);
     let sidecar_bytes = serde_json::to_vec(&sidecar)
         .map_err(|error| W8aError::BackupFailed(format!("serializing the sidecar: {error}")))?;
     super::super::write_private(&sidecar_path, &sidecar_bytes).map_err(backup_error)?;
     let sidecar_sha256 = super::super::hash(&sidecar_path).map_err(backup_error)?;
-    super::super::write_private(&staging.join(COMPLETE), sidecar_sha256.as_bytes()).map_err(backup_error)?;
-    super::super::publish(staging, target).map_err(backup_error)?;
+    super::super::write_private(&staging.path().join(COMPLETE), sidecar_sha256.as_bytes()).map_err(backup_error)?;
+    staging.publish_to(target)?;
     Ok(W8aCreateReceipt {
         w8a_backup_id,
         destination: target.display().to_string(),
@@ -203,36 +223,6 @@ async fn build(
         key_reference,
         sidecar,
     })
-}
-
-async fn read_source(config: &Config) -> W8aResult<SourceIdentity> {
-    let client = super::super::pg(config).await.map_err(backup_error)?;
-    let row = client
-        .query_one(
-            "SELECT
-                 (SELECT count(*) FROM public.repositories),
-                 (SELECT count(*) FROM public.repositories WHERE storage_backend='pg_refstore'),
-                 (SELECT count(*) FROM public.ref_cas_projection_cursors),
-                 (SELECT count(*) FROM public.ref_cas_projected_operations),
-                 ca.incarnation, p.authority_id, p.authority_epoch
-             FROM public.cluster_authority ca, public.pando_storage_authorities p
-             WHERE ca.singleton=true AND p.singleton=true",
-            &[],
-        )
-        .await
-        .map_err(|error| W8aError::BackupFailed(format!("source preflight: {error}")))?;
-    let total: i64 = row.get(0);
-    let served: i64 = row.get(1);
-    let raft_cursors: i64 = row.get(2);
-    let raft_operations: i64 = row.get(3);
-    ensure_clean_source(total, served, raft_cursors, raft_operations)?;
-    let source = SourceIdentity {
-        cluster_incarnation: row.get(4),
-        storage_authority_id: row.get(5),
-        storage_authority_epoch: row.get(6),
-    };
-    drop(client);
-    Ok(source)
 }
 
 fn ensure_clean_source(total: i64, served: i64, raft_cursors: i64, raft_operations: i64) -> W8aResult<()> {
@@ -265,112 +255,4 @@ mod tests {
         assert!(ensure_clean_source(1, 1, 1, 0).is_err());
         assert!(ensure_clean_source(1, 1, 0, 1).is_err());
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct W8aRepoFsckReceipt {
-    pub repository_id: Uuid,
-    pub object_format: String,
-    pub head_ref: String,
-    pub head_oid: String,
-    pub refs: usize,
-    pub pack_artifacts: usize,
-}
-
-pub(super) async fn fsck_one(
-    config: &Config,
-    directory: &Path,
-    repository_id: Uuid,
-    object_format: &str,
-    head_ref: &str,
-    head_oid: &str,
-    refs: &[(String, String)],
-    members: &[&super::super::ledger::Artifact],
-    transfer: &ArchiveTransfer,
-    read: &super::super::ArchiveRead,
-    deadline: Instant,
-) -> W8aResult<W8aRepoFsckReceipt> {
-    let init = vec![
-        OsString::from("init"),
-        OsString::from("--bare"),
-        OsString::from("--quiet"),
-        OsString::from(format!("--object-format={object_format}")),
-        directory.as_os_str().to_owned(),
-    ];
-    git_output(config, init).await?;
-    let pack_dir = directory.join("objects/pack");
-    std::fs::create_dir_all(&pack_dir).map_err(|error| W8aError::RestoreFailed(error.to_string()))?;
-    let mut temporary: BTreeMap<Uuid, BTreeMap<String, std::path::PathBuf>> = BTreeMap::new();
-    for artifact in members {
-        let target = pack_dir.join(format!("w8a-tmp-{}-{}", artifact.pack_id, artifact.role));
-        transfer
-            .export(
-                read,
-                &artifact.locator().map_err(map_archive_error)?,
-                &artifact.sha256,
-                artifact.length,
-                &target,
-                deadline,
-            )
-            .await
-            .map_err(|error| W8aError::MissingOrCorruptBlobArtifact(format!("exporting {}: {error}", artifact.role)))?;
-        temporary.entry(artifact.pack_id).or_default().insert(artifact.role.clone(), target);
-    }
-    let checksum_len = if object_format == "sha1" { 20 } else { 32 };
-    for (pack_id, mut roles) in temporary {
-        let pack = roles
-            .remove("pack")
-            .ok_or_else(|| W8aError::MissingOrCorruptBlobArtifact(format!("pack {pack_id} has no pack member")))?;
-        let bytes = std::fs::read(&pack)
-            .map_err(|error| W8aError::MissingOrCorruptBlobArtifact(format!("reading pack {pack_id}: {error}")))?;
-        if bytes.len() < checksum_len {
-            return Err(W8aError::MissingOrCorruptBlobArtifact(format!("pack {pack_id} is truncated")));
-        }
-        let name = format!("pack-{}", hex::encode(&bytes[bytes.len() - checksum_len..]));
-        std::fs::rename(&pack, pack_dir.join(format!("{name}.pack")))
-            .map_err(|error| W8aError::RestoreFailed(format!("naming pack {pack_id}: {error}")))?;
-        let idx = roles
-            .remove("idx")
-            .ok_or_else(|| W8aError::MissingOrCorruptBlobArtifact(format!("pack {pack_id} has no idx member")))?;
-        std::fs::rename(&idx, pack_dir.join(format!("{name}.idx")))
-            .map_err(|error| W8aError::RestoreFailed(format!("naming idx {pack_id}: {error}")))?;
-    }
-    for (name, oid) in refs {
-        git_at(config, directory, &["update-ref", name, oid]).await?;
-    }
-    git_at(config, directory, &["symbolic-ref", "HEAD", head_ref]).await?;
-    let fsck = git_at(config, directory, &["fsck", "--full", "--strict"]).await?;
-    if !fsck.status.success() {
-        return Err(W8aError::GitFsckFailed { repository_id, detail: output_tail(&fsck) });
-    }
-    Ok(W8aRepoFsckReceipt {
-        repository_id,
-        object_format: object_format.into(),
-        head_ref: head_ref.into(),
-        head_oid: head_oid.into(),
-        refs: refs.len(),
-        pack_artifacts: members.len(),
-    })
-}
-
-async fn git_at(config: &Config, directory: &Path, args: &[&str]) -> W8aResult<Output> {
-    let mut full = vec![OsString::from("--git-dir"), directory.as_os_str().to_owned()];
-    full.extend(args.iter().map(OsString::from));
-    git_output(config, full).await
-}
-
-async fn git_output(config: &Config, args: Vec<OsString>) -> W8aResult<Output> {
-    let mut command = super::super::command(&config.git);
-    command.args(args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    command.output().await.map_err(|error| W8aError::RestoreFailed(format!("running Git: {error}")))
-}
-
-fn output_tail(output: &Output) -> String {
-    let mut combined = output.stdout.clone();
-    combined.extend_from_slice(&output.stderr);
-    String::from_utf8_lossy(&combined[combined.len().saturating_sub(1024)..]).into_owned()
-}
-
-fn map_archive_error(error: anyhow::Error) -> W8aError {
-    W8aError::MissingOrCorruptBlobArtifact(format!("{error:#}").chars().take(512).collect())
 }

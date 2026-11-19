@@ -242,7 +242,7 @@ async fn publish(db: &Db, store: &BlobStore, plan: &PackCommitPlan, file: &PairF
     let publication = uploader
         .consume_and_upload(&db.pool, grant, &sources, deadline().into_std())
         .await
-        .map_err(|_| anyhow!("protected upload refused"))?;
+        .map_err(|error| anyhow!("protected upload refused: {error}"))?;
     ensure!(publication.receipts().len() == 2, "publication is not exactly one pair");
     Ok(publication)
 }

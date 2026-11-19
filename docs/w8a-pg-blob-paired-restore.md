@@ -123,6 +123,26 @@ enabled maintenance worker or remote delete switch is
 `DestructiveGcForbidden`. See
 [`deleter_fence.rs`](../src/backup/w8a_paired/deleter_fence.rs).
 
+## Snapshot-bound authority and guard retention
+
+The source authority identity (`cluster_incarnation`, `storage_authority_id` and
+`storage_authority_epoch`) and the single-node cleanliness counters
+(repositories, served repositories, raft cursors and raft operations) are
+captured inside the exact same `RepeatableRead` + `SHARE`-locked
+`pg_export_snapshot()` transaction that feeds `pg_dump` in
+[`snapshot.rs`](../src/backup/snapshot.rs). The restored database is verified
+against that sealed source identity before any authority rotation or Blob
+import, so a relabelled archive or a database that still carries raft projection
+rows is refused before a single byte is rebuilt.
+
+The restore keeps the local startup guard (`.<target-name>.rootyard-restoring`),
+the database-wide `rootyard.restore_in_progress` marker, the unpublished staging
+volume and the exclusive `BackupMutex` lifecycle barrier continuously through
+`fence_w8a_fresh_incarnation` and `git fsck --full --strict`
+([`fsck.rs`](../src/backup/w8a_paired/fsck.rs)). A failure or cancellation
+preserves the startup guard and the database marker while removing the temporary
+staging and compute directories, so a half-restored target is never published.
+
 ## Blob and Git proof
 
 The restorer opens the target Blob store, compares its backend identity with the

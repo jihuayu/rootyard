@@ -10,16 +10,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 LIMITS = {
     "src/backup/authority.rs": 160,
+    "src/backup/snapshot.rs": 300,
+    "src/backup/restore.rs": 480,
     "src/backup/w8a_paired.rs": 95,
     "src/backup/w8a_paired/manifest_key_ref.rs": 360,
     "src/backup/w8a_paired/create.rs": 400,
     "src/backup/w8a_paired/restore.rs": 460,
+    "src/backup/w8a_paired/fsck.rs": 250,
     "src/backup/w8a_paired/deleter_fence.rs": 220,
     "src/backup/w8a_paired/tests.rs": 380,
     "src/bin/rootyard-w8a-backup.rs": 95,
     "tests/w8a_pg_blob_paired_restore.rs": 460,
-    "tests/w8a_pg_blob_support/s3.rs": 280,
+    "tests/w8a_pg_blob_support/s3.rs": 330,
     "tests/w8a_pg_blob_support/seed.rs": 420,
+    "tests/w8a_pg_blob_support/lifecycle_guards.rs": 220,
     "tests/test_w8a_pg_blob_paired_contracts.py": 260,
     "docs/w8a-pg-blob-paired-restore.md": 300,
     ".github/workflows/w8a-pg-blob-restore.yml": 150,
@@ -48,16 +52,20 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
                 continue
             self.assertNotIn("#[allow(", text, f"broad allow in {relative}")
             self.assertNotIn("#![allow(", text, f"broad allow in {relative}")
-            self.assertNotIn("unsafe", text, f"unsafe in authored src file {relative}")
+            self.assertIsNone(re.search(r"\bunsafe\b", text), f"unsafe in authored src file {relative}")
 
-        for relative in ["tests/w8a_pg_blob_paired_restore.rs", "tests/w8a_pg_blob_support/seed.rs"]:
+        for relative in [
+            "tests/w8a_pg_blob_paired_restore.rs",
+            "tests/w8a_pg_blob_support/seed.rs",
+            "tests/w8a_pg_blob_support/lifecycle_guards.rs",
+        ]:
             self.assertNotIn("#[allow(", files[relative])
-            self.assertNotIn("unsafe", files[relative])
+            self.assertIsNone(re.search(r"\bunsafe\b", files[relative]))
         s3 = files["tests/w8a_pg_blob_support/s3.rs"]
         self.assertIn("unsafe { std::env::", s3)
         self.assertIn("static ENV_LOCK: Mutex<()>", s3)
         self.assertIn("struct EnvGuard", s3)
-        self.assertEqual(s3.count("unsafe"), 6)
+        self.assertEqual(s3.count("unsafe"), 7)
         self.assertFalse((ROOT / "src/backup/w8a_paired/mod.rs").exists())
         self.assertFalse((ROOT / "tests/w8a_pg_blob_support/mod.rs").exists())
 
@@ -90,13 +98,16 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
             "BackupFailed", "RestoreFailed",
         ]:
             self.assertIn(variant, errors, f"missing W8aError::{variant}")
-        restore = files["src/backup/w8a_paired/restore.rs"]
+        restore_and_fsck = files["src/backup/w8a_paired/restore.rs"] + "\n" + files["src/backup/w8a_paired/fsck.rs"]
         for token in [
             "restored_incarnation", "verify_key_reference", "fence_w8a_fresh_incarnation",
             "repositories_fscked", "ArchiveTransfer::for_export", "ref_store_core_refs",
-            "ref_store_serving_repositories",
+            "ref_store_serving_repositories", "verify_restored_source_snapshot",
+            "finish_guarded_restore", "symbolic-ref",
         ]:
-            self.assertIn(token, restore, f"restore.rs missing {token}")
+            self.assertIn(token, restore_and_fsck, f"restore/fsck missing {token}")
+        for relative in ["src/backup/snapshot.rs", "src/backup/w8a_paired/create.rs"]:
+            self.assertIn("create_with_source_check", files[relative], f"{relative} missing create_with_source_check")
         create = files["src/backup/w8a_paired/create.rs"]
         self.assertIn("W8A_COMPLETE", create)
         self.assertIn("w8a-paired.json", create)
@@ -164,6 +175,8 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
         self.assertTrue("  on:" in workflow or "\non:" in workflow)
         self.assertIn("permissions:", workflow)
         self.assertIn("contents: read", workflow)
+        for token in ["'src/backup/**'", "'src/blob_store/**'"]:
+            self.assertIn(token, workflow, f"workflow paths missing {token}")
 
 
 if __name__ == "__main__":

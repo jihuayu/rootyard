@@ -1,6 +1,8 @@
 //! Issue #120: single-node paired PostgreSQL + Blob backup and new-incarnation restore.
 #![cfg(unix)]
 
+#[path = "w8a_pg_blob_support/lifecycle_guards.rs"]
+mod lifecycle_guards;
 #[path = "retention_roots_support/mod.rs"]
 mod retention_roots_support;
 #[path = "w8a_pg_blob_support/s3.rs"]
@@ -14,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow, bail, ensure};
 use deadpool_postgres::Pool;
 use rootyard::backup::w8a_paired::{
-    W8aError, admit_deleter_epoch, check, create, fence_w8a_fresh_incarnation, restore,
+    W8aError, admit_deleter_epoch, capture_key_reference, check, create, fence_w8a_fresh_incarnation, restore,
+    verify_key_reference,
 };
 use rootyard::blob_store::config::BlobProfile;
 use rootyard::blob_store::opendal::BlobStore;
@@ -185,9 +188,9 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
         ("ROOTYARD_BLOB_ACCESS_KEY_ID", Some("w8a-access")),
         ("ROOTYARD_BLOB_SECRET_ACCESS_KEY", Some("w8a-secret")),
         ("ROOTYARD_BLOB_RETRY_MAX_TIMES", Some("3")),
-        ("ROOTYARD_BLOB_ENCRYPTION_MODE", Some("local-envelope")),
-        (KEYRING, Some(keyring.as_str())),
-        ("ROOTYARD_BLOB_KMS_KEY_REF", None),
+        ("ROOTYARD_BLOB_ENCRYPTION_MODE", Some("provider-managed")),
+        (KEYRING, None),
+        ("ROOTYARD_BLOB_KMS_KEY_REF", Some("kms://w8a/source-key-1")),
         ("ROOTYARD_PAIRED_RAFT_CLUSTER_JSON", None),
         (BLOB_DELETE, Some("disabled")),
         (MAINTENANCE, Some("false")),
@@ -244,12 +247,30 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
         matches!(check(&raft_shape), Err(W8aError::RaftCutForbiddenInSingleNodeW8a(_))),
         "raft sidecar shape was not refused"
     );
-    env.update(KEYRING, second_keys.to_str().ok_or_else(|| anyhow!("second keyring is not UTF-8"))?);
-    expect_failure(&mut env, &admin, temp.path(), &git, &archive, "wrong-key", is_key).await?;
-    env.update(KEYRING, &keyring);
+    env.set_opt("ROOTYARD_BLOB_KMS_KEY_REF", Some("kms://w8a/wrong-key-2"));
+    expect_failure(&mut env, &admin, temp.path(), &git, &archive, "wrong-kms", is_key).await?;
+    env.set_opt("ROOTYARD_BLOB_ENCRYPTION_MODE", Some("local-envelope"));
+    env.set_opt(KEYRING, Some(keyring.as_str()));
+    env.set_opt("ROOTYARD_BLOB_KMS_KEY_REF", None);
+    expect_failure(&mut env, &admin, temp.path(), &git, &archive, "wrong-mode", is_key).await?;
+    let local_ref = capture_key_reference(created.w8a_backup_id, &created.sidecar.blob_backend_identity)?;
+    let second_keyring = second_keys.to_str().ok_or_else(|| anyhow!("second keyring is not UTF-8"))?;
+    env.set_opt(KEYRING, Some(second_keyring));
+    ensure!(
+        matches!(
+            verify_key_reference(&local_ref, created.w8a_backup_id, &created.sidecar.blob_backend_identity),
+            Err(W8aError::KeyReferenceMismatch(_))
+        ),
+        "local-envelope canary mismatch was not refused"
+    );
+    env.set_opt("ROOTYARD_BLOB_ENCRYPTION_MODE", Some("provider-managed"));
+    env.set_opt(KEYRING, None);
+    env.set_opt("ROOTYARD_BLOB_KMS_KEY_REF", Some("kms://w8a/source-key-1"));
     env.update(MAINTENANCE, "true");
     expect_failure(&mut env, &admin, temp.path(), &git, &archive, "gc", is_gc).await?;
     env.update(MAINTENANCE, "false");
+    lifecycle_guards::run_lifecycle_guard_drills(&mut env, &admin, temp.path(), &git, server, &archive, &created)
+        .await?;
 
     let destination = format!("w8a_{}", Uuid::new_v4().simple());
     seed::create_database(&admin, &destination).await?;

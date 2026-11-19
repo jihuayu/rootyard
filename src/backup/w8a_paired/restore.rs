@@ -4,28 +4,22 @@
 //! shared format30 path, proves no raft projection rows, applies the W8-A
 //! fresh-incarnation fence, and runs stock Git fsck on bytes re-exported from
 //! the target Blob backend.
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::blob_store::archive::ArchiveTransfer;
-use crate::blob_store::config::BlobProfile;
-use crate::blob_store::opendal::BlobStore;
 use crate::config::Config;
 use crate::storage_lifecycle::models::Policy;
 
-use super::create::W8aRepoFsckReceipt;
+use super::fsck::W8aRepoFsckReceipt;
 use super::manifest_key_ref::{ENV_PAIRED_RAFT_CLUSTER, W8aPairedSidecarManifest, verify_key_reference};
-use super::{W8aError, W8aResult, ensure_destructive_gc_disabled};
+use super::{W8aError, W8aFenceReceipt, W8aResult, ensure_destructive_gc_disabled};
 const SIDECAR: &str = "w8a-paired.json";
 const COMPLETE: &str = "W8A_COMPLETE";
 const INNER: &str = "format30";
 const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
-const EXPORT_SECONDS: u64 = 600;
 #[derive(Debug, Clone, Serialize)]
 pub struct W8aRestoreReceipt {
     pub w8a_backup_id: Uuid,
@@ -57,7 +51,6 @@ pub struct W8aRestoreReceipt {
 struct Checked {
     root: PathBuf,
     sidecar: W8aPairedSidecarManifest,
-    manifest: super::super::Manifest,
 }
 pub fn check(source: &Path) -> W8aResult<W8aPairedSidecarManifest> {
     Ok(inspect(source)?.sidecar)
@@ -85,65 +78,13 @@ pub async fn restore(
         &checked.sidecar.blob_backend_identity,
     )?;
     let compute = prepare_compute(compute_dir, &checked.root, &config.data_dir)?;
-    super::super::restore(
-        config,
-        &checked.root.join(INNER),
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-    )
-    .await
-    .map_err(|error| classify_restore_error(&format!("{error:#}")))?;
-    let mut client = super::super::pg(config).await.map_err(|error| W8aError::RestoreFailed(error.to_string()))?;
-    let raft: i64 = client
-        .query_one(
-            "SELECT (SELECT count(*) FROM public.ref_cas_projection_cursors)
-                  + (SELECT count(*) FROM public.ref_cas_projected_operations)",
-            &[],
-        )
+    let plan = super::super::restore::W8aRestorePlan { sidecar: &checked.sidecar, compute_dir: compute.path() };
+    let (fence, repos) = super::super::restore::restore_w8a_paired(config, &checked.root.join(INNER), plan)
         .await
-        .map_err(|error| W8aError::RestoreFailed(format!("raft projection check: {error}")))?
-        .get(0);
-    if raft != 0 {
-        return Err(W8aError::RaftCutForbiddenInSingleNodeW8a(format!(
-            "restored database contains {raft} raft projection rows"
-        )));
-    }
-    let fence = super::super::authority::fence_w8a_fresh_incarnation(
-        &mut client,
-        checked.sidecar.source_cluster_incarnation,
-        checked.sidecar.source_storage_authority_epoch,
-    )
-    .await
-    .map_err(|error| W8aError::RestoreFailed(format!("restored_incarnation fence: {error:#}")))?;
-    let store = BlobStore::open(
-        BlobProfile::from_env().map_err(|error| W8aError::RestoreFailed(format!("opening Blob backend: {error}")))?,
-    )
-    .map_err(|error| W8aError::RestoreFailed(format!("opening Blob backend: {error}")))?;
-    if store.backend_identity().as_hex() != checked.sidecar.blob_backend_identity {
-        return Err(W8aError::MissingOrCorruptBlobArtifact(
-            "target Blob backend identity differs from the archive".into(),
-        ));
-    }
-    let read = super::super::ArchiveRead::seal(checked.sidecar.inner_volume_id, checked.sidecar.inner_backup_id)
-        .map_err(|error| W8aError::RestoreFailed(error.to_string()))?;
-    let transfer = ArchiveTransfer::for_export(&read, store);
-    let repos =
-        fsck_repositories(config, &client, &checked.manifest.blob_artifacts, &transfer, &read, &compute).await?;
-    drop(client);
-    let _ = std::fs::remove_dir_all(&compute);
+        .map_err(|error| match error.downcast::<W8aError>() {
+            Ok(typed) => typed,
+            Err(other) => classify_restore_error(&format!("{other:#}")),
+        })?;
     Ok(W8aRestoreReceipt {
         w8a_backup_id: checked.sidecar.w8a_backup_id,
         source: checked.root.display().to_string(),
@@ -302,7 +243,7 @@ fn inspect(source: &Path) -> W8aResult<Checked> {
         }
     }
     super::super::check(&inner).map_err(|error| classify_inner_error(&format!("{error:#}")))?;
-    Ok(Checked { root, sidecar, manifest })
+    Ok(Checked { root, sidecar })
 }
 fn regular_file(path: &Path, label: &str, blob: bool) -> W8aResult<std::fs::Metadata> {
     let invalid = |message: String| {
@@ -344,103 +285,108 @@ fn classify_inner_error(error: &str) -> W8aError {
 fn map_archive_error(error: anyhow::Error) -> W8aError {
     classify_inner_error(&format!("{error:#}"))
 }
-fn prepare_compute(compute_dir: &Path, source: &Path, target: &Path) -> W8aResult<PathBuf> {
+struct ComputeDirGuard {
+    path: PathBuf,
+}
+
+impl ComputeDirGuard {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ComputeDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn prepare_compute(compute_dir: &Path, source: &Path, target: &Path) -> W8aResult<ComputeDirGuard> {
     let exists = std::fs::symlink_metadata(compute_dir).is_ok();
     let compute = super::super::absolute(compute_dir, exists)
         .map_err(|error| W8aError::RestoreFailed(format!("compute directory: {error:#}")))?;
-    if !exists {
-        super::super::private_dir(&compute)
-            .map_err(|error| W8aError::RestoreFailed(format!("creating compute directory: {error:#}")))?;
-    }
-    let empty = std::fs::read_dir(&compute)
-        .map_err(|error| W8aError::RestoreFailed(format!("reading compute directory: {error}")))?
-        .next()
-        .is_none();
-    if !empty {
-        return Err(W8aError::RestoreFailed("compute directory must be empty".into()));
-    }
     let target = super::super::absolute(target, std::fs::symlink_metadata(target).is_ok())
         .map_err(|error| W8aError::RestoreFailed(format!("restore target: {error:#}")))?;
     for (label, other) in [("archive", source), ("restore target", target.as_path())] {
         super::super::disjoint(&compute, other)
             .map_err(|error| W8aError::RestoreFailed(format!("compute directory overlaps the {label}: {error:#}")))?;
     }
-    Ok(compute)
+    if exists {
+        let empty = std::fs::read_dir(&compute)
+            .map_err(|error| W8aError::RestoreFailed(format!("reading compute directory: {error}")))?
+            .next()
+            .is_none();
+        if !empty {
+            return Err(W8aError::RestoreFailed("compute directory must be empty".into()));
+        }
+    } else {
+        super::super::private_dir(&compute)
+            .map_err(|error| W8aError::RestoreFailed(format!("creating compute directory: {error:#}")))?;
+    }
+    Ok(ComputeDirGuard { path: compute })
 }
-async fn fsck_repositories(
-    config: &Config,
+
+pub(super) async fn verify_restored_source_snapshot(
     client: &tokio_postgres::Client,
+    sidecar: &W8aPairedSidecarManifest,
+) -> W8aResult<()> {
+    let row = client
+        .query_one(
+            "SELECT (SELECT count(*) FROM public.ref_cas_projection_cursors) + (SELECT count(*) FROM public.ref_cas_projected_operations), ca.incarnation, p.authority_id, p.authority_epoch FROM public.cluster_authority ca, public.pando_storage_authorities p WHERE ca.singleton=true AND p.singleton=true",
+            &[],
+        )
+        .await
+        .map_err(|error| W8aError::RestoreFailed(format!("restored source authority: {error}")))?;
+    let raft: i64 = row.get(0);
+    if raft != 0 {
+        return Err(W8aError::RaftCutForbiddenInSingleNodeW8a(format!(
+            "restored database contains {raft} raft projection rows"
+        )));
+    }
+    let incarnation: Uuid = row.get(1);
+    let authority_id: Uuid = row.get(2);
+    let epoch: i64 = row.get(3);
+    if incarnation != sidecar.source_cluster_incarnation
+        || authority_id != sidecar.source_storage_authority_id
+        || epoch != sidecar.source_storage_authority_epoch
+    {
+        return Err(W8aError::MixedPointInTime(
+            "restored database source authority differs from the captured paired source".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn finish_guarded_restore(
+    config: &Config,
+    client: &mut tokio_postgres::Client,
+    mutex: &super::super::BackupMutex,
+    sidecar: &W8aPairedSidecarManifest,
     artifacts: &[super::super::ledger::Artifact],
-    transfer: &ArchiveTransfer,
-    read: &super::super::ArchiveRead,
     compute: &Path,
-) -> W8aResult<Vec<W8aRepoFsckReceipt>> {
-    let repos = client
-        .query(
-            "SELECT r.id, r.object_format, g.head_ref FROM public.repositories r
-             JOIN public.ref_store_core_gates g ON g.repository_id=r.id
-             JOIN public.ref_store_serving_repositories s ON s.repository_id=r.id
-             WHERE r.storage_backend='pg_refstore' AND s.state='ready' ORDER BY r.id",
+) -> W8aResult<(W8aFenceReceipt, Vec<W8aRepoFsckReceipt>)> {
+    let raft: i64 = client
+        .query_one(
+            "SELECT (SELECT count(*) FROM public.ref_cas_projection_cursors) + (SELECT count(*) FROM public.ref_cas_projected_operations)",
             &[],
         )
         .await
-        .map_err(|error| W8aError::RestoreFailed(format!("listing restored repositories: {error}")))?;
-    if repos.is_empty() {
-        return Err(W8aError::RestoreFailed("restored database has no serving repositories".into()));
+        .map_err(|error| W8aError::RestoreFailed(format!("raft projection check: {error}")))?
+        .get(0);
+    if raft != 0 {
+        return Err(W8aError::RaftCutForbiddenInSingleNodeW8a(format!(
+            "restored database contains {raft} raft projection rows"
+        )));
     }
-    let refs = client
-        .query(
-            "SELECT repository_id, ref_name, oid FROM public.ref_store_core_refs
-             ORDER BY repository_id, ref_name",
-            &[],
-        )
-        .await
-        .map_err(|error| W8aError::RestoreFailed(format!("listing restored refs: {error}")))?;
-    let mut refs_by_repo: BTreeMap<Uuid, Vec<(String, String)>> = BTreeMap::new();
-    for row in refs {
-        refs_by_repo.entry(row.get(0)).or_default().push((row.get(1), row.get(2)));
-    }
-    let deadline = Instant::now() + Duration::from_secs(EXPORT_SECONDS);
-    let mut receipts = Vec::new();
-    for row in repos {
-        let repository_id: Uuid = row.get(0);
-        let object_format: String = row.get(1);
-        let head_ref: String = row.get(2);
-        if !matches!(object_format.as_str(), "sha1" | "sha256") {
-            return Err(W8aError::RestoreFailed(format!(
-                "repository {repository_id} has an unsupported object format"
-            )));
-        }
-        let members: Vec<_> = artifacts.iter().filter(|artifact| artifact.repository_id == repository_id).collect();
-        if members.is_empty() {
-            return Err(W8aError::MissingOrCorruptBlobArtifact(format!("repository {repository_id} has no Blob pack")));
-        }
-        let repo_refs = refs_by_repo
-            .get(&repository_id)
-            .ok_or_else(|| W8aError::RestoreFailed(format!("repository {repository_id} has no restored refs")))?;
-        let head_oid =
-            repo_refs.iter().find(|(name, _)| name == &head_ref).map(|(_, oid)| oid.clone()).ok_or_else(|| {
-                W8aError::RestoreFailed(format!("repository {repository_id} is missing its head ref"))
-            })?;
-        let directory = compute.join(format!(".w8a-fsck-{}", repository_id.simple()));
-        super::super::private_dir(&directory)
-            .map_err(|error| W8aError::RestoreFailed(format!("creating fsck directory: {error:#}")))?;
-        let result = super::create::fsck_one(
-            config,
-            &directory,
-            repository_id,
-            &object_format,
-            &head_ref,
-            &head_oid,
-            repo_refs,
-            &members,
-            transfer,
-            read,
-            deadline,
-        )
-        .await;
-        let _ = std::fs::remove_dir_all(&directory);
-        receipts.push(result?);
-    }
-    Ok(receipts)
+    mutex.ensure_held(client).await.map_err(|error| W8aError::RestoreFailed(format!("{error:#}")))?;
+    let fence = super::super::authority::fence_w8a_fresh_incarnation(
+        client,
+        sidecar.source_cluster_incarnation,
+        sidecar.source_storage_authority_epoch,
+    )
+    .await
+    .map_err(|error| W8aError::RestoreFailed(format!("restored_incarnation fence: {error:#}")))?;
+    let repos = super::fsck::run_guarded_fsck(config, client, mutex, sidecar, artifacts, compute).await?;
+    mutex.ensure_held(client).await.map_err(|error| W8aError::RestoreFailed(format!("{error:#}")))?;
+    Ok((fence, repos))
 }
