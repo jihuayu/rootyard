@@ -91,11 +91,25 @@ const LANE_WAIT_PROBE: &str = "SELECT
         pg_blocking_pids(a.pid),
         EXISTS(
             SELECT 1 FROM pg_locks l
-            WHERE l.pid=$1 AND l.locktype='advisory' AND l.granted
+            WHERE l.pid=$1
+              AND l.locktype='advisory'
+              AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+              AND l.objsubid=1
+              AND l.mode='ExclusiveLock'
+              AND l.granted
+              AND ((l.classid::bigint << 32) | l.objid::bigint)
+                  = rootyard_ref_store_attempt_key($3::uuid,$4::uuid)
         ) AS creator_holds_operation_key,
         EXISTS(
             SELECT 1 FROM pg_locks l
-            WHERE l.pid=a.pid AND l.locktype='advisory' AND l.granted
+            WHERE l.pid=a.pid
+              AND l.locktype='advisory'
+              AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+              AND l.objsubid=1
+              AND l.mode='ExclusiveLock'
+              AND l.granted
+              AND ((l.classid::bigint << 32) | l.objid::bigint)
+                  = rootyard_ref_store_attempt_key($3::uuid,$5::uuid)
         ) AS waiter_holds_operation_key
     FROM pg_stat_activity a
     WHERE a.datname=current_database()
@@ -364,13 +378,31 @@ async fn case(db: &Pool, gateway_pool: &Pool, gateway_application_name: &str) ->
         // Positive evidence: the gateway is in the first-lane INSERT, blocked
         // by the creator. The independent authority transaction below then
         // proves it has not taken repository/binding locks.
-        observe_blocked_first_lane(db, lane_pid, gateway_application_name, &mut waiter).await?;
+        observe_blocked_first_lane(
+            db,
+            lane_pid,
+            gateway_application_name,
+            repository_id,
+            creator_operation,
+            public_id,
+            &mut waiter,
+        )
+        .await?;
 
         // A third, independent authority transaction can lock both rows while
         // the gateway waiter is still parked. This is the regression: the lane
         // wait must happen before any repository/binding authority lock.
         third_authority_can_lock(db, repository_id).await?;
-        observe_blocked_first_lane(db, lane_pid, gateway_application_name, &mut waiter).await?;
+        observe_blocked_first_lane(
+            db,
+            lane_pid,
+            gateway_application_name,
+            repository_id,
+            creator_operation,
+            public_id,
+            &mut waiter,
+        )
+        .await?;
 
         let owned = lane_tx.take().ok_or_else(|| anyhow!("lane creator transaction was already consumed"))?;
         timeout(WAIT, owned.commit()).await.context("lane creator COMMIT did not finish")??;
@@ -384,18 +416,8 @@ async fn case(db: &Pool, gateway_pool: &Pool, gateway_application_name: &str) ->
             Err(error) => return Err(anyhow!("gateway admission was refused: {error:?}")),
         };
 
-        assert_natural_admission(
-            db,
-            repository_id,
-            public_id,
-            producer,
-            plan.as_ref(),
-            &serving,
-            owner.identity.id,
-            backend_identity.as_str(),
-            baseline.gate().revision(),
-        )
-        .await?;
+        assert_natural_admission(db, public_id, producer, plan.as_ref(), &serving, owner.identity.id, backend_identity)
+            .await?;
         let natural_counts = ledger_effect_counts(db, repository_id).await?;
         ensure!(
             natural_counts == [1, 1, 1, 1, 0, 0, 0],
@@ -553,6 +575,9 @@ async fn observe_blocked_first_lane(
     pool: &Pool,
     lane_pid: i32,
     gateway_application_name: &str,
+    repository_id: Uuid,
+    creator_operation: Uuid,
+    public_id: Uuid,
     waiter: &mut Option<JoinHandle<std::result::Result<Start, GatewayError>>>,
 ) -> Result<()> {
     let observer = checkout(pool, "lane witness").await?;
@@ -575,7 +600,12 @@ async fn observe_blocked_first_lane(
                 };
             }
             ensure!(waiter.is_some(), "gateway waiter task was lost before the first lane insert was observed");
-            let row = observer.query_opt(LANE_WAIT_PROBE, &[&lane_pid, &gateway_application_name]).await?;
+            let row = observer
+                .query_opt(
+                    LANE_WAIT_PROBE,
+                    &[&lane_pid, &gateway_application_name, &repository_id, &creator_operation, &public_id],
+                )
+                .await?;
             if let Some(row) = row {
                 let waiter_pid: i32 = row.get(0);
                 let blockers: Vec<i32> = row.get(1);
@@ -679,18 +709,17 @@ async fn ledger_effect_counts(pool: &Pool, repository_id: Uuid) -> Result<[i64; 
     ])
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn assert_natural_admission(
     pool: &Pool,
-    repository_id: Uuid,
     public_id: Uuid,
     producer: RequestDigest,
     plan: &PackCommitPlan,
     serving: &ServingRepository,
     issuer_id: Uuid,
     backend_identity: &str,
-    baseline_revision: i64,
 ) -> Result<()> {
+    let repository_id = plan.repository_id();
+    let baseline_revision = plan.expected().revision();
     let client = checkout(pool, "natural admission witness").await?;
     let row = timeout(
         WAIT,
