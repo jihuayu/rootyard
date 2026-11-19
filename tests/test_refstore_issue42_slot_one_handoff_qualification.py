@@ -149,7 +149,6 @@ class FailureStageTests(unittest.TestCase):
             f"test {case} ... FAILED\n\n"
             "failures:\n\n"
             f"---- {case} stdout ----\n"
-            f"---- {case} stderr ----\n"
             f"{body}"
             "\nfailures:\n"
             f"    {case}\n\n"
@@ -204,13 +203,21 @@ class FailureStageTests(unittest.TestCase):
             b"running 1 test\n" + f"test {expected} ... FAILED\n".encode())
         self.assertEqual(self.stage(duplicate), "stage_unavailable")
         foreign = self.raw("fixture_guard").replace(
-            f"---- {expected} stderr ----".encode(),
-            b"---- other-case stderr ----")
+            f"---- {expected} stdout ----".encode(),
+            b"---- other-case stdout ----")
         self.assertEqual(self.stage(foreign), "stage_unavailable")
         duplicate_block = self.raw("fixture_guard").replace(
-            f"---- {expected} stderr ----".encode(),
-            f"---- {expected} stderr ----\n---- {expected} stderr ----".encode())
+            f"---- {expected} stdout ----".encode(),
+            f"---- {expected} stdout ----\n---- {expected} stdout ----".encode())
         self.assertEqual(self.stage(duplicate_block), "stage_unavailable")
+        stale_pair = self.raw("fixture_guard").replace(
+            f"---- {expected} stdout ----".encode(),
+            f"---- {expected} stdout ----\n---- {expected} stderr ----".encode())
+        self.assertEqual(self.stage(stale_pair), "stage_unavailable")
+        stderr_only = self.raw("fixture_guard").replace(
+            f"---- {expected} stdout ----".encode(),
+            f"---- {expected} stderr ----".encode())
+        self.assertEqual(self.stage(stderr_only), "stage_unavailable")
 
     def test_malformed_marker_after_valid_and_sibling_stage_are_rejected(self):
         expected = qualification.CASES[0]

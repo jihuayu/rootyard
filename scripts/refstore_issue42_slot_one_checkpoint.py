@@ -231,13 +231,16 @@ def classify_result(raw, exit_code, *, outcome="exited", error_class=None,
 
 
 def classify_failure_stage(raw, *, expected=CASE, sequence=FAILURE_STAGES):
-    """Return one stage only from the exact FAILED row and its stderr block.
+    """Return one stage only from the exact FAILED row and its stdout block.
 
+    The pinned libtest pretty formatter places the combined captured stream,
+    including stderr markers, under one ``---- <case> stdout ----`` header.
     The caller must already have projected ``case_failed``; this function
     independently requires one exact FAILED row, one exact failure summary, and
-    one uniquely delimited stderr capture block for the same case. All other
-    rows, capture blocks, markers and ordering are closed as
-    ``stage_unavailable``. No raw output is returned or persisted.
+    exactly that one stdout capture block for the same case. Any additional,
+    stderr, duplicate or foreign capture header is closed as
+    ``stage_unavailable``, as are malformed or out-of-order markers. No raw
+    output is returned or persisted.
     """
     try:
         text = raw.decode("utf-8")
@@ -264,11 +267,9 @@ def classify_failure_stage(raw, *, expected=CASE, sequence=FAILURE_STAGES):
             headers.append((index, match.group(1), match.group(2)))
     if any(header_name != expected for _index, header_name, _stream in headers):
         return FAILURE_STAGE_UNAVAILABLE
-    if sum(1 for _index, _name, stream in headers if stream == "stderr") != 1:
+    if len(headers) != 1 or headers[0][2] != "stdout":
         return FAILURE_STAGE_UNAVAILABLE
-    if sum(1 for _index, _name, stream in headers if stream == "stdout") > 1:
-        return FAILURE_STAGE_UNAVAILABLE
-    start = next(index for index, _name, stream in headers if stream == "stderr") + 1
+    start = headers[0][0] + 1
     end = None
     for index in range(start, len(lines)):
         stripped = lines[index].strip()
