@@ -16,10 +16,10 @@ use rootyard::{
     storage_lifecycle::{
         models::Policy,
         safe_gc::{
-            ENV_BLOB_SAFE_GC_DESTRUCTIVE, SafeGcArmReceipt, SafeGcError,
+            ENV_BLOB_SAFE_GC_DESTRUCTIVE, SafeGcError,
             anti_aba::AntiAbaKeyRegistry,
             domain::AuthorityRecord,
-            model::{AuthorityLane, GcMode, SafeGcObjectFormat, SourceFreshness},
+            model::{GcMode, SafeGcObjectFormat, SourceFreshness},
             pg_maintenance::safe_gc_journal_path,
             pg_maintenance_dist::InMemoryRefCasCutpointSource,
             pg_reconcile::reconcile_pg_refstore_authority,
@@ -35,7 +35,12 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::{
-    PG_SAFE_GC_TEST_LOCK, app_config, isolated_pg_pool,
+    PG_SAFE_GC_TEST_LOCK, app_config,
+    dist_auth_harness::{
+        provision_distributed_trust, seal_test_lane_arm, test_arm_signer, test_dist_lane,
+        write_refcas_group_keyring_dir,
+    },
+    isolated_pg_pool,
     pg_refcas_merge_fixture::{force_scan_and_schedule, production_refcas_pr_merge},
     provision_pg_refstore_repo,
     s3_harness::{LoopbackS3, build_pack_via_opendal, build_snapshot, git_cmd, make_serving_record},
@@ -112,10 +117,22 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         build_pack_via_opendal(&provider, &git_repo, &dir.path().join("so"), "HEAD", (tenant_id, repo_id, 1), dl)
             .await?;
 
+    let keyring_dir = dir.path().join("refcas-keyring");
+    std::fs::create_dir_all(&keyring_dir)?;
+    write_refcas_group_keyring_dir(
+        &keyring_dir,
+        0,
+        history_id,
+        2,
+        &[(1, 0, [0x11; 32]), (2, 0, [0x12; 32]), (3, 0, [0x13; 32])],
+    )?;
+    provision_distributed_trust(&state.storage.root, tenant_id, repo_id, history_id, &keyring_dir)?;
+
     let auth_rec = AuthorityRecord {
         tenant_id,
         repo_id,
         history_id,
+        trusted_arm_pubkey_hex: test_arm_signer().pubkey_hex().to_owned(),
         incarnation_id: Uuid::new_v4(),
         incarnation_epoch: 1,
         membership_generation: 1,
@@ -181,24 +198,13 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         .execute("UPDATE ref_store_core_refs SET revision = 50 WHERE repository_id = $1", &[&repo_id])
         .await?;
     let armed = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
-    armed.set_gc_mode(GcMode::ArmedDestructive(SafeGcArmReceipt::seal(
+    armed.set_gc_mode(GcMode::ArmedDestructive(seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
-        true,
-        AuthorityLane::DistributedRefCas {
-            ref_cas_authority_id: repo_id,
-            quorum_epoch: 1,
-            raft_commit_index: 4,
-            quorum_verified: true,
-            global_hold_bridge_verified: true,
-            global_hold_bridge_seq: 4,
-            remote_backup_root_verified: true,
-            remote_backup_root_epoch: 1,
-            async_projection_only: false,
-        },
+        test_dist_lane(repo_id, 1, 4, &[], SafeGcObjectFormat::Sha1),
     )?))?;
     drop(armed);
     unsafe {
@@ -288,7 +294,10 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     assert_eq!(res_json["refcas_cut_log_index"], 4);
     drop(pgc);
 
-    let _ = worker::run_once_with_refcas_source(&state, &policy, worker_owner, Some(&mem_src)).await?;
+    // A second pass with a caller-supplied (non-production) cutpoint source must not
+    // authorize a distributed destructive sweep. No job is queued here, and any
+    // attempted run fails closed by design.
+    let _ = worker::run_once_with_refcas_source(&state, &policy, worker_owner, Some(&mem_src)).await;
     unsafe {
         std::env::remove_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE);
     }

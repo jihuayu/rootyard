@@ -14,15 +14,17 @@ use crate::ref_store::ref_version::pack_cover::PackRetentionState;
 use super::{
     SafeGcError,
     anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey},
+    dist_auth::tests::{make_test_dist_lane, test_arm_signer},
     domain::{
         ActiveDeleteFence, AuthorityRecord, BlobLocatorRecord, DeleteAuthorizationTicket, ProviderDeleteOutcome,
         RemotePresence, SafeGcDeleteBackend, SafeGcFuture,
     },
     executor::{DeleteFaultHook, SafeGcSweepRequest, execute_safe_gc_sweep},
     model::{
-        AuthorityLane, CandidatePackTarget, GcMode, GroupClosureReceipt, LiveRefRoot, PairedCursorReconciliation,
-        ProducerReconciliationEntry, RetentionProducer, SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT, SAFE_GC_SCHEMA_VERSION,
-        SafeGcArmReceipt, SafeGcObjectFormat, SourceFreshness,
+        AuthorityLane, CandidatePackTarget, DecisionKind, DecisionState, GcMode, GroupClosureReceipt,
+        InFlightDecisionRecord, LiveRefRoot, PairedCursorReconciliation, ProducerReconciliationEntry,
+        RetentionProducer, SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT, SAFE_GC_SCHEMA_VERSION, SafeGcArmReceipt,
+        SafeGcObjectFormat, SourceFreshness,
     },
     proof::{DeletionProofInputs, build_and_verify_deletion_proof, seal_group_receipt, verify_deletion_proof},
     quiescence::{ReaderLeaseRegistry, ReaderQuiescenceObservation},
@@ -218,6 +220,7 @@ pub(super) fn seed_fixture(
         tenant_id: Uuid::new_v4(),
         repo_id: Uuid::new_v4(),
         history_id: Uuid::new_v4(),
+        trusted_arm_pubkey_hex: test_arm_signer().pubkey_hex().to_owned(),
         incarnation_id: Uuid::new_v4(),
         incarnation_epoch: 1,
         membership_generation: 2,
@@ -254,17 +257,7 @@ pub(super) fn seed_fixture(
     })
     .unwrap();
     let lane = if distributed {
-        AuthorityLane::DistributedRefCas {
-            ref_cas_authority_id: Uuid::new_v4(),
-            quorum_epoch: 1,
-            raft_commit_index: 10,
-            quorum_verified: true,
-            global_hold_bridge_verified: true,
-            global_hold_bridge_seq: 10,
-            remote_backup_root_verified: true,
-            remote_backup_root_epoch: 1,
-            async_projection_only: false,
-        }
+        make_test_dist_lane(Uuid::new_v4(), 1, 10, &[], fmt)
     } else {
         AuthorityLane::SingleNodePg {
             pg_authority_id: auth.repo_id,
@@ -274,6 +267,7 @@ pub(super) fn seed_fixture(
         }
     };
     let arm = SafeGcArmReceipt::seal(
+        &test_arm_signer(),
         auth.tenant_id,
         auth.repo_id,
         auth.history_id,
@@ -386,35 +380,6 @@ async fn default_off_gate_and_ttl_or_tampered_arming_fail_closed() {
     assert!(matches!(authority.set_gc_mode(GcMode::ArmedDestructive(arm)), Err(SafeGcError::ArmingRejected(_))));
 }
 
-#[test]
-fn distributed_refcas_lane_refuses_async_projection_and_missing_151_153() {
-    let (snap, _, _) = seed_fixture(SafeGcObjectFormat::Sha256, true);
-    let auth = &snap.authority;
-    let base_lane = |bridge: bool, backup: bool, async_only: bool| AuthorityLane::DistributedRefCas {
-        ref_cas_authority_id: Uuid::new_v4(),
-        quorum_epoch: 1,
-        raft_commit_index: 10,
-        quorum_verified: true,
-        global_hold_bridge_verified: bridge,
-        global_hold_bridge_seq: 10,
-        remote_backup_root_verified: backup,
-        remote_backup_root_epoch: 1,
-        async_projection_only: async_only,
-    };
-    for (b, k, a) in [(false, true, false), (true, false, false), (true, true, true)] {
-        let err = SafeGcArmReceipt::seal(
-            auth.tenant_id,
-            auth.repo_id,
-            auth.history_id,
-            auth.incarnation_id,
-            1,
-            true,
-            base_lane(b, k, a),
-        );
-        assert!(matches!(err, Err(SafeGcError::DistributedPrereqsMissing(_))));
-    }
-}
-
 #[tokio::test]
 async fn proof_and_live_barrier_reject_forged_header_oids_lane_cursor_and_active_readers() {
     let (snap, arm, mut base_proof) = seed_fixture(SafeGcObjectFormat::Sha256, true);
@@ -446,6 +411,7 @@ async fn proof_and_live_barrier_reject_forged_header_oids_lane_cursor_and_active
     // 3. Cross-repo proof header paired with current deleter args MUST fail closed!
     let other_repo = Uuid::new_v4();
     let other_arm = SafeGcArmReceipt::seal(
+        &test_arm_signer(),
         snap.authority.tenant_id,
         other_repo,
         snap.authority.history_id,
@@ -478,4 +444,25 @@ async fn proof_and_live_barrier_reject_forged_header_oids_lane_cursor_and_active
     // 5. Tampered proof digest rejected.
     base_proof.live_ref_seq = 999;
     assert!(matches!(verify_deletion_proof(&base_proof), Err(SafeGcError::ProofDigestMismatch)));
+}
+
+#[test]
+fn unbounded_install_to_commit_decision_blocks_deletion_and_pins_all_packs() {
+    let (mut snap, _arm, mut proof) = seed_fixture(SafeGcObjectFormat::Sha1, true);
+    let pending = InFlightDecisionRecord {
+        decision_id: Uuid::new_v4(),
+        kind: DecisionKind::PullMerge,
+        state: DecisionState::Pending,
+        snapshot_seq: 1,
+        protected_pack_ids: vec![],
+        protected_oids: vec![],
+    };
+    snap.in_flight_decisions.push(pending.clone());
+    let authority = DurableSafeGcAuthority::in_memory(snap.clone()).unwrap();
+    let pinned = authority.directly_pinned_pack_ids();
+    assert!(snap.active_packs.iter().chain(snap.retired_packs.iter()).all(|p| pinned.contains(&p.pack_id)));
+
+    proof.in_flight_decisions.push(pending);
+    proof.proof_digest = super::proof_digest::compute_proof_digest(&proof);
+    assert!(matches!(verify_deletion_proof(&proof), Err(SafeGcError::ConcurrentRetentionRace(_))));
 }

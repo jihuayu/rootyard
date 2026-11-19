@@ -1,7 +1,13 @@
 //! Real PG17 + `storage_lifecycle` scheduler/worker + OpenDAL S3 Safe GC acceptance (#122).
 
+#[path = "storage_safe_gc_support/dist_auth_harness.rs"]
+pub mod dist_auth_harness;
+#[path = "storage_safe_gc_support/pg_child_worker.rs"]
+mod pg_child_worker;
 #[path = "storage_safe_gc_support/pg_refcas_cases.rs"]
 mod pg_refcas_cases;
+#[path = "storage_safe_gc_support/pg_refcas_lifecycle_cases.rs"]
+mod pg_refcas_lifecycle_cases;
 #[path = "storage_safe_gc_support/pg_refcas_merge_fixture.rs"]
 mod pg_refcas_merge_fixture;
 #[path = "storage_safe_gc_support/pg_refcas_restart_cases.rs"]
@@ -31,7 +37,7 @@ use rootyard::{
     storage_lifecycle::{
         models::Policy,
         safe_gc::{
-            ENV_BLOB_SAFE_GC_DESTRUCTIVE, SafeGcArmReceipt, SafeGcError,
+            ENV_BLOB_SAFE_GC_DESTRUCTIVE, SafeGcError,
             anti_aba::AntiAbaKeyRegistry,
             compaction::{CompactionFault, SafeGcCompactionRequest, execute_two_phase_compaction},
             domain::{AuthorityRecord, StagedUploadState},
@@ -91,18 +97,26 @@ pub(crate) fn app_config(root: &Path, db_url: String) -> Config {
     }
 }
 
-pub(crate) async fn isolated_pg_pool(url: &str) -> Result<Pool> {
+pub(crate) async fn open_pg_pool_for_schema(url: &str, schema: &str) -> Result<Pool> {
+    let mut cfg: tokio_postgres::Config = url.parse()?;
+    cfg.options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=5000 -c lock_timeout=3000"));
+    Ok(Pool::builder(Manager::new(cfg, tokio_postgres::NoTls))
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .max_size(8)
+        .build()?)
+}
+
+pub(crate) async fn isolated_pg_pool_with_schema(url: &str) -> Result<(Pool, String)> {
     let admin = db::pool(url)?;
     let schema = format!("safegc122_{}", Uuid::new_v4().simple());
     admin.get().await?.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
-    let mut cfg: tokio_postgres::Config = url.parse()?;
-    cfg.options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=5000 -c lock_timeout=3000"));
-    let pool = Pool::builder(Manager::new(cfg, tokio_postgres::NoTls))
-        .runtime(deadpool_postgres::Runtime::Tokio1)
-        .max_size(8)
-        .build()?;
+    let pool = open_pg_pool_for_schema(url, &schema).await?;
     db::migrate(&pool).await?;
-    Ok(pool)
+    Ok((pool, schema))
+}
+
+pub(crate) async fn isolated_pg_pool(url: &str) -> Result<Pool> {
+    Ok(isolated_pg_pool_with_schema(url).await?.0)
 }
 
 pub(crate) async fn provision_pg_refstore_repo(
@@ -261,12 +275,14 @@ async fn real_pg17_scheduler_worker_default_off_staging_restart_fence_and_openda
         tenant_id,
         repo_id,
         history_id,
+        trusted_arm_pubkey_hex: dist_auth_harness::test_arm_signer().pubkey_hex().to_owned(),
         incarnation_id: Uuid::new_v4(),
         incarnation_epoch: 1,
         membership_generation: 1,
         live_ref_seq: 1,
         lease_epoch: 1,
     };
+    dist_auth_harness::provision_single_node_trust(&state.storage.root, tenant_id, repo_id, history_id)?;
     let mut reg = AntiAbaKeyRegistry::new();
     let srv_main = make_serving_record(&mut reg, &auth_rec, p_main_rec, i_main_rec, oids_main);
     let srv_pr = make_serving_record(&mut reg, &auth_rec, p_pr_rec, i_pr_rec, oids_pr);
@@ -341,13 +357,12 @@ async fn real_pg17_scheduler_worker_default_off_staging_restart_fence_and_openda
     let rep_idx_loc = reloaded.snapshot().active_packs[0].idx_locator.to_locator()?;
 
     // 2. Arm SingleNodePg destructive GC + enable ROOTYARD_BLOB_SAFE_GC_DESTRUCTIVE=true!
-    let arm = SafeGcArmReceipt::seal(
+    let arm = dist_auth_harness::seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
-        true,
         AuthorityLane::SingleNodePg {
             pg_authority_id: repo_id,
             pg_tx_seq: 1,

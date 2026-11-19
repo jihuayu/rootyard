@@ -8,7 +8,15 @@ use uuid::Uuid;
 
 use crate::ref_store::ref_version::pack_cover::PackRetentionState;
 
-use super::{SafeGcError, quiescence::ReaderQuiescenceObservation, refcas_cut::RefCasReconciledCut};
+use super::{
+    SafeGcError,
+    dist_auth::{
+        BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, SafeGcEd25519Signer,
+        verify_distributed_cursor_coverage, verify_distributed_lane_prereqs, verify_ed25519_domain,
+    },
+    quiescence::ReaderQuiescenceObservation,
+    refcas_cut::RefCasReconciledCut,
+};
 
 pub const SAFE_GC_SCHEMA_VERSION: u32 = 2;
 /// Mandatory safe-by-default invariant: destructive GC is OFF unless armed.
@@ -47,6 +55,7 @@ impl SafeGcObjectFormat {
 
 /// Authority lane under which safe-GC operates (#122).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum AuthorityLane {
     /// Standalone single-node PostgreSQL gate bound to live PG tx, gc_epoch, and reader barrier.
     SingleNodePg { pg_authority_id: Uuid, pg_tx_seq: u64, pg_gc_fence_epoch: u64, reader_barrier_epoch: u64 },
@@ -55,11 +64,9 @@ pub enum AuthorityLane {
         ref_cas_authority_id: Uuid,
         quorum_epoch: u64,
         raft_commit_index: u64,
-        quorum_verified: bool,
-        global_hold_bridge_verified: bool,
-        global_hold_bridge_seq: u64,
-        remote_backup_root_verified: bool,
-        remote_backup_root_epoch: u64,
+        quorum_evidence: QuorumCommitEvidence,
+        hold_bridge_evidence: HoldBridgeEvidence,
+        backup_root_evidence: BackupRootEvidence,
         async_projection_only: bool,
     },
 }
@@ -82,29 +89,17 @@ impl AuthorityLane {
                 ref_cas_authority_id,
                 quorum_epoch,
                 raft_commit_index,
-                quorum_verified,
-                global_hold_bridge_verified,
-                global_hold_bridge_seq,
-                remote_backup_root_verified,
-                remote_backup_root_epoch,
+                quorum_evidence,
+                hold_bridge_evidence,
+                backup_root_evidence,
                 async_projection_only,
-            } => {
-                if *async_projection_only {
-                    return Err(SafeGcError::DistributedPrereqsMissing(
-                        "distributed GC cannot rely on async PG projection alone",
-                    ));
-                }
-                if ref_cas_authority_id.is_nil() || !*quorum_verified || *quorum_epoch == 0 || *raft_commit_index == 0 {
-                    return Err(SafeGcError::DistributedPrereqsMissing("Ref-CAS quorum not verified"));
-                }
-                if !*global_hold_bridge_verified || *global_hold_bridge_seq == 0 {
-                    return Err(SafeGcError::DistributedPrereqsMissing("#151 global hold bridge unverified"));
-                }
-                if !*remote_backup_root_verified || *remote_backup_root_epoch == 0 {
-                    return Err(SafeGcError::DistributedPrereqsMissing("#153 remote backup root unverified"));
-                }
-                Ok(())
-            }
+            } => verify_distributed_lane_prereqs(
+                *ref_cas_authority_id,
+                *quorum_epoch,
+                *raft_commit_index,
+                (quorum_evidence, hold_bridge_evidence, backup_root_evidence),
+                *async_projection_only,
+            ),
         }
     }
 
@@ -139,28 +134,17 @@ impl AuthorityLane {
                 }
                 Ok(())
             }
-            Self::DistributedRefCas { quorum_epoch, raft_commit_index, global_hold_bridge_seq, .. } => {
-                let refcas_floor = (*raft_commit_index).max(*global_hold_bridge_seq).max(live_ref_seq);
-                let Some(ref cut) = cursors.refcas_cut else {
-                    return Err(SafeGcError::IncompleteProof(
-                        "DistributedRefCas requires an authoritative RefCasReconciledCut; PG ref seq cannot prove Ref-CAS cut",
-                    ));
-                };
-                cut.verify_reconciled(history_id, refcas_floor, *quorum_epoch)?;
-                if cursors.refcas_applied_index != cut.sm_applied_log_index
-                    || cursors.refcas_applied_index < refcas_floor
-                {
-                    return Err(SafeGcError::IncompleteProof(
-                        "paired Ref-CAS cursor disagrees with verified RefCasReconciledCut",
-                    ));
-                }
-                if cursors.pg_applied_seq < *global_hold_bridge_seq {
-                    return Err(SafeGcError::IncompleteProof(
-                        "paired PG cursor has not covered #151 global_hold_bridge_seq",
-                    ));
-                }
-                Ok(())
-            }
+            Self::DistributedRefCas {
+                quorum_epoch, raft_commit_index, quorum_evidence, hold_bridge_evidence, ..
+            } => verify_distributed_cursor_coverage(
+                history_id,
+                live_ref_seq,
+                *quorum_epoch,
+                *raft_commit_index,
+                hold_bridge_evidence.bridge_seq,
+                quorum_evidence,
+                cursors,
+            ),
         }
     }
 
@@ -177,25 +161,19 @@ impl AuthorityLane {
                 ref_cas_authority_id,
                 quorum_epoch,
                 raft_commit_index,
-                quorum_verified,
-                global_hold_bridge_verified,
-                global_hold_bridge_seq,
-                remote_backup_root_verified,
-                remote_backup_root_epoch,
+                quorum_evidence,
+                hold_bridge_evidence,
+                backup_root_evidence,
                 async_projection_only,
             } => {
-                h.update(b"dist-refcas-v2|");
+                h.update(b"dist-refcas-v3|");
                 h.update(ref_cas_authority_id.as_bytes());
                 h.update(quorum_epoch.to_be_bytes());
                 h.update(raft_commit_index.to_be_bytes());
-                h.update([
-                    u8::from(*quorum_verified),
-                    u8::from(*global_hold_bridge_verified),
-                    u8::from(*remote_backup_root_verified),
-                    u8::from(*async_projection_only),
-                ]);
-                h.update(global_hold_bridge_seq.to_be_bytes());
-                h.update(remote_backup_root_epoch.to_be_bytes());
+                h.update([u8::from(*async_projection_only)]);
+                quorum_evidence.encode_canonical(h);
+                hold_bridge_evidence.encode_canonical(h);
+                backup_root_evidence.encode_canonical(h);
             }
         }
     }
@@ -214,11 +192,14 @@ pub struct SafeGcArmReceipt {
     pub operator_opt_in: bool,
     pub armed_from_cache_or_ttl_only: bool,
     pub lane: AuthorityLane,
+    pub arm_pubkey_hex: String,
+    pub arm_signature_hex: String,
     pub arm_digest: String,
 }
 
 impl SafeGcArmReceipt {
     pub fn seal(
+        signer: &SafeGcEd25519Signer,
         tenant_id: Uuid,
         repo_id: Uuid,
         history_id: Uuid,
@@ -237,16 +218,20 @@ impl SafeGcArmReceipt {
             operator_opt_in,
             armed_from_cache_or_ttl_only: false,
             lane,
+            arm_pubkey_hex: signer.pubkey_hex().to_owned(),
+            arm_signature_hex: String::new(),
             arm_digest: String::new(),
         };
         receipt.arm_digest = receipt.compute_digest();
+        receipt.arm_signature_hex =
+            signer.sign_domain(b"rootyard/safe-gc-arm-ed25519/v3", receipt.arm_digest.as_bytes());
         receipt.validate()?;
         Ok(receipt)
     }
 
     pub fn compute_digest(&self) -> String {
         let mut h = Sha256::new();
-        h.update(b"safe-gc-arm-v2|");
+        h.update(b"safe-gc-arm-v3|");
         h.update(self.schema_version.to_be_bytes());
         h.update(self.tenant_id.as_bytes());
         h.update(self.repo_id.as_bytes());
@@ -255,6 +240,7 @@ impl SafeGcArmReceipt {
         h.update(self.incarnation_epoch.to_be_bytes());
         h.update([u8::from(self.operator_opt_in), u8::from(self.armed_from_cache_or_ttl_only)]);
         self.lane.encode_canonical(&mut h);
+        encode_len_bytes(&mut h, self.arm_pubkey_hex.as_bytes());
         hex::encode(h.finalize())
     }
 
@@ -277,7 +263,13 @@ impl SafeGcArmReceipt {
         if self.arm_digest != self.compute_digest() {
             return Err(SafeGcError::ArmingRejected("arm receipt digest mismatch"));
         }
-        Ok(())
+        verify_ed25519_domain(
+            &self.arm_pubkey_hex,
+            b"rootyard/safe-gc-arm-ed25519/v3",
+            self.arm_digest.as_bytes(),
+            &self.arm_signature_hex,
+        )
+        .map_err(|_| SafeGcError::ArmingRejected("arm receipt Ed25519 signature verification failed"))
     }
 }
 
@@ -451,34 +443,10 @@ pub struct CandidatePackTarget {
     pub contained_oids: Vec<String>,
 }
 
-pub(crate) fn validate_non_zero_oid(format: SafeGcObjectFormat, oid: &str) -> Result<(), SafeGcError> {
-    if oid.len() != format.oid_hex_len()
-        || !oid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        || oid.bytes().all(|b| b == b'0')
-    {
-        return Err(SafeGcError::InvalidInput("invalid or zero Git OID".into()));
-    }
-    Ok(())
-}
+#[path = "codec.rs"]
+mod codec;
 
-pub(crate) fn validate_sha256_hex(value: &str) -> Result<(), SafeGcError> {
-    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return Err(SafeGcError::InvalidInput("invalid 64-hex SHA-256 digest".into()));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_bounded_name(label: &str, value: &str) -> Result<(), SafeGcError> {
-    if value.is_empty() || value.len() > MAX_STRING_FIELD_BYTES || value.contains('\0') || value.contains("..") {
-        return Err(SafeGcError::InvalidInput(format!("invalid {label}")));
-    }
-    Ok(())
-}
-
-pub(crate) fn encode_len_bytes(h: &mut Sha256, bytes: &[u8]) {
-    h.update((bytes.len() as u64).to_be_bytes());
-    h.update(bytes);
-}
+pub(crate) use codec::{encode_len_bytes, validate_bounded_name, validate_non_zero_oid, validate_sha256_hex};
 
 pub(crate) fn check_missing_producers(present: &BTreeSet<RetentionProducer>) -> Result<(), SafeGcError> {
     if present.len() != MAX_PRODUCER_ITEMS {

@@ -55,6 +55,15 @@ async fn run_once_scoped_with_refcas(
     operation: &OperationContext,
     refcas_source: Option<&dyn super::safe_gc::RefCasCutpointSource>,
 ) -> Result<Option<JobOutcome>> {
+    // The scheduled worker must read Ref-CAS authority from the live registered
+    // state machine (or its sealed volume), never from a caller's stale handle.
+    let production_source = if refcas_source.is_none() {
+        Some(super::safe_gc::ProductionRefCasAuthoritySource::new(state.storage.root.as_path()))
+    } else {
+        None
+    };
+    let fallback = production_source.as_ref().map(|source| source as &dyn super::safe_gc::RefCasCutpointSource);
+    let refcas_source = refcas_source.or(fallback);
     // Observe a claim failure inside the Claim scope before `?` drops it, so
     // the event keeps the worker, the fixed phase and any SQLSTATE.
     let Some(job) = observability::worker::run(operation, Phase::Claim, async {

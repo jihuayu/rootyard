@@ -10,6 +10,8 @@
 pub mod anti_aba;
 #[path = "safe_gc/compaction.rs"]
 pub mod compaction;
+#[path = "safe_gc/dist_auth.rs"]
+pub mod dist_auth;
 #[path = "safe_gc/domain.rs"]
 pub mod domain;
 #[path = "safe_gc/error.rs"]
@@ -58,6 +60,9 @@ mod tests_reconcile;
 
 pub use anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey};
 pub use compaction::{SafeGcCompactionRequest, SafeGcCompactionResult, execute_two_phase_compaction};
+pub use dist_auth::{
+    BackupRootEvidence, HoldBridgeEvidence, QuorumCommitEvidence, SafeGcEd25519Signer, SafeGcRepoTrustConfig,
+};
 pub use domain::{
     ActiveDeleteFence, AuthorityRecord, BlobStoreReadbackBackend, CasCompactionPublish, CompactionPublishResult,
     DeleteAuthorizationTicket, DeleteExecutionReport, GcAuditEvent, ProviderDeleteOutcome, RemotePresence,
@@ -80,8 +85,8 @@ pub use model::{
 pub use pg_maintenance::{ENV_BLOB_SAFE_GC_DESTRUCTIVE, safe_gc_destructive_env_enabled, safe_gc_journal_path};
 pub use pg_maintenance_dist::{
     FsSealedRefCasCutpointSource, InMemoryRefCasCutpointSource, PersistedRefCasCutpointEnvelope,
-    RefCasCommitCutpointPublisher, RefCasCutpointSource, persist_refcas_cutpoint_snapshot,
-    safe_gc_refcas_cutpoint_path,
+    ProductionRefCasAuthoritySource, RefCasCommitCutpointPublisher, RefCasCutpointSource,
+    persist_refcas_cutpoint_snapshot, safe_gc_refcas_cutpoint_path,
 };
 pub use pg_reconcile::{reconcile_pg_refstore_authority, reconcile_refcas_quorum_into_authority};
 pub use proof::{DeletionProof, DeletionProofInputs, build_and_verify_deletion_proof, verify_deletion_proof};

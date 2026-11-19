@@ -24,6 +24,7 @@ pub struct AuthorityRecord {
     pub tenant_id: Uuid,
     pub repo_id: Uuid,
     pub history_id: Uuid,
+    pub trusted_arm_pubkey_hex: String,
     pub incarnation_id: Uuid,
     pub incarnation_epoch: u64,
     pub membership_generation: u64,
@@ -398,7 +399,7 @@ impl<'a> ActiveDeleteFence<'a> {
         candidate.verify_digest_and_locator()?;
         self.authority.verify_active_step_ticket(candidate)?;
         let is_pg =
-            matches!(self.authority.snapshot().gc_mode.require_armed()?.lane, AuthorityLane::SingleNodePg { .. });
+            matches!(&self.authority.snapshot().gc_mode.require_armed()?.lane, AuthorityLane::SingleNodePg { .. });
         match (is_pg, self.external_check) {
             (true, None) => {
                 return Err(SafeGcError::StaleDeleterFenced(

@@ -7,6 +7,7 @@ use uuid::Uuid;
 use super::{
     SafeGcError,
     anti_aba::KeyLifecycleState,
+    dist_auth::{compute_holds_digest, validate_ed25519_pubkey_hex},
     domain::{DeleteAuthorizationTicket, GcAuditEvent, StagedUploadState},
     model::{AuthorityLane, CandidatePackTarget, DecisionState, GlobalHoldState, LiveRefRoot, SourceFreshness},
     proof::{DeletionProof, seal_group_receipt},
@@ -62,6 +63,7 @@ impl DurableSafeGcAuthority {
 
 impl SafeGcRepoSnapshot {
     pub(super) fn register_initial_keys(&mut self) -> Result<(), SafeGcError> {
+        validate_ed25519_pubkey_hex(&self.authority.trusted_arm_pubkey_hex)?;
         for p in self.active_packs.iter().chain(self.retired_packs.iter()) {
             if !self.key_registry.keys_by_path.contains_key(&p.pack_key.object_path) {
                 self.key_registry.register_verified_key(p.pack_key.clone())?;
@@ -103,6 +105,11 @@ impl SafeGcRepoSnapshot {
 
     pub(super) fn verify_staging_cleanup_ticket(&self, ticket: &DeleteAuthorizationTicket) -> Result<(), SafeGcError> {
         let arm = self.gc_mode.require_armed()?;
+        if arm.arm_pubkey_hex != self.authority.trusted_arm_pubkey_hex {
+            return Err(SafeGcError::ArmingRejected(
+                "arm receipt Ed25519 public key not trusted by repository authority",
+            ));
+        }
         if ticket.proof_digest() != arm.arm_digest
             || arm.incarnation_id != self.authority.incarnation_id
             || arm.incarnation_epoch != self.authority.incarnation_epoch
@@ -156,6 +163,11 @@ impl SafeGcRepoSnapshot {
         proof: &DeletionProof,
     ) -> Result<(), SafeGcError> {
         let arm = self.gc_mode.require_armed()?;
+        if arm.arm_pubkey_hex != self.authority.trusted_arm_pubkey_hex {
+            return Err(SafeGcError::ArmingRejected(
+                "arm receipt Ed25519 public key not trusted by repository authority",
+            ));
+        }
         if proof.tenant_id != self.authority.tenant_id
             || proof.repo_id != self.authority.repo_id
             || proof.history_id != self.authority.history_id
@@ -179,9 +191,9 @@ impl SafeGcRepoSnapshot {
         if proof.lane != arm.lane {
             return Err(SafeGcError::DistributedPrereqsMissing("proof lane disagrees with armed authority lane"));
         }
-        if let AuthorityLane::SingleNodePg { pg_gc_fence_epoch, reader_barrier_epoch, .. } = arm.lane
-            && (pg_gc_fence_epoch != reader_barrier_epoch
-                || self.reader_leases.pg_exclusive_barrier_epoch != Some(reader_barrier_epoch))
+        if let AuthorityLane::SingleNodePg { pg_gc_fence_epoch, reader_barrier_epoch, .. } = &arm.lane
+            && (*pg_gc_fence_epoch != *reader_barrier_epoch
+                || self.reader_leases.pg_exclusive_barrier_epoch != Some(*reader_barrier_epoch))
         {
             return Err(SafeGcError::StaleDeleterFenced(
                 "SingleNodePg live fence epoch does not exactly equal armed barrier epoch",
@@ -277,6 +289,27 @@ impl SafeGcRepoSnapshot {
             .flat_map(|c| c.contained_oids.iter().map(String::as_str))
             .filter(|o| !active_oids.contains(o))
             .collect();
+        if let AuthorityLane::DistributedRefCas {
+            ref_cas_authority_id,
+            quorum_epoch,
+            quorum_evidence,
+            hold_bridge_evidence,
+            backup_root_evidence,
+            ..
+        } = lane
+        {
+            quorum_evidence.verify(*ref_cas_authority_id, *quorum_epoch)?;
+            hold_bridge_evidence.verify(*ref_cas_authority_id, *quorum_epoch)?;
+            backup_root_evidence.verify(*ref_cas_authority_id, *quorum_epoch)?;
+            if hold_bridge_evidence.active_holds_digest != compute_holds_digest(&self.global_holds) {
+                return Err(SafeGcError::DistributedPrereqsMissing(
+                    "#151 hold_bridge_evidence digest disagrees with live global_holds",
+                ));
+            }
+            if backup_root_evidence.protected_root_oids.iter().any(|o| cand_oids.contains(o.as_str())) {
+                return Err(SafeGcError::ProtectionOverlap("#153 backup_root_evidence protects candidate OID".into()));
+            }
+        }
         if self.active_packs.iter().any(|p| cand_ids.contains(&p.pack_id)) {
             return Err(SafeGcError::ProtectionOverlap("candidate is still in active serving set".into()));
         }
@@ -319,6 +352,11 @@ impl SafeGcRepoSnapshot {
             }
         }
         for d in &self.in_flight_decisions {
+            if d.state == DecisionState::Pending && d.protected_pack_ids.is_empty() && d.protected_oids.is_empty() {
+                return Err(SafeGcError::ConcurrentRetentionRace(
+                    "in-flight decision between install and commit protects repository packs",
+                ));
+            }
             if d.state == DecisionState::Unknown
                 || (d.state == DecisionState::Pending
                     && (d.protected_pack_ids.iter().any(|id| cand_ids.contains(id))

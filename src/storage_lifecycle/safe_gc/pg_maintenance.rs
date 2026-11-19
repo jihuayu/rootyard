@@ -30,7 +30,7 @@ use super::{
         quarantine_abandoned_staging_without_delete, reclaim_abandoned_compaction_staging,
         reconcile_pending_delete_after_restart_fenced,
     },
-    model::{AuthorityLane, GcMode, SafeGcArmReceipt},
+    model::{AuthorityLane, GcMode},
     pg_reconcile::reconcile_pg_refstore_authority,
     provider_delete::OpenDalS3GcProvider,
     store::DurableSafeGcAuthority,
@@ -86,7 +86,7 @@ pub async fn schedule_pg_refstore(state: &AppState, policy: &Policy) -> Result<u
         let auth = DurableSafeGcAuthority::open_with_journal(&journal, None)
             .map_err(|e| anyhow::anyhow!("open safe_gc journal failed: {e}"))?;
         let snap = auth.snapshot();
-        let armed_destructive = destructive_env && matches!(snap.gc_mode, GcMode::ArmedDestructive(_));
+        let armed_destructive = destructive_env && matches!(&snap.gc_mode, GcMode::ArmedDestructive(_));
         let need_compact = snap.active_packs.len() >= policy.pack_threshold as usize;
         let need_staging = armed_destructive
             && snap.staged_uploads.iter().any(|u| u.state == super::domain::StagedUploadState::AbandonedPendingCleanup);
@@ -302,7 +302,7 @@ async fn run_safe_gc_phases(
         reconcile_pg_refstore_authority(&**pg_client, job.repository_id, &blob_store, &authority, Some(fence_epoch))
             .await
             .map_err(|e| anyhow::anyhow!("reconcile_pg_refstore_authority: {e}"))?;
-    let fresh_cut = super::pg_maintenance_dist::reconcile_worker_refcas_cut_if_needed(
+    let (fresh_cut, verified_voters) = super::pg_maintenance_dist::reconcile_worker_refcas_cut_if_needed(
         &**pg_client,
         job.repository_id,
         &state.storage.root,
@@ -348,7 +348,7 @@ async fn run_safe_gc_phases(
     }
 
     let snap_post_compact = authority.snapshot();
-    if !destructive_env || matches!(snap_post_compact.gc_mode, GcMode::DisabledByDefault) {
+    if !destructive_env || matches!(&snap_post_compact.gc_mode, GcMode::DisabledByDefault) {
         let quarantined = quarantine_abandoned_staging_without_delete(&authority)
             .map_err(|e| anyhow::anyhow!("quarantine staging failed: {e}"))?;
         ensure!(
@@ -366,24 +366,18 @@ async fn run_safe_gc_phases(
         }));
     }
 
-    let GcMode::ArmedDestructive(existing_arm) = snap_post_compact.gc_mode else {
+    let GcMode::ArmedDestructive(existing_arm) = &snap_post_compact.gc_mode else {
         unreachable!("checked armed destructive above");
     };
     let is_dist = matches!(&existing_arm.lane, AuthorityLane::DistributedRefCas { .. });
-    let upgraded_lane = super::pg_maintenance_dist::upgrade_armed_lane_for_worker(
-        existing_arm.lane,
+    let live_arm = super::pg_maintenance_dist::reseal_worker_arm_receipt(
+        &state.storage.root,
+        &snap_post_compact,
+        existing_arm,
         reconciled.gate_revision,
         fence_epoch,
         fresh_cut.as_ref(),
-    )?;
-    let live_arm = SafeGcArmReceipt::seal(
-        snap_post_compact.authority.tenant_id,
-        snap_post_compact.authority.repo_id,
-        snap_post_compact.authority.history_id,
-        snap_post_compact.authority.incarnation_id,
-        snap_post_compact.authority.incarnation_epoch,
-        true,
-        upgraded_lane,
+        verified_voters,
     )
     .map_err(|e| anyhow::anyhow!("re-seal live PG arm: {e}"))?;
     authority

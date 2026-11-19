@@ -1,4 +1,4 @@
-//! Real PG17 `DistributedRefCas` `pending_delete` interruption + live `gc_epoch` restart fence proof (#122).
+//! Real PG17 `DistributedRefCas` `pending_delete` interruption + multi-process restart fence proof (#122).
 
 use std::{
     sync::{Arc, atomic::Ordering},
@@ -14,17 +14,18 @@ use rootyard::{
     },
     storage,
     storage_lifecycle::{
+        models::{JobOutcome, Policy},
         safe_gc::{
-            ENV_BLOB_SAFE_GC_DESTRUCTIVE, SafeGcArmReceipt, SafeGcError,
+            ENV_BLOB_SAFE_GC_DESTRUCTIVE, SafeGcError,
             anti_aba::AntiAbaKeyRegistry,
             domain::AuthorityRecord,
             executor::DeleteFaultHook,
-            model::{AuthorityLane, GcMode, SafeGcObjectFormat},
+            model::{GcMode, SafeGcObjectFormat},
             pg_maintenance::{run_claimed_safe_gc_once_with_fault, safe_gc_journal_path},
             reconcile_pending_delete_after_restart_fenced,
             store::DurableSafeGcAuthority,
         },
-        scheduler, worker,
+        scheduler,
     },
 };
 use tempfile::TempDir;
@@ -32,14 +33,19 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::{
-    PG_SAFE_GC_TEST_LOCK, app_config, isolated_pg_pool,
+    PG_SAFE_GC_TEST_LOCK, app_config,
+    dist_auth_harness::{
+        provision_distributed_trust, seal_test_lane_arm, test_arm_signer, test_dist_lane,
+        write_refcas_group_keyring_dir,
+    },
+    isolated_pg_pool_with_schema, pg_child_worker,
     pg_refcas_merge_fixture::{force_scan_and_schedule, production_refcas_pr_merge},
     provision_pg_refstore_repo,
     s3_harness::{LoopbackS3, build_pack_via_opendal, build_snapshot, git_cmd, make_serving_record},
     test_policy,
 };
 
-async fn project_all_refcas_events(
+pub(super) async fn project_all_refcas_events(
     pool: &deadpool_postgres::Pool,
     tenant_id: Uuid,
     repo_id: Uuid,
@@ -65,6 +71,25 @@ async fn project_all_refcas_events(
     Ok(())
 }
 
+/// Pass #1 crash helper executed inside the spawned child OS process.
+pub(super) async fn execute_pass1_crash_after_one_delete(
+    state: &Arc<AppState>,
+    pool: &deadpool_postgres::Pool,
+    policy: &Policy,
+    repo_id: Uuid,
+) -> Result<JobOutcome> {
+    force_scan_and_schedule(state, pool, policy, repo_id).await?;
+    run_claimed_safe_gc_once_with_fault(
+        state,
+        policy,
+        Uuid::new_v4(),
+        None,
+        DeleteFaultHook::SimulateCrashAfterDeletes(1),
+    )
+    .await?
+    .context("pass1 interrupted sweep")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fence_and_resumes() -> Result<()> {
     let _serial = PG_SAFE_GC_TEST_LOCK.lock().await;
@@ -78,10 +103,10 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
 
     let s3 = LoopbackS3::shared();
     let (blob_store, provider) = s3.open_store_and_provider()?;
-    let pool = isolated_pg_pool(&db_url).await?;
+    let (pool, schema) = isolated_pg_pool_with_schema(&db_url).await?;
     let (tenant_id, repo_id, history_id) = provision_pg_refstore_repo(&pool, &blob_store).await?;
     let dir = TempDir::new()?;
-    let cfg = app_config(dir.path(), db_url);
+    let cfg = app_config(dir.path(), db_url.clone());
     let state = Arc::new(AppState {
         mirror_primary: None,
         dispatch: dispatch::Signals::default(),
@@ -119,10 +144,22 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
         build_pack_via_opendal(&provider, &git_repo, &dir.path().join("so"), "HEAD", (tenant_id, repo_id, 1), dl)
             .await?;
 
+    let keyring_dir = dir.path().join("refcas-keyring");
+    std::fs::create_dir_all(&keyring_dir)?;
+    write_refcas_group_keyring_dir(
+        &keyring_dir,
+        0,
+        history_id,
+        2,
+        &[(1, 0, [0x11; 32]), (2, 0, [0x12; 32]), (3, 0, [0x13; 32])],
+    )?;
+    provision_distributed_trust(&state.storage.root, tenant_id, repo_id, history_id, &keyring_dir)?;
+
     let auth_rec = AuthorityRecord {
         tenant_id,
         repo_id,
         history_id,
+        trusted_arm_pubkey_hex: test_arm_signer().pubkey_hex().to_owned(),
         incarnation_id: Uuid::new_v4(),
         incarnation_epoch: 1,
         membership_generation: 1,
@@ -163,7 +200,7 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
 
     // Default-off repack: 1 replacement pack active, 2 packs (4 physical keys) retired, 0 deletes.
     assert_eq!(scheduler::schedule_once(&state, &policy).await?, 1);
-    let off_out = worker::run_once(&state, &policy, Uuid::new_v4()).await?.context("default-off repack")?;
+    let off_out = super::worker::run_once(&state, &policy, Uuid::new_v4()).await?.context("default-off repack")?;
     assert_eq!(off_out.kind, "pando_repack");
     assert_eq!(off_out.state, "succeeded");
     assert_eq!(s3.state.delete_requests.load(Ordering::SeqCst), pre_default_off_deletes, "0 deletes when default-off");
@@ -182,42 +219,24 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     project_all_refcas_events(&pool, tenant_id, repo_id, ProjectionRealm::new(history_id, 0, 1)?, &sm).await?;
 
     let armed = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
-    armed.set_gc_mode(GcMode::ArmedDestructive(SafeGcArmReceipt::seal(
+    armed.set_gc_mode(GcMode::ArmedDestructive(seal_test_lane_arm(
         tenant_id,
         repo_id,
         history_id,
         auth_rec.incarnation_id,
         1,
-        true,
-        AuthorityLane::DistributedRefCas {
-            ref_cas_authority_id: repo_id,
-            quorum_epoch: 1,
-            raft_commit_index: 4,
-            quorum_verified: true,
-            global_hold_bridge_verified: true,
-            global_hold_bridge_seq: 4,
-            remote_backup_root_verified: true,
-            remote_backup_root_epoch: 1,
-            async_projection_only: false,
-        },
+        test_dist_lane(repo_id, 1, 4, &[], SafeGcObjectFormat::Sha1),
     )?))?;
     drop(armed);
     unsafe {
         std::env::set_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE, "true");
     }
+    // Child #1 must reopen the volume itself: release the parent's exclusive writer lock first.
+    drop(state);
 
-    // Pass #1: interrupt the DistributedRefCas pending batch after exactly one provider delete.
-    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
-    let pass1 = run_claimed_safe_gc_once_with_fault(
-        &state,
-        &policy,
-        Uuid::new_v4(),
-        None,
-        DeleteFaultHook::SimulateCrashAfterDeletes(1),
-    )
-    .await?
-    .context("pass1 interrupted sweep")?;
-    assert_eq!(pass1.state, "failed");
+    // Child #1 (separate OS process, exact isolated PG schema): crash after one provider delete.
+    let c1 = pg_child_worker::spawn_pass1_crash_child(dir.path(), &db_url, &schema, repo_id, &s3.env_pairs())?;
+    assert_ne!(c1.pid, std::process::id(), "pass1 must run in a separate OS process");
     let retired = [p_main.clone(), i_main.clone(), p_orph.clone(), i_orph.clone()];
     assert_eq!(retired.iter().filter(|l| !s3.has_key(l)).count(), 1, "exactly one retired locator deleted");
     assert_eq!(retired.iter().filter(|l| s3.has_key(l)).count(), 3, "three retired locators remain on S3");
@@ -230,7 +249,7 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     assert!(epoch_1 >= 1);
     drop(inspected);
 
-    // Cold restart clears the unheld historical PG barrier epoch in memory and refuses an un-rebound batch.
+    // Cold restart clears the unheld historical PG barrier epoch and refuses an un-rebound batch.
     let cold_reopened = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
     let cold_auth = cold_reopened.snapshot().authority;
     assert!(cold_reopened.snapshot().reader_leases.pg_exclusive_barrier_epoch.is_none());
@@ -248,22 +267,21 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     assert_eq!(retired.iter().filter(|l| s3.has_key(l)).count(), 3, "un-rebound restart must not delete");
     drop(cold_reopened);
 
-    // Pass #2: the real scheduled worker acquires a fresh PG gc_epoch fence, rebinds, and finishes the batch.
-    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
-    let pass2 = worker::run_once(&state, &policy, Uuid::new_v4()).await?.context("pass2 restart resumption")?;
-    unsafe {
-        std::env::remove_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE);
-    }
-    assert_eq!(pass2.kind, "pando_tombstone_delete");
-    assert_eq!(pass2.state, "succeeded");
-    let pgc = pool.get().await?;
-    let res_json: serde_json::Value =
-        pgc.query_one("SELECT result FROM storage_maintenance_jobs WHERE id = $1", &[&pass2.job_id]).await?.get(0);
-    assert_eq!(res_json["authority_lane"], "distributed_refcas");
-    let epoch_2 = res_json["gc_epoch"].as_u64().context("pass2 gc_epoch")?;
+    // Child #2 (separate OS process): the scheduled runtime acquires a fresh PG fence and resumes.
+    let c2 = pg_child_worker::spawn_pass2_scheduled_runtime_child(
+        dir.path(),
+        &db_url,
+        &schema,
+        repo_id,
+        c1.job_id,
+        &s3.env_pairs(),
+    )?;
+    assert_ne!(c2.pid, std::process::id(), "pass2 must run in a separate OS process");
+    assert_ne!(c2.pid, c1.pid, "each pass must run in its own OS process");
+    assert_eq!(c2.result["authority_lane"], "distributed_refcas");
+    let epoch_2 = c2.result["gc_epoch"].as_u64().context("pass2 gc_epoch")?;
     assert!(epoch_2 > epoch_1, "restart must acquire a strictly newer PG gc_epoch fence");
-    assert_eq!(res_json["deleted_keys"].as_array().unwrap().len(), 3);
-    drop(pgc);
+    assert_eq!(c2.result["deleted_keys"].as_array().unwrap().len(), 3);
 
     let final_auth = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
     let final_snap = final_auth.snapshot();
@@ -290,5 +308,8 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     blob_store.get_to_file(&rep_idx_loc, &ix_dst, dl).await?;
     git_cmd(&verify_dir, &["update-ref", "refs/heads/main", &main_oid], None)?;
     git_cmd(&verify_dir, &["fsck", "--full", "--strict"], None)?;
+    unsafe {
+        std::env::remove_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE);
+    }
     Ok(())
 }

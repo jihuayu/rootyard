@@ -22,13 +22,18 @@ impl DurableSafeGcAuthority {
         target_pack_ids: &[Uuid],
     ) -> Result<DeletionProof, SafeGcError> {
         let snap = self.update_persisted(|s| {
-            if let super::model::AuthorityLane::SingleNodePg { reader_barrier_epoch, .. } = arm_receipt.lane {
-                s.reader_leases.set_pg_exclusive_barrier_epoch(Some(reader_barrier_epoch));
+            if let super::model::AuthorityLane::SingleNodePg { reader_barrier_epoch, .. } = &arm_receipt.lane {
+                s.reader_leases.set_pg_exclusive_barrier_epoch(Some(*reader_barrier_epoch));
             }
             s.reader_leases.refresh_drain_watermark(s.authority.membership_generation);
             s.refresh_group_receipts_quiescence()?;
             Ok(s.clone())
         })?;
+        if arm_receipt.arm_pubkey_hex != snap.authority.trusted_arm_pubkey_hex {
+            return Err(SafeGcError::ArmingRejected(
+                "arm receipt Ed25519 public key not trusted by repository authority",
+            ));
+        }
         let selected: Vec<&ServingPackRecord> = if target_pack_ids.is_empty() {
             snap.retired_packs.iter().collect()
         } else {

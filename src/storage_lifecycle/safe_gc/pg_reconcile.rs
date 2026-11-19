@@ -329,7 +329,7 @@ async fn load_pg_open_decisions<C: GenericClient + Sync>(
             }
         }
     }
-    Ok(map
+    let mut records: Vec<InFlightDecisionRecord> = map
         .into_iter()
         .map(|(decision_id, (kind, oids))| InFlightDecisionRecord {
             decision_id,
@@ -339,7 +339,41 @@ async fn load_pg_open_decisions<C: GenericClient + Sync>(
             protected_pack_ids: Vec::new(),
             protected_oids: oids.into_iter().collect(),
         })
-        .collect())
+        .collect();
+    let attempts_exists = client
+        .query_opt("SELECT to_regclass('pull_remote_merge_attempts')::text", &[])
+        .await
+        .map_err(|e| SafeGcError::Io(format!("read pull_remote_merge_attempts registration failed: {e}")))?
+        .is_some_and(|row| row.get::<_, Option<String>>(0).is_some());
+    if attempts_exists {
+        let rows = client
+            .query(
+                "SELECT decision_id, expected_head_oid, expected_base_oid, candidate_target_oid \
+                 FROM pull_remote_merge_attempts WHERE repository_id = $1 AND state = 'pending_merge'",
+                &[&repo_id],
+            )
+            .await
+            .map_err(|e| SafeGcError::Io(format!("read pull_remote_merge_attempts failed: {e}")))?;
+        for row in rows {
+            let decision_id: Uuid = row.get(0);
+            let mut oids = BTreeSet::new();
+            for col in 1..=3 {
+                if let Some(oid) = row.get::<_, Option<String>>(col) {
+                    oids.insert(oid);
+                }
+            }
+            records.retain(|record| record.decision_id != decision_id);
+            records.push(InFlightDecisionRecord {
+                decision_id,
+                kind: DecisionKind::PullMerge,
+                state: DecisionState::Pending,
+                snapshot_seq: seq,
+                protected_pack_ids: Vec::new(),
+                protected_oids: oids.into_iter().collect(),
+            });
+        }
+    }
+    Ok(records)
 }
 
 async fn load_pg_serving_read_leases<C: GenericClient + Sync>(

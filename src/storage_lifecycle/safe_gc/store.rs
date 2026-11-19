@@ -104,6 +104,10 @@ impl SafeGcRepoSnapshot {
         for d in &self.in_flight_decisions {
             if matches!(d.state, DecisionState::Pending | DecisionState::Unknown) {
                 pinned.extend(d.protected_pack_ids.iter().copied());
+                if d.state == DecisionState::Pending && d.protected_pack_ids.is_empty() && d.protected_oids.is_empty() {
+                    pinned.extend(self.active_packs.iter().map(|p| p.pack_id));
+                    pinned.extend(self.retired_packs.iter().map(|p| p.pack_id));
+                }
             }
         }
         if !pinned_keys.is_empty() {
@@ -210,8 +214,13 @@ impl DurableSafeGcAuthority {
                 {
                     return Err(SafeGcError::ArmingRejected("arm receipt disagrees with live authority"));
                 }
-                if let super::model::AuthorityLane::SingleNodePg { reader_barrier_epoch, .. } = receipt.lane {
-                    s.reader_leases.set_pg_exclusive_barrier_epoch(Some(reader_barrier_epoch));
+                if receipt.arm_pubkey_hex != s.authority.trusted_arm_pubkey_hex {
+                    return Err(SafeGcError::ArmingRejected(
+                        "arm receipt Ed25519 public key not trusted by repository authority",
+                    ));
+                }
+                if let super::model::AuthorityLane::SingleNodePg { reader_barrier_epoch, .. } = &receipt.lane {
+                    s.reader_leases.set_pg_exclusive_barrier_epoch(Some(*reader_barrier_epoch));
                     s.refresh_group_receipts_quiescence()?;
                 }
             }

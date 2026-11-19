@@ -22,6 +22,7 @@ use crate::ref_store::{
 use super::{
     SafeGcError,
     anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState},
+    dist_auth::tests::{make_test_dist_lane, test_arm_signer},
     domain::{ActiveDeleteFence, AuthorityRecord, CasCompactionPublish, UploadedCompactionPair},
     executor::{quarantine_abandoned_staging_without_delete, reclaim_abandoned_compaction_staging},
     model::{
@@ -91,6 +92,7 @@ async fn default_off_blocks_abandoned_staging_deletes_until_explicitly_armed() {
     ));
     let stale_tickets = authority.mint_staging_cleanup_tickets().unwrap();
     let arm_gc2 = SafeGcArmReceipt::seal(
+        &test_arm_signer(),
         auth.tenant_id,
         auth.repo_id,
         auth.history_id,
@@ -199,7 +201,7 @@ fn reconciled_sql_and_sm_holds_and_decisions_clear_when_resolved_preserving_manu
         sm_applied_event_seq: 2,
         sm_last_event_log_term: 1,
         sm_last_event_log_index: 10,
-        sm_snapshot_checksum: sha("sm"),
+        sm_snapshot_checksum: sha("sm-snapshot"),
         pg_projected_log_term: 1,
         pg_projected_log_index: 10,
         pg_projected_event_seq: 2,
@@ -288,7 +290,7 @@ fn refcas_cut_rejects_event_seq_off_by_one_against_pg_projection() {
         sm_applied_event_seq: 1,
         sm_last_event_log_term: 1,
         sm_last_event_log_index: 3,
-        sm_snapshot_checksum: sha("sm-cut"),
+        sm_snapshot_checksum: sha("sm-snapshot"),
         pg_projected_log_term: 1,
         pg_projected_log_index: 3,
         pg_projected_event_seq: 0,
@@ -470,23 +472,14 @@ fn cold_reopen_clears_unheld_pg_barrier_and_requires_live_rebind() {
 
 fn distributed_arm(auth: &AuthorityRecord) -> SafeGcArmReceipt {
     SafeGcArmReceipt::seal(
+        &test_arm_signer(),
         auth.tenant_id,
         auth.repo_id,
         auth.history_id,
         auth.incarnation_id,
         auth.incarnation_epoch,
         true,
-        AuthorityLane::DistributedRefCas {
-            ref_cas_authority_id: auth.repo_id,
-            quorum_epoch: 1,
-            raft_commit_index: 10,
-            quorum_verified: true,
-            global_hold_bridge_verified: true,
-            global_hold_bridge_seq: 10,
-            remote_backup_root_verified: true,
-            remote_backup_root_epoch: 1,
-            async_projection_only: false,
-        },
+        make_test_dist_lane(auth.repo_id, 1, 10, &[], SafeGcObjectFormat::Sha1),
     )
     .unwrap()
 }

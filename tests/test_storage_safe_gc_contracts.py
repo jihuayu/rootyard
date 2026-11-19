@@ -19,7 +19,11 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "worker.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "anti_aba.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "codec.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "compaction.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_auth.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_evidence.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "dist_keyring.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "domain.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "error.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "executor.rs",
@@ -33,6 +37,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "provider_delete.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "quiescence.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "refcas_cut.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "refcas_publisher.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "retention_bridge.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store_barrier.rs",
@@ -40,13 +45,18 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store_verify.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_concurrency.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_auth.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_reconcile.rs",
     ROOT / "tests" / "storage_safe_gc.rs",
     ROOT / "tests" / "storage_safe_gc_maintenance.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "dist_auth_harness.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "pg_child_worker.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_merge_fixture.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_restart_cases.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_lifecycle_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "s3_harness.rs",
+    ROOT / "src" / "pulls" / "remote_merge_finalizer" / "coordinator_outcome.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "storage-safe-gc.yml"
 DOC = ROOT / "docs" / "storage-safe-gc.md"
@@ -80,6 +90,9 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             "quiescence.rs",
             "refcas_cut.rs",
             "pg_maintenance_dist.rs",
+            "dist_auth.rs",
+            "dist_evidence.rs",
+            "dist_keyring.rs",
         ):
             src = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / name).read_text(encoding="utf-8")
             for m in re.finditer(r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*pub struct (\w+)", src):
@@ -106,6 +119,18 @@ class StorageSafeGcContractsTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("with_safe_gc_cutpoint_publisher", coordinator)
         self.assertIn("publish_committed_state", coordinator)
+        self.assertIn("abort_after_install_once", coordinator)
+        self.assertIn("publish_cutpoint", coordinator)
+        self.assertIn("register_safe_gc_repo", coordinator)
+        self.assertIn("arm_signature_hex", model)
+        self.assertNotIn("quorum_verified: bool", model)
+        worker = (ROOT / "src" / "storage_lifecycle" / "worker.rs").read_text(encoding="utf-8")
+        self.assertIn("ProductionRefCasAuthoritySource", worker)
+        child = (
+            ROOT / "tests" / "storage_safe_gc_support" / "pg_child_worker.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("storage_lifecycle::run", child)
+        self.assertIn("Command::new", child)
         cases = (ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs").read_text(
             encoding="utf-8"
         )
@@ -115,6 +140,11 @@ class StorageSafeGcContractsTest(unittest.TestCase):
         restart = (
             ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_restart_cases.rs"
         ).read_text(encoding="utf-8")
+        lifecycle = (
+            ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_lifecycle_cases.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("set_abort_after_install_once", lifecycle)
+        self.assertIn("isolated_pg_pool_with_schema", lifecycle)
         self.assertIn("with_safe_gc_cutpoint_publisher", merge_fixture)
         self.assertIn("production_refcas_pr_merge", cases)
         self.assertIn("production_refcas_pr_merge", restart)

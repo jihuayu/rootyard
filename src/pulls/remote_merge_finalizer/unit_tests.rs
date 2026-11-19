@@ -35,23 +35,23 @@ pub(super) fn hex_digest(byte: u8) -> String {
     format!("{byte:02x}").repeat(32)
 }
 
-pub(super) struct Fixture {
-    pub(super) tenant_id: Uuid,
-    pub(super) repo_id: Uuid,
-    pub(super) actor_id: Uuid,
-    pub(super) scope_id: Uuid,
-    pub(super) realm: GrantExpectedRealm,
-    pub(super) svc: ServiceMtlsIdentity,
-    pub(super) keyring: DecisionGrantKeyring,
-    pub(super) backend: InProcessRefCasBackend,
-    pub(super) store: InMemoryMergeStore,
-    pub(super) base_oid: String,
-    pub(super) head_oid: String,
-    pub(super) base_revision: i64,
-    pub(super) base_gate_digest: String,
+pub(crate) struct Fixture {
+    pub(crate) tenant_id: Uuid,
+    pub(crate) repo_id: Uuid,
+    pub(crate) actor_id: Uuid,
+    pub(crate) scope_id: Uuid,
+    pub(crate) realm: GrantExpectedRealm,
+    pub(crate) svc: ServiceMtlsIdentity,
+    pub(crate) keyring: DecisionGrantKeyring,
+    pub(crate) backend: InProcessRefCasBackend,
+    pub(crate) store: InMemoryMergeStore,
+    pub(crate) base_oid: String,
+    pub(crate) head_oid: String,
+    pub(crate) base_revision: i64,
+    pub(crate) base_gate_digest: String,
 }
 
-pub(super) fn setup_fixture(fmt: GitObjectFormat) -> Fixture {
+pub(crate) fn setup_fixture(fmt: GitObjectFormat) -> Fixture {
     let (tenant_id, repo_id, actor_id, scope_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let realm = GrantExpectedRealm {
         tenant_id,
@@ -153,7 +153,7 @@ pub(super) fn setup_fixture(fmt: GitObjectFormat) -> Fixture {
     }
 }
 
-pub(super) fn build_spec_and_pull(
+pub(crate) fn build_spec_and_pull(
     f: &Fixture,
     pull_number: i64,
     seq: i64,

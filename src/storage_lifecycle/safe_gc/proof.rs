@@ -9,6 +9,7 @@ use crate::ref_store::ref_version::pack_cover::PackRetentionState;
 
 use super::{
     SafeGcError,
+    dist_auth::compute_holds_digest,
     model::{
         AuthorityLane, CandidatePackTarget, DecisionState, GlobalHoldEntry, GlobalHoldState, GroupClosureReceipt,
         InFlightDecisionRecord, LiveRefRoot, MAX_CANDIDATES_PER_SWEEP, MAX_DELETION_ROOTS, MAX_GLOBAL_HOLDS,
@@ -119,7 +120,7 @@ pub fn build_and_verify_deletion_proof(inputs: DeletionProofInputs) -> Result<De
 
 pub fn verify_deletion_proof(proof: &DeletionProof) -> Result<(), SafeGcError> {
     check_proof_bounds_and_seal(proof)?;
-    let require_pg_barrier = matches!(proof.lane, AuthorityLane::SingleNodePg { .. });
+    let require_pg_barrier = matches!(&proof.lane, AuthorityLane::SingleNodePg { .. });
     proof.reader_quiescence.verify_quiesced(require_pg_barrier)?;
 
     let mut protected_oids = BTreeSet::new();
@@ -129,6 +130,17 @@ pub fn verify_deletion_proof(proof: &DeletionProof) -> Result<(), SafeGcError> {
     collect_live_refs(proof, &mut protected_oids)?;
     collect_producers(proof, &mut protected_oids, &mut protected_packs)?;
     collect_holds(proof, &mut protected_oids, &mut protected_packs, &mut protected_keys)?;
+    if let AuthorityLane::DistributedRefCas { hold_bridge_evidence, backup_root_evidence, .. } = &proof.lane {
+        if hold_bridge_evidence.active_holds_digest != compute_holds_digest(&proof.global_holds) {
+            return Err(SafeGcError::DistributedPrereqsMissing(
+                "#151 hold_bridge_evidence digest disagrees with proof global_holds",
+            ));
+        }
+        for oid in &backup_root_evidence.protected_root_oids {
+            validate_non_zero_oid(proof.object_format, oid)?;
+            protected_oids.insert(oid.clone());
+        }
+    }
     collect_decisions(proof, &mut protected_oids, &mut protected_packs)?;
     verify_paired_cursors(&proof.paired_cursors)?;
     proof.lane.verify_cursor_coverage(proof.history_id, proof.live_ref_seq, &proof.paired_cursors)?;
@@ -241,7 +253,7 @@ fn collect_holds(
                 }
             }
             GlobalHoldState::Released { released_at_seq } => {
-                let is_dist = matches!(p.lane, AuthorityLane::DistributedRefCas { .. });
+                let is_dist = matches!(&p.lane, AuthorityLane::DistributedRefCas { .. });
                 if released_at_seq > p.paired_cursors.pg_applied_seq
                     || (is_dist && released_at_seq > p.paired_cursors.refcas_applied_index)
                 {
@@ -261,6 +273,11 @@ fn collect_decisions(
     for d in &p.in_flight_decisions {
         if d.decision_id.is_nil() {
             return Err(SafeGcError::InvalidInput("nil in-flight decision id".into()));
+        }
+        if d.state == DecisionState::Pending && d.protected_pack_ids.is_empty() && d.protected_oids.is_empty() {
+            return Err(SafeGcError::ConcurrentRetentionRace(
+                "in-flight decision between install and commit blocks candidate deletion",
+            ));
         }
         match d.state {
             DecisionState::Unknown => {

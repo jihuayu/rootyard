@@ -11,6 +11,7 @@ use uuid::Uuid;
 use super::{
     SafeGcError,
     anti_aba::KeyLifecycleState,
+    dist_auth::tests::test_arm_signer,
     executor::{
         DeleteFaultHook, PostTicketDriftFault, SafeGcSweepRequest, execute_safe_gc_sweep,
         execute_safe_gc_sweep_with_external_fence, reconcile_pending_delete_after_restart,
@@ -262,6 +263,7 @@ async fn dual_pack_idx_lifecycle_live_pg_restart_fence_and_post_rotation_unwedge
     let curs2 = reopened.snapshot().paired_cursors;
     reopened.set_producers_and_cursors(prods2, curs2).unwrap();
     let arm2 = SafeGcArmReceipt::seal(
+        &test_arm_signer(),
         auth.tenant_id,
         auth.repo_id,
         auth.history_id,

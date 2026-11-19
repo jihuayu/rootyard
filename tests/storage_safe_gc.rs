@@ -1,5 +1,7 @@
 //! Real OpenDAL S3 + BlobStore + stock Git (SHA-1 & SHA-256) Safe GC integration tests (#122).
 
+#[path = "storage_safe_gc_support/dist_auth_harness.rs"]
+pub mod dist_auth_harness;
 #[path = "storage_safe_gc_support/s3_harness.rs"]
 pub mod s3_harness;
 
@@ -10,6 +12,7 @@ use std::{
 };
 
 use anyhow::Result;
+use dist_auth_harness::{provision_single_node_trust, seal_test_lane_arm, test_arm_signer, test_dist_lane};
 use rootyard::{
     blob_store::{BlobError, disposable_view::DisposableViewRoot},
     storage_lifecycle::safe_gc::{
@@ -23,7 +26,7 @@ use rootyard::{
             reclaim_abandoned_compaction_staging, reconcile_pending_delete_after_restart,
             reconcile_pending_delete_after_restart_fenced,
         },
-        model::{AuthorityLane, GcMode, SafeGcArmReceipt, SafeGcObjectFormat},
+        model::{AuthorityLane, GcMode, SafeGcObjectFormat},
         refcas_cut::RefCasReconciledCut,
         store::DurableSafeGcAuthority,
     },
@@ -68,12 +71,14 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
             tenant_id: Uuid::new_v4(),
             repo_id: Uuid::new_v4(),
             history_id: Uuid::new_v4(),
+            trusted_arm_pubkey_hex: test_arm_signer().pubkey_hex().to_owned(),
             incarnation_id: Uuid::new_v4(),
             incarnation_epoch: 1,
             membership_generation: 1,
             live_ref_seq: 1,
             lease_epoch: 1,
         };
+        provision_single_node_trust(dir.path(), auth.tenant_id, auth.repo_id, auth.history_id)?;
         let ext: Option<ExternalFenceCheck<'_>> = if distributed { None } else { Some(&live_pg_fence) };
 
         std::fs::write(git_repo.join("app.txt"), b"v1")?;
@@ -230,17 +235,7 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
         let live_snap = authority.snapshot();
         let cur_seq = live_snap.authority.live_ref_seq;
         let lane = if distributed {
-            AuthorityLane::DistributedRefCas {
-                ref_cas_authority_id: auth.repo_id,
-                quorum_epoch: 1,
-                raft_commit_index: cur_seq,
-                quorum_verified: true,
-                global_hold_bridge_verified: true,
-                global_hold_bridge_seq: cur_seq,
-                remote_backup_root_verified: true,
-                remote_backup_root_epoch: 1,
-                async_projection_only: false,
-            }
+            test_dist_lane(auth.repo_id, 1, cur_seq, &live_snap.global_holds, fmt)
         } else {
             AuthorityLane::SingleNodePg {
                 pg_authority_id: auth.repo_id,
@@ -249,8 +244,7 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
                 reader_barrier_epoch: 1,
             }
         };
-        let arm =
-            SafeGcArmReceipt::seal(auth.tenant_id, auth.repo_id, auth.history_id, auth.incarnation_id, 1, true, lane)?;
+        let arm = seal_test_lane_arm(auth.tenant_id, auth.repo_id, auth.history_id, auth.incarnation_id, 1, lane)?;
 
         let overlap_set: BTreeSet<_> = p3_oids.iter().cloned().collect();
         assert!(p2_oids.iter().all(|o| !overlap_set.contains(o)));
@@ -304,13 +298,12 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
         }
         let curs2 = authority.snapshot().paired_cursors;
         authority.set_producers_and_cursors(prods2, curs2)?;
-        let arm2 = SafeGcArmReceipt::seal(
+        let arm2 = seal_test_lane_arm(
             auth.tenant_id,
             auth.repo_id,
             auth.history_id,
             authority.snapshot().authority.incarnation_id,
             2,
-            true,
             arm.lane.clone(),
         )?;
         authority.set_gc_mode(GcMode::ArmedDestructive(arm2.clone()))?;
@@ -350,13 +343,12 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
         }
         let curs3 = authority.snapshot().paired_cursors;
         authority.set_producers_and_cursors(prods3, curs3)?;
-        let arm3 = SafeGcArmReceipt::seal(
+        let arm3 = seal_test_lane_arm(
             auth.tenant_id,
             auth.repo_id,
             auth.history_id,
             authority.snapshot().authority.incarnation_id,
             3,
-            true,
             arm.lane.clone(),
         )?;
         authority.set_gc_mode(GcMode::ArmedDestructive(arm3.clone()))?;
@@ -398,13 +390,12 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
         }
         let curs4 = authority.snapshot().paired_cursors;
         authority.set_producers_and_cursors(prods4, curs4)?;
-        let arm4 = SafeGcArmReceipt::seal(
+        let arm4 = seal_test_lane_arm(
             auth.tenant_id,
             auth.repo_id,
             auth.history_id,
             authority.snapshot().authority.incarnation_id,
             4,
-            true,
             arm.lane,
         )?;
         authority.set_gc_mode(GcMode::ArmedDestructive(arm4.clone()))?;

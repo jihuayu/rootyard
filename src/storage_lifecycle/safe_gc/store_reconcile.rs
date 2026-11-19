@@ -191,6 +191,11 @@ impl DurableSafeGcAuthority {
             if fence_epoch == 0 {
                 return Err(SafeGcError::StaleDeleterFenced("SingleNodePg recovery requires non-zero fence_epoch"));
             }
+            if live_arm.arm_pubkey_hex != s.authority.trusted_arm_pubkey_hex {
+                return Err(SafeGcError::ArmingRejected(
+                    "arm receipt Ed25519 public key not trusted by repository authority",
+                ));
+            }
             s.reader_leases.set_pg_exclusive_barrier_epoch(Some(fence_epoch));
             s.refresh_group_receipts_quiescence()?;
             s.gc_mode = GcMode::ArmedDestructive(live_arm.clone());

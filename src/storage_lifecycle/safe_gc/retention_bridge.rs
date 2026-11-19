@@ -167,6 +167,17 @@ pub fn build_pack_cover_retention_index(inputs: &PackCoverBridgeInputs<'_>) -> R
         }
     }
 
+    if let AuthorityLane::DistributedRefCas { backup_root_evidence, .. } = inputs.lane
+        && !backup_root_evidence.protected_root_oids.is_empty()
+    {
+        index.add_hold(CoverRetentionHold::BackupManifest {
+            manifest_id: Uuid::from_u128(0x0153_0000_u128 + backup_root_evidence.backup_root_epoch as u128),
+            version_ids: backup_root_evidence.protected_root_oids.iter().map(|o| oid_version_id(o)).collect(),
+            cover_ids: Vec::new(),
+            retained: true,
+        });
+    }
+
     for d in inputs.in_flight_decisions {
         if matches!(d.state, DecisionState::Pending | DecisionState::Unknown) {
             index.add_hold(CoverRetentionHold::PendingOrUnknownOperation {

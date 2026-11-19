@@ -7,7 +7,7 @@
 //! exact `(applied_event_seq, log_term, log_index)` equality with
 //! `ref_cas_projection_cursors`, and zero unresolved `ref_cas_projection_jobs`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,8 @@ use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
 use crate::ref_store::{
-    core::state_machine::{RefCasStateMachine, SmDecisionState, SmHoldState, SmPinState, WireDecisionKind},
+    contract::OperationState,
+    core::state_machine::{RefCasStateMachine, SmDecisionState, SmHoldState, SmPinState},
     projector::{ProjectionStreamState, pg::load_cursor},
 };
 
@@ -207,41 +208,75 @@ pub async fn reconcile_refcas_cut_with_pg<C: GenericClient + Sync>(
         }
     }
 
+    let prior_holds: BTreeMap<Uuid, &GlobalHoldEntry> =
+        snap_before.global_holds.iter().map(|h| (h.hold_id, h)).collect();
     let sm_holds: Vec<GlobalHoldEntry> = sm_snap
         .body
         .holds
         .iter()
         .filter(|h| h.repository_id == repo_id && h.state == SmHoldState::Active)
-        .map(|h| GlobalHoldEntry {
-            hold_id: h.hold_id,
-            tenant_id: h.tenant_id,
-            repo_id,
-            incarnation_epoch: snap_before.authority.incarnation_epoch,
-            registered_seq: last_applied.index.max(1),
-            state: GlobalHoldState::Active,
-            protected_pack_ids: Vec::new(),
-            protected_oids: Vec::new(),
-            protected_physical_keys: Vec::new(),
+        .map(|h| {
+            // A Ref-CAS hold carries no artifact coordinate. Preserve the PG-reconciled
+            // coverage for the same hold, and fail closed when no coverage was observed.
+            let mut entry = GlobalHoldEntry {
+                hold_id: h.hold_id,
+                tenant_id: h.tenant_id,
+                repo_id,
+                incarnation_epoch: snap_before.authority.incarnation_epoch,
+                registered_seq: last_applied.index.max(1),
+                state: GlobalHoldState::Unknown,
+                protected_pack_ids: Vec::new(),
+                protected_oids: Vec::new(),
+                protected_physical_keys: Vec::new(),
+            };
+            if let Some(prior) = prior_holds.get(&h.hold_id)
+                && prior.state != GlobalHoldState::Unknown
+                && (!prior.protected_pack_ids.is_empty()
+                    || !prior.protected_oids.is_empty()
+                    || !prior.protected_physical_keys.is_empty())
+            {
+                entry.state = GlobalHoldState::Active;
+                entry.protected_pack_ids = prior.protected_pack_ids.clone();
+                entry.protected_oids = prior.protected_oids.clone();
+                entry.protected_physical_keys = prior.protected_physical_keys.clone();
+            }
+            entry
         })
         .collect();
 
-    let sm_decisions: Vec<InFlightDecisionRecord> = sm_snap
+    let mut sm_decisions: Vec<InFlightDecisionRecord> = sm_snap
         .body
         .decisions
         .iter()
         .filter(|d| d.repository_id == repo_id && d.state == SmDecisionState::Open)
         .map(|d| InFlightDecisionRecord {
             decision_id: d.decision_id,
-            kind: match d.kind {
-                WireDecisionKind::Atomic => DecisionKind::Push,
-                WireDecisionKind::AcceptedSubset => DecisionKind::Push,
-            },
+            kind: DecisionKind::Push,
             state: DecisionState::Pending,
             snapshot_seq: last_applied.index.max(1),
             protected_pack_ids: Vec::new(),
             protected_oids: Vec::new(),
         })
         .collect();
+    let known_decisions: BTreeSet<Uuid> = sm_decisions.iter().map(|d| d.decision_id).collect();
+    for op in sm_snap
+        .body
+        .operations
+        .iter()
+        .filter(|op| op.key.repository_id == repo_id && op.record.state == OperationState::Pending)
+    {
+        if known_decisions.contains(&op.key.entity_id) {
+            continue;
+        }
+        sm_decisions.push(InFlightDecisionRecord {
+            decision_id: op.key.entity_id,
+            kind: DecisionKind::Push,
+            state: DecisionState::Pending,
+            snapshot_seq: last_applied.index.max(1),
+            protected_pack_ids: Vec::new(),
+            protected_oids: Vec::new(),
+        });
+    }
 
     authority.apply_refcas_reconciled_cut(
         live_refs,
