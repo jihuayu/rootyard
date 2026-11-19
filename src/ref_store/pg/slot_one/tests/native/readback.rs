@@ -5,8 +5,8 @@ use super::{REF_RETRY, REF_SIDE, Retired, db, pack};
 use anyhow::{Result, anyhow, bail, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::{
-    CapturedRef, OperationLookup, OperationRecord, OperationState,
-    core::pack_commit::{PackCommitPlan, PackCommitTerminal},
+    OperationLookup, OperationRecord, OperationState,
+    core::pack_commit::{CapturedRef, PackCommitPlan, PackCommitTerminal},
     pg::{PgRefStore, slot_one::SlotOneRotationReceipt},
 };
 use uuid::Uuid;

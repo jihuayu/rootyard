@@ -14,7 +14,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::{
     CommitMode, CommitRejectCode, GitObjectFormat, IssuerLane, OperationLookup, OperationState, RefCommitResult,
-    TerminalKind,
+    RefUpdate, TerminalKind,
     core::pack_commit::{
         PackCommitBaseline, PackCommitError, PackCommitPlan, PackCommitTerminal, PackPendingToken, PgAuthorizedCommit,
     },
@@ -198,7 +198,10 @@ async fn admit_slot_zero(
     };
 
     let mut client = db.pool.get().await?;
-    let tx = client.transaction().await?;
+    // The admission future owns the raw tokio transaction so only the outer
+    // COMMIT below can publish it. `Client::transaction` is the same-connection
+    // form already used by the crate's slot-zero tests.
+    let tx = tokio_postgres::Client::transaction(&mut client).await?;
     let mut built = None;
     let admission = PgRefStore
         .admit_slot_zero_in_tx(
