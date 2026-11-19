@@ -224,6 +224,22 @@ fn publication_lock_is_released_after_panic_unwind() {
 }
 
 #[test]
+fn publication_lock_release_covers_a_duplicate_open_file_description() {
+    let td = TempDir::new().expect("tempdir");
+    let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
+    let repository_id = Uuid::new_v4();
+    let guard = store.acquire_publication_lock(repository_id).expect("guard");
+    let duplicate = guard.file.try_clone().expect("duplicate lock handle sharing the open file description");
+    let error = store.acquire_publication_lock(repository_id).unwrap_err();
+    assert!(matches!(error, CloneKitError::GitFailed(ref message) if message.contains("busy")));
+    drop(guard);
+    let _reacquired = store
+        .acquire_publication_lock(repository_id)
+        .expect("owner drop must release the lock even while a duplicate descriptor stays open");
+    drop(duplicate);
+}
+
+#[test]
 fn generation_u64_max_is_reported_as_exhausted_not_overflowed() {
     let _serial = test_seam::serial();
     test_seam::reset();
