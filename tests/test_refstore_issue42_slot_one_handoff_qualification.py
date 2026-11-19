@@ -9,6 +9,7 @@ policy and the scoped workflow wiring.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -185,6 +186,31 @@ class QualificationRunTests(unittest.TestCase):
             names,
             set(qualification.REPORTS)
             | {"slot-one-handoff-qualification.json"})
+        for item in manifest["cases"]:
+            final = json.loads(
+                (Path(self.temporary.name) / item["report_label"]).read_text())
+            self.assertEqual(item["passed"], final["passed"])
+            self.assertEqual(item["failed"], final["failed"])
+            self.assertEqual(item["ignored"], final["ignored"])
+            self.assertEqual(item["complete"], final["complete"])
+            self.assertEqual(item["case"], final["case"])
+
+    def test_success_writes_each_case_once_and_manifest_once(self):
+        writes = []
+        real_write = checkpoint.write_report
+
+        def counted(path, payload):
+            writes.append(Path(path).name)
+            return real_write(path, payload)
+
+        runner, _ = runner_factory()
+        with patch.object(checkpoint, "write_report", side_effect=counted):
+            manifest = self.run_qualification(runner)
+        self.assertEqual(manifest["result"], "passed")
+        for label in qualification.REPORTS:
+            self.assertEqual(writes.count(label), 1)
+        self.assertEqual(
+            writes.count("slot-one-handoff-qualification.json"), 1)
 
     def test_report_contains_no_paths_credentials_or_raw_output(self):
         runner, _ = runner_factory()
@@ -212,15 +238,106 @@ class QualificationRunTests(unittest.TestCase):
                 self.assertEqual(manifest["cases"][1]["result"], "passed")
                 qualification.validate_manifest(manifest)
 
-    def test_setup_failure_is_closed_and_the_other_case_still_runs(self):
+    def test_runner_exception_is_closed_and_the_other_case_still_runs(self):
         runner, calls = runner_factory({qualification.CASES[0]: None})
         manifest = self.run_qualification(runner)
         self.assertEqual(len(calls), 2)
         self.assertEqual(manifest["result"], "failed")
-        self.assertEqual(manifest["error_class"], "setup")
-        self.assertEqual(manifest["cases"][0]["error_class"], "setup")
+        self.assertEqual(manifest["error_class"], "runner")
+        self.assertEqual(manifest["cases"][0]["error_class"], "runner")
         self.assertEqual(manifest["cases"][1]["result"], "passed")
         self.assertNotIn("preflight_binary_sha256", json.dumps(manifest))
+        self.assertFalse(
+            (Path(self.temporary.name) / qualification.REPORTS[0]).exists())
+
+    def test_exception_after_valid_pass_file_is_not_accepted(self):
+        def runner(namespace):
+            if namespace.case == qualification.CASES[0]:
+                checkpoint.write_report(namespace.report, report(namespace.case))
+                raise RuntimeError("SECRET=do-not-leak")
+            payload = report(namespace.case)
+            checkpoint.write_report(namespace.report, payload)
+            return payload
+
+        manifest = self.run_qualification(runner)
+        self.assertEqual(manifest["result"], "failed")
+        self.assertEqual(manifest["error_class"], "runner")
+        self.assertEqual(manifest["cases"][0]["error_class"], "runner")
+        self.assertEqual(manifest["cases"][1]["result"], "passed")
+        self.assertFalse(
+            (Path(self.temporary.name) / qualification.REPORTS[0]).exists())
+        self.assertFalse(
+            (Path(self.temporary.name) / qualification.STAGING_DIR_NAME).exists())
+        self.assertNotIn("SECRET", json.dumps(manifest))
+        self.assertNotIn("do-not-leak", json.dumps(manifest))
+
+    def test_disk_pass_with_different_returned_report_is_rejected(self):
+        def runner(namespace):
+            if namespace.case == qualification.CASES[0]:
+                checkpoint.write_report(namespace.report, report(namespace.case))
+                return report(namespace.case, FAILED)
+            payload = report(namespace.case)
+            checkpoint.write_report(namespace.report, payload)
+            return payload
+
+        manifest = self.run_qualification(runner)
+        self.assertEqual(manifest["result"], "failed")
+        self.assertEqual(manifest["error_class"], "returned_mismatch")
+        self.assertEqual(
+            manifest["cases"][0]["error_class"], "returned_mismatch")
+        self.assertEqual(manifest["cases"][1]["result"], "passed")
+        self.assertFalse(
+            (Path(self.temporary.name) / qualification.REPORTS[0]).exists())
+
+    def test_final_on_disk_tamper_is_rejected(self):
+        real_place = qualification._place_staged
+
+        def tamper(staged, final):
+            real_place(staged, final)
+            if Path(final).name == qualification.REPORTS[0]:
+                checkpoint.write_report(
+                    final, report(qualification.CASES[0], FAILED))
+
+        runner, _ = runner_factory()
+        with patch.object(qualification, "_place_staged", side_effect=tamper):
+            manifest = self.run_qualification(runner)
+        self.assertEqual(manifest["result"], "failed")
+        self.assertEqual(manifest["error_class"], "returned_mismatch")
+        self.assertEqual(
+            manifest["cases"][0]["error_class"], "returned_mismatch")
+        self.assertEqual(manifest["cases"][1]["result"], "passed")
+        self.assertFalse(
+            (Path(self.temporary.name) / qualification.REPORTS[0]).exists())
+
+    def test_bounded_readback_rejects_wrong_parent_size_symlink_and_directory(self):
+        root = Path(self.temporary.name) / "readback"
+        root.mkdir()
+        valid = root / "valid.json"
+        payload = report(qualification.CASES[0])
+        valid.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(
+            qualification._read_bounded(valid, parent=root), payload)
+        self.assertIsNone(
+            qualification._read_bounded(valid, parent=root / "other"))
+        oversized = root / "oversized.json"
+        oversized.write_bytes(b"x" * (qualification.MAX_REPORT_BYTES + 1))
+        self.assertIsNone(qualification._read_bounded(oversized, parent=root))
+        directory = root / "directory"
+        directory.mkdir()
+        self.assertIsNone(qualification._read_bounded(directory, parent=root))
+        self.assertIsNone(
+            qualification._read_bounded(root / "missing.json", parent=root))
+        malformed = root / "malformed.json"
+        malformed.write_text("{", encoding="utf-8")
+        self.assertIsNone(qualification._read_bounded(malformed, parent=root))
+        link = root / "link.json"
+        try:
+            os.symlink(valid, link)
+        except OSError:
+            link = None
+        if link is not None:
+            self.assertIsNone(
+                qualification._read_bounded(link, parent=root))
 
     def test_non_matching_attestation_is_closed(self):
         runner, _ = runner_factory(

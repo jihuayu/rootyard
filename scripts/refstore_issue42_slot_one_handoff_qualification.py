@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
+import stat
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +42,8 @@ MANIFEST_SCHEMA = "rootyard/refstore-issue42-slot-one-handoff-qualification/v1"
 LIB_LABEL = "preflighted-#174-libtest"
 ISSUE = 42
 PROBE_COUNT = 2
+STAGING_DIR_NAME = ".slot-one-handoff-staging"
+MAX_REPORT_BYTES = 64 * 1024
 
 if len(CASES) != PROBE_COUNT or len(REPORTS) != PROBE_COUNT:
     raise RuntimeError("slot-one handoff probe inventory is not exactly two")
@@ -57,7 +62,8 @@ ATTESTATION_FIELDS = MANIFEST_FIELDS[2:11]
 REPORT_ATTESTATION_FIELDS = tuple(
     "lib_alias" if key == "lib_label" else key for key in ATTESTATION_FIELDS)
 CASE_ERROR_CLASSES = frozenset(
-    set(checkpoint.ERROR_CLASSES) | {"setup", "report_invalid", "attestation_mismatch"})
+    set(checkpoint.ERROR_CLASSES)
+    | {"setup", "report_invalid", "attestation_mismatch", "returned_mismatch"})
 MANIFEST_ERROR_CLASSES = frozenset(
     set(CASE_ERROR_CLASSES) | {"probe_count", "manifest"})
 SAFE_LABEL = re.compile(r"^[A-Za-z0-9._#-]{1,64}$")
@@ -109,12 +115,94 @@ def _same_attestation(expected, report):
     return all(expected.get(key) == actual.get(key) for key in ATTESTATION_FIELDS)
 
 
-def _read_report(path):
+def _read_bounded(path, *, parent=None):
+    """Read one bounded regular non-symlink report, or return None.
+
+    The checkpoint performs its own mandatory readback.  This second read is a
+    fresh, bounded view of the exact file the wrapper will accept, so a valid
+    file written before a runner exception can never become evidence.
+    """
+    path = Path(path)
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if parent is not None and path.parent.resolve() != Path(parent).resolve():
+            return None
+        if path.is_symlink() or not path.is_file():
+            return None
+        info = path.stat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_size > MAX_REPORT_BYTES):
+            return None
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_REPORT_BYTES + 1)
+        if len(raw) > MAX_REPORT_BYTES:
+            return None
+        return json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return None
-    return payload
+
+
+def _clear(path):
+    try:
+        Path(path).unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _discard(path):
+    try:
+        Path(path).unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _place_staged(staged, final):
+    """Move the one checkpoint-owned file into its final evidence name."""
+    os.replace(staged, final)
+
+
+def _checked_report(path, *, parent, case, attestation, returned):
+    report = _read_bounded(path, parent=parent)
+    if report is None:
+        return None, "report_invalid"
+    try:
+        checkpoint.validate_report(report, schema=CASE_SCHEMA, case=case)
+    except checkpoint_failed:
+        return None, "report_invalid"
+    if not _same_attestation(attestation, report):
+        return None, "attestation_mismatch"
+    if report != returned:
+        return None, "returned_mismatch"
+    return report, None
+
+
+def _admit_case(attestation, case, staged_path, final_path, returned):
+    """Accept only the exact returned report, read fresh from final storage."""
+    if not isinstance(returned, dict):
+        return None, "runner"
+    try:
+        checkpoint.validate_report(returned, schema=CASE_SCHEMA, case=case)
+    except checkpoint_failed:
+        return None, "report_invalid"
+    if not _same_attestation(attestation, returned):
+        return None, "attestation_mismatch"
+    _, failure = _checked_report(
+        staged_path, parent=staged_path.parent, case=case,
+        attestation=attestation, returned=returned)
+    if failure is not None:
+        return None, failure
+    try:
+        _place_staged(staged_path, final_path)
+    except OSError:
+        return None, "setup"
+    final, failure = _checked_report(
+        final_path, parent=final_path.parent, case=case,
+        attestation=attestation, returned=returned)
+    if failure is not None:
+        return None, failure
+    return final, None
 
 
 def _case_args(args, case, report):
@@ -142,42 +230,52 @@ def run_qualification(args, run_checkpoint=None):
     checkpoint.apply_lib_alias_label(attestation, LIB_LABEL)
     attestation = _attestation(attestation)
     report_dir = Path(args.report_dir)
-    report_dir.mkdir(parents=True, exist_ok=True)
+    if report_dir.is_symlink():
+        raise checkpoint_failed("staging")
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise checkpoint_failed("staging")
+    staging_dir = report_dir / STAGING_DIR_NAME
+    if staging_dir.is_symlink():
+        raise checkpoint_failed("staging")
+    try:
+        staging_dir.mkdir(exist_ok=True)
+    except OSError:
+        raise checkpoint_failed("staging")
+    if staging_dir.resolve().parent != report_dir.resolve():
+        raise checkpoint_failed("staging")
 
     records = []
-    for case, label in zip(CASES, REPORTS):
-        report_path = report_dir / label
-        try:
-            report_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            records.append(_closed_failure(case, label, "setup"))
-            continue
-        candidate = None
-        try:
-            candidate = runner(_case_args(args, case, report_path))
-        except Exception:
-            candidate = None
-        if candidate is None:
-            candidate = _read_report(report_path)
-        if candidate is None:
-            records.append(_closed_failure(case, label, "setup"))
-            continue
-        try:
-            checkpoint.validate_report(candidate, schema=CASE_SCHEMA, case=case)
-        except checkpoint_failed:
-            records.append(_closed_failure(case, label, "report_invalid"))
-            continue
-        if not _same_attestation(attestation, candidate):
-            records.append(_closed_failure(case, label, "attestation_mismatch"))
-            continue
-        try:
-            checkpoint.write_report(report_path, candidate)
-        except OSError:
-            records.append(_closed_failure(case, label, "setup"))
-            continue
-        records.append(_case_record(candidate, label))
+    try:
+        for case, label in zip(CASES, REPORTS):
+            final_path = report_dir / label
+            staged_path = staging_dir / label
+            if not _clear(final_path) or not _clear(staged_path):
+                _discard(final_path)
+                _discard(staged_path)
+                records.append(_closed_failure(case, label, "setup"))
+                continue
+            try:
+                returned = runner(_case_args(args, case, staged_path))
+            except Exception:
+                # A checkpoint that wrote a valid passing file and then raised
+                # is still a failed probe: discard the staged file and never
+                # publish a pass-substitute final report.
+                _discard(staged_path)
+                _discard(final_path)
+                records.append(_closed_failure(case, label, "runner"))
+                continue
+            final, failure = _admit_case(
+                attestation, case, staged_path, final_path, returned)
+            if failure is not None:
+                _discard(staged_path)
+                _discard(final_path)
+                records.append(_closed_failure(case, label, failure))
+                continue
+            records.append(_case_record(final, label))
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     if len(records) != PROBE_COUNT or tuple(item["case"] for item in records) != CASES:
         raise checkpoint_failed("probe_count")
