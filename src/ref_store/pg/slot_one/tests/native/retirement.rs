@@ -7,7 +7,7 @@ use super::{
     publication::{
         authorized_commit, capture_baseline, child_commit, plan_from_baseline, ref_update, stage, wire_digest,
     },
-    readback::{operation_record, publication_for, stored_ref},
+    readback::{operation_record, private_retirement_evidence, publication_for, stored_ref},
     serving,
 };
 use anyhow::{Result, anyhow, bail, ensure};
@@ -179,6 +179,7 @@ async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_re
         operation_record(db, repository.id, private0).await?.state() == OperationState::Rejected,
         "the mirror selection changed the durable P0 terminal"
     );
+    let private_evidence = private_retirement_evidence(db, &public, &admission, &retirement).await?;
 
     Ok(Retired {
         verified,
@@ -191,6 +192,7 @@ async fn retire_p0_inner(db: &db::Db, store: &BlobStore, git: &Path, producer_re
         admission,
         plan,
         retirement,
+        private_evidence,
         gate: gate1,
     })
 }

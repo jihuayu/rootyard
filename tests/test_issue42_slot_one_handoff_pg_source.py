@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 GATEWAY = ROOT / "src/ref_store/pg/slot_one/tests/native/gateway.rs"
 NATIVE = ROOT / "src/ref_store/pg/slot_one/tests/native.rs"
 RETIREMENT = ROOT / "src/ref_store/pg/slot_one/tests/native/retirement.rs"
+READBACK = ROOT / "src/ref_store/pg/slot_one/tests/native/readback.rs"
 SUPPORT = ROOT / "src/blob_git_gateway/slot_one_acceptance_support.rs"
 RECEIVE = ROOT / "src/blob_git_gateway/receive.rs"
 SLOT_ONE = ROOT / "src/blob_git_gateway/publish/slot_one.rs"
@@ -34,6 +35,7 @@ class SlotOneHandoffPostgresSourceTest(unittest.TestCase):
         cls.gateway = GATEWAY.read_text()
         cls.native = NATIVE.read_text()
         cls.retirement = RETIREMENT.read_text()
+        cls.readback = READBACK.read_text()
         cls.support = SUPPORT.read_text()
         cls.receive = RECEIVE.read_text()
         cls.slot_one = SLOT_ONE.read_text()
@@ -63,6 +65,23 @@ class SlotOneHandoffPostgresSourceTest(unittest.TestCase):
         self.assertIn("receive::producer_request_digest(", self.support)
         self.assertIn("receive::verified_receive_from_test_wire(", self.support)
         self.assertIn("#[cfg(test)]\npub(crate) mod slot_one_acceptance_support;", self.mod)
+
+    def test_retirement_boundary_uses_independent_private_evidence(self):
+        self.assertIn("private_evidence: PublicAttemptEvidence", self.native)
+        self.assertIn(
+            "private_retirement_evidence(db, &public, &admission, &retirement)",
+            self.retirement,
+        )
+        self.assertIn("let evidence = &retired.private_evidence;", self.gateway)
+        self.assertNotIn("PublicAttemptLookup::Rejected", self.gateway)
+        self.assertIn("wrapper_state == OperationState::Pending.as_str()", self.readback)
+        self.assertIn("retirement private operation is not rejected", self.readback)
+        self.assertIn("retirement private event differs from the selected retirement", self.readback)
+        self.assertIn(
+            "blob_git_gateway::{BlobGitConfig, BlobGitState, GatewayError, slot_one_acceptance_support as acceptance}",
+            self.gateway,
+        )
+        self.assertNotIn("error::GatewayError", self.gateway)
 
     def test_receive_stays_on_legacy_publish_push(self):
         production_receive = production(self.receive)

@@ -70,7 +70,11 @@ use rootyard::db::{Identity, Repository};
 use rootyard::ref_store::{
     CoreGateVersion,
     core::pack_commit::PackCommitPlan,
-    pg::{public_attempt::PublicAttemptRequest, public_terminal::PublicAttemptRetirement, slot_zero::SlotZeroReceipt},
+    pg::{
+        public_attempt::{PublicAttemptEvidence, PublicAttemptRequest},
+        public_terminal::PublicAttemptRetirement,
+        slot_zero::SlotZeroReceipt,
+    },
 };
 
 use readback::{assert_a5_after_rotation, assert_no_registry_promotion, publication_for, stored_ref};
@@ -98,6 +102,10 @@ struct Retired {
     admission: SlotZeroReceipt,
     plan: PackCommitPlan,
     retirement: PublicAttemptRetirement,
+    /// Independently read private rejection/event evidence for the legal
+    /// retirement boundary. The public wrapper remains pending slot zero with no
+    /// public event, so this is not a `PublicAttemptLookup::Rejected` result.
+    private_evidence: PublicAttemptEvidence,
     gate: CoreGateVersion,
 }
 

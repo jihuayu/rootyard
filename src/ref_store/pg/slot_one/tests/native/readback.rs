@@ -1,13 +1,19 @@
 //! Durable operation/ref/publication/attempt readback and A5 snapshot checks.
 
 use super::db::deadline;
-use super::{REF_RETRY, REF_SIDE, Retired, db, pack};
+use super::{REF_RETRY, REF_SIDE, Retired, SLOT_ZERO_LANE, db, pack};
 use anyhow::{Result, anyhow, bail, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::{
-    CapturedRef, OperationLookup, OperationRecord, OperationState,
+    CapturedRef, IssuerLane, OperationLookup, OperationRecord, OperationState,
     core::pack_commit::{PackCommitPlan, PackCommitTerminal},
-    pg::{PgRefStore, slot_one::SlotOneRotationReceipt},
+    pg::{
+        PgRefStore,
+        public_attempt::{PublicAttempt, PublicAttemptEvidence, PublicAttemptRequest},
+        public_terminal::PublicAttemptRetirement,
+        slot_one::SlotOneRotationReceipt,
+        slot_zero::SlotZeroReceipt,
+    },
 };
 use uuid::Uuid;
 
@@ -50,6 +56,99 @@ pub(super) async fn operation_event_id(db: &db::Db, repository_id: Uuid, operati
         )
         .await?;
     Ok(row.map(|row| row.get(0)))
+}
+
+/// Independently prove the legal slot-zero retirement boundary and derive the
+/// private evidence the gateway handoff consumes.
+///
+/// The public resolver intentionally refuses a slot-zero private rejection whose
+/// wrapper is still pending, so this fixture must not ask it for a `Rejected`
+/// answer. Instead this reads the durable private attempt, operation, event and
+/// pending wrapper in one statement and checks every field against the admission
+/// receipt and the retirement selected by the production mirror. It writes
+/// nothing and never relaxes the resolver's own consistency checks.
+pub(super) async fn private_retirement_evidence(
+    db: &db::Db,
+    public: &PublicAttemptRequest,
+    admission: &SlotZeroReceipt,
+    retirement: &PublicAttemptRetirement,
+) -> Result<PublicAttemptEvidence> {
+    let row = db
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT a.slot,a.private_id,a.plan_digest,a.proof_digest,a.base_revision,
+                    o.lane,o.sequence,o.state,
+                    e.event_id,e.revision,e.outcome,
+                    w.current_slot,w.state,w.event_id,w.retired_event_id,w.cancelled_private_id
+               FROM ref_store_private_attempts a
+               JOIN ref_store_operations o
+                 ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
+               JOIN ref_store_core_events e
+                 ON e.repository_id=a.repository_id AND e.operation_id=a.private_id
+               JOIN ref_store_public_operations w
+                 ON w.repository_id=a.repository_id AND w.public_id=a.public_id
+              WHERE a.repository_id=$1 AND a.public_id=$2 AND a.slot=0",
+            &[&public.repository_id, &public.public_id],
+        )
+        .await?;
+    let slot: i16 = row.get(0);
+    let private_id: Uuid = row.get(1);
+    let plan_digest: String = row.get(2);
+    let proof_digest: String = row.get(3);
+    let base_revision: i64 = row.get(4);
+    let lane: String = row.get(5);
+    let sequence: i64 = row.get(6);
+    let state: String = row.get(7);
+    let event_id: Uuid = row.get(8);
+    let event_revision: i64 = row.get(9);
+    let outcome: String = row.get(10);
+    let wrapper_slot: i16 = row.get(11);
+    let wrapper_state: String = row.get(12);
+    let wrapper_event_id: Option<Uuid> = row.get(13);
+    let wrapper_retired_event_id: Option<Uuid> = row.get(14);
+    let wrapper_cancelled_private_id: Option<Uuid> = row.get(15);
+
+    ensure!(slot == 0, "retirement private attempt is not slot zero");
+    ensure!(private_id == admission.private_id, "retirement private attempt id differs from admission");
+    ensure!(plan_digest == admission.plan_digest.as_hex(), "retirement private plan digest differs from admission");
+    ensure!(proof_digest == admission.proof_digest.as_hex(), "retirement private proof digest differs from admission");
+    ensure!(base_revision == admission.base_revision, "retirement private base revision differs from admission");
+    ensure!(lane == SLOT_ZERO_LANE, "retirement private operation is not on the slot-zero lane");
+    ensure!(sequence == admission.sequence, "retirement private sequence differs from admission");
+    ensure!(state == OperationState::Rejected.as_str(), "retirement private operation is not rejected");
+    ensure!(event_id == retirement.event_id, "retirement private event differs from the selected retirement");
+    ensure!(
+        event_revision == retirement.event_revision,
+        "retirement private event revision differs from the selected retirement"
+    );
+    ensure!(outcome == OperationState::Rejected.as_str(), "retirement private event is not a rejection");
+    ensure!(
+        wrapper_slot == 0
+            && wrapper_state == OperationState::Pending.as_str()
+            && wrapper_event_id.is_none()
+            && wrapper_retired_event_id.is_none()
+            && wrapper_cancelled_private_id.is_none(),
+        "legal retirement boundary wrapper is not pending slot zero without a public event"
+    );
+
+    Ok(PublicAttemptEvidence {
+        public_id: public.public_id,
+        current: PublicAttempt {
+            slot,
+            private_id,
+            plan_digest: admission.plan_digest,
+            proof_digest: admission.proof_digest,
+            base_revision,
+            lane: IssuerLane::new(lane).map_err(|_| anyhow!("retirement private lane is not canonical"))?,
+            sequence,
+            state: OperationState::Rejected,
+            event_id: Some(event_id),
+            event_revision: Some(event_revision),
+        },
+        retired: None,
+    })
 }
 
 pub(super) async fn public_attempt_event_count(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Result<i64> {

@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use rootyard::{
     auth,
-    blob_git_gateway::{BlobGitConfig, BlobGitState, error::GatewayError, slot_one_acceptance_support as acceptance},
+    blob_git_gateway::{BlobGitConfig, BlobGitState, GatewayError, slot_one_acceptance_support as acceptance},
     blob_store::opendal::BlobStore,
     db::{self as product_db, Identity},
     ref_store::{
@@ -35,7 +35,7 @@ use rootyard::{
         core::pack_commit::{PackArtifactRole, PackCommitPlan},
         pg::{
             PgRefStore,
-            public_attempt::{PublicAttemptEvidence, PublicAttemptLookup, PublicAttemptRequest},
+            public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
             public_terminal::{PublicAttemptTerminalOutcome, PublicAttemptTerminalReceipt},
         },
         serving::{self, ServingRepository},
@@ -46,9 +46,12 @@ use rootyard::{
 use super::{
     REF_RETRY, REF_SIDE, Retired,
     db::{self, deadline},
-    git, pack,
+    pack,
     publication::{authorized_commit, capture_baseline, child_commit, ref_update, stage},
-    readback::{assert_a5_after_rotation, operation_event_id, operation_record, publication_for, stored_ref},
+    readback::{
+        assert_a5_after_rotation, operation_event_id, operation_record, private_retirement_evidence, publication_for,
+        stored_ref,
+    },
     retirement::retire_p0_with_producer,
     setup::{require_owned_disposable_fixture, require_postgres_17},
 };
@@ -152,7 +155,7 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
             serving.cluster_incarnation == retired.public.restore_incarnation,
             "live serving restore incarnation differs from P0"
         );
-        let evidence = rejected_slot_zero(&db, &retired.public).await?;
+        let evidence = &retired.private_evidence;
         let baseline = capture_baseline(&db, retired.repository.id, retired.verified.tenant).await?;
         ensure!(baseline.gate().revision() == retired.gate.revision(), "rotation baseline is not the advanced P1 gate");
         let body_dir = tempfile::tempdir()?;
@@ -168,7 +171,7 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
             &retired.p0_files.pack,
             &retired.p0_files.idx,
             &baseline,
-            &evidence,
+            evidence,
             &retired.retirement,
             deadline(),
         )
@@ -355,7 +358,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             serving.cluster_incarnation == retired.public.restore_incarnation,
             "live serving restore incarnation differs from P0"
         );
-        let evidence = rejected_slot_zero(&db, &retired.public).await?;
+        let evidence = &retired.private_evidence;
         let baseline = capture_baseline(&db, retired.repository.id, retired.verified.tenant).await?;
         let body_dir = tempfile::tempdir()?;
         let body = write_p0_body(&body_dir, &retired)?;
@@ -375,7 +378,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             &retired.p0_files.pack,
             &retired.p0_files.idx,
             &baseline,
-            &evidence,
+            evidence,
             &retired.retirement,
             deadline(),
         )
@@ -388,13 +391,11 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             ledger_snapshot(&db, retired.repository.id, retired.public.public_id).await? == retired_snapshot,
             "revoked fresh handoff left a durable candidate, sequence, ref or write effect"
         );
-        let wrapper_after_refusal = wrapper_row(&db, retired.repository.id, retired.public.public_id).await?;
+        let private_after_refusal =
+            private_retirement_evidence(&db, &retired.public, &retired.admission, &retired.retirement).await?;
         ensure!(
-            wrapper_after_refusal.current_slot == 0
-                && wrapper_after_refusal.state == "rejected"
-                && wrapper_after_refusal.retired_event_id.is_none()
-                && wrapper_after_refusal.event_id == Some(retired.retirement.event_id),
-            "revoked fresh handoff changed the slot-zero wrapper"
+            private_after_refusal == retired.private_evidence,
+            "revoked fresh handoff changed the pending wrapper or private rejection evidence"
         );
 
         // Restore exactly the same user identity through the production token
@@ -410,7 +411,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             &retired.p0_files.pack,
             &retired.p0_files.idx,
             &baseline,
-            &evidence,
+            evidence,
             &retired.retirement,
             deadline(),
         )
@@ -445,7 +446,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             &retired.p0_files.pack,
             &retired.p0_files.idx,
             &replay_baseline,
-            &evidence,
+            evidence,
             &retired.retirement,
             deadline(),
         )
@@ -487,7 +488,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             &retired.p0_files.pack,
             &retired.p0_files.idx,
             &replay_baseline,
-            &evidence,
+            evidence,
             &retired.retirement,
             deadline(),
         )
@@ -514,7 +515,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
             &retired.p0_files.pack,
             &retired.p0_files.idx,
             &replay_baseline,
-            &evidence,
+            evidence,
             &retired.retirement,
             deadline(),
         )
@@ -646,19 +647,6 @@ async fn advance_gate(
         "later authorized commit did not apply its own ref"
     );
     super::db::gate_version(&db.pool, retired.repository.id, retired.verified.tenant).await
-}
-
-async fn rejected_slot_zero(db: &db::Db, public: &PublicAttemptRequest) -> Result<PublicAttemptEvidence> {
-    match public_lookup(db, public).await? {
-        PublicAttemptLookup::Rejected(evidence)
-            if evidence.current.slot == 0
-                && evidence.current.state == OperationState::Rejected
-                && evidence.retired.is_none() =>
-        {
-            Ok(evidence)
-        }
-        _ => bail!("retirement selection is not the exact current slot-zero rejection"),
-    }
 }
 
 async fn public_lookup(db: &db::Db, request: &PublicAttemptRequest) -> Result<PublicAttemptLookup> {
