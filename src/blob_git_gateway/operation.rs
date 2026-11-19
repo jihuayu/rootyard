@@ -32,7 +32,10 @@ use crate::ref_store::{
     CommitMode, GitObjectFormat, OperationLookup, OperationRecord, OperationState, PgRefStore, RefCommitResult,
     RequestDigest, TerminalKind,
     core::pack_commit::{PackCommitTerminal, read_serving_operation},
-    pg::public_attempt::PublicAttemptEvidence,
+    pg::{
+        public_attempt::{PublicAttemptEvidence, PublicAttemptRequest},
+        slot_one, slot_zero,
+    },
 };
 
 use super::{error::GatewayError, native, protocol::PushRequest, state::BlobGitState};
@@ -313,20 +316,36 @@ pub(super) fn classify(
 /// record from a legacy route. Every refusal is fixed and carries no UUID.
 pub(super) async fn lookup_public_private_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
-    repository_id: Uuid,
-    public_id: Uuid,
+    public_request: &PublicAttemptRequest,
     evidence: &PublicAttemptEvidence,
-    issuer_id: Uuid,
     request: &PushRequest,
     digest: RequestDigest,
     deadline: Instant,
 ) -> Result<Claim, GatewayError> {
+    let repository_id = public_request.repository_id;
+    let public_id = public_request.public_id;
     if evidence.public_id != public_id {
         return Err(GatewayError::Internal("verified public attempt names another public operation"));
     }
     let private_id = evidence.current.private_id;
     if private_id.is_nil() || private_id == public_id {
         return Err(GatewayError::Internal("verified public attempt has an invalid private identity"));
+    }
+    let expected_proof = match evidence.current.slot {
+        0 => slot_zero::recompute_slot_zero_proof(public_request, &evidence.current)
+            .map_err(|_| GatewayError::Internal("verified public attempt proof is not recomputable"))?,
+        1 => {
+            let retired = evidence
+                .retired
+                .as_ref()
+                .ok_or_else(|| GatewayError::Internal("verified slot-one attempt has no retired evidence"))?;
+            slot_one::recompute_slot_one_proof(public_request, retired, &evidence.current)
+                .map_err(|_| GatewayError::Internal("verified slot-one proof is not recomputable"))?
+        }
+        _ => return Err(GatewayError::Internal("verified public attempt has an unsupported slot")),
+    };
+    if expected_proof != evidence.current.proof_digest {
+        return Err(GatewayError::Internal("verified public attempt proof differs from its durable attempt"));
     }
     // The public preflight lock includes every existing private attempt of this
     // wrapper. Re-prove that exact operation lock before the raw core read.
@@ -364,7 +383,7 @@ pub(super) async fn lookup_public_private_in_tx(
     classify(
         ResolvedOperation { record, producer_digest: *binding.producer_digest() },
         repository_id,
-        issuer_id,
+        public_request.issuer_id,
         private_id,
         request,
         digest,

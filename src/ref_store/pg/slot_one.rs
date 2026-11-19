@@ -1191,6 +1191,33 @@ struct SlotOneProofFacts<'a> {
     plan_digest: RequestDigest,
 }
 
+/// Recompute the exact slot-one rotation proof from the verified public
+/// evidence. Performs no SQL and accepts no stored proof bytes as input.
+pub(crate) fn recompute_slot_one_proof(
+    public: &PublicAttemptRequest,
+    retired: &super::public_attempt::PublicAttempt,
+    current: &super::public_attempt::PublicAttempt,
+) -> Result<RequestDigest, PackCommitError> {
+    if retired.slot != 0 || current.slot != 1 {
+        return Err(ledger("slot one proof requested for a non-slot-one pair"));
+    }
+    let retired_event_id = retired.event_id.ok_or_else(|| ledger("slot one retired event is missing"))?;
+    let retired_event_revision =
+        retired.event_revision.ok_or_else(|| ledger("slot one retired event revision is missing"))?;
+    Ok(slot_one_proof_digest(&SlotOneProofFacts {
+        public,
+        lane: &retired.lane,
+        retired_private_id: retired.private_id,
+        retired_event_id,
+        retired_event_revision,
+        retired_plan_digest: retired.plan_digest,
+        private_id: current.private_id,
+        sequence: current.sequence,
+        base_revision: current.base_revision,
+        plan_digest: current.plan_digest,
+    }))
+}
+
 fn slot_one_proof_digest(facts: &SlotOneProofFacts<'_>) -> RequestDigest {
     let fields = slot_one_proof_fields(facts);
     let parts = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();

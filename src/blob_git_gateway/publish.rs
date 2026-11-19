@@ -91,6 +91,11 @@ const DURABLY_CANCELLED: GatewayError = GatewayError::Conflict("operation is dur
 /// most this many distinct winners against the same original deadline.
 const MAX_ADMISSION_REBASES: usize = 2;
 
+/// One gateway-owned savepoint on the authenticated deadpool transaction. The
+/// slot-zero coordinator creates its own nested savepoint inside this one, so
+/// the outer `COMMIT` remains the only durability point.
+const GATEWAY_SLOT_ZERO_SAVEPOINT: &str = "rootyard_gateway_slot_zero_admission";
+
 /// One staged `.pack` + `.idx` pair with its verified content digest.
 pub(super) struct Pair {
     pub pack: PathBuf,
@@ -363,9 +368,14 @@ pub(super) async fn begin_slot_zero(
     let backend_identity = state.store().backend_identity().as_hex().to_owned();
     let public_request =
         public_attempt_request(serving, actor, public_id, request_digest, mode, baseline, backend_identity)?;
+    let lane = IssuerLane::new(ISSUER_LANE).map_err(ref_error)?;
 
     let mut client = state.pooled(deadline).await?;
-    let tx = begin_bounded(&mut client, deadline).await.map_err(ref_error)?;
+    let tx = match timeout_at(deadline, client.transaction()).await {
+        Ok(Ok(tx)) => tx,
+        Ok(Err(_)) => return Err(GatewayError::Internal("private admission transaction failed")),
+        Err(_) => return Err(GatewayError::Timeout),
+    };
     let preflight = timeout_at(
         deadline,
         slot_zero_public_preflight(
@@ -374,6 +384,7 @@ pub(super) async fn begin_slot_zero(
             actor,
             &public_request,
             state.store().backend_identity(),
+            &lane,
             private_id,
             request,
             baseline,
@@ -390,18 +401,18 @@ pub(super) async fn begin_slot_zero(
             begin_slot_zero_fresh(tx, request, pairs, mode, baseline, public_request, private_id, deadline).await
         }
         Ok(Ok(SlotZeroPreflight::Claim(claim))) => {
-            rollback_bounded(tx, deadline).await?;
+            rollback_deadpool_bounded(tx, deadline).await?;
             start_from_claim(claim)
         }
         Ok(Err(error)) => {
             // Every branch above returned a typed refusal, not a legacy
             // fallback. The transaction has no publishable admission; keep the
             // typed error if best-effort cleanup is unconfirmed.
-            let _ = rollback_bounded(tx, deadline).await;
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
             Err(error)
         }
         Err(_) => {
-            let _ = rollback_bounded(tx, deadline).await;
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
             Err(GatewayError::Timeout)
         }
     }
@@ -419,26 +430,43 @@ enum SlotZeroPreflight {
 /// One authenticated, lock-ordered public preflight in the caller's transaction.
 ///
 /// Order is fixed: migration-152 public/attempt locks, the migration-138
-/// operation key, live serving authority, then the read-only public lookup. The
-/// fresh restore/realm must equal the already authorized baseline; a moved
-/// authority is a conflict, never a silently adopted realm. Explicit
-/// `LegacyPath` is the only branch that calls the older legacy operation
-/// lookup, and it does so only after that operation key is already held.
+/// operation key, the expected issuer-lane pre-lock, live serving authority
+/// (token/role/scope/restore/realm/binding/backend), then the read-only public
+/// lookup. The lane pre-lock is the slot-zero order-sensitive step: it is held
+/// before the repository/binding/gate reads and advances no sequence. The fresh
+/// restore/realm must equal the already authorized baseline; a moved authority
+/// is a conflict, never a silently adopted realm.
+///
+/// Exits are closed: `Unknown` keeps this transaction for fresh admission;
+/// wrapper evidence resolves in this transaction then rolls back; a claim rolls
+/// back; `PrivateIdentifier` is a conflict; `LegacyPath` is the only branch that
+/// calls the older legacy lookup and only under the already-held operation key;
+/// mixed/corrupt evidence returns a typed error. No branch falls through to the
+/// legacy fresh writer.
 #[allow(clippy::too_many_arguments)]
 async fn slot_zero_public_preflight(
-    tx: &tokio_postgres::Transaction<'_>,
+    tx: &deadpool_postgres::Transaction<'_>,
     serving: &ServingRepository,
     actor: &Identity,
     public_request: &PublicAttemptRequest,
     backend_identity: &crate::blob_store::BlobBackendIdentity,
+    lane: &IssuerLane,
     private_id: Uuid,
     request: &PushRequest,
     baseline: &PackCommitBaseline,
     deadline: Instant,
 ) -> Result<SlotZeroPreflight, GatewayError> {
-    let repository_id = serving.gate.repository_id();
-    PgRefStore.lock_public_attempt(tx, public_request, private_id, deadline).await.map_err(GatewayError::from)?;
-    crate::ref_store::pg::lock_operation(tx, repository_id, public_request.public_id, deadline)
+    let repository_id = baseline.gate().repository_id();
+    PgRefStore.lock_public_attempt(&**tx, public_request, private_id, deadline).await.map_err(GatewayError::from)?;
+    crate::ref_store::pg::lock_operation(&**tx, repository_id, public_request.public_id, deadline)
+        .await
+        .map_err(GatewayError::from)?;
+    // The lane lock must precede the repository/binding/gate locks taken by the
+    // authenticated lookup and by the slot-zero coordinator. This is only a
+    // pre-lock: no sequence advances until the same transaction builds and
+    // validates the plan. Any later auth/identity refusal rolls it back.
+    PgRefStore
+        .lock_expected_lane(&**tx, repository_id, actor.id, private_id, lane, deadline)
         .await
         .map_err(GatewayError::from)?;
     let fresh = crate::ref_store::serving::lookup_in_tx(
@@ -461,7 +489,7 @@ async fn slot_zero_public_preflight(
         return Err(GatewayError::Conflict("repository authority changed; retry"));
     }
 
-    match PgRefStore.lookup_public_attempt(tx, public_request, deadline).await.map_err(GatewayError::from)? {
+    match PgRefStore.lookup_public_attempt(&**tx, public_request, deadline).await.map_err(GatewayError::from)? {
         PublicAttemptLookup::Unknown => Ok(SlotZeroPreflight::Fresh(public_request.clone())),
         PublicAttemptLookup::PrivateIdentifier => {
             Err(GatewayError::Conflict("operation identifier is already a private attempt"))
@@ -471,7 +499,7 @@ async fn slot_zero_public_preflight(
             // lookup proved there is no wrapper or private claim for this UUID;
             // the migration-138 key is already held, so the guarded legacy
             // lookup can resolve only its own durable record.
-            match operation::lookup_in_tx(tx, repository_id, public_request.public_id, deadline).await? {
+            match operation::lookup_in_tx(&**tx, repository_id, public_request.public_id, deadline).await? {
                 operation::Lookup::Known(resolved) => Ok(SlotZeroPreflight::Claim(operation::classify(
                     resolved,
                     repository_id,
@@ -490,11 +518,9 @@ async fn slot_zero_public_preflight(
         | PublicAttemptLookup::Rejected(evidence)
         | PublicAttemptLookup::Cancelled(evidence) => Ok(SlotZeroPreflight::Claim(
             operation::lookup_public_private_in_tx(
-                tx,
-                repository_id,
-                public_request.public_id,
+                &**tx,
+                public_request,
                 &evidence,
-                actor.id,
                 request,
                 public_request.wire_digest,
                 deadline,
@@ -521,7 +547,7 @@ async fn slot_zero_public_preflight(
 /// existing generic gateway outcome.
 #[allow(clippy::too_many_arguments)]
 async fn begin_slot_zero_fresh(
-    tx: tokio_postgres::Transaction<'_>,
+    mut tx: deadpool_postgres::Transaction<'_>,
     request: &PushRequest,
     pairs: &[Pair],
     mode: CommitMode,
@@ -533,11 +559,29 @@ async fn begin_slot_zero_fresh(
     let repository_id = public_request.repository_id;
     let admission = slot_zero_admission_request(&public_request, private_id)?;
 
+    // Keep the authenticated deadpool transaction as the owner. The coordinator
+    // receives a tokio savepoint borrowed from that same connection, so its
+    // locks, rows and synchronous WAL setting remain inside the one outer
+    // transaction. No connection or transaction is split.
+    let savepoint =
+        match timeout_at(deadline, tokio_postgres::Transaction::savepoint(&mut *tx, GATEWAY_SLOT_ZERO_SAVEPOINT)).await
+        {
+            Ok(Ok(savepoint)) => savepoint,
+            Ok(Err(_)) => {
+                let _ = rollback_deadpool_bounded(tx, deadline).await;
+                return Err(GatewayError::Internal("slot zero admission savepoint failed"));
+            }
+            Err(_) => {
+                let _ = rollback_deadpool_bounded(tx, deadline).await;
+                return Err(GatewayError::Timeout);
+            }
+        };
+
     let mut built = None;
     let outcome = timeout_at(
         deadline,
         PgRefStore.admit_slot_zero_in_tx(
-            tx,
+            savepoint,
             &admission,
             |preview| {
                 let plan = build_slot_zero_plan(
@@ -559,12 +603,19 @@ async fn begin_slot_zero_fresh(
         ),
     )
     .await;
-    let (tx, admission_result) = match outcome {
+    let (savepoint, admission_result) = match outcome {
         Ok(Ok(admission)) => admission.into_parts(),
-        // The coordinator owns and drops the outer transaction on an inner
-        // fatal/uncertain error; there is no handle here to commit.
-        Ok(Err(error)) => return Err(GatewayError::from(error)),
-        Err(_) => return Err(GatewayError::Timeout),
+        // The coordinator owns and drops the savepoint on an inner fatal or
+        // uncertain error; only the outer transaction remains and is rolled
+        // back by this adapter.
+        Ok(Err(error)) => {
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
+            return Err(GatewayError::from(error));
+        }
+        Err(_) => {
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
+            return Err(GatewayError::Timeout);
+        }
     };
 
     match admission_result {
@@ -572,17 +623,21 @@ async fn begin_slot_zero_fresh(
             // Exact public replay: no plan was built and no sequence, wrapper or
             // operation write occurred. Resolve the stored private operation
             // through the same verified public evidence, never the legacy
-            // private-id lookup, then roll the read/lock transaction back.
+            // private-id lookup, then roll back the savepoint and outer owner.
             let claim =
-                replay_slot_zero_claim(&tx, &public_request, request, public_request.wire_digest, deadline).await;
-            let cleanup = rollback_bounded(tx, deadline).await;
+                replay_slot_zero_claim(&savepoint, &public_request, request, public_request.wire_digest, deadline)
+                    .await;
+            let savepoint_cleanup = rollback_bounded(savepoint, deadline).await;
+            let outer_cleanup = rollback_deadpool_bounded(tx, deadline).await;
             let claim = claim?;
-            cleanup?;
+            savepoint_cleanup?;
+            outer_cleanup?;
             start_from_claim(claim)
         }
         Ok(receipt) => {
             let Some(plan) = built else {
-                let _ = rollback_bounded(tx, deadline).await;
+                let _ = rollback_bounded(savepoint, deadline).await;
+                let _ = rollback_deadpool_bounded(tx, deadline).await;
                 return Err(GatewayError::Internal("slot zero admission did not build its plan"));
             };
             if receipt.state != OperationState::Pending
@@ -593,35 +648,55 @@ async fn begin_slot_zero_fresh(
                 || receipt.base_revision != plan.expected().revision()
                 || receipt.plan_digest != *plan.parent_digest()
             {
-                let _ = rollback_bounded(tx, deadline).await;
+                let _ = rollback_bounded(savepoint, deadline).await;
+                let _ = rollback_deadpool_bounded(tx, deadline).await;
                 return Err(GatewayError::Internal("slot zero admission receipt differs from its plan"));
             }
             // The token is only the opaque plan identity the existing prepare
             // path consumes; it carries no additional authority. Mint it before
             // COMMIT so a successful admission cannot fail on a local shaping
             // error after the durability point.
-            let token =
-                PackPendingToken::established(repository_id, plan.tenant_id(), receipt.private_id, receipt.plan_digest)
-                    .map_err(GatewayError::from)?;
-            // The public UUID is the stable operation header. Passing it to the
-            // bounded commit keeps the private UUID out of any COMMIT-unknown
-            // error identity; `From<RefStoreError>` renders the generic unknown
-            // outcome, never the private id.
-            commit_bounded(tx, deadline, repository_id, Some(public_request.public_id)).await.map_err(ref_error)?;
-            Ok(Start::Fresh { _token: token, plan: Box::new(plan) })
+            let token = match PackPendingToken::established(
+                repository_id,
+                plan.tenant_id(),
+                receipt.private_id,
+                receipt.plan_digest,
+            ) {
+                Ok(token) => token,
+                Err(error) => {
+                    let _ = rollback_bounded(savepoint, deadline).await;
+                    let _ = rollback_deadpool_bounded(tx, deadline).await;
+                    return Err(GatewayError::from(error));
+                }
+            };
+            // Release the gateway savepoint, then acknowledge durability on the
+            // real outer transaction. The public UUID is the stable operation
+            // header; the private UUID never enters the COMMIT-unknown identity.
+            match commit_bounded(savepoint, deadline, repository_id, Some(public_request.public_id)).await {
+                Ok(()) => {
+                    commit_deadpool_bounded(tx, deadline).await?;
+                    Ok(Start::Fresh { _token: token, plan: Box::new(plan) })
+                }
+                Err(error) => {
+                    let _ = rollback_deadpool_bounded(tx, deadline).await;
+                    Err(ref_error(error))
+                }
+            }
         }
         Err(error) if is_rolled_back_revision_mismatch(&error) => {
-            // A rebase is safe only after the whole admission transaction (not
-            // merely the savepoint) is acknowledged as rolled back.
-            rollback_bounded(tx, deadline).await?;
+            // A rebase is safe only after both the gateway savepoint and the
+            // whole owned transaction are acknowledged as rolled back.
+            let _ = rollback_bounded(savepoint, deadline).await;
+            rollback_deadpool_bounded(tx, deadline).await?;
             Ok(Start::Rebaseline)
         }
         Err(error) => {
-            // The slot-zero coordinator has already rolled back and released
-            // its savepoint. The outer transaction is a definite non-success;
-            // keep the typed answer if this best-effort cleanup is unconfirmed,
-            // exactly like `begin_fresh`.
-            let _ = rollback_bounded(tx, deadline).await;
+            // The coordinator has already rolled back and released its nested
+            // savepoint. The gateway savepoint and outer transaction are a
+            // definite non-success; keep the typed answer if best-effort
+            // cleanup is unconfirmed, exactly like `begin_fresh`.
+            let _ = rollback_bounded(savepoint, deadline).await;
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
             Err(GatewayError::from(error))
         }
     }
@@ -751,17 +826,7 @@ async fn replay_slot_zero_claim(
                 return Err(GatewayError::Internal("slot zero replay evidence is not a verified public attempt"));
             }
         };
-    operation::lookup_public_private_in_tx(
-        tx,
-        repository_id,
-        public_request.public_id,
-        &evidence,
-        public_request.issuer_id,
-        request,
-        request_digest,
-        deadline,
-    )
-    .await
+    operation::lookup_public_private_in_tx(tx, public_request, &evidence, request, request_digest, deadline).await
 }
 
 /// What one fresh-write transaction decided about this operation identity.
@@ -903,6 +968,36 @@ async fn rollback_bounded(tx: tokio_postgres::Transaction<'_>, deadline: Instant
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(GatewayError::Internal("admission rollback was not acknowledged")),
         Err(_) => Err(GatewayError::Timeout),
+    }
+}
+
+/// Bounded rollback of the gateway-owned deadpool transaction. The tokio
+/// savepoint is always consumed first, so this is the real outer cleanup.
+async fn rollback_deadpool_bounded(
+    tx: deadpool_postgres::Transaction<'_>,
+    deadline: Instant,
+) -> Result<(), GatewayError> {
+    match timeout_at(deadline, tx.rollback()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(GatewayError::Internal("admission rollback was not acknowledged")),
+        Err(_) => Err(GatewayError::Timeout),
+    }
+}
+
+/// Commit the real outer transaction after the gateway savepoint was released.
+/// An unacknowledged COMMIT is the existing generic unknown outcome and never
+/// carries the private UUID.
+async fn commit_deadpool_bounded(
+    tx: deadpool_postgres::Transaction<'_>,
+    deadline: Instant,
+) -> Result<(), GatewayError> {
+    if Instant::now() >= deadline {
+        let _ = timeout_at(Instant::now() + std::time::Duration::from_secs(2), tx.rollback()).await;
+        return Err(GatewayError::Timeout);
+    }
+    match timeout_at(deadline, tx.commit()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(GatewayError::OutcomeUnknown),
     }
 }
 

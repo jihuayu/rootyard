@@ -29,12 +29,15 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
     def test_timeout_result_is_matched_before_into_parts(self):
         body = slice_between(
             self.publish,
-            'let (tx, admission_result) = match outcome {',
+            'let (savepoint, admission_result) = match outcome {',
             'match admission_result {',
         )
         self.assertIn('Ok(Ok(admission)) => admission.into_parts()', body)
-        self.assertIn('Ok(Err(error)) => return Err(GatewayError::from(error))', body)
-        self.assertIn('Err(_) => return Err(GatewayError::Timeout)', body)
+        self.assertIn('Ok(Err(error)) => {', body)
+        self.assertIn('return Err(GatewayError::from(error));', body)
+        self.assertIn('Err(_) => {', body)
+        self.assertIn('return Err(GatewayError::Timeout);', body)
+        self.assertIn('rollback_deadpool_bounded(tx, deadline).await', body)
         self.assertNotIn('Ok(admission) => admission.into_parts()', body)
 
     def test_private_entry_does_not_use_the_legacy_public_lookup(self):
@@ -55,6 +58,8 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
             'enum SlotZeroPreflight',
         )
         self.assertIn('backend_identity().as_hex().to_owned()', entry)
+        self.assertIn('client.transaction()', entry)
+        self.assertNotIn('begin_bounded(', entry)
         self.assertIn('begin_slot_zero_fresh(tx,', entry)
 
         fresh = slice_between(
@@ -62,7 +67,11 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
             'async fn begin_slot_zero_fresh(',
             '/// Construct the exact typed public request',
         )
-        self.assertIn("tx: tokio_postgres::Transaction<'_>", fresh)
+        self.assertIn("tx: deadpool_postgres::Transaction<'_>", fresh)
+        self.assertIn('tokio_postgres::Transaction::savepoint(&mut *tx, GATEWAY_SLOT_ZERO_SAVEPOINT)', fresh)
+        self.assertIn('PgRefStore.admit_slot_zero_in_tx(', fresh)
+        self.assertIn('commit_bounded(savepoint, deadline, repository_id', fresh)
+        self.assertIn('commit_deadpool_bounded(tx, deadline)', fresh)
         self.assertNotIn('state.pooled(', fresh)
         self.assertNotIn('begin_bounded(', fresh)
 
@@ -74,9 +83,12 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
         )
         self.assertIn('lock_public_attempt(', preflight)
         self.assertIn('lock_operation(', preflight)
-        self.assertIn('serving::lookup_in_tx(', preflight)
+        self.assertIn('lock_expected_lane(', preflight)
+        self.assertIn("tx: &deadpool_postgres::Transaction<'_>", preflight)
+        self.assertIn('lookup_in_tx(', preflight)
         self.assertIn('lookup_public_attempt(', preflight)
         self.assertIn('LegacyPath', preflight)
+        self.assertLess(preflight.index('lock_expected_lane('), preflight.index('lookup_in_tx('))
 
         unknown = slice_between(
             preflight,
@@ -115,6 +127,8 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
         self.assertIn('rootyard_ref_store_require_attempt_lock', helper)
         self.assertIn('read_serving_operation(', helper)
         self.assertIn('PgRefStore.get(tx,', helper)
+        self.assertIn('recompute_slot_zero_proof(', helper)
+        self.assertIn('recompute_slot_one_proof(', helper)
         self.assertNotIn('get_legacy_locked', helper)
         self.assertNotIn('lookup_in_tx(', helper)
 

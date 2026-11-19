@@ -882,6 +882,41 @@ struct ProofFacts<'a> {
     plan_digest: RequestDigest,
 }
 
+/// Recompute the exact slot-zero proof from one verified public attempt
+/// snapshot. This is the writer-replay companion to `replay_slot_zero`; it
+/// performs no SQL and trusts no caller-supplied proof bytes.
+pub(crate) fn recompute_slot_zero_proof(
+    public: &super::public_attempt::PublicAttemptRequest,
+    current: &super::public_attempt::PublicAttempt,
+) -> Result<RequestDigest, PackCommitError> {
+    if current.slot != 0 {
+        return Err(ledger_integrity("slot zero proof requested for a non-zero attempt"));
+    }
+    let request = SlotZeroAdmissionRequest {
+        repository_id: public.repository_id,
+        admission_owner_id: public.admission_owner_id,
+        issuer_id: public.issuer_id,
+        lane: current.lane.clone(),
+        public_id: public.public_id,
+        private_id: current.private_id,
+        wire_digest: public.wire_digest,
+        request_mode: public.request_mode,
+        backend_identity: public.backend_identity.clone(),
+        object_format: public.object_format,
+        history_incarnation: public.history_incarnation,
+        authority_epoch: public.authority_epoch,
+        group_epoch: public.group_epoch,
+        restore_incarnation: public.restore_incarnation,
+    };
+    Ok(proof_digest(&ProofFacts {
+        request: &request,
+        private_id: current.private_id,
+        sequence: current.sequence,
+        base_revision: current.base_revision,
+        plan_digest: current.plan_digest,
+    }))
+}
+
 fn proof_digest(facts: &ProofFacts<'_>) -> RequestDigest {
     let request = facts.request;
     let fields = [

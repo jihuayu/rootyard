@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SLOT_ZERO = ROOT / 'src/ref_store/pg/slot_zero.rs'
 SLOT_ZERO_TESTS = ROOT / 'src/ref_store/pg/slot_zero/tests.rs'
 PUBLISH = ROOT / 'src/blob_git_gateway/publish.rs'
+RECEIVE = ROOT / 'src/blob_git_gateway/receive.rs'
 PACK_SNAPSHOT_MOD = ROOT / 'src/ref_store/core/pack_snapshot/mod.rs'
 SERVING_READ_SQL = ROOT / 'src/ref_store/core/pack_snapshot/serving_read_sql.rs'
 SEALED = ROOT / 'src/ref_store/core/pack_snapshot/serving_read_sql/sealed.rs'
@@ -107,12 +108,19 @@ class SlotZeroSourceTest(unittest.TestCase):
         positions = [fresh.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
 
-    def test_gateway_keeps_the_legacy_reservation_and_binding_path(self):
+    def test_gateway_private_adapter_is_defined_but_unwired(self):
         publish = PUBLISH.read_text()
         self.assertIn('reserve_sequence', publish)
         self.assertIn('begin_serving_pending_in_tx', publish)
-        self.assertNotIn('admit_slot_zero', publish)
-        self.assertNotIn('slot_zero', publish)
+        self.assertIn('pub(super) async fn begin_slot_zero(', publish)
+
+        legacy_begin = publish.split('async fn begin(', 1)[1].split('/// Crate-private entry', 1)[0]
+        self.assertIn('begin_fresh(', legacy_begin)
+        self.assertNotIn('begin_slot_zero(', legacy_begin)
+
+        push = publish.split('pub(super) async fn push(', 1)[1].split('async fn repository_owner(', 1)[0]
+        self.assertNotIn('begin_slot_zero(', push)
+        self.assertNotIn('begin_slot_zero(', RECEIVE.read_text())
 
     def test_restore_fence_is_shared_before_lane_and_repository_locks(self):
         markers = [

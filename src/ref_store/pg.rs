@@ -60,6 +60,32 @@ impl PgRefStore {
         Capabilities::pg_transition_increment()
     }
 
+    /// Lock the expected issuer lane before an authorization/repository read
+    /// in a caller-owned transaction.
+    ///
+    /// This is deliberately a lock-only preflight: it creates the lane row when
+    /// absent and takes the same `FOR NO KEY UPDATE` row lock as the slot-zero
+    /// coordinator, but never advances the sequence, inserts an operation or
+    /// grants authority. The caller must already hold the operation key and must
+    /// roll back on any later authorization/identity refusal. The same
+    /// transaction later re-previews this lane under its existing lock.
+    pub(crate) async fn lock_expected_lane<'a>(
+        &self,
+        tx: &'a Transaction<'_>,
+        repository_id: Uuid,
+        issuer_id: Uuid,
+        operation_id: Uuid,
+        lane: &'a IssuerLane,
+        deadline: Instant,
+    ) -> Result<(), RefStoreError> {
+        if repository_id.is_nil() || issuer_id.is_nil() || operation_id.is_nil() {
+            return Err(RefStoreError::InvalidIdentity("expected lane ids must be non-nil".into()));
+        }
+        bound(tx, deadline).await?;
+        let _ = LockedSequence::preview(tx, repository_id, issuer_id, operation_id, lane).await?;
+        Ok(())
+    }
+
     /// Reserve the next sequence in one durable issuer lane. This is the
     /// preallocation primitive for trusted callers that can keep their own
     /// operation id across a retry. The caller chooses `operation_id` before
