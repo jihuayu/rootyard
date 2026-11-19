@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Bounded CI checkpoint for the exact #42 slot-one native replay case.
+"""Bounded CI checkpoint for one exact #42 native replay case.
 
 The workflow already builds one immutable, preflight-bound #174 libtest
 artifact and owns a disposable PostgreSQL 17 database and Garage scope.  This
 module only re-anchors that artifact to the current HEAD/source tree, proves
-the fixed case is present exactly once, runs the single selected ignored case
-with ``--exact --test-threads=1``, and writes a closed, raw-output-free report.
+the selected case is present exactly once, runs the single selected ignored
+case with ``--exact --test-threads=1``, and writes a closed, raw-output-free
+report.  The CLI defaults to the slot-one case; the same closed machinery
+accepts an explicit exact ``--case``/``--report-schema`` pair for the scoped
+first-lane selection without changing the default slot-one gate.
 
 The selector/listing and result/report parsers are importable without touching
 a database, the network, Cargo, rustc, native services or the local runtime.
@@ -189,7 +192,8 @@ def classify_result(raw, exit_code, *, outcome="exited", error_class=None,
     }
 
 
-def make_report(attestation, projection, exit_code, process_outcome):
+def make_report(attestation, projection, exit_code, process_outcome,
+                *, schema=REPORT_SCHEMA, case=CASE):
     """Merge source attestations and one projection into the closed report."""
     report = dict(attestation)
     report.update({
@@ -203,17 +207,17 @@ def make_report(attestation, projection, exit_code, process_outcome):
         "result": "passed" if projection["complete"] else "failed",
         "error_class": projection["error_class"],
     })
-    validate_report(report)
+    validate_report(report, schema=schema, case=case)
     return report
 
 
-def validate_report(report):
+def validate_report(report, *, schema=REPORT_SCHEMA, case=CASE):
     """Reject anything that is not the one closed, self-consistent report."""
     if not isinstance(report, dict) or set(report) != set(REPORT_FIELDS):
         raise CheckpointError("report_shape")
-    if report.get("schema") != REPORT_SCHEMA:
+    if report.get("schema") != schema:
         raise CheckpointError("report_schema")
-    if report.get("case") != CASE:
+    if report.get("case") != case:
         raise CheckpointError("report_case")
     for key in ("expected_commit", "head"):
         if not isinstance(report.get(key), str) or COMMIT.fullmatch(report[key]) is None:
@@ -271,12 +275,12 @@ def write_report(path, report):
     os.replace(temporary, path)
 
 
-def recheck_report(path):
+def recheck_report(path, *, schema=REPORT_SCHEMA, case=CASE):
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeDecodeError) as error:
         raise CheckpointError("report_recheck") from error
-    return validate_report(payload)
+    return validate_report(payload, schema=schema, case=case)
 
 
 def _readonly_file(path, label):
@@ -317,7 +321,8 @@ def load_preflight(path):
     return payload
 
 
-def build_attestation(lib, receipt, preflight_path, workspace, expected_commit):
+def build_attestation(lib, receipt, preflight_path, workspace, expected_commit,
+                      *, schema=REPORT_SCHEMA, case=CASE):
     """Re-anchor the exact preflighted #174 libtest to HEAD and its sources."""
     workspace = Path(workspace).resolve()
     lib = _readonly_file(lib, "lib_alias")
@@ -377,8 +382,8 @@ def build_attestation(lib, receipt, preflight_path, workspace, expected_commit):
     if validated.schema == "v2" and artifact.get("executable_sha256") != validated.binary_sha256:
         raise CheckpointError("receipt_artifact_sha256")
     return {
-        "schema": REPORT_SCHEMA,
-        "case": CASE,
+        "schema": schema,
+        "case": case,
         "expected_commit": expected_commit,
         "head": head,
         "tree": tree,
@@ -486,23 +491,25 @@ def run_bounded(command, *, timeout, stdout_limit, environment=None):
 def run_checkpoint(args):
     attestation = build_attestation(
         args.lib, args.receipt, args.preflight, args.workspace,
-        args.expected_commit)
+        args.expected_commit, schema=args.report_schema, case=args.case)
     listing = run_bounded(
         listing_command(args.lib), timeout=min(60.0, args.timeout),
         stdout_limit=LISTING_STDOUT_LIMIT)
     if listing["outcome"] != "exited" or listing["exit_code"] != 0:
         raise CheckpointError("listing_failed")
     attestation["selection"] = require_membership(
-        parse_listing(listing["stdout"]), CASE)
+        parse_listing(listing["stdout"]), args.case)
     run = run_bounded(
-        exact_command(args.lib), timeout=args.timeout,
+        exact_command(args.lib, args.case), timeout=args.timeout,
         stdout_limit=args.stdout_limit, environment=os.environ.copy())
     projection = classify_result(
         run["stdout"], run["exit_code"], outcome=run["outcome"],
-        error_class=run["error_class"])
-    report = make_report(attestation, projection, run["exit_code"], run["outcome"])
+        error_class=run["error_class"], expected=args.case)
+    report = make_report(
+        attestation, projection, run["exit_code"], run["outcome"],
+        schema=args.report_schema, case=args.case)
     write_report(args.report, report)
-    recheck_report(args.report)
+    recheck_report(args.report, schema=args.report_schema, case=args.case)
     return report
 
 
@@ -513,6 +520,8 @@ def main(argv=None):
     parser.add_argument("--preflight", required=True)
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--case", default=CASE)
+    parser.add_argument("--report-schema", default=REPORT_SCHEMA)
     parser.add_argument("--report", required=True)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--stdout-limit", type=int, default=DEFAULT_STDOUT_LIMIT)
@@ -520,13 +529,13 @@ def main(argv=None):
     try:
         report = run_checkpoint(args)
     except CheckpointError as error:
-        print("slot-one checkpoint failed: " + str(error), file=sys.stderr)
+        print("issue42 checkpoint failed: " + str(error), file=sys.stderr)
         return 1
     except Exception as error:  # never echo child output or environment values
-        print("slot-one checkpoint failed: internal " + type(error).__name__,
+        print("issue42 checkpoint failed: internal " + type(error).__name__,
               file=sys.stderr)
         return 1
-    print("slot-one checkpoint: " + report["result"] + " " + CASE)
+    print("issue42 checkpoint: " + report["result"] + " " + report["case"])
     print("  head=" + report["head"] + " tree=" + report["tree"])
     print("  source_inputs_sha256=" + report["source_inputs_sha256"])
     print("  lib_test_support_inputs_sha256="

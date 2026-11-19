@@ -25,6 +25,14 @@ CASE = (
     "ref_store::pg::slot_one::tests::native::"
     "slot_one_rotation_replays_identical_wire_command_on_real_a3_a4_a5"
 )
+FIRST_LANE_CASE = (
+    "blob_git_gateway::slot_zero_admission_acceptance::"
+    "first_lane_insert_waits_before_authority_locks"
+)
+FIRST_LANE_SCHEMA = "rootyard/refstore-issue42-first-lane-checkpoint/v1"
+FIRST_LANE_REF = (
+    "refs/heads/codex/goal-issue42-first-lane-qualification-20261119"
+)
 
 
 def selected_output(status="ok", name=CASE, summary=None):
@@ -251,6 +259,61 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "report_failure_inconsistent")
 
 
+class FirstLaneSelectionTests(unittest.TestCase):
+    def test_exact_command_and_listing_use_the_selected_case(self):
+        self.assertEqual(
+            checkpoint.exact_command("/tmp/libtest", FIRST_LANE_CASE),
+            ["/tmp/libtest", "--ignored", "--exact", FIRST_LANE_CASE,
+             "--test-threads=1"])
+        names = checkpoint.parse_listing(
+            b"other::case: test\n" + FIRST_LANE_CASE.encode() + b": test\n")
+        self.assertEqual(
+            checkpoint.require_membership(names, FIRST_LANE_CASE), "unique")
+        with self.assertRaises(checkpoint.CheckpointError) as missing:
+            checkpoint.require_membership(names)
+        self.assertEqual(str(missing.exception), "selection_missing")
+
+    def test_result_projection_is_bound_to_the_selected_case(self):
+        raw = selected_output(name=FIRST_LANE_CASE)
+        self.assertTrue(
+            checkpoint.classify_result(
+                raw, 0, expected=FIRST_LANE_CASE)["complete"])
+        self.assertEqual(
+            checkpoint.classify_result(raw, 0)["error_class"], "case_wrong")
+        skipped = selected_output(status="ignored", name=FIRST_LANE_CASE)
+        self.assertEqual(
+            checkpoint.classify_result(
+                skipped, 0, expected=FIRST_LANE_CASE)["error_class"],
+            "case_skipped")
+        missing = selected_output().decode().split("\n\n", 1)[1].encode()
+        self.assertEqual(
+            checkpoint.classify_result(
+                missing, 0, expected=FIRST_LANE_CASE)["error_class"],
+            "case_missing")
+
+    def test_custom_report_schema_is_closed_but_defaults_stay_slot_one(self):
+        source = attestation()
+        source["schema"] = FIRST_LANE_SCHEMA
+        source["case"] = FIRST_LANE_CASE
+        report = checkpoint.make_report(
+            source, projection(), 0, "exited",
+            schema=FIRST_LANE_SCHEMA, case=FIRST_LANE_CASE)
+        self.assertEqual(
+            checkpoint.validate_report(
+                report, schema=FIRST_LANE_SCHEMA, case=FIRST_LANE_CASE),
+            report)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "first-lane-admission.json"
+            checkpoint.write_report(path, report)
+            self.assertEqual(
+                checkpoint.recheck_report(
+                    path, schema=FIRST_LANE_SCHEMA, case=FIRST_LANE_CASE),
+                report)
+        with self.assertRaises(checkpoint.CheckpointError) as raised:
+            checkpoint.validate_report(report)
+        self.assertEqual(str(raised.exception), "report_schema")
+
+
 class WorkflowWiringTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -286,9 +349,86 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_default_174_inventory_and_case18_index_are_unchanged(self):
         step = self.step('"Exercise the #174 HTTP foundation cases')
         self.assertNotIn(CASE, step)
+        self.assertNotIn(FIRST_LANE_CASE, step)
         self.assertIn("index == 18", step)
         self.assertIn(
             "pre_admission_revision_mismatch_rebases_to_old_oid_mismatch", step)
+
+    def test_first_lane_gate_is_scoped_to_its_own_manual_ref(self):
+        step = self.step(
+            '"Replay exactly one #42 first-lane admission case')
+        self.assertEqual(self.text.count(FIRST_LANE_REF), 1)
+        self.assertEqual(step.count("github.ref"), 1)
+        self.assertIn("workflow_dispatch", step)
+        self.assertIn("success()", step)
+        self.assertIn("ISSUE42_FIRST_LANE_MANUAL_REF", step)
+        # The existing slot-one ref remains its own single gate.
+        self.assertEqual(
+            self.text.count(
+                "refs/heads/codex/goal-issue42-original-ac-source-audit-20261117"),
+            1)
+
+    def test_first_lane_step_runs_after_slot_one_and_before_cleanup(self):
+        slot_one = self.text.index(
+            '"Replay exactly one #42 slot-one rotation case')
+        first_lane = self.text.index(
+            '"Replay exactly one #42 first-lane admission case')
+        cleanup = self.text.index(
+            '"Drop only the run-owned #174 foundation database"')
+        self.assertLess(slot_one, first_lane)
+        self.assertLess(first_lane, cleanup)
+
+    def test_first_lane_step_reuses_preflight_and_exact_selector(self):
+        step = self.step(
+            '"Replay exactly one #42 first-lane admission case')
+        self.assertIn(
+            "scripts/refstore_issue42_slot_one_checkpoint.py", step)
+        self.assertIn(
+            '--case "' + FIRST_LANE_CASE + '"', step)
+        self.assertIn(
+            '--report-schema "' + FIRST_LANE_SCHEMA + '"', step)
+        self.assertIn(
+            '--report "test-results/refstore/session174-foundation/'
+            'first-lane-admission.json"', step)
+        for required in ('--lib "$lib"', '--receipt "$receipt"',
+                         '--preflight "$evidence/preflight.json"',
+                         '--expected-commit "$GITHUB_SHA"',
+                         '--timeout 600', '--stdout-limit 16384'):
+            self.assertIn(required, step)
+        self.assertNotIn("ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES", step)
+        self.assertNotIn("ROOTYARD_BLOB_", step)
+        self.assertNotIn("tee ", step)
+
+    def test_first_lane_step_reuses_the_owned_174_database(self):
+        step = self.step(
+            '"Replay exactly one #42 first-lane admission case')
+        self.assertIn(
+            "SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}",
+            step)
+        expected = (
+            'expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}'
+            '_a${GITHUB_RUN_ATTEMPT}"')
+        self.assertIn(expected, step)
+        self.assertIn('if [ "$SESSION174_DATABASE" != "$expected" ]', step)
+        self.assertIn(
+            'export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"', step)
+        self.assertIn(
+            'export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/'
+            '$SESSION174_DATABASE"', step)
+
+    def test_first_lane_report_is_only_the_narrow_existing_archive_member(self):
+        step = self.step(
+            '"Replay exactly one #42 first-lane admission case')
+        report = (
+            "test-results/refstore/session174-foundation/"
+            "first-lane-admission.json")
+        self.assertIn(report, step)
+        # The existing collector/upload archive is not widened or edited.
+        self.assertNotIn(
+            "first-lane-admission.json",
+            self.step('"Collect #174 acceptance evidence"'))
+        self.assertIn("path: |\n            test-results/refstore/",
+                      self.text)
 
     def test_step_reuses_preflighted_binary_and_fresh_prefix(self):
         step = self.step('"Replay exactly one #42 slot-one rotation case')

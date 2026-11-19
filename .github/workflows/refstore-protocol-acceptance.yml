@@ -78,6 +78,7 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 12
     env:
       ISSUE42_MANUAL_REF: refs/heads/codex/goal-issue42-original-ac-source-audit-20261117
+      ISSUE42_FIRST_LANE_MANUAL_REF: refs/heads/codex/goal-issue42-first-lane-qualification-20261119
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_protocol
       SESSION174_DATABASE_ADMIN_URL: postgresql://rootyard@127.0.0.1:55432/postgres
       SESSION174_DATABASE_PREFIX: session174_foundation
@@ -2508,6 +2509,56 @@ jobs:
             --workspace "$GITHUB_WORKSPACE" \
             --expected-commit "$GITHUB_SHA" \
             --report "$evidence/slot-one-rotation.json" \
+            --timeout 600 \
+            --stdout-limit 16384
+      - name: "Replay exactly one #42 first-lane admission case on the owned #174 scope"
+        # One gate only: the manually dispatched, owned first-lane ref. Every
+        # other ref keeps the slot-one gate and the complete existing workflow
+        # unchanged, including the eighteen #174 selectors.
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && github.ref == env.ISSUE42_FIRST_LANE_MANUAL_REF }}
+        timeout-minutes: 12
+        shell: bash
+        env:
+          SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/session174-foundation"
+          lib="${ROOTYARD_174_LIB_ALIAS:-}"
+          receipt="${ROOTYARD_174_LIB_ALIAS_RECEIPT:-}"
+          if [ -z "$lib" ] || [ -z "$receipt" ]; then
+            echo "missing preflighted #174 libtest aliases" >&2
+            exit 1
+          fi
+          if [ ! -s "$evidence/preflight.json" ]; then
+            echo "missing preflighted #174 evidence" >&2
+            exit 1
+          fi
+          if [ -z "${SESSION174_DATABASE:-}" ]; then
+            echo "missing owned #174 database" >&2
+            exit 1
+          fi
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"
+          if [ "$SESSION174_DATABASE" != "$expected" ]; then echo "refusing to run on a database not owned by this run" >&2; exit 1; fi
+          case "$SESSION174_DATABASE" in ''|*[!a-z0-9_]*|postgres|rootyard_protocol|template*)
+            echo "refusing to run on a shared or unsafe database" >&2
+            exit 1
+            ;;
+          esac
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
+          export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
+          mkdir -p test-results/refstore/session174-foundation
+          python3 scripts/refstore_issue42_slot_one_checkpoint.py \
+            --lib "$lib" \
+            --receipt "$receipt" \
+            --preflight "$evidence/preflight.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --expected-commit "$GITHUB_SHA" \
+            --case "blob_git_gateway::slot_zero_admission_acceptance::first_lane_insert_waits_before_authority_locks" \
+            --report-schema "rootyard/refstore-issue42-first-lane-checkpoint/v1" \
+            --report "test-results/refstore/session174-foundation/first-lane-admission.json" \
             --timeout 600 \
             --stdout-limit 16384
       - name: "Drop only the run-owned #174 foundation database"
