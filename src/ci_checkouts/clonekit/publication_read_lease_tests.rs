@@ -267,7 +267,7 @@ async fn actual_empty_fallback_parks_stock_git_until_gc_proof() {
     let store_for_gc = store.clone();
     let ready_for_observer = ready.clone();
     let observer = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(8);
         while !ready_for_observer.exists() {
             if Instant::now() >= deadline {
                 let _ = gc_tx.send(Err("stock Git fallback did not park".to_string()));
