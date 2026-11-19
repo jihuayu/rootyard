@@ -91,7 +91,7 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
         self.assertIn('validate_wrapper_shape(wrapper, &stored)', status)
         self.assertIn('snapshot.realm_matches', status)
         self.assertIn('stale_realm()', status)
-        self.assertIn('validate_current_attempts(&snapshot, wrapper, state)', status)
+        self.assertIn('validate_current_attempts(&snapshot, wrapper, state, false)', status)
         self.assertIn('project_terminal(', status)
         self.assertIn('snapshot.status_terminal.as_ref()', status)
         self.assertIn('state, terminal', status)

@@ -283,6 +283,53 @@ impl fmt::Debug for PublicAttemptLookup {
     }
 }
 
+/// Finish-side read of one public wrapper. Unlike [`PublicAttemptLookup`], this
+/// permits the narrow crash window where the exact private attempt is already
+/// terminal while the public wrapper is still pending: the terminal mirror has
+/// not yet published it. The marker is not a final Git result and carries no
+/// terminal body, so a caller must ask the mirror to derive the owned
+/// disposition before it may ACK anything.
+#[allow(dead_code)] // The private finish path is activation-safe until the serving cutover.
+#[derive(Clone)]
+pub(crate) enum PublicAttemptFinishLookup {
+    Unknown,
+    PrivateIdentifier,
+    LegacyPath,
+    Evidence(PublicAttemptFinishEvidence),
+}
+
+impl fmt::Debug for PublicAttemptFinishLookup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => formatter.write_str("Unknown"),
+            Self::PrivateIdentifier => formatter.write_str("PrivateIdentifier"),
+            Self::LegacyPath => formatter.write_str("LegacyPath"),
+            Self::Evidence(evidence) => formatter.debug_tuple("Evidence").field(evidence).finish(),
+        }
+    }
+}
+
+/// The exact current/retired evidence plus the public wrapper state that owns
+/// it. `wrapper_state == Pending` with a terminal current attempt is the
+/// finishable crash window; every other combination is the ordinary resolved
+/// state and still has to pass the same attempt/event/binding proof.
+#[allow(dead_code)] // The private finish path is activation-safe until the serving cutover.
+#[derive(Clone)]
+pub(crate) struct PublicAttemptFinishEvidence {
+    pub evidence: PublicAttemptEvidence,
+    pub wrapper_state: OperationState,
+}
+
+impl fmt::Debug for PublicAttemptFinishEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicAttemptFinishEvidence")
+            .field("evidence", &self.evidence)
+            .field("wrapper_state", &self.wrapper_state)
+            .finish()
+    }
+}
+
 /// The authorization scope the caller has already resolved before asking for a
 /// public operation status. This module does not authenticate a token or query
 /// repository roles; it only refuses to return state unless the caller states
@@ -535,6 +582,40 @@ impl PgRefStore {
         evaluate(snapshot, request)
     }
 
+    /// Resolve the same request-aware snapshot while allowing exactly one
+    /// transient finish window: a pending public wrapper whose current private
+    /// attempt is already terminal or cancelled. The ordinary lookup keeps
+    /// refusing that window closed, so existing replay semantics are unchanged.
+    ///
+    /// This is a read-only resolver. It never writes the wrapper, allocates a
+    /// sequence or returns a terminal body; the caller must run the reviewed
+    /// terminal mirror to derive `Mirrored` or `RetirementRequired` before any
+    /// public HTTP result. The exact wrapper identity, realm, attempt/event
+    /// binding and retired slot-zero proof still pass the same validators.
+    #[allow(dead_code)] // The private finish path is activation-safe until the serving cutover.
+    pub(crate) async fn lookup_public_attempt_finish(
+        &self,
+        tx: &Transaction<'_>,
+        request: &PublicAttemptRequest,
+        deadline: Instant,
+    ) -> Result<PublicAttemptFinishLookup, PackCommitError> {
+        request.validate()?;
+        match timeout_at(deadline, self.lookup_public_attempt_finish_checked(tx, request, deadline)).await {
+            Ok(result) => result,
+            Err(_) => Err(PackCommitError::from(RefStoreError::Timeout)),
+        }
+    }
+
+    async fn lookup_public_attempt_finish_checked(
+        &self,
+        tx: &Transaction<'_>,
+        request: &PublicAttemptRequest,
+        deadline: Instant,
+    ) -> Result<PublicAttemptFinishLookup, PackCommitError> {
+        let snapshot = read_public_snapshot(tx, request.repository_id, request.public_id, deadline).await?;
+        evaluate_finish(snapshot, request)
+    }
+
     /// Resolve only the current public operation state for a future GET inside
     /// the same caller-owned, caller-preauthorized read transaction.
     ///
@@ -754,7 +835,7 @@ fn evaluate_status(
         return Err(stale_realm());
     }
 
-    let evidence = validate_current_attempts(&snapshot, wrapper, state)?;
+    let evidence = validate_current_attempts(&snapshot, wrapper, state, false)?;
     if snapshot.status_terminal_over_bound {
         return Err(ledger("public terminal exceeds the bounded transport projection"));
     }
@@ -792,13 +873,48 @@ fn evaluate(snapshot: RawSnapshot, request: &PublicAttemptRequest) -> Result<Pub
         return Err(stale_realm());
     }
 
-    let evidence = validate_current_attempts(&snapshot, wrapper, state)?;
+    let evidence = validate_current_attempts(&snapshot, wrapper, state, false)?;
     match state {
         OperationState::Pending => Ok(PublicAttemptLookup::Pending(evidence)),
         OperationState::Committed => Ok(PublicAttemptLookup::Committed(evidence)),
         OperationState::Rejected => Ok(PublicAttemptLookup::Rejected(evidence)),
         OperationState::Cancelled => Ok(PublicAttemptLookup::Cancelled(evidence)),
     }
+}
+
+/// Finish-side evaluation. It shares every wrapper/attempt/event/binding proof
+/// with [`evaluate`] but additionally permits a pending wrapper whose current
+/// private attempt is already terminal/cancelled. That is the only difference:
+/// the marker is not a final result, and a terminal wrapper still has to match
+/// its current attempt exactly.
+fn evaluate_finish(
+    snapshot: RawSnapshot,
+    request: &PublicAttemptRequest,
+) -> Result<PublicAttemptFinishLookup, PackCommitError> {
+    validate_request(request)?;
+    let Some(wrapper) = snapshot.wrapper.as_ref() else {
+        if snapshot.private_occupied {
+            return Ok(PublicAttemptFinishLookup::PrivateIdentifier);
+        }
+        if snapshot.legacy_operation || snapshot.legacy_cancellation {
+            return Ok(PublicAttemptFinishLookup::LegacyPath);
+        }
+        return Ok(PublicAttemptFinishLookup::Unknown);
+    };
+
+    if snapshot.private_occupied {
+        return Err(ledger("public operation identifier is also a private attempt identifier"));
+    }
+    if snapshot.legacy_operation || snapshot.legacy_cancellation {
+        return Err(ledger("public operation identifier is also claimed by the legacy operation registry"));
+    }
+
+    let state = validate_wrapper(wrapper, request)?;
+    if !snapshot.realm_matches {
+        return Err(stale_realm());
+    }
+    let evidence = validate_current_attempts(&snapshot, wrapper, state, true)?;
+    Ok(PublicAttemptFinishLookup::Evidence(PublicAttemptFinishEvidence { evidence, wrapper_state: state }))
 }
 
 /// The one current/retired attempt proof shared by the request-aware lookup and
@@ -808,6 +924,7 @@ fn validate_current_attempts(
     snapshot: &RawSnapshot,
     wrapper: &RawWrapper,
     state: OperationState,
+    allow_finish: bool,
 ) -> Result<PublicAttemptEvidence, PackCommitError> {
     if wrapper.current_slot != 0 && wrapper.current_slot != 1 {
         return Err(ledger("public operation current slot is not zero or one"));
@@ -845,7 +962,7 @@ fn validate_current_attempts(
     };
 
     let current_facts = validate_attempt(current_raw, wrapper)?;
-    validate_current(wrapper, state, &current_facts)?;
+    validate_current(wrapper, state, &current_facts, allow_finish)?;
 
     let retired_facts = match retired_raw {
         Some(retired_raw) => {
@@ -1098,9 +1215,34 @@ fn validate_current(
     wrapper: &RawWrapper,
     state: OperationState,
     current: &AttemptFacts,
+    allow_finish: bool,
 ) -> Result<(), PackCommitError> {
-    if current.slot != wrapper.current_slot || current.state != state {
+    if current.slot != wrapper.current_slot {
         return Err(ledger("current private attempt state differs from its public operation"));
+    }
+    if current.state != state {
+        if !allow_finish || state != OperationState::Pending {
+            return Err(ledger("current private attempt state differs from its public operation"));
+        }
+        match current.state {
+            OperationState::Committed | OperationState::Rejected => {
+                if wrapper.event_id.is_some() || current.event_id.is_none() {
+                    return Err(ledger("finishable terminal private attempt event differs"));
+                }
+            }
+            OperationState::Cancelled => {
+                if wrapper.event_id.is_some()
+                    || current.event_id.is_some()
+                    || wrapper.cancelled_private_id.is_some()
+                {
+                    return Err(ledger("finishable cancelled private attempt evidence differs"));
+                }
+            }
+            OperationState::Pending => {
+                return Err(ledger("current private attempt state differs from its public operation"));
+            }
+        }
+        return Ok(());
     }
     match state {
         OperationState::Pending => {
