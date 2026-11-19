@@ -95,6 +95,7 @@ impl CloneKitPublicationStore {
         kit_generation: u64,
         ledger: &RetentionPinLedger,
     ) -> Result<bool, CloneKitError> {
+        read_lease::require_supported_backend()?;
         match fs::symlink_metadata(self.repo_dir(repo_id)) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => return Err(CloneKitError::GitFailed(format!("stat publication repository: {err}"))),

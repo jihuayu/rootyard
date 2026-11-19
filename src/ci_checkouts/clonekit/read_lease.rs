@@ -25,6 +25,25 @@ const IDX_FILE: &str = "clonekit.idx";
 const MANIFEST_FILE: &str = "manifest.json";
 const COPY_CAPACITY_HINT: usize = 8 * 1024 * 1024;
 
+/// `fs2` is pinned to 0.4.3 in `Cargo.lock`. On these targets its Unix backend uses
+/// `flock(2)`, whose ownership follows the open file description (so a duplicate fd keeps a
+/// lock alive). Solaris/illumos and other process-scoped `fcntl` or non-Unix backends are
+/// deliberately refused instead of being treated as equivalent.
+pub(super) fn backend_uses_open_file_description_flock(target_os: &str) -> bool {
+    matches!(target_os, "linux" | "android" | "macos" | "ios" | "freebsd" | "openbsd" | "netbsd" | "dragonfly")
+}
+
+/// Fail closed when this target's fs2 backend cannot provide an open-file-description lock.
+pub(super) fn require_supported_backend() -> Result<(), CloneKitError> {
+    if backend_uses_open_file_description_flock(std::env::consts::OS) {
+        Ok(())
+    } else {
+        Err(CloneKitError::InvalidConfig(
+            "clonekit local read lease requires open-file-description flock semantics (fs2 0.4.3); this target uses an unsupported locking backend",
+        ))
+    }
+}
+
 /// Shared read lease protecting one verified local generation from cross-process GC.
 #[derive(Debug)]
 pub struct CloneKitReadLease {
@@ -87,13 +106,31 @@ impl LeasedCloneKitManifest {
 
 #[derive(Debug)]
 pub(super) struct ReadLeaseLock {
-    file: File,
+    file: Option<File>,
     repository_id: Uuid,
 }
 
 impl ReadLeaseLock {
-    pub(super) fn bind(self, generation: VerifiedGeneration) -> CloneKitReadLease {
-        CloneKitReadLease { file: self.file, repository_id: self.repository_id, generation }
+    fn file(&self) -> &File {
+        self.file.as_ref().expect("read lease lock file")
+    }
+
+    pub(super) fn bind(mut self, generation: VerifiedGeneration) -> CloneKitReadLease {
+        let file = self.file.take().expect("read lease lock file");
+        CloneKitReadLease { file, repository_id: self.repository_id, generation }
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_locked_file_for_test(file: File, repository_id: Uuid) -> Self {
+        Self { file: Some(file), repository_id }
+    }
+}
+
+impl Drop for ReadLeaseLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = FileExt::unlock(&file);
+        }
     }
 }
 
@@ -240,6 +277,7 @@ fn open_read_lease(repo_dir: &Path) -> Result<(PathBuf, File), CloneKitError> {
 }
 
 pub(super) fn acquire_shared(repo_dir: &Path, repository_id: Uuid) -> Result<ReadLeaseLock, CloneKitError> {
+    require_supported_backend()?;
     let (path, file) = open_read_lease(repo_dir)?;
     match FileExt::try_lock_shared(&file) {
         Ok(()) => {}
@@ -250,12 +288,25 @@ pub(super) fn acquire_shared(repo_dir: &Path, repository_id: Uuid) -> Result<Rea
         }
         Err(err) => return Err(CloneKitError::GitFailed(format!("clonekit read lease failed: {err}"))),
     }
-    verify_lease_path(&path, &file)?;
-    Ok(ReadLeaseLock { file, repository_id })
+    let lock = ReadLeaseLock { file: Some(file), repository_id };
+    verify_lease_path(&path, lock.file())?;
+    Ok(lock)
 }
 
+#[derive(Debug)]
 pub(super) struct ReadLeaseExclusive {
     file: File,
+}
+
+impl ReadLeaseExclusive {
+    fn file(&self) -> &File {
+        &self.file
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_locked_file_for_test(file: File) -> Self {
+        Self { file }
+    }
 }
 
 impl Drop for ReadLeaseExclusive {
@@ -265,6 +316,7 @@ impl Drop for ReadLeaseExclusive {
 }
 
 pub(super) fn acquire_exclusive(repo_dir: &Path) -> Result<ReadLeaseExclusive, CloneKitError> {
+    require_supported_backend()?;
     let (path, file) = open_read_lease(repo_dir)?;
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => {}
@@ -275,8 +327,9 @@ pub(super) fn acquire_exclusive(repo_dir: &Path) -> Result<ReadLeaseExclusive, C
         }
         Err(err) => return Err(CloneKitError::GitFailed(format!("clonekit gc read lease failed: {err}"))),
     }
-    verify_lease_path(&path, &file)?;
-    Ok(ReadLeaseExclusive { file })
+    let guard = ReadLeaseExclusive { file };
+    verify_lease_path(&path, guard.file())?;
+    Ok(guard)
 }
 
 pub(super) fn verify_generation(
