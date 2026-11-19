@@ -73,7 +73,7 @@ def _create_private_receipt(path):
             os.close(descriptor)
         return (
             stat.S_ISREG(info.st_mode)
-            and (info.st_mode & 0o777) == RECEIPT_MODE
+            and (info.st_mode & 0o7777) == RECEIPT_MODE
             and info.st_uid == os.geteuid()
             and info.st_nlink == 1
             and info.st_size == 0
@@ -769,7 +769,7 @@ def _read_private_receipt(path):
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             return None
-        if (info.st_mode & 0o777) != RECEIPT_MODE:
+        if (info.st_mode & 0o7777) != RECEIPT_MODE:
             return None
         if info.st_uid != os.geteuid():
             return None

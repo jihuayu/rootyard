@@ -191,7 +191,7 @@ static void open_receipt(const char *name)
         return;
     if (fstat((int)descriptor, &info) != 0
         || !S_ISREG(info.st_mode)
-        || (info.st_mode & 0777) != WITNESS_RECEIPT_MODE
+        || (info.st_mode & 07777) != WITNESS_RECEIPT_MODE
         || info.st_uid != geteuid()
         || info.st_nlink != 1
         || info.st_size < 0
@@ -676,6 +676,7 @@ int posix_spawnp(pid_t *pid, const char *file,
 
 static void prepare_api_environment(void)
 {
+    char resolved[PATH_MAX + 1];
     ssize_t length = 0;
     int written = 0;
 
@@ -684,11 +685,11 @@ static void prepare_api_environment(void)
                      "ROOTYARD_TEST_FUSE_WITNESS_DIR");
     copy_environment(witness_library, sizeof(witness_library),
                      "ROOTYARD_TEST_FUSE_WITNESS_LIBRARY");
-    length = readlink("/proc/self/exe", witness_self_exe,
-                      sizeof(witness_self_exe) - 1);
-    if (length <= 0 || length >= (ssize_t)sizeof(witness_self_exe))
+    length = readlink("/proc/self/exe", resolved, PATH_MAX);
+    if (length <= 0 || length >= PATH_MAX)
         return;
-    witness_self_exe[length] = '\0';
+    resolved[length] = '\0';
+    memcpy(witness_self_exe, resolved, (size_t)length + 1);
     if (witness_library[0] == '\0' || witness_dir[0] == '\0')
         return;
     /* Fixed helper environment entries, prepared once in this process. */

@@ -378,6 +378,8 @@ class BusyWitnessReceiptParserTest(unittest.TestCase):
             self.assertIsNotNone(parse_witness_receipt(path))
             path.chmod(0o644)
             self.assertIsNone(parse_witness_receipt(path))
+            path.chmod(0o4600)
+            self.assertIsNone(parse_witness_receipt(path))
             path.chmod(0o600)
             with mock.patch.object(normal_shutdown.os, "geteuid",
                                    return_value=os.geteuid() + 1):
@@ -471,11 +473,20 @@ class BusyWitnessSourceContractTest(unittest.TestCase):
     def test_umount_records_only_ebusy_after_the_return_sample(self):
         text = self.SOURCE.read_text(encoding="utf-8")
         block = self._block(text, "int umount2(")
+        self.assertIn("flags != 0", block)
         self.assertIn("result != -1 || saved_errno != EBUSY", block)
         sample = block.index("result_ns = monotonic_ns();")
         self.assertLess(sample, block.index("mount_identity("))
         self.assertLess(sample, block.index("record_event("))
         self.assertNotIn("O_CREAT", block)
+
+    def test_record_event_is_one_bounded_pid_guarded_write(self):
+        text = self.SOURCE.read_text(encoding="utf-8")
+        block = self._block(text, "static void record_event")
+        self.assertIn("(long)getpid() != witness_pid", block)
+        self.assertEqual(block.count("SYS_write"), 1)
+        self.assertIn("One bounded append-only write", block)
+        self.assertNotIn("while (", block)
 
     def test_helper_environment_is_prepared_and_pid_guarded(self):
         text = self.SOURCE.read_text(encoding="utf-8")
