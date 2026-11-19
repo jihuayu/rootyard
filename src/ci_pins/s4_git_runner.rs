@@ -239,7 +239,9 @@ pub(super) fn signal_group(child: &mut Child, pid: i32) {
     let _ = child.start_kill();
 }
 
-pub(crate) use super::s4_git_reaper::{GroupProbe, ReaperTask, spawn_reaper_with, spawn_reaper_with_probe};
+pub(crate) use super::s4_git_reaper::{ReaperTask, spawn_reaper_with};
+#[cfg(test)]
+pub(crate) use super::s4_git_reaper::spawn_reaper_with_probe;
 #[cfg(test)]
 pub(super) use super::s4_git_reaper::{WaitFuture, reap_fallback_with_wait};
 
