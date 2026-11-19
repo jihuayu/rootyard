@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +27,17 @@ from rubicon_workload.report import (  # noqa: E402
     render_summary_markdown,
     validate_report,
 )
-from rubicon_workload.runner import PreflightError, WorkloadConfig, _preflight  # noqa: E402
+from rubicon_workload.runner import (  # noqa: E402
+    PreflightError,
+    WorkloadConfig,
+    _SUBSET_WITNESS_FILENAME,
+    _closed_subset_failure_witness,
+    _phase_atomic_subset,
+    _preflight,
+    _validate_subset_witness,
+    _write_subset_witness,
+    run_rubicon_workload,
+)
 from rubicon_workload.workloads import S3MeterProxy  # noqa: E402
 
 
@@ -115,6 +125,19 @@ def _valid_sample_report() -> dict:
         "tiers": [tier_base, tier2],
         "scaling_comparison": {"ratios": {"throughput_ratio_2_vs_1": 1.366}, "bottlenecks": ["single host contention"]},
         "limitations": ["Single host shared PG + S3"],
+    }
+
+
+def _subset_witness_pre() -> dict:
+    return {
+        "source_commit": "a" * 40,
+        "source_dirty": False,
+        "receipt_verified": True,
+        "receipt_schema": "rootyard/native-build-receipt/v2",
+        "workspace_commit": "a" * 40,
+        "source_inputs_sha256": "c" * 64,
+        "receipt_sha256": "d" * 64,
+        "config_digest": "e" * 64,
     }
 
 
@@ -300,6 +323,257 @@ class RubiconReportValidationTests(unittest.TestCase):
         self.assertIn("public.cluster_authority", doc_text)
         self.assertIn("same_repo_mixed_concurrency", doc_text)
         self.assertIn("verify_source_files=True", doc_text)
+
+
+class RubiconSubsetFailureWitnessTests(unittest.TestCase):
+    def _witness(self) -> dict:
+        return _closed_subset_failure_witness(
+            2,
+            _subset_witness_pre(),
+            client_return_unsuccessful=True,
+            porcelain_success_exact=True,
+            porcelain_rejection_exact=False,
+            durable_main_exact=True,
+            durable_protected_exact=False,
+        )
+
+    def test_closed_witness_has_exact_five_booleans_and_rejects_ambiguous_state(self) -> None:
+        witness = self._witness()
+        self.assertEqual(set(witness), {"schema_version", "issue", "kind", "tier", "source", "observed"})
+        self.assertEqual(witness["observed"], {
+            "client_return_unsuccessful": True,
+            "porcelain_success_exact": True,
+            "porcelain_rejection_exact": False,
+            "durable_main_exact": True,
+            "durable_protected_exact": False,
+        })
+        self.assertEqual(witness["source"]["receipt"]["config_digest"], "e" * 64)
+        _validate_subset_witness(witness)
+
+        for bad_tier in (0, 3, True, "2"):
+            with self.assertRaisesRegex(ValueError, "tier"):
+                _closed_subset_failure_witness(
+                    bad_tier,
+                    _subset_witness_pre(),
+                    client_return_unsuccessful=False,
+                    porcelain_success_exact=True,
+                    porcelain_rejection_exact=True,
+                    durable_main_exact=True,
+                    durable_protected_exact=True,
+                )
+
+        with self.assertRaisesRegex(ValueError, "false observation"):
+            _closed_subset_failure_witness(
+                1,
+                _subset_witness_pre(),
+                client_return_unsuccessful=True,
+                porcelain_success_exact=True,
+                porcelain_rejection_exact=True,
+                durable_main_exact=True,
+                durable_protected_exact=True,
+            )
+
+        bad_type = copy.deepcopy(witness)
+        bad_type["observed"]["client_return_unsuccessful"] = 1
+        with self.assertRaisesRegex(ValueError, "booleans"):
+            _validate_subset_witness(bad_type)
+
+        extra = copy.deepcopy(witness)
+        extra["raw_porcelain"] = "*\tHEAD:refs/heads/main"
+        with self.assertRaisesRegex(ValueError, "fixed top-level"):
+            _validate_subset_witness(extra)
+
+        missing_receipt = _subset_witness_pre()
+        missing_receipt.pop("receipt_sha256")
+        with self.assertRaisesRegex(ValueError, "receipt digest"):
+            _closed_subset_failure_witness(
+                1,
+                missing_receipt,
+                client_return_unsuccessful=False,
+                porcelain_success_exact=True,
+                porcelain_rejection_exact=True,
+                durable_main_exact=True,
+                durable_protected_exact=True,
+            )
+
+        unverified = _subset_witness_pre()
+        unverified["receipt_verified"] = False
+        no_receipt = _closed_subset_failure_witness(
+            4,
+            unverified,
+            client_return_unsuccessful=False,
+            porcelain_success_exact=True,
+            porcelain_rejection_exact=True,
+            durable_main_exact=True,
+            durable_protected_exact=True,
+        )
+        self.assertIsNone(no_receipt["source"]["receipt"])
+
+    def test_sidecar_writer_is_atomic_closed_and_never_creates_the_report(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rubicon-witness-") as tmp:
+            report = Path(tmp) / "nested" / "report.json"
+            witness = self._witness()
+            path = _write_subset_witness(report, witness)
+            self.assertEqual(path, report.parent / _SUBSET_WITNESS_FILENAME)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), witness)
+            self.assertFalse(report.exists())
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
+            before = path.read_text(encoding="utf-8")
+            adversarial = copy.deepcopy(witness)
+            adversarial["observed"]["durable_main_exact"] = "true"
+            with self.assertRaisesRegex(ValueError, "booleans"):
+                _write_subset_witness(report, adversarial)
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_phase_captures_exact_five_booleans_for_first_failed_tier_from_stage_state(self) -> None:
+        base_oid, adv_oid, sib_oid = "1" * 40, "2" * 40, "3" * 40
+        pre = _subset_witness_pre()
+        pre["git"] = "/usr/bin/git"
+        repos = {
+            "atomic_subset": {
+                "work": Path("/tmp/rubicon-atomic"),
+                "seed_oid": base_oid,
+                "info": {"clone_path": "/git/u/atomic.git"},
+                "rw": {"username": "u", "token": "rw"},
+                "ro": {"username": "u", "token": "ro"},
+            }
+        }
+        refs_f = {"refs/heads/main": base_oid, "refs/heads/protected": adv_oid}
+        # Client porcelain says success+rejection, but the protected readback did not land.
+        refs_s = {"refs/heads/main": adv_oid, "refs/heads/protected": sib_oid}
+        refs_ok = {"refs/heads/atom-a": adv_oid, "refs/heads/atom-b": sib_oid}
+
+        def fake_run_git(_git: str, args: list[str], _cwd: object, _env: dict[str, str], timeout: int = 60) -> tuple[Mock, float]:
+            if args[0] == "rev-parse":
+                return Mock(returncode=0, stdout=b"tree\n", stderr=b""), 1.0
+            if args[0] == "commit-tree":
+                return Mock(returncode=0, stdout=sib_oid.encode() + b"\n", stderr=b""), 1.0
+            if args[0] == "push":
+                if "--atomic" in args and any("refs/heads/main" in arg for arg in args):
+                    return Mock(returncode=1, stdout=b"", stderr=b"rejected"), 1.0
+                if "--atomic" in args:
+                    return Mock(returncode=0, stdout=b"", stderr=b""), 1.0
+                if any("refs/heads/main" in arg for arg in args):
+                    return Mock(
+                        returncode=0,
+                        stdout=b"*\tHEAD:refs/heads/main\tok\n!\tHEAD:refs/heads/protected\trejected\n",
+                        stderr=b"",
+                    ), 1.0
+                return Mock(returncode=0, stdout=b"", stderr=b""), 1.0
+            raise AssertionError(args)
+
+        remote_calls = {"count": 0}
+
+        def fake_remote(*_args: object) -> tuple[dict[str, str], float]:
+            refs = (refs_f, refs_s, refs_ok)[remote_calls["count"] % 3]
+            remote_calls["count"] += 1
+            return refs, 1.0
+
+        witnesses: list[dict] = []
+        with (
+            patch("rubicon_workload.runner.materialize_commit_spec", return_value=adv_oid),
+            patch("rubicon_workload.runner.run_git", side_effect=fake_run_git),
+            patch("rubicon_workload.runner.git_remote_refs", side_effect=fake_remote),
+        ):
+            result = _phase_atomic_subset(
+                pre,
+                {},
+                ["http://127.0.0.1:1"],
+                Path("/tmp/askpass"),
+                repos,
+                [],
+                [],
+                tier=2,
+                subset_witnesses=witnesses,
+            )
+            # A later failed tier must not replace the first failed tier witness.
+            _phase_atomic_subset(
+                pre,
+                {},
+                ["http://127.0.0.1:1"],
+                Path("/tmp/askpass"),
+                repos,
+                [],
+                [],
+                tier=4,
+                subset_witnesses=witnesses,
+            )
+
+        self.assertFalse(result["subset_partial_exact"])
+        self.assertEqual(len(witnesses), 1)
+        self.assertEqual(witnesses[0]["tier"], 2)
+        self.assertEqual(witnesses[0]["observed"], {
+            "client_return_unsuccessful": False,
+            "porcelain_success_exact": True,
+            "porcelain_rejection_exact": True,
+            "durable_main_exact": True,
+            "durable_protected_exact": False,
+        })
+
+    def test_runner_writes_sidecar_without_replacing_root_failure_when_unwritable(self) -> None:
+        import contextlib
+        import json
+
+        witness = self._witness()
+        fake_pre = {
+            "binary": "/bin/true",
+            "binary_sha256": "0" * 64,
+            "binary_size_bytes": 1,
+            "receipt_verified": False,
+            "git_version": "git version 2.43.0",
+            "psql_version": "psql 17",
+            "pg_base": "postgresql://u@127.0.0.1/db",
+            "s3_loopback_http": False,
+            "s3_host": "127.0.0.1",
+            "s3_port": 9000,
+            "s3_scheme": "http",
+            "s3_is_loopback": True,
+            "logical_cpus": 2,
+            "tiers": [1],
+            "tier_notes": [],
+        }
+        fake_env = {
+            "ROOTYARD_TEST_DATABASE_URL": "postgresql://u:topsecret@127.0.0.1/db",
+            "ROOTYARD_BLOB_SECRET_ACCESS_KEY": "s3secretval",
+            "ROOTYARD_BLOB_ACCESS_KEY_ID": "s3keyid",
+            "ROOTYARD_BLOB_ENDPOINT": "http://127.0.0.1:9000",
+        }
+
+        def fake_tier(*args: object) -> dict:
+            args[11].append(copy.deepcopy(witness))
+            raise ValueError("subset push partial outcome mismatch")
+
+        def run_case(report: Path, sidecar_error: bool) -> None:
+            cfg = WorkloadConfig(binary="/bin/true", report=str(report), git="/usr/bin/git", require_build_receipt=False)
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("rubicon_workload.runner._preflight", return_value=fake_pre))
+                stack.enter_context(patch("rubicon_workload.runner._verify_public_cluster_authority"))
+                stack.enter_context(patch("rubicon_workload.runner.subprocess.run"))
+                stack.enter_context(patch("rubicon_workload.runner.subprocess.check_output", return_value="17.0"))
+                stack.enter_context(patch("rubicon_workload.runner._cli", return_value="{}"))
+                stack.enter_context(patch("rubicon_workload.runner._run_tier", side_effect=fake_tier))
+                if sidecar_error:
+                    stack.enter_context(
+                        patch("rubicon_workload.runner._write_subset_witness", side_effect=OSError("unwritable sidecar"))
+                    )
+                with self.assertRaisesRegex(RuntimeError, "subset push partial outcome mismatch"):
+                    run_rubicon_workload(cfg, env=fake_env)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "out" / "report.json"
+            run_case(report, sidecar_error=False)
+            sidecar = report.parent / _SUBSET_WITNESS_FILENAME
+            self.assertTrue(sidecar.is_file())
+            self.assertEqual(json.loads(sidecar.read_text(encoding="utf-8")), witness)
+            self.assertFalse(report.exists())
+
+            unwritable_report = Path(tmp) / "unwritable" / "report.json"
+            run_case(unwritable_report, sidecar_error=True)
+            self.assertFalse((unwritable_report.parent / _SUBSET_WITNESS_FILENAME).exists())
+            self.assertFalse(unwritable_report.exists())
 
 
 class RubiconProvisioningAndAuthorityTests(unittest.TestCase):

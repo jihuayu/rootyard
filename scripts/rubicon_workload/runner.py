@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -88,6 +89,160 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+_SUBSET_WITNESS_SCHEMA = "rootyard/rubicon-subset-witness/v1"
+_SUBSET_WITNESS_FILENAME = "subset-witness.json"
+_SUBSET_WITNESS_KEYS = frozenset({"schema_version", "issue", "kind", "tier", "source", "observed"})
+_SUBSET_WITNESS_OBSERVED_KEYS = frozenset(
+    {
+        "client_return_unsuccessful",
+        "porcelain_success_exact",
+        "porcelain_rejection_exact",
+        "durable_main_exact",
+        "durable_protected_exact",
+    }
+)
+_SUBSET_WITNESS_SOURCE_KEYS = frozenset({"commit", "dirty", "receipt"})
+_SUBSET_WITNESS_RECEIPT_KEYS = frozenset(
+    {"schema", "workspace_commit", "source_inputs_sha256", "receipt_sha256", "config_digest"}
+)
+
+
+def _is_hex(value: Any, length: int) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(rf"[0-9a-f]{{{length}}}", value))
+
+
+def _closed_subset_failure_witness(
+    tier: int,
+    pre: dict[str, Any],
+    *,
+    client_return_unsuccessful: bool,
+    porcelain_success_exact: bool,
+    porcelain_rejection_exact: bool,
+    durable_main_exact: bool,
+    durable_protected_exact: bool,
+) -> dict[str, Any]:
+    """Build one fixed-shape subset failure witness; refuse ambiguous inputs."""
+    if not isinstance(tier, int) or isinstance(tier, bool) or tier not in (1, 2, 4):
+        raise ValueError("subset witness tier must be one of 1,2,4")
+    observed = {
+        "client_return_unsuccessful": client_return_unsuccessful,
+        "porcelain_success_exact": porcelain_success_exact,
+        "porcelain_rejection_exact": porcelain_rejection_exact,
+        "durable_main_exact": durable_main_exact,
+        "durable_protected_exact": durable_protected_exact,
+    }
+    if not all(isinstance(value, bool) for value in observed.values()):
+        raise ValueError("subset witness observations must be booleans")
+    if all(observed.values()):
+        raise ValueError("subset witness requires at least one false observation")
+
+    commit = pre.get("source_commit")
+    dirty = pre.get("source_dirty")
+    if not _is_hex(commit, 40) or not isinstance(dirty, bool):
+        raise ValueError("subset witness source state unavailable")
+
+    receipt: dict[str, Any] | None = None
+    receipt_verified = pre.get("receipt_verified")
+    if receipt_verified is not None and not isinstance(receipt_verified, bool):
+        raise ValueError("subset witness receipt flag is ambiguous")
+    if receipt_verified is True:
+        schema = pre.get("receipt_schema")
+        workspace_commit = pre.get("workspace_commit")
+        source_inputs_sha256 = pre.get("source_inputs_sha256")
+        receipt_sha256 = pre.get("receipt_sha256")
+        config_digest = pre.get("config_digest")
+        if not isinstance(schema, str) or not schema:
+            raise ValueError("subset witness receipt schema unavailable")
+        if not _is_hex(workspace_commit, 40) or workspace_commit != commit:
+            raise ValueError("subset witness receipt workspace does not match source")
+        if not _is_hex(source_inputs_sha256, 64) or not _is_hex(receipt_sha256, 64):
+            raise ValueError("subset witness receipt digest unavailable")
+        if config_digest is not None and not _is_hex(config_digest, 64):
+            raise ValueError("subset witness config digest unavailable")
+        if schema == "v2" and config_digest is None:
+            raise ValueError("subset witness v2 config digest unavailable")
+        receipt = {
+            "schema": schema,
+            "workspace_commit": workspace_commit,
+            "source_inputs_sha256": source_inputs_sha256,
+            "receipt_sha256": receipt_sha256,
+            "config_digest": config_digest,
+        }
+
+    witness = {
+        "schema_version": _SUBSET_WITNESS_SCHEMA,
+        "issue": "#164",
+        "kind": "subset_push_partial_outcome_mismatch",
+        "tier": tier,
+        "source": {"commit": commit, "dirty": dirty, "receipt": receipt},
+        "observed": observed,
+    }
+    _validate_subset_witness(witness)
+    return witness
+
+
+def _validate_subset_witness(witness: Any) -> None:
+    """Validate the closed sidecar shape; reject any extra or untyped fields."""
+    if not isinstance(witness, dict) or set(witness) != _SUBSET_WITNESS_KEYS:
+        raise ValueError("subset witness must have exactly the fixed top-level fields")
+    if witness.get("schema_version") != _SUBSET_WITNESS_SCHEMA:
+        raise ValueError("subset witness schema_version mismatch")
+    if witness.get("issue") != "#164":
+        raise ValueError("subset witness issue mismatch")
+    if witness.get("kind") != "subset_push_partial_outcome_mismatch":
+        raise ValueError("subset witness kind mismatch")
+    tier = witness.get("tier")
+    if not isinstance(tier, int) or isinstance(tier, bool) or tier not in (1, 2, 4):
+        raise ValueError("subset witness tier must be one of 1,2,4")
+
+    source = witness.get("source")
+    if not isinstance(source, dict) or set(source) != _SUBSET_WITNESS_SOURCE_KEYS:
+        raise ValueError("subset witness source must have exactly the fixed fields")
+    if not _is_hex(source.get("commit"), 40) or not isinstance(source.get("dirty"), bool):
+        raise ValueError("subset witness source state is invalid")
+    receipt = source.get("receipt")
+    if receipt is not None:
+        if not isinstance(receipt, dict) or set(receipt) != _SUBSET_WITNESS_RECEIPT_KEYS:
+            raise ValueError("subset witness receipt must have exactly the fixed fields")
+        if not isinstance(receipt.get("schema"), str) or not receipt["schema"]:
+            raise ValueError("subset witness receipt schema is invalid")
+        if not _is_hex(receipt.get("workspace_commit"), 40) or receipt["workspace_commit"] != source["commit"]:
+            raise ValueError("subset witness receipt workspace does not match source")
+        if not _is_hex(receipt.get("source_inputs_sha256"), 64) or not _is_hex(receipt.get("receipt_sha256"), 64):
+            raise ValueError("subset witness receipt digest is invalid")
+        config_digest = receipt.get("config_digest")
+        if config_digest is not None and not _is_hex(config_digest, 64):
+            raise ValueError("subset witness config digest is invalid")
+        if receipt["schema"] == "v2" and config_digest is None:
+            raise ValueError("subset witness v2 config digest is missing")
+
+    observed = witness.get("observed")
+    if not isinstance(observed, dict) or set(observed) != _SUBSET_WITNESS_OBSERVED_KEYS:
+        raise ValueError("subset witness observed must have exactly the five boolean fields")
+    if not all(isinstance(value, bool) for value in observed.values()):
+        raise ValueError("subset witness observations must be booleans")
+    if all(observed.values()):
+        raise ValueError("subset witness cannot describe a successful subset push")
+
+
+def _write_subset_witness(report_path: str | Path, witness: dict[str, Any]) -> Path:
+    """Atomically write the validated sidecar next to the benchmark report."""
+    _validate_subset_witness(witness)
+    path = Path(report_path).parent / _SUBSET_WITNESS_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    payload = json.dumps(witness, indent=2) + "\n"
+    try:
+        tmp_path.write_text(payload, encoding="utf-8", newline="\n")
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+    return path
 
 
 def _allocate_distinct_ports(count: int) -> list[int]:
@@ -956,6 +1111,9 @@ def _phase_atomic_subset(
     repos: dict[str, dict[str, Any]],
     records: list[dict[str, Any]],
     acked: list[dict[str, Any]],
+    *,
+    tier: int | None = None,
+    subset_witnesses: list[dict[str, Any]] | None = None,
 ) -> dict[str, bool]:
     at = repos["atomic_subset"]
     at_env = build_git_env(base_env, askpass, at["rw"])
@@ -973,8 +1131,36 @@ def _phase_atomic_subset(
     p_sub, ms_s = run_git(pre["git"], ["push", "--porcelain", "origin", f"{adv_oid}:refs/heads/main", f"{sib_oid}:refs/heads/protected"], at_dir, at_env)
     entries = parse_push_porcelain(p_sub.stdout.decode("utf-8", errors="replace"))
     refs_s, _ = git_remote_refs(pre["git"], at_remote, base_env, askpass, at["ro"])
-    sub_exact = p_sub.returncode != 0 and push_has_success(entries, "refs/heads/main") and push_has_rejection(entries, "refs/heads/protected") and refs_s.get("refs/heads/main") == adv_oid and refs_s.get("refs/heads/protected") == adv_oid
+    client_return_unsuccessful = p_sub.returncode != 0
+    porcelain_success_exact = push_has_success(entries, "refs/heads/main")
+    porcelain_rejection_exact = push_has_rejection(entries, "refs/heads/protected")
+    durable_main_exact = refs_s.get("refs/heads/main") == adv_oid
+    durable_protected_exact = refs_s.get("refs/heads/protected") == adv_oid
+    sub_exact = (
+        client_return_unsuccessful
+        and porcelain_success_exact
+        and porcelain_rejection_exact
+        and durable_main_exact
+        and durable_protected_exact
+    )
     _record_op(records, "subset_push", "small_deltas", "typed_refusal" if sub_exact else "unknown_outcome", ms_s, "measured")
+    if not sub_exact and subset_witnesses is not None and not subset_witnesses and tier is not None:
+        try:
+            subset_witnesses.append(
+                _closed_subset_failure_witness(
+                    tier,
+                    pre,
+                    client_return_unsuccessful=client_return_unsuccessful,
+                    porcelain_success_exact=porcelain_success_exact,
+                    porcelain_rejection_exact=porcelain_rejection_exact,
+                    durable_main_exact=durable_main_exact,
+                    durable_protected_exact=durable_protected_exact,
+                )
+            )
+        except (TypeError, ValueError):
+            # The witness is diagnostic only; ambiguity must never replace the
+            # original validation failure that follows this probe.
+            pass
 
     p_ok, ms_ok = run_git(pre["git"], ["push", "--atomic", "--porcelain", "origin", f"{adv_oid}:refs/heads/atom-a", f"{sib_oid}:refs/heads/atom-b"], at_dir, at_env)
     refs_ok, _ = git_remote_refs(pre["git"], at_remote, base_env, askpass, at["ro"])
@@ -1154,6 +1340,7 @@ def _run_tier(
     tier_dir: Path,
     askpass: Path,
     secrets: list[str],
+    subset_witnesses: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     users = [_create_user_and_tokens(pre["binary"], cli_env, f"rubicon_t{n_procs}_u{i}", secrets) for i in range(3)]
     # Pre-mint the sacrificial token before starting serve-blob because CLI
@@ -1182,7 +1369,17 @@ def _run_tier(
         overlap = _phase_concurrent_overlap(n_procs, config, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
         same_repo = _phase_same_repo_mixed(n_procs, config.seed, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
         cas = _phase_cas_race(n_procs, config.seed, pre, base_env, bases, tier_dir, askpass, repos, records, acked)
-        atomic = _phase_atomic_subset(pre, base_env, bases, askpass, repos, records, acked)
+        atomic = _phase_atomic_subset(
+            pre,
+            base_env,
+            bases,
+            askpass,
+            repos,
+            records,
+            acked,
+            tier=n_procs,
+            subset_witnesses=subset_witnesses,
+        )
         fleet, ci_info, cold_warm = _phase_cold_warm_and_ci(
             n_procs, pre, base_env, pg_url, s3_endpoint, s3_proxy, tier_scratch, tier_dir, askpass, repos, records, fleet, sampler
         )
@@ -1302,6 +1499,7 @@ def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = No
     schema_created = False
     s3_proxy: S3MeterProxy | None = None
     s3_endpoint = run_env["ROOTYARD_BLOB_ENDPOINT"]
+    subset_witnesses: list[dict[str, Any]] = []
 
     try:
         _verify_public_cluster_authority(pre["pg_base"], run_env)
@@ -1327,7 +1525,7 @@ def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = No
             s3_endpoint = s3_proxy.endpoint
 
         askpass = write_askpass_script(work_root / "askpass.sh")
-        tiers_out = [_run_tier(n, config, pre, run_env, cli_env, pg_url, s3_endpoint, s3_proxy, work_root / f"tier-{n}", askpass, secrets) for n in pre["tiers"]]
+        tiers_out = [_run_tier(n, config, pre, run_env, cli_env, pg_url, s3_endpoint, s3_proxy, work_root / f"tier-{n}", askpass, secrets, subset_witnesses) for n in pre["tiers"]]
         source_sha, source_dirty = _git_source_state(repo_root)
         source_obj: dict[str, Any] = {"commit": source_sha, "dirty": source_dirty}
         binary_obj: dict[str, Any] = {
@@ -1396,6 +1594,13 @@ def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = No
                 diag_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
             except Exception:
                 pass
+            if subset_witnesses:
+                try:
+                    _write_subset_witness(config.report, subset_witnesses[0])
+                except Exception:
+                    # Keep the original strict failure; an unwritable sidecar
+                    # must not mask the benchmark's own error.
+                    pass
         raise RuntimeError(f"{type(exc).__name__}: {msg}\n{tb_tail}") from None
     finally:
         if s3_proxy is not None:
