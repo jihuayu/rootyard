@@ -104,7 +104,7 @@ fn assert_procfs_mount() {
     let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: the path is a NUL-terminated literal and statfs writes the buffer
     // on success; it is only assumed initialized after a zero return.
-    let result = unsafe { libc::statfs(b"/proc\0".as_ptr().cast(), statfs.as_mut_ptr()) };
+    let result = unsafe { libc::statfs(c"/proc".as_ptr(), statfs.as_mut_ptr()) };
     assert_eq!(result, 0, "cannot statfs /proc");
     // SAFETY: the successful statfs call initialized the buffer.
     let statfs = unsafe { statfs.assume_init() };
