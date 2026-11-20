@@ -30,6 +30,126 @@ async fn wait_pids(path: &FsPath) -> (i32, i32) {
     panic!("test Git wrapper did not publish its process group");
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcStat {
+    state: u8,
+    group: i32,
+    start_time: u64,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum Probe {
+    Present(ProcStat),
+    Missing,
+    Invalid,
+}
+
+#[cfg(unix)]
+fn recognized_state(state: u8) -> bool {
+    matches!(state, b'R' | b'S' | b'D' | b'T' | b't' | b'Z' | b'X' | b'I' | b'P' | b'W' | b'K')
+}
+
+#[cfg(unix)]
+fn live_state(state: u8) -> bool {
+    recognized_state(state) && !matches!(state, b'Z' | b'X')
+}
+
+#[cfg(unix)]
+fn parse_stat(raw: &str, pid: i32) -> Option<ProcStat> {
+    // The command name is parenthesized and may itself contain ") ". Split at
+    // the final delimiter, then validate the exact PID prefix before fields.
+    let (prefix, tail) = raw.rsplit_once(") ")?;
+    let expected_pid = pid.to_string();
+    if prefix.split_once(" (")?.0 != expected_pid {
+        return None;
+    }
+    let fields: Vec<_> = tail.split_whitespace().collect();
+    let state = fields.first()?.as_bytes();
+    if fields.len() < 20
+        || state.len() != 1
+        || !recognized_state(state[0])
+        || fields[1..20].iter().any(|field| field.parse::<i128>().is_err())
+    {
+        return None;
+    }
+    Some(ProcStat { state: state[0], group: fields[2].parse().ok()?, start_time: fields[19].parse().ok()? })
+}
+
+#[cfg(unix)]
+fn probe(pid: i32) -> Probe {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(raw) => parse_stat(&raw, pid).map_or(Probe::Invalid, Probe::Present),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Probe::Missing
+        }
+        Err(_) => Probe::Invalid,
+    }
+}
+
+#[cfg(unix)]
+fn live_procfs() -> bool {
+    let Some(pid) = i32::try_from(std::process::id()).ok() else {
+        return false;
+    };
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|raw| parse_stat(&raw, pid))
+        .is_some_and(|stat| live_state(stat.state))
+}
+
+#[cfg(unix)]
+fn classify_grandchild(expected: ProcStat, observed: Probe, procfs_live: bool) -> Result<&'static str, &'static str> {
+    match observed {
+        Probe::Present(stat) if !recognized_state(stat.state) => Err("inconclusive"),
+        Probe::Present(stat) if stat.start_time != expected.start_time => Ok("pid-reused"),
+        Probe::Present(stat) if matches!(stat.state, b'Z' | b'X') => Ok("quiescent"),
+        Probe::Present(_) => Err("live-same-identity"),
+        Probe::Missing if procfs_live => Ok("exited"),
+        Probe::Missing | Probe::Invalid => Err("inconclusive"),
+    }
+}
+
+#[cfg(unix)]
+fn fixture_identity(leader: i32, grandchild: i32) -> ProcStat {
+    match probe(grandchild) {
+        Probe::Present(stat) if stat.group == leader && live_state(stat.state) => stat,
+        Probe::Present(_) => panic!("fixture grandchild stat: not-live-or-wrong-group"),
+        Probe::Missing => panic!("fixture grandchild stat: missing"),
+        Probe::Invalid => panic!("fixture grandchild stat: invalid"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_descendant_stat_is_strict_and_closed() {
+    let raw = format!("4242 (git ) child) S 77 77 {}9000", "0 ".repeat(16));
+    let expected = ProcStat { state: b'S', group: 77, start_time: 9_000 };
+    assert_eq!(parse_stat(&raw, 4242), Some(expected));
+    assert_eq!(parse_stat(&format!("{raw} 0 0 0"), 4242), Some(expected));
+    assert!(parse_stat(&raw, 4243).is_none());
+    assert!(parse_stat("4242 sh) S 0 1 1", 4242).is_none());
+    assert!(parse_stat(&raw.replace("S 77 77", "? 77 77").replace(" 9000", " 9001"), 4242).is_none());
+    assert!(parse_stat(&raw.replace(" 9000", " nope"), 4242).is_none());
+    assert!(parse_stat(&raw.replace("S 77 77", "S 77 nope"), 4242).is_none());
+    assert!(parse_stat("4242 (sh) S 0 77", 4242).is_none());
+
+    let present = |state: u8, group: i32, start_time: u64| {
+        Probe::Present(ProcStat { state, group, start_time })
+    };
+    assert_eq!(classify_grandchild(expected, present(b'R', 77, 9_001), false), Ok("pid-reused"));
+    assert_eq!(classify_grandchild(expected, present(b'Z', 456, 9_000), false), Ok("quiescent"));
+    assert_eq!(classify_grandchild(expected, present(b'X', 77, 9_000), false), Ok("quiescent"));
+    assert_eq!(classify_grandchild(expected, present(b'S', 456, 9_000), false), Err("live-same-identity"));
+    assert_eq!(classify_grandchild(expected, present(b'?', 77, 9_001), false), Err("inconclusive"));
+    assert_eq!(classify_grandchild(expected, Probe::Missing, true), Ok("exited"));
+    assert_eq!(classify_grandchild(expected, Probe::Missing, false), Err("inconclusive"));
+    assert_eq!(classify_grandchild(expected, Probe::Invalid, true), Err("inconclusive"));
+}
+
 fn command(pidfile: &FsPath) -> Command {
     let mut cmd = base_command(FsPath::new("/bin/sh"));
     cmd.args(["-c", SCRIPT, "sh", pidfile.to_str().unwrap()]);
@@ -85,6 +205,9 @@ async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
             _ = tokio::time::sleep(Duration::from_millis(5)) => {}
         }
     };
+    // Pin the fixture as a live recognized descendant in the published process
+    // group and its start time before cancellation invalidates the PID.
+    let identity = fixture_identity(leader, grandchild);
     drop(future);
     drop(scratch);
     for _ in 0..100 {
@@ -95,7 +218,15 @@ async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
     }
     assert!(!root.exists(), "the scratch directory outlived the cancelled Git command");
     assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
-    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
+    // The reaped leader cannot reap the orphaned grandchild: namespace init may
+    // do so asynchronously. A missing PID is exit proof only when live procfs is
+    // independently validated; a same-identity live entry fails even if it
+    // moved process groups.
+    let observed = probe(grandchild);
+    let procfs_live = matches!(observed, Probe::Missing) && live_procfs();
+    if let Err(class) = classify_grandchild(identity, observed, procfs_live) {
+        panic!("cancelled Git descendant cleanup class: {class} (expected exited, pid-reused or quiescent)");
+    }
 }
 
 #[cfg(unix)]
