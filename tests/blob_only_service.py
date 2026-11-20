@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -487,15 +488,55 @@ _PUSH_STDERR_SIGNATURES = (
     ("unexpected disconnect", "disconnect"),
     ("failed to push", "failed-to-push"),
 )
+# Only ordinary, registered 4xx/5xx HTTP outcomes are reportable. A syntactically
+# valid but unlisted code, a redirect/success code, or a non-HTTP number is not.
+_PUSH_HTTP_STATUSES = frozenset({
+    "400", "401", "402", "403", "404", "405", "406", "407", "408", "409",
+    "410", "411", "412", "413", "414", "415", "416", "417", "418", "421",
+    "422", "423", "424", "425", "426", "428", "429", "431", "451",
+    "500", "501", "502", "503", "504", "505", "506", "507", "508", "510",
+    "511",
+})
+# Only whole, anchored Git transport error lines are credible. The URL region is
+# matched as one opaque token, so status-like text inside it is never read as a
+# code. Sideband, proxy, handshake, header and arbitrary-prefix lines fail.
+_PUSH_UNABLE_LINE = re.compile(
+    r"""^fatal: unable to access (?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|\S+): """
+    r"""The requested URL returned error: (\d{3})\s*$""",
+    re.IGNORECASE,
+)
+_PUSH_RPC_HTTP_LINE = re.compile(
+    r"^error: RPC failed; HTTP (\d{3}) curl(?:\s.*)?\s*$", re.IGNORECASE)
+_PUSH_RPC_RETURNED = re.compile(
+    r"The requested URL returned error: (\d{3})\s*$", re.IGNORECASE)
 def _push_text(process, name):
     value = getattr(process, name, b"") or b""
     return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+def _push_http_status(process):
+    found = set()
+    for line in _push_text(process, "stderr").splitlines():
+        match = _PUSH_UNABLE_LINE.match(line)
+        if match:
+            found.add(match.group(1))
+            continue
+        match = _PUSH_RPC_HTTP_LINE.match(line)
+        if match:
+            found.add(match.group(1))
+            returned = _PUSH_RPC_RETURNED.search(line)
+            if returned:
+                found.add(returned.group(1))
+    if len(found) == 1:
+        status = found.pop()
+        if status in _PUSH_HTTP_STATUSES:
+            return status
+    return "unknown"
 def push_failure(process):
     """Narrow attribution for the one failed stock `sha_roundtrip` push.
 
     Only exact three-column porcelain lines are parsed. The refspec column is
     never inspected, so a ref or path containing marker text cannot forge a
-    summary class.
+    summary class. `http_status` is a fixed allowlisted code or "unknown"; raw
+    stderr, headers, URLs and credentials are never returned.
     """
     flag = "none"
     summary = "unclassified"
@@ -521,6 +562,7 @@ def push_failure(process):
         "exit": process.returncode if type(getattr(process, "returncode", None)) is int else -1,
         "flag": flag,
         "summary": summary,
+        "http_status": _push_http_status(process),
         "stderr": classes or ["unclassified"],
     }
 def parse_push(text):

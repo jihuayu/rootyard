@@ -40,6 +40,7 @@ class BlobOnlyGitFailureDiagnosticsTest(unittest.TestCase):
         self.assertIs(type(diagnostic["exit"]), int)
         self.assertIs(type(diagnostic["flag"]), str)
         self.assertIs(type(diagnostic["summary"]), str)
+        self.assertIs(type(diagnostic["http_status"]), str)
         self.assertTrue(all(type(value) is str for value in diagnostic["stderr"]))
 
     def test_fake_refspec_and_path_markers_cannot_forge_summary(self):
@@ -65,6 +66,122 @@ class BlobOnlyGitFailureDiagnosticsTest(unittest.TestCase):
         self.assertEqual(diagnostic["summary"], "remote-rejected")
         self.assertIn("unable to access", diagnostic["stderr"])
         self.assertIn("http", diagnostic["stderr"])
+        self.assertEqual(diagnostic["http_status"], "503")
+        self.assert_closed(diagnostic)
+
+    def test_http_status_uses_only_the_closed_allowlist(self):
+        for code in ("400", "403", "404", "409", "422", "429", "500", "502", "503", "504"):
+            diagnostic = blob.push_failure(process(
+                stderr=(b"fatal: unable to access 'https://user:token@secret.example/r.git/': "
+                        b"The requested URL returned error: " + code.encode() + b"\n"),
+            ))
+            self.assertEqual(diagnostic["http_status"], code)
+            self.assert_closed(diagnostic)
+        for code in ("200", "301", "302", "304", "600", "999"):
+            diagnostic = blob.push_failure(process(
+                stderr=(b"fatal: unable to access 'https://user:token@secret.example/r.git/': "
+                        b"The requested URL returned error: " + code.encode() + b"\n"),
+            ))
+            self.assertEqual(diagnostic["http_status"], "unknown")
+            self.assert_closed(diagnostic)
+
+    def test_rpc_http_status_is_attributed_only_once(self):
+        diagnostic = blob.push_failure(process(
+            stderr=(b"error: RPC failed; HTTP 502 curl 22 "
+                    b"The requested URL returned error: 502\n"),
+        ))
+        self.assertEqual(diagnostic["http_status"], "502")
+        self.assert_closed(diagnostic)
+        conflicting = blob.push_failure(process(
+            stderr=(b"error: RPC failed; HTTP 502 curl 22 "
+                    b"The requested URL returned error: 503\n"),
+        ))
+        self.assertEqual(conflicting["http_status"], "unknown")
+        self.assert_closed(conflicting)
+
+    def test_http_status_candidate_in_url_is_not_attributed(self):
+        quoted = blob.push_failure(process(
+            stderr=(b"fatal: unable to access "
+                    b"'https://user:token@secret.example/http 500/"
+                    b"The requested URL returned error: 503/status/429.git': "
+                    b"Could not resolve host: secret.example\n"),
+        ))
+        self.assertEqual(quoted["http_status"], "unknown")
+        self.assert_closed(quoted)
+        unquoted = blob.push_failure(process(
+            stderr=(b"fatal: unable to access "
+                    b"https://user:token@secret.example/http:500/returned-error:503.git: "
+                    b"Could not resolve host: secret.example\n"),
+        ))
+        self.assertEqual(unquoted["http_status"], "unknown")
+        self.assert_closed(unquoted)
+
+    def test_sideband_headers_and_prefixes_cannot_supply_status(self):
+        for stderr in (
+            b"remote: HTTP 503\n",
+            b"remote: The requested URL returned error: 503\n",
+            b"X-HTTP 503\n",
+            b"proxy: HTTP 503\n",
+            b"HTTP/1.1 503 Service Unavailable\n",
+            b"error: proxy handshake failed; HTTP 503\n",
+            b"warning: unable to access 'https://user:token@secret.example/r.git/': "
+            b"The requested URL returned error: 503\n",
+        ):
+            diagnostic = blob.push_failure(process(stderr=stderr))
+            self.assertEqual(diagnostic["http_status"], "unknown")
+            self.assert_closed(diagnostic)
+
+        mixed = blob.push_failure(process(
+            stderr=(b"remote: HTTP 503\n"
+                    b"remote: The requested URL returned error: 500\n"
+                    b"X-HTTP 500\n"
+                    b"HTTP/1.1 500 Internal Server Error\n"
+                    b"fatal: unable to access 'https://user:token@secret.example/r.git/': "
+                    b"The requested URL returned error: 503\n"),
+        ))
+        self.assertEqual(mixed["http_status"], "503")
+        self.assert_closed(mixed)
+
+        conflicting = blob.push_failure(process(
+            stderr=(b"fatal: unable to access 'https://user:token@secret.example/r.git/': "
+                    b"The requested URL returned error: 503\n"
+                    b"error: RPC failed; HTTP 500 curl 22 "
+                    b"The requested URL returned error: 500\n"),
+        ))
+        self.assertEqual(conflicting["http_status"], "unknown")
+        self.assert_closed(conflicting)
+
+    def test_ambiguous_and_challenge_only_statuses_are_unknown(self):
+        ambiguous = blob.push_failure(process(
+            stderr=(b"error: RPC failed; HTTP 500 curl 22\n"
+                    b"fatal: unable to access 'https://user:token@secret.example/r.git/': "
+                    b"The requested URL returned error: 503\n"),
+        ))
+        self.assertEqual(ambiguous["http_status"], "unknown")
+        self.assert_closed(ambiguous)
+        challenge = blob.push_failure(process(
+            stderr=(b"remote: HTTP Basic: Access denied\n"
+                    b"fatal: Authentication failed for "
+                    b"'https://user:token@secret.example/r.git/'\n"),
+        ))
+        self.assertEqual(challenge["http_status"], "unknown")
+        self.assert_closed(challenge)
+
+    def test_http_status_output_contains_no_raw_stderr_or_headers(self):
+        diagnostic = blob.push_failure(process(
+            stdout=b"raw stdout body",
+            stderr=(b"fatal: unable to access 'https://user:token@secret.example/r.git/': "
+                    b"The requested URL returned error: 503\n"
+                    b"Authorization: Bearer token-123\n"
+                    b"WWW-Authenticate: Basic realm=\"secret.example\"\n"),
+        ))
+        self.assertEqual(diagnostic["http_status"], "503")
+        self.assertEqual(set(diagnostic),
+                         {"exit", "flag", "summary", "http_status", "stderr"})
+        encoded = json.dumps(diagnostic)
+        for raw in ("Authorization", "WWW-Authenticate", "Bearer",
+                    "secret.example", "token-123", "raw stdout body"):
+            self.assertNotIn(raw, encoded)
         self.assert_closed(diagnostic)
 
     def test_ordinary_exit_rpc_disconnect_and_unknown_outcome(self):
@@ -75,6 +192,7 @@ class BlobOnlyGitFailureDiagnosticsTest(unittest.TestCase):
         self.assertEqual(rpc["exit"], 1)
         self.assertEqual(rpc["flag"], "none")
         self.assertEqual(rpc["summary"], "unclassified")
+        self.assertEqual(rpc["http_status"], "unknown")
         self.assertIn("rpc", rpc["stderr"])
         self.assertIn("disconnect", rpc["stderr"])
         self.assert_closed(rpc)
@@ -87,6 +205,7 @@ class BlobOnlyGitFailureDiagnosticsTest(unittest.TestCase):
         self.assertEqual(unknown["exit"], -1)
         self.assertEqual(unknown["flag"], "none")
         self.assertEqual(unknown["summary"], "unclassified")
+        self.assertEqual(unknown["http_status"], "unknown")
         self.assertEqual(unknown["stderr"], ["unclassified"])
         self.assert_closed(unknown)
 
