@@ -2,14 +2,21 @@ name: Native kernel cgroup acceptance
 
 # Manual feature acceptance only. This is intentionally not part of ordinary
 # push/pull_request CI. The default dispatch runs the cgroup v2 job; the opt-in
-# fuse_compat input also runs the hosted FUSE compatibility witness. Both need
-# a disposable PostgreSQL service; the cgroup job also needs a cgroup v2 VM
-# with root delegation.
+# fuse_compat input also runs the hosted FUSE compatibility witness. The
+# workspace_remote_detached input runs the #88 detached-HEAD/inert-LFS remote
+# checkpoint witness. Both need a disposable PostgreSQL service; the remote job
+# also owns a pinned Garage 2.1 fixture. The cgroup job also needs a cgroup v2
+# VM with root delegation.
 on:
   workflow_dispatch:
     inputs:
       fuse_compat:
         description: "Also run the hosted FUSE compatibility witness on the attested build"
+        required: false
+        default: false
+        type: boolean
+      workspace_remote_detached:
+        description: "Also run the #88 detached-HEAD/inert-LFS remote checkpoint witness on the attested build"
         required: false
         default: false
         type: boolean
@@ -239,8 +246,8 @@ jobs:
       # Opt-in handoff for the sibling FUSE witness job.  This only copies the
       # already attested build products; it does not change the cgroup
       # acceptance, its database, its evidence or its result.
-      - name: Stage the opt-in FUSE build artifact
-        if: ${{ inputs.fuse_compat }}
+      - name: Stage the opt-in FUSE/remote build artifact
+        if: ${{ inputs.fuse_compat || inputs.workspace_remote_detached }}
         run: |
           set -euo pipefail
           build_dir="$RUNNER_TEMP/fuse-build"
@@ -250,8 +257,8 @@ jobs:
           cp -- "$(command -v bwrap)" "$build_dir/bwrap"
           chmod 0755 "$build_dir/rootyard" "$build_dir/bwrap"
           (cd "$build_dir" && sha256sum rootyard bwrap rootyard.build.json >SHA256SUMS)
-      - name: Upload the opt-in FUSE build artifact
-        if: ${{ inputs.fuse_compat }}
+      - name: Upload the opt-in FUSE/remote build artifact
+        if: ${{ inputs.fuse_compat || inputs.workspace_remote_detached }}
         uses: actions/upload-artifact@v4
         with:
           name: native-fuse-build-${{ github.run_id }}-${{ github.run_attempt }}
@@ -776,4 +783,444 @@ jobs:
               print("failed checks:", ",".join(failed), file=sys.stderr)
               raise SystemExit(1)
           print("FUSE compatibility witness passed: 1 test, 0 skipped")
+          PY
+
+  # Opt-in #88 qualification. It consumes the same attested build artifact as
+  # the FUSE compatibility job, owns its own PostgreSQL 17 database and pinned
+  # Garage 2.1 fixture, and runs only the named remote witness. The default
+  # dispatch and the existing fuse_compat job keep their behavior.
+  workspace-remote-detached:
+    name: "#88 detached inert-LFS remote checkpoint witness"
+    needs: native-kernel-cgroup
+    if: ${{ always() && inputs.workspace_remote_detached }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          # Bootstrap database only. The witness uses its own exact run-specific
+          # database created below.
+          POSTGRES_DB: rootyard_issue88_remote
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_issue88_remote"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_SOURCE_COMMIT: ${{ github.sha }}
+      PYTHONPATH: ${{ github.workspace }}
+      PG_URL_BASE: postgresql://rootyard@127.0.0.1:5432
+      REMOTE_DB: rootyard_issue88_remote_${{ github.run_id }}_${{ github.run_attempt }}
+      ROOTYARD_TEST_ISSUE88_REMOTE_DETACHED_WITNESS: "1"
+      ROOTYARD_TEST_FUSE_BACKEND: fuse
+      ROOTYARD_SANDBOX_MODE: dev
+    steps:
+      - name: Prepare private paths outside the checkout
+        run: |
+          echo "RECEIPT_DIR=$RUNNER_TEMP/workspace-remote-detached" >>"$GITHUB_ENV"
+          echo "RECEIPT=$RUNNER_TEMP/workspace-remote-detached/receipt.json" >>"$GITHUB_ENV"
+          echo "CLEANUP_RECEIPT=$RUNNER_TEMP/workspace-remote-detached/cleanup.json" >>"$GITHUB_ENV"
+          echo "PRIVATE_DIR=$RUNNER_TEMP/workspace-remote-detached-private" >>"$GITHUB_ENV"
+          echo "GARAGE_ROOT=$RUNNER_TEMP/workspace-remote-detached-garage" >>"$GITHUB_ENV"
+          echo "OBJECT_STORE_ENV_FILE=$RUNNER_TEMP/workspace-remote-detached-garage/object-store.env" >>"$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP/workspace-remote-detached-private/tmp" >>"$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/workspace-remote-detached" \
+            "$RUNNER_TEMP/workspace-remote-detached-private/tmp" \
+            "$RUNNER_TEMP/workspace-remote-detached-garage"
+
+      - name: Checkout the dispatched commit without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Use the project Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the attested build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: native-fuse-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fuse-build
+
+      - name: Install FUSE runtime, PostgreSQL 17 clients and Garage fixture tools
+        timeout-minutes: 8
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl fuse3 git gnupg libcap2 openssl util-linux
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >>"$GITHUB_PATH"
+          echo "$RUNNER_TEMP/fuse-build" >>"$GITHUB_PATH"
+          fusermount3 --version
+          psql --version
+
+      - name: Verify the downloaded attested binary, receipt and bubblewrap
+        id: remote_verify
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          build_dir="$RUNNER_TEMP/fuse-build"
+          # Artifact transport is not relied on to preserve executable bits.
+          chmod 0755 "$build_dir/rootyard" "$build_dir/bwrap"
+          test -x "$build_dir/rootyard"
+          test -f "$build_dir/rootyard.build.json"
+          test -x "$build_dir/bwrap"
+          (cd "$build_dir" && sha256sum -c SHA256SUMS)
+          test "$("$build_dir/rootyard" --rootyard-hook-self-check)" = rootyard-hook-v1
+          test "$(bwrap --version | awk '{print $2}')" != ""
+          echo "ROOTYARD_BIN=$build_dir/rootyard" >>"$GITHUB_ENV"
+          echo "ROOTYARD_BINARY=$build_dir/rootyard" >>"$GITHUB_ENV"
+          echo "ROOTYARD_BUILD_RECEIPT=$build_dir/rootyard.build.json" >>"$GITHUB_ENV"
+          sha256sum "$build_dir/rootyard" "$build_dir/rootyard.build.json" \
+            >"$RECEIPT_DIR/build.sha256"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+
+      - name: "Pin the exact #88 witness bytes"
+        id: remote_pin
+        if: steps.remote_verify.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python3 - "$PWD/tests/workspace_remote_detached_witness.py" <<'PY'
+          import hashlib
+          import sys
+          from pathlib import Path
+          data = Path(sys.argv[1]).read_bytes()
+          sha256 = hashlib.sha256(data).hexdigest()
+          blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+          assert sha256 == "bfbfc195e3457a18463ffa7eb13d98f5bc95430c027fbe68508584a068b1edc1", sha256
+          assert blob == "c8075efe514ecec8fb695852abcbc18ea53ce582", blob
+          print("exact #88 witness pinned:", blob)
+          PY
+
+      - name: Bind the prebuilt binary to the dispatched source
+        id: remote_bind
+        if: steps.remote_pin.outcome == 'success'
+        run: |
+          python3 - "$ROOTYARD_BIN" "$GITHUB_SHA" "$RECEIPT_DIR/binding.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path("tests").resolve()))
+          from runtime_binary import select_runtime_binary
+          binary, binding = select_runtime_binary(
+              {"ROOTYARD_BIN": sys.argv[1], "GITHUB_SHA": sys.argv[2]},
+              root=Path.cwd(),
+          )
+          Path(sys.argv[3]).write_text(
+              json.dumps({"binary": str(binary), "binding": binding},
+                         indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print("source-bound binary sha256:", binding["binary_sha256"])
+          PY
+
+      - name: Probe /dev/fuse and rootless namespaces
+        id: remote_preflight
+        if: steps.remote_bind.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          test -c /dev/fuse
+          dev_fuse=$(stat -Lc '%F mode=%a' /dev/fuse)
+          test "$(stat -Lc '%F' /dev/fuse)" = "character special file"
+          unshare -Urm true
+          unshare -Urm bwrap --unshare-all --die-with-parent --ro-bind / / \
+            --size 1048576 --tmpfs /tmp -- /bin/true
+          fusermount3 --version >"$PRIVATE_DIR/fusermount.txt"
+          bwrap --version >"$PRIVATE_DIR/bwrap.txt"
+          printf '%s\n' "$dev_fuse" >"$PRIVATE_DIR/dev-fuse.txt"
+          printf '%s\n' "unshare -Urm: ok" >"$PRIVATE_DIR/unshare.txt"
+          mkdir -p "$RECEIPT_DIR"
+          cp -- "$PRIVATE_DIR/dev-fuse.txt" "$PRIVATE_DIR/unshare.txt" \
+            "$PRIVATE_DIR/bwrap.txt" "$PRIVATE_DIR/fusermount.txt" "$RECEIPT_DIR/"
+
+      - name: Create the exact run-specific PostgreSQL 17 database
+        id: remote_db
+        if: steps.remote_preflight.outcome == 'success'
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          server_version=$(psql "$PG_URL_BASE/postgres" -tAc 'show server_version')
+          case "$server_version" in
+            17.*) ;;
+            *)
+              echo "unexpected PostgreSQL server version" >&2
+              exit 1
+              ;;
+          esac
+          createdb -h 127.0.0.1 -p 5432 -U rootyard "$REMOTE_DB"
+          test "$(psql "$PG_URL_BASE/$REMOTE_DB" -tAc 'select current_database()')" = "$REMOTE_DB"
+          printf '%s\n' "$server_version" >"$RECEIPT_DIR/postgres-version.txt"
+          printf '%s\n' "$REMOTE_DB" >"$RECEIPT_DIR/database-name.txt"
+
+      - name: Start the job-owned pinned Garage 2.1 S3 fixture
+        id: remote_garage
+        if: steps.remote_preflight.outcome == 'success' && steps.remote_db.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          mkdir -p "$GARAGE_ROOT"
+          # The helper prints the loopback endpoint and bucket; keep that raw
+          # console output private. Only the pinned image/version record is
+          # copied into the uploaded receipt directory.
+          scripts/owned_garage_fixture.sh start \
+            --directory "$GARAGE_ROOT/fixture" \
+            --output-env "$OBJECT_STORE_ENV_FILE" \
+            --bucket-prefix rootyard-issue88 --region garage \
+            >"$PRIVATE_DIR/garage-start.log" 2>&1
+          cp -- "$GARAGE_ROOT/fixture/garage-image.json" "$RECEIPT_DIR/garage-image.json"
+
+      - name: "Run the #88 detached inert-LFS remote checkpoint witness"
+        id: remote_test
+        if: steps.remote_pin.outcome == 'success' && steps.remote_bind.outcome == 'success' && steps.remote_preflight.outcome == 'success' && steps.remote_db.outcome == 'success' && steps.remote_garage.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          ROOTYARD_TEST_DATABASE_URL: ${{ env.PG_URL_BASE }}/${{ env.REMOTE_DB }}
+          ROOTYARD_BIN: ${{ env.ROOTYARD_BIN }}
+          ROOTYARD_BINARY: ${{ env.ROOTYARD_BINARY }}
+          ROOTYARD_BUILD_RECEIPT: ${{ env.ROOTYARD_BUILD_RECEIPT }}
+          ROOTYARD_TEST_ISSUE88_REMOTE_DETACHED_WITNESS: "1"
+          ROOTYARD_TEST_FUSE_BACKEND: fuse
+          ROOTYARD_SANDBOX_MODE: dev
+          ROOTYARD_SOURCE_COMMIT: ${{ github.sha }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set +e
+          set -a
+          # shellcheck disable=SC1090
+          source "$OBJECT_STORE_ENV_FILE"
+          set +a
+          python3 tests/workspace_remote_detached_witness.py -v \
+            >"$PRIVATE_DIR/unittest.log" 2>&1
+          test_status=$?
+          set -e
+          garage_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
+            "$RECEIPT_DIR/garage-image.json" 2>/dev/null || true)
+          garage_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_digest"])' \
+            "$RECEIPT_DIR/garage-image.json" 2>/dev/null || true)
+          python3 scripts/workspace_remote_detached_receipt.py \
+            --output "$RECEIPT" \
+            --raw-log "$PRIVATE_DIR/unittest.log" \
+            --exit-code "$test_status" \
+            --source-commit "$GITHUB_SHA" \
+            --source-tree "$(git rev-parse HEAD^{tree})" \
+            --binary "$ROOTYARD_BIN" \
+            --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+            --harness tests/workspace_remote_detached_witness.py \
+            --workflow .github/workflows/native-kernel-acceptance.yml \
+            --test-case test_detached_inert_lfs_remote_publish_and_fresh_root_restore \
+            --database-name "$REMOTE_DB" \
+            --pg-version "$(cat "$RECEIPT_DIR/postgres-version.txt" 2>/dev/null || true)" \
+            --dev-fuse "$(cat "$RECEIPT_DIR/dev-fuse.txt" 2>/dev/null || true)" \
+            --unshare-status "$(cat "$RECEIPT_DIR/unshare.txt" 2>/dev/null || true)" \
+            --bwrap-status "$(cat "$RECEIPT_DIR/bwrap.txt" 2>/dev/null || true)" \
+            --fusermount-version "$(cat "$RECEIPT_DIR/fusermount.txt" 2>/dev/null || true)" \
+            --garage-version "$garage_version" \
+            --garage-image-digest "$garage_digest"
+
+      - name: Write a blocked or failed receipt when the witness did not run
+        if: always()
+        env:
+          VERIFY_OUTCOME: ${{ steps.remote_verify.outcome }}
+          PIN_OUTCOME: ${{ steps.remote_pin.outcome }}
+          BIND_OUTCOME: ${{ steps.remote_bind.outcome }}
+          PREFLIGHT_OUTCOME: ${{ steps.remote_preflight.outcome }}
+          DB_OUTCOME: ${{ steps.remote_db.outcome }}
+          GARAGE_OUTCOME: ${{ steps.remote_garage.outcome }}
+        run: |
+          mkdir -p "$RECEIPT_DIR"
+          if [ -s "$RECEIPT" ]; then
+            exit 0
+          fi
+          if [ "$VERIFY_OUTCOME" != "success" ]; then
+            classification="build_artifact_unavailable"
+            blocked=
+          elif [ "$PIN_OUTCOME" != "success" ]; then
+            classification="witness_bytes_unavailable"
+            blocked=
+          elif [ "$BIND_OUTCOME" != "success" ]; then
+            classification="build_artifact_or_binding_unavailable"
+            blocked=
+          elif [ "$PREFLIGHT_OUTCOME" != "success" ]; then
+            classification="fuse_preflight_unavailable"
+            blocked=--blocked
+          elif [ "$DB_OUTCOME" != "success" ]; then
+            classification="postgres17_database_unavailable"
+            blocked=--blocked
+          elif [ "$GARAGE_OUTCOME" != "success" ]; then
+            classification="garage_fixture_unavailable"
+            blocked=--blocked
+          else
+            classification="witness_process_exited_without_receipt"
+            blocked=
+          fi
+          garage_version=
+          garage_digest=
+          if [ -s "$RECEIPT_DIR/garage-image.json" ]; then
+            garage_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
+              "$RECEIPT_DIR/garage-image.json" 2>/dev/null || true)
+            garage_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_digest"])' \
+              "$RECEIPT_DIR/garage-image.json" 2>/dev/null || true)
+          fi
+          python3 scripts/workspace_remote_detached_receipt.py \
+            --output "$RECEIPT" \
+            --raw-log "$PRIVATE_DIR/unittest.log" \
+            --exit-code 1 \
+            --source-commit "$GITHUB_SHA" \
+            --source-tree "$(git rev-parse HEAD^{tree})" \
+            --binary "${ROOTYARD_BIN:-}" \
+            --build-receipt "${ROOTYARD_BUILD_RECEIPT:-}" \
+            --harness tests/workspace_remote_detached_witness.py \
+            --workflow .github/workflows/native-kernel-acceptance.yml \
+            --test-case test_detached_inert_lfs_remote_publish_and_fresh_root_restore \
+            --database-name "$REMOTE_DB" \
+            --pg-version "$(cat "$RECEIPT_DIR/postgres-version.txt" 2>/dev/null || true)" \
+            --dev-fuse "$(cat "$RECEIPT_DIR/dev-fuse.txt" 2>/dev/null || true)" \
+            --unshare-status "$(cat "$RECEIPT_DIR/unshare.txt" 2>/dev/null || true)" \
+            --bwrap-status "$(cat "$RECEIPT_DIR/bwrap.txt" 2>/dev/null || true)" \
+            --fusermount-version "$(cat "$RECEIPT_DIR/fusermount.txt" 2>/dev/null || true)" \
+            --garage-version "$garage_version" \
+            --garage-image-digest "$garage_digest" \
+            --classification "$classification" $blocked
+
+      - name: Reclaim the Garage fixture, database and private capture
+        if: always()
+        timeout-minutes: 3
+        run: |
+          set +e
+          mkdir -p "$RECEIPT_DIR" "$PRIVATE_DIR"
+          garage_status=0
+          if [ -n "${GARAGE_ROOT:-}" ] && [ -f "$GARAGE_ROOT/fixture/.rootyard-owned-fixture" ]; then
+            scripts/owned_garage_fixture.sh stop --directory "$GARAGE_ROOT/fixture" \
+              >"$PRIVATE_DIR/garage-stop.log" 2>&1
+            garage_status=$?
+          fi
+          rm -f -- "$OBJECT_STORE_ENV_FILE"
+          env_status=$?
+          psql "$PG_URL_BASE/postgres" -v ON_ERROR_STOP=1 -c \
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$REMOTE_DB' AND pid <> pg_backend_pid()" \
+            >/dev/null 2>&1
+          dropdb -h 127.0.0.1 -p 5432 -U rootyard --if-exists "$REMOTE_DB"
+          db_status=$?
+          timeout 20s rm -rf -- "$PRIVATE_DIR"
+          private_status=$?
+          if [ -d "${GARAGE_ROOT:-}" ]; then
+            rmdir "$GARAGE_ROOT" 2>/dev/null || true
+          fi
+          # Later steps must not inherit a removed private TMPDIR.
+          echo "TMPDIR=/tmp" >>"$GITHUB_ENV"
+          python3 - "$CLEANUP_RECEIPT" "$db_status" "$private_status" "$garage_status" "$env_status" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          db_status = int(sys.argv[2])
+          private_status = int(sys.argv[3])
+          garage_status = int(sys.argv[4])
+          env_status = int(sys.argv[5])
+          payload = {
+              "schema": "rootyard/workspace-remote-detached-cleanup/v1",
+              "status": "passed"
+              if db_status == 0 and private_status == 0 and garage_status == 0 and env_status == 0
+              else "failed",
+              "database_dropped": db_status == 0,
+              "private_tree_removed": private_status == 0,
+              "garage_stopped": garage_status == 0,
+              "object_store_env_removed": env_status == 0,
+              "database_url_retained": False,
+              "object_store_endpoint_retained": False,
+              "credentials_retained": False,
+              "raw_unittest_output_retained": False,
+          }
+          Path(sys.argv[1]).write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print("workspace remote detached cleanup:", payload["status"])
+          PY
+
+      - name: "Upload sanitized #88 remote checkpoint receipt"
+        if: always() && inputs.workspace_remote_detached
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-remote-detached-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RECEIPT_DIR }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: "Enforce the #88 remote checkpoint result"
+        if: always() && inputs.workspace_remote_detached
+        run: |
+          if [ ! -s "$RECEIPT" ]; then
+            echo "#88 remote receipt is missing: the witness produced no evidence" >&2
+            exit 1
+          fi
+          python3 - "$RECEIPT" "$CLEANUP_RECEIPT" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          receipt = json.load(open(sys.argv[1], encoding="utf-8"))
+          cleanup = json.load(open(sys.argv[2], encoding="utf-8"))
+          head = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+          checks = {
+              "schema": receipt.get("schema") == "rootyard/workspace-remote-detached-receipt/v1",
+              "status": receipt.get("status") == "passed",
+              "source_commit": receipt.get("source_commit") == os.environ.get("GITHUB_SHA"),
+              "source_tree": receipt.get("source_tree") == head,
+              "tests_run": receipt.get("tests_run") == 1,
+              "skipped": receipt.get("skipped") == 0,
+              "failures": receipt.get("failures") == 0,
+              "errors": receipt.get("errors") == 0,
+              "exit": receipt.get("unittest_exit_code") == 0,
+              "summary": receipt.get("summary") == "ok",
+              "selected": receipt.get("expected_case_selected") is True,
+              "case_ok": receipt.get("case_outcome") == "ok",
+              "test_file": receipt.get("test_file") == "tests/workspace_remote_detached_witness.py",
+              "test_case": receipt.get("test_case") == "test_detached_inert_lfs_remote_publish_and_fresh_root_restore",
+              "binary": isinstance(receipt.get("binary_sha256"), str),
+              "build_receipt": isinstance(receipt.get("build_receipt_sha256"), str),
+              "workflow": isinstance(receipt.get("workflow_sha256"), str),
+              "harness_pinned": receipt.get("harness_pinned") is True,
+              "harness_sha256": receipt.get("harness_sha256") == "bfbfc195e3457a18463ffa7eb13d98f5bc95430c027fbe68508584a068b1edc1",
+              "harness_blob": receipt.get("harness_blob_sha1") == "c8075efe514ecec8fb695852abcbc18ea53ce582",
+              "gate": receipt.get("selection", {}).get("gate") == "ROOTYARD_TEST_ISSUE88_REMOTE_DETACHED_WITNESS=1",
+              "backend": receipt.get("selection", {}).get("backend") == "ROOTYARD_TEST_FUSE_BACKEND=fuse",
+              "pg17": str(receipt.get("database", {}).get("server_version", "")).startswith("17."),
+              "garage_version": receipt.get("garage", {}).get("version") == "2.1.0",
+              "garage_image": receipt.get("garage", {}).get("image_digest") == "sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a",
+              "source_root": receipt.get("data_roots", {}).get("source") == "owned temporary source root, quarantined by exact rename after clean source exit",
+              "destination_root": receipt.get("data_roots", {}).get("destination") == "separate fresh empty owned root",
+              "roots_independent": receipt.get("data_roots", {}).get("independent") is True,
+              "not_multihost": receipt.get("data_roots", {}).get("physical_multi_host") is False,
+              "cleanup": cleanup.get("status") == "passed",
+              "cleanup_garage": cleanup.get("garage_stopped") is True,
+              "cleanup_env": cleanup.get("object_store_env_removed") is True,
+              "no_db_url": receipt.get("database_url_retained") is False,
+              "no_raw_log": receipt.get("raw_unittest_output_retained") is False,
+              "no_endpoint": receipt.get("object_store_endpoint_retained") is False,
+              "no_credentials": receipt.get("credentials_retained") is False,
+          }
+          failed = sorted(name for name, ok in checks.items() if not ok)
+          print("#88 remote checkpoint receipt status:", receipt.get("status"))
+          print("checks:", ",".join(name for name in checks if checks[name]))
+          if failed:
+              print("failed checks:", ",".join(failed), file=sys.stderr)
+              raise SystemExit(1)
+          print("#88 remote checkpoint witness passed: 1 test, 0 skipped")
           PY
