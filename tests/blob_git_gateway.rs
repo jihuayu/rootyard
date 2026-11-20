@@ -452,14 +452,20 @@ fn git_text(output: &GitOutput) -> String {
 fn has_stock_http_error(text: &str, status: &str) -> bool {
     let rpc_error = format!("RPC failed; HTTP {status} curl ");
     let url_error = format!("The requested URL returned error: {status}");
+    let access_prefix = "fatal: unable to access '";
+    let access_suffix = format!("': {url_error}");
     text.lines().any(|line| {
-        line.strip_prefix("error: ").unwrap_or(line).starts_with(rpc_error.as_str())
-            || line.ends_with(url_error.as_str())
+        let rpc = line.strip_prefix("error: ").unwrap_or(line).starts_with(rpc_error.as_str());
+        let access = line
+            .strip_prefix(access_prefix)
+            .and_then(|rest| rest.strip_suffix(access_suffix.as_str()))
+            .is_some_and(|url| !url.is_empty() && !url.contains('\'') && !url.contains(url_error.as_str()));
+        rpc || access
     })
 }
 
 #[test]
-fn stock_http_errors_distinguish_status_from_destination_digits_and_headers() {
+fn stock_http_errors_anchor_url_failure_to_git_fatal_line() {
     // Both status digits can occur in the loopback port and random owner/repo
     // name while the client still received the real stale-info report-status.
     for destination in [
@@ -482,18 +488,28 @@ fn stock_http_errors_distinguish_status_from_destination_digits_and_headers() {
         }
     }
     for status in ["409", "503"] {
+        let destination = "http://127.0.0.1:54090/git/owner/race-admission-a503b0000000.git/";
         // Stock Git's real curl 22 transport failure still matches, even with
         // the status digits repeated in the failed destination URL.
         let rpc = format!(
             "error: RPC failed; HTTP {status} curl 22 The requested URL returned error: {status}\n\
-             To http://127.0.0.1:54090/git/owner/race-409f000000.git"
+             To {destination}"
         );
         assert!(has_stock_http_error(&rpc, status));
-        let access = format!(
-            "fatal: unable to access 'http://127.0.0.1:54090/git/owner/race-409f000000.git/': \
-             The requested URL returned error: {status}"
-        );
+
+        // The URL-error form is accepted only as Git's whole fatal access line.
+        let access = format!("fatal: unable to access '{destination}': The requested URL returned error: {status}");
         assert!(has_stock_http_error(&access, status));
+
+        // A remote sideband line, an arbitrary header prefix, a trailing suffix
+        // and a URL that itself prints the marker are all rejected.
+        assert!(!has_stock_http_error(&format!("remote: {access}"), status));
+        assert!(!has_stock_http_error(&format!("X-Upstream: {access}"), status));
+        assert!(!has_stock_http_error(&format!("{access} remote: trailing"), status));
+        let marker_in_url = format!(
+            "fatal: unable to access '{destination}The requested URL returned error: {status}': The requested URL returned error: {status}"
+        );
+        assert!(!has_stock_http_error(&marker_in_url, status));
     }
 }
 
