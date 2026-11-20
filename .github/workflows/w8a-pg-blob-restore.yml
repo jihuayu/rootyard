@@ -1,0 +1,143 @@
+name: W8-A PG+Blob Paired Restore
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/w8a-pg-blob-restore.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'migrations/**'
+      - 'src/db.rs'
+      - 'src/events.rs'
+      - 'src/events/**'
+      - 'src/mirror.rs'
+      - 'src/backup.rs'
+      - 'src/backup/**'
+      - 'src/blob_store.rs'
+      - 'src/blob_store/**'
+      - 'src/bin/rootyard-w8a-backup.rs'
+      - 'tests/w8a_pg_blob_paired_restore.rs'
+      - 'tests/w8a_pg_blob_support/**'
+      - 'tests/test_w8a_pg_blob_paired_contracts.py'
+      - 'docs/w8a-pg-blob-paired-restore.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: w8a-pg-blob-restore-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  w8a-pg-blob-restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_w8a
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_w8a"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_w8a
+      ROOTYARD_TEST_GIT: /usr/bin/git
+      RUSTFLAGS: '-D warnings'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PostgreSQL 17 clients
+        timeout-minutes: 8
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >>"$GITHUB_PATH"
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          pg_dump --version | grep -Eq '^pg_dump \(PostgreSQL\) 17\.'
+
+      - name: Install pinned Rust 1.99.1
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+
+      - name: Install pinned CargoFork 1.101.0
+        run: |
+          mkdir -p test-results/w8a-pg-blob-restore
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/w8a-pg-blob-restore/cargo-fork.json
+
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+
+      - name: Check formatting, design docs, Clippy, unit and live restore contracts
+        timeout-minutes: 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/w8a-pg-blob-restore
+          log=test-results/w8a-pg-blob-restore/test.log
+          : >"$log"
+          {
+            echo "== cargo fmt =="
+            cargo fmt --all -- --check
+            echo "== design docs =="
+            python3 scripts/check_design_docs.py
+            echo "== clippy =="
+            cargo clippy --locked --no-default-features --lib --bin rootyard-w8a-backup --test w8a_pg_blob_paired_restore -- -D warnings
+            echo "== W8-A unit tests =="
+            cargo test --locked --no-default-features --lib backup::w8a_paired -- --test-threads=1
+            echo "== W8-A live paired restore =="
+            cargo test --locked --no-default-features --test w8a_pg_blob_paired_restore -- --ignored --test-threads=1
+            echo "== offline contracts =="
+            python3 tests/test_w8a_pg_blob_paired_contracts.py
+            python3 tests/test_ci_cargo_fork_workflows.py
+            python3 tests/test_ci_workflow_triggers.py
+            echo "== done =="
+          } 2>&1 | tee -a "$log"
+
+      - name: Upload W8-A restore evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w8a-pg-blob-restore-evidence
+          path: |
+            test-results/w8a-pg-blob-restore/test.log
+            test-results/w8a-pg-blob-restore/cargo-fork.json
+          if-no-files-found: warn
