@@ -2,8 +2,9 @@
 """Focused offline checks for the CI Python unittest diagnostics runner.
 
 The repository's real unittest tree is not imported here. Temporary fixture
-modules exercise discovery selection, verbose progress, skip/failure exits and
-faulthandler cleanup without Cargo, a database, a container or a network.
+modules exercise discovery selection, verbose progress, skip/failure exits,
+the periodic diagnostics lifecycle and fatal-handler ownership without Cargo,
+a database, a container or a network.
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import types
 import unittest
 from unittest import mock
 
@@ -30,10 +33,10 @@ assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
 
-# Run the real faulthandler timer in child processes.  The CI runner already
-# owns the process-global timer while this suite runs, so a nested in-process
-# dump/cancel would silently disable the outer diagnostics.
-_INNER_TIMER_DRIVER = r"""
+# Run the real Python diagnostics daemon in child processes. The CI runner
+# already owns a live diagnostics thread while this suite runs, so a nested
+# in-process thread is isolated from the outer test process.
+_INNER_WATCHDOG_DRIVER = r"""
 import importlib.util
 import json
 from pathlib import Path
@@ -55,7 +58,7 @@ with diagnostics.open("w+", encoding="utf-8") as stream:
         watchdog_stream=stream,
         traceback_interval=0.05,
     )
-    # Let an in-flight dump settle, then prove the repeating timer stopped.
+    # Let an in-flight dump settle, then prove the daemon stopped.
     time.sleep(0.1)
     settled = diagnostics.read_text(encoding="utf-8")
     time.sleep(0.15)
@@ -71,6 +74,13 @@ from pathlib import Path
 import sys
 import time
 
+class _NoopDiagnostics:
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
 runner_path = Path(sys.argv[1])
 tests_dir = Path(sys.argv[2])
 outer_path = Path(sys.argv[3])
@@ -84,8 +94,7 @@ with outer_path.open("w+", encoding="utf-8") as outer:
         code = child_runner.run(
             tests_dir,
             stream=sys.stderr,
-            start_timer=lambda *args, **kwargs: None,
-            stop_timer=lambda: None,
+            diagnostics_factory=lambda interval, stream: _NoopDiagnostics(),
         )
         # The nested run must leave this outer timer alive and repeating.
         before = outer_path.stat().st_size
@@ -146,26 +155,24 @@ class DiagnosticsRunnerTest(unittest.TestCase):
 
     def run_fixture(self) -> tuple[int, str]:
         output = io.StringIO()
-        # Inject timer callbacks: this fixture run must never touch the real
-        # process-global watchdog owned by the outer full-suite runner.
-        start = mock.Mock()
-        stop = mock.Mock()
+        # Inject a no-op diagnostics control: this fixture run must never
+        # start a thread in the outer full-suite test process.
+        watchdog = mock.Mock()
+        factory = mock.Mock(return_value=watchdog)
         code = runner.run(
             self.tests,
             stream=output,
-            start_timer=start,
-            stop_timer=stop,
+            diagnostics_factory=factory,
             enable_fatal_handler=mock.Mock(),
             disable_fatal_handler=mock.Mock(),
             is_fatal_handler_enabled=mock.Mock(return_value=True),
             marker_write=lambda payload: len(payload),
         )
-        self.assertEqual(stop.call_count, 1)
-        self.assertEqual(
-            start.call_args.args, (runner.TRACEBACK_INTERVAL_SECONDS,)
+        factory.assert_called_once_with(
+            runner.TRACEBACK_INTERVAL_SECONDS, None
         )
-        self.assertTrue(start.call_args.kwargs["repeat"])
-        self.assertIs(start.call_args.kwargs["file"], sys.stderr)
+        watchdog.start.assert_called_once_with()
+        watchdog.stop.assert_called_once_with()
         return code, output.getvalue()
 
     def run_child(
@@ -301,8 +308,8 @@ class DiagnosticsRunnerTest(unittest.TestCase):
                 def test_ok(self): pass
         """)
 
-        start = mock.Mock()
-        stop = mock.Mock()
+        watchdog = mock.Mock()
+        factory = mock.Mock(return_value=watchdog)
         with mock.patch.object(
             runner, "discover", side_effect=RuntimeError("fixture discovery error")
         ):
@@ -310,15 +317,14 @@ class DiagnosticsRunnerTest(unittest.TestCase):
                 runner.run(
                     self.tests,
                     stream=io.StringIO(),
-                    start_timer=start,
-                    stop_timer=stop,
+                    diagnostics_factory=factory,
                     enable_fatal_handler=mock.Mock(),
                     disable_fatal_handler=mock.Mock(),
                     is_fatal_handler_enabled=mock.Mock(return_value=True),
                     marker_write=lambda payload: len(payload),
                 )
-        start.assert_called_once()
-        stop.assert_called_once_with()
+        watchdog.start.assert_called_once_with()
+        watchdog.stop.assert_called_once_with()
 
     def test_entrypoint_restores_repo_root_imports_and_matches_old_discovery(
         self,
@@ -420,16 +426,19 @@ class DiagnosticsRunnerTest(unittest.TestCase):
         """)
         diagnostics = self.tests / "diagnostics.log"
         completed = self.run_child(
-            _INNER_TIMER_DRIVER, self.tests, diagnostics
+            _INNER_WATCHDOG_DRIVER, self.tests, diagnostics
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
         self.assertEqual(payload["code"], 0)
         self.assertTrue(payload["stable"])
         self.assertIn("test_slow", completed.stderr)
-        self.assertIn("in test_slow", payload["settled"])
+        self.assertIn("state=PERIODIC", payload["settled"])
+        self.assertIn('file="test_runner_fixture_slow.py"', payload["settled"])
+        self.assertIn("function=test_slow", payload["settled"])
         self.assertIn("most recent call first", payload["settled"])
         self.assertNotIn("runner-fixture-local-secret", payload["settled"])
+        self.assertNotIn("local_secret =", payload["settled"])
 
     def test_nested_run_does_not_cancel_an_outer_periodic_watchdog(self) -> None:
         self.write("test_runner_fixture_inner.py", """
@@ -451,6 +460,333 @@ class DiagnosticsRunnerTest(unittest.TestCase):
         self.assertIn("most recent call first", payload["outer_tail"])
 
 
+class PeriodicDiagnosticsTest(unittest.TestCase):
+    """Pure checks for the Python-only periodic stack snapshot path."""
+
+    @staticmethod
+    def frame(
+        filename: object, function: object, lineno: object, back: object = None
+    ) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            f_code=types.SimpleNamespace(
+                co_filename=filename, co_name=function
+            ),
+            f_lineno=lineno,
+            f_back=back,
+        )
+
+    @staticmethod
+    def scripted_stop(results: list[bool]):
+        class ScriptedStop:
+            def __init__(self) -> None:
+                self.results = list(results)
+                self.wait_calls = 0
+                self.set_called = False
+
+            def wait(self, interval: float) -> bool:
+                self.wait_calls += 1
+                if not self.results:
+                    return True
+                return self.results.pop(0)
+
+            def set(self) -> None:
+                self.set_called = True
+
+        return ScriptedStop()
+
+    def test_trusted_source_requires_repo_or_stdlib_and_bounded_components(
+        self,
+    ) -> None:
+        self.assertEqual(
+            runner._trusted_source_basename(str(ROOT / "tests" / "x.py")),
+            "x.py",
+        )
+        self.assertEqual(
+            runner._trusted_source_basename(os.__file__),
+            os.path.basename(os.__file__),
+        )
+        self.assertIsNone(
+            runner._trusted_source_basename("/private/secret/x.py")
+        )
+        self.assertIsNone(
+            runner._trusted_source_basename(str(ROOT / ".." / "outside.py"))
+        )
+        deep = ROOT.joinpath(
+            *(["d"] * (runner.DIAGNOSTIC_MAX_PATH_COMPONENTS + 1)), "x.py"
+        )
+        self.assertIsNone(runner._trusted_source_basename(str(deep)))
+        long_component = "x" * (
+            runner.DIAGNOSTIC_MAX_PATH_COMPONENT_LENGTH + 1
+        )
+        self.assertIsNone(
+            runner._trusted_source_basename(
+                str(ROOT / long_component / "x.py")
+            )
+        )
+
+    def test_snapshot_emits_names_only_from_trusted_roots(self) -> None:
+        trusted = str(ROOT / "tests" / "allowed_module.py")
+        unknown = self.frame(
+            "/private/secret/leak\nname.py",
+            "AllowedClass.test_case",
+            9,
+        )
+        hostile_function = self.frame(
+            trusted, "bad\nfunction", 8, back=unknown
+        )
+        hostile_line = self.frame(
+            trusted,
+            "AllowedClass.test_case",
+            "not-a-line",
+            back=hostile_function,
+        )
+        stdlib = self.frame(os.__file__, "stat", 11, back=hostile_line)
+        allowed = self.frame(
+            trusted, "AllowedClass.test_case", 7, back=stdlib
+        )
+        watchdog = runner._PeriodicDiagnostics(
+            120, io.StringIO(), frames_snapshot=lambda: {12345: allowed}
+        )
+        payload = watchdog.render().decode("ascii")
+        self.assertIn('file="allowed_module.py"', payload)
+        self.assertIn(f'file="{os.path.basename(os.__file__)}"', payload)
+        self.assertIn("line=7", payload)
+        self.assertIn("line=11", payload)
+        self.assertIn("function=AllowedClass.test_case", payload)
+        self.assertIn("function=stat", payload)
+        self.assertIn("function=<omitted>", payload)
+        self.assertIn("line=0", payload)
+        self.assertIn('file="<omitted>"', payload)
+        for forbidden in (
+            "/private/secret",
+            "leak",
+            "name.py",
+            "bad",
+            "locals",
+            "arguments",
+        ):
+            self.assertNotIn(forbidden, payload)
+
+    def test_function_allowlist_accepts_known_code_names_only(self) -> None:
+        self.assertEqual(runner._safe_function("<module>"), "<module>")
+        self.assertEqual(runner._safe_function("<lambda>"), "<lambda>")
+        self.assertEqual(
+            runner._safe_function("AllowedClass.test_case"),
+            "AllowedClass.test_case",
+        )
+        for hostile in (
+            "<script>",
+            "has space",
+            "path/name",
+            "x" * (runner.DIAGNOSTIC_MAX_FUNCTION_LENGTH + 1),
+            17,
+        ):
+            self.assertEqual(
+                runner._safe_function(hostile), runner.DIAGNOSTIC_OMITTED
+            )
+
+    def test_snapshot_bounds_threads_frames_and_bytes(self) -> None:
+        frame = self.frame(str(ROOT / "module.py"), "work", 1)
+        main_ident = threading.main_thread().ident
+        self.assertIsNotNone(main_ident)
+        assert main_ident is not None
+        other_ids = [
+            ident for ident in range(1, 100) if ident != main_ident
+        ][:36]
+        frames = {ident: frame for ident in other_ids}
+        frames[main_ident] = self.frame(
+            str(ROOT / "main.py"), "main", 2
+        )
+        watchdog = runner._PeriodicDiagnostics(
+            120, io.StringIO(), frames_snapshot=lambda: frames
+        )
+        text = watchdog.render().decode("ascii")
+        self.assertIn(f"threads={len(frames)}", text)
+        self.assertIn(f"shown={runner.DIAGNOSTIC_MAX_THREADS}", text)
+        self.assertIn("threads_truncated=", text)
+        self.assertEqual(
+            text.count("thread ordinal="), runner.DIAGNOSTIC_MAX_THREADS
+        )
+        self.assertIn("thread ordinal=1 main=1", text)
+        self.assertLess(
+            text.index("thread ordinal=1 main=1"),
+            text.index("thread ordinal=2 main=0"),
+        )
+        self.assertLessEqual(
+            len(watchdog.render()), runner.DIAGNOSTIC_MAX_BYTES
+        )
+
+        deep = None
+        for index in range(runner.DIAGNOSTIC_MAX_FRAMES + 5):
+            deep = self.frame(
+                str(ROOT / "deep.py"),
+                f"level_{index}",
+                index + 1,
+                back=deep,
+            )
+        deep_watchdog = runner._PeriodicDiagnostics(
+            120, io.StringIO(), frames_snapshot=lambda: {1: deep}
+        )
+        deep_text = deep_watchdog.render().decode("ascii")
+        self.assertEqual(
+            deep_text.count('file="deep.py"'), runner.DIAGNOSTIC_MAX_FRAMES
+        )
+        self.assertIn("frames_truncated=1", deep_text)
+
+        with mock.patch.object(runner, "DIAGNOSTIC_MAX_BYTES", 256):
+            bounded = deep_watchdog.render()
+        self.assertLessEqual(len(bounded), 256)
+        self.assertTrue(bounded.endswith(runner.DIAGNOSTIC_TRUNCATED))
+
+    def test_snapshot_excludes_the_calling_thread(self) -> None:
+        frames = {
+            1: self.frame(str(ROOT / "main.py"), "main", 1),
+            2: self.frame(str(ROOT / "other.py"), "other", 2),
+        }
+        watchdog = runner._PeriodicDiagnostics(
+            120, io.StringIO(), frames_snapshot=lambda: frames
+        )
+        text = watchdog.render(exclude_ident=2).decode("ascii")
+        self.assertIn("threads=1", text)
+        self.assertIn("thread ordinal=1", text)
+        self.assertNotIn("thread ordinal=2", text)
+
+    def test_single_daemon_thread_dumps_and_stops_cleanly(self) -> None:
+        class Sink:
+            def __init__(self) -> None:
+                self.chunks: list[str] = []
+                self.lock = threading.Lock()
+                self.written = threading.Event()
+
+            def write(self, text: str) -> None:
+                with self.lock:
+                    self.chunks.append(text)
+                self.written.set()
+
+            def flush(self) -> None:
+                pass
+
+            def text(self) -> str:
+                with self.lock:
+                    return "".join(self.chunks)
+
+        sink = Sink()
+        frames = {4242: self.frame(str(ROOT / "module.py"), "work", 3)}
+        watchdog = runner._PeriodicDiagnostics(
+            0.02, sink, frames_snapshot=lambda: frames
+        )
+        watchdog.start()
+        self.assertTrue(sink.written.wait(1.0))
+        self.assertIsNotNone(watchdog._thread)
+        assert watchdog._thread is not None
+        self.assertTrue(watchdog._thread.daemon)
+        watchdog.stop()
+        self.assertFalse(watchdog._thread.is_alive())
+        settled = sink.text()
+        self.assertIn("state=PERIODIC", settled)
+        self.assertIn("thread ordinal=1", settled)
+
+    def test_run_writes_each_successful_tick_until_the_event_is_set(
+        self,
+    ) -> None:
+        class Sink:
+            def __init__(self) -> None:
+                self.writes = 0
+
+            def write(self, text: str) -> None:
+                self.writes += 1
+
+            def flush(self) -> None:
+                pass
+
+        sink = Sink()
+        watchdog = runner._PeriodicDiagnostics(
+            120, sink, frames_snapshot=lambda: {}
+        )
+        scripted = self.scripted_stop([False, False, True])
+        watchdog._stop = scripted
+        watchdog._run()
+        self.assertFalse(watchdog.failed)
+        self.assertFalse(scripted.set_called)
+        self.assertEqual(sink.writes, 2)
+        self.assertEqual(scripted.wait_calls, 3)
+
+    def test_run_stops_after_the_first_failed_dump(self) -> None:
+        class Sink:
+            def __init__(self) -> None:
+                self.writes = 0
+
+            def write(self, text: str) -> None:
+                self.writes += 1
+                raise OSError("diagnostics sink unavailable")
+
+            def flush(self) -> None:
+                pass
+
+        sink = Sink()
+        watchdog = runner._PeriodicDiagnostics(
+            120, sink, frames_snapshot=lambda: {}
+        )
+        scripted = self.scripted_stop([False, False, True])
+        watchdog._stop = scripted
+        watchdog._run()
+        self.assertTrue(watchdog.failed)
+        self.assertTrue(scripted.set_called)
+        self.assertEqual(sink.writes, 1)
+        self.assertEqual(scripted.wait_calls, 1)
+
+    def test_broken_sink_cannot_fail_the_suite(self) -> None:
+        class Broken:
+            def write(self, text: str) -> None:
+                raise OSError("diagnostics sink unavailable")
+
+            def flush(self) -> None:
+                raise OSError("diagnostics sink unavailable")
+
+        watchdog = runner._PeriodicDiagnostics(
+            120, Broken(), frames_snapshot=lambda: {}
+        )
+        self.assertFalse(watchdog.dump_once())
+        self.assertTrue(watchdog.failed)
+
+    def test_default_run_does_not_use_the_faulthandler_periodic_timer(self) -> None:
+        timer_error = AssertionError("periodic faulthandler timer must not be used")
+        with (
+            mock.patch.object(
+                runner, "discover", return_value=unittest.TestSuite()
+            ),
+            mock.patch.object(
+                runner.faulthandler,
+                "dump_traceback_later",
+                side_effect=timer_error,
+            ),
+            mock.patch.object(
+                runner.faulthandler,
+                "cancel_dump_traceback_later",
+                side_effect=timer_error,
+            ),
+        ):
+            code = runner.run(
+                stream=io.StringIO(),
+                watchdog_stream=io.StringIO(),
+                is_fatal_handler_enabled=mock.Mock(return_value=True),
+                marker_write=lambda payload: len(payload),
+            )
+        self.assertEqual(code, 5)
+
+    def test_interval_keeps_the_120_second_default_and_stays_positive(self) -> None:
+        self.assertEqual(
+            runner._PeriodicDiagnostics(
+                runner.TRACEBACK_INTERVAL_SECONDS
+            ).interval,
+            float(runner.TRACEBACK_INTERVAL_SECONDS),
+        )
+        self.assertGreaterEqual(
+            runner._PeriodicDiagnostics(0).interval,
+            runner.DIAGNOSTIC_MIN_INTERVAL_SECONDS,
+        )
+
+
 class FatalHandlerSeamTest(unittest.TestCase):
     """Pure-mock checks for the fatal-handler ownership seam.
 
@@ -465,14 +801,22 @@ class FatalHandlerSeamTest(unittest.TestCase):
             side_effect=lambda: self.events.append(("disable", None))
         )
         self.is_enabled = mock.Mock()
-        self.start_timer = mock.Mock(
-            side_effect=lambda *args, **kwargs: self.events.append(
-                ("timer_start", (args, kwargs))
+        self.watchdog = mock.Mock()
+        self.watchdog.start.side_effect = lambda: self.events.append(
+            ("watchdog_start", None)
+        )
+        self.watchdog.stop.side_effect = lambda: self.events.append(
+            ("watchdog_stop", None)
+        )
+        self.watchdog_factory = mock.Mock(
+            side_effect=lambda interval, stream: self._make_watchdog(
+                interval, stream
             )
         )
-        self.stop_timer = mock.Mock(
-            side_effect=lambda: self.events.append(("timer_stop", None))
-        )
+
+    def _make_watchdog(self, interval: object, stream: object):
+        self.events.append(("watchdog_factory", (interval, stream)))
+        return self.watchdog
 
     def run_runner(
         self,
@@ -502,8 +846,7 @@ class FatalHandlerSeamTest(unittest.TestCase):
             return runner.run(
                 ROOT / "tests",
                 stream=io.StringIO(),
-                start_timer=self.start_timer,
-                stop_timer=self.stop_timer,
+                diagnostics_factory=self.watchdog_factory,
                 enable_fatal_handler=self.enable,
                 disable_fatal_handler=self.disable,
                 is_fatal_handler_enabled=self.is_enabled,
@@ -514,24 +857,36 @@ class FatalHandlerSeamTest(unittest.TestCase):
         self.assertEqual(code, 5)
         self.assertEqual(
             [name for name, _ in self.events],
-            ["state", "enable", "timer_start", "discover", "timer_stop", "disable"],
+            [
+                "state",
+                "enable",
+                "watchdog_factory",
+                "watchdog_start",
+                "discover",
+                "watchdog_stop",
+                "disable",
+            ],
         )
         self.enable.assert_called_once_with(all_threads=True)
         self.disable.assert_called_once_with()
-        self.start_timer.assert_called_once()
-        self.assertEqual(
-            self.start_timer.call_args.args, (runner.TRACEBACK_INTERVAL_SECONDS,)
+        self.watchdog_factory.assert_called_once_with(
+            runner.TRACEBACK_INTERVAL_SECONDS, None
         )
-        self.assertTrue(self.start_timer.call_args.kwargs["repeat"])
-        self.assertIs(self.start_timer.call_args.kwargs["file"], sys.stderr)
-        self.stop_timer.assert_called_once_with()
+        self.watchdog.start.assert_called_once_with()
+        self.watchdog.stop.assert_called_once_with()
 
     def test_preexisting_handler_is_left_untouched(self) -> None:
         code = self.run_runner(handler_enabled=True)
         self.assertEqual(code, 5)
         self.assertEqual(
             [name for name, _ in self.events],
-            ["state", "timer_start", "discover", "timer_stop"],
+            [
+                "state",
+                "watchdog_factory",
+                "watchdog_start",
+                "discover",
+                "watchdog_stop",
+            ],
         )
         self.enable.assert_not_called()
         self.disable.assert_not_called()
@@ -541,7 +896,15 @@ class FatalHandlerSeamTest(unittest.TestCase):
             self.run_runner(discovery_error=RuntimeError("fixture discovery error"))
         self.assertEqual(
             [name for name, _ in self.events],
-            ["state", "enable", "timer_start", "discover", "timer_stop", "disable"],
+            [
+                "state",
+                "enable",
+                "watchdog_factory",
+                "watchdog_start",
+                "discover",
+                "watchdog_stop",
+                "disable",
+            ],
         )
         self.disable.assert_called_once_with()
 
@@ -552,8 +915,9 @@ class FatalHandlerSeamTest(unittest.TestCase):
             [name for name, _ in self.events],
             ["state", "enable"],
         )
-        self.start_timer.assert_not_called()
-        self.stop_timer.assert_not_called()
+        self.watchdog_factory.assert_not_called()
+        self.watchdog.start.assert_not_called()
+        self.watchdog.stop.assert_not_called()
         self.disable.assert_not_called()
 
 
@@ -563,8 +927,8 @@ class MarkerSeamTest(unittest.TestCase):
     def setUp(self) -> None:
         self.markers: list[bytes] = []
         self.output = io.StringIO()
-        self.start_timer = mock.Mock()
-        self.stop_timer = mock.Mock()
+        self.watchdog = mock.Mock()
+        self.diagnostics_factory = mock.Mock(return_value=self.watchdog)
         self.enable_fatal = mock.Mock()
         self.disable_fatal = mock.Mock()
         self.is_fatal_enabled = mock.Mock(return_value=True)
@@ -578,8 +942,7 @@ class MarkerSeamTest(unittest.TestCase):
             return runner.run(
                 ROOT / "tests",
                 stream=self.output,
-                start_timer=self.start_timer,
-                stop_timer=self.stop_timer,
+                diagnostics_factory=self.diagnostics_factory,
                 enable_fatal_handler=self.enable_fatal,
                 disable_fatal_handler=self.disable_fatal,
                 is_fatal_handler_enabled=self.is_fatal_enabled,
@@ -671,8 +1034,8 @@ class MarkerSeamTest(unittest.TestCase):
             self.assertNotIn(secret, joined)
         for payload in self.markers:
             self.assertLessEqual(len(payload), runner.MARKER_MAX_BYTES)
-        self.start_timer.assert_called_once()
-        self.stop_timer.assert_called_once_with()
+        self.watchdog.start.assert_called_once_with()
+        self.watchdog.stop.assert_called_once_with()
 
     def test_markers_preserve_success_and_skip_counts(self) -> None:
         class Outcomes(unittest.TestCase):
@@ -767,8 +1130,8 @@ class MarkerSeamTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("Ran 1 test", self.output.getvalue())
         self.assertIn("OK", self.output.getvalue())
-        self.start_timer.assert_called_once()
-        self.stop_timer.assert_called_once_with()
+        self.watchdog.start.assert_called_once_with()
+        self.watchdog.stop.assert_called_once_with()
 
     def test_marker_failure_does_not_mask_a_real_failure(self) -> None:
         class Fail(unittest.TestCase):
@@ -958,8 +1321,7 @@ class MarkerSeamTest(unittest.TestCase):
         with mock.patch.object(runner, "discover", side_effect=error), self.assertRaises(RuntimeError) as caught:
             runner.run(
                 stream=self.output,
-                start_timer=self.start_timer,
-                stop_timer=self.stop_timer,
+                diagnostics_factory=self.diagnostics_factory,
                 is_fatal_handler_enabled=self.is_fatal_enabled,
                 marker_write=self.write_marker,
                 report_out=path,
@@ -994,7 +1356,7 @@ class MarkerSeamTest(unittest.TestCase):
         self.assertEqual((report["stage"], report["outcome"], report["exit_code"]), ("suite", "incomplete", None))
         self.assertEqual(report["counts"]["tests_run"], 1)
         self.assertEqual(report["cases"], [{"test_sha256": expected_hash, "outcome": "failure"}])
-        self.stop_timer.assert_called_once_with()
+        self.watchdog.stop.assert_called_once_with()
 
 
 if __name__ == "__main__":
