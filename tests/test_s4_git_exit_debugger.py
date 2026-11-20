@@ -60,11 +60,20 @@ if mode in ("interrupt", "interrupt_result"):
                 "exit 101",
                 "signal 0",
             ]) + "\n")
+    readyfile = os.environ["FAKE_GDB_READY"]
     child = subprocess.Popen([
         sys.executable,
         "-c",
-        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+        "import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w').write('ready'); time.sleep(30)",
+        readyfile,
     ])
+    deadline = time.monotonic() + 5
+    while not os.path.exists(readyfile):
+        if time.monotonic() >= deadline:
+            child.kill()
+            raise SystemExit(3)
+        time.sleep(0.01)
     pidfile = os.environ.get("FAKE_GDB_PIDFILE")
     if pidfile:
         with open(pidfile, "w", encoding="utf-8") as handle:
@@ -146,14 +155,23 @@ import sys
 import time
 
 pidfile = sys.argv[1]
+readyfile = sys.argv[2]
 child = subprocess.Popen([
     sys.executable,
     "-c",
-    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+    "import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "open(sys.argv[1], 'w').write('ready'); time.sleep(30)",
+    readyfile,
 ])
+deadline = time.monotonic() + 5
+while not os.path.exists(readyfile):
+    if time.monotonic() >= deadline:
+        child.kill()
+        raise SystemExit(3)
+    time.sleep(0.01)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 with open(pidfile, "w", encoding="utf-8") as handle:
     handle.write(str(child.pid))
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 time.sleep(30)
 """
 
@@ -454,9 +472,15 @@ class InstrumentedObserverTests(ObserverFixture):
         for mode, expected_exit, expected_suite in cases:
             with self.subTest(mode=mode):
                 pidfile = self.base / (mode + ".pid")
+                readyfile = self.base / (mode + ".ready")
                 report_path = self.base / (mode + ".json")
                 work = self.base / ("work-" + mode)
-                environment = dict(os.environ, FAKE_GDB_MODE=mode, FAKE_GDB_PIDFILE=str(pidfile))
+                environment = dict(
+                    os.environ,
+                    FAKE_GDB_MODE=mode,
+                    FAKE_GDB_PIDFILE=str(pidfile),
+                    FAKE_GDB_READY=str(readyfile),
+                )
                 process = subprocess.Popen(
                     [
                         sys.executable,
@@ -510,17 +534,21 @@ class InstrumentedObserverTests(ObserverFixture):
         leader_script = self.base / "leader.py"
         leader_script.write_text(LEADER_SCRIPT, encoding="utf-8")
         pidfile = self.base / "descendant.pid"
+        readyfile = self.base / "descendant.ready"
+        test_pgid = os.getpgid(0)
         leader = subprocess.Popen(
-            [sys.executable, str(leader_script), str(pidfile)],
+            [sys.executable, str(leader_script), str(pidfile), str(readyfile)],
             start_new_session=True,
         )
         descendant_pid = None
         try:
+            self.assertNotEqual(os.getpgid(0), leader.pid)
             _wait_for_path(pidfile)
             descendant_pid = int(pidfile.read_text(encoding="utf-8").strip())
             debugger._stop_process_group(leader)
             self.assertIsNotNone(leader.poll())
             self.assertTrue(_pid_gone(descendant_pid))
+            self.assertEqual(os.getpgid(0), test_pgid)
         finally:
             try:
                 os.killpg(leader.pid, signal.SIGKILL)
@@ -536,29 +564,6 @@ class InstrumentedObserverTests(ObserverFixture):
                     pass
 
 
-class ReportShapeTests(unittest.TestCase):
-    def sample(self) -> dict[str, object]:
-        return debugger.make_report(
-            status=debugger.Status.NO_FAILURE_OBSERVED,
-            reason=debugger.Reason.NONE,
-            run_phase=debugger.RunPhase.COMPLETED,
-            test_exit=0,
-            failure_observed=False,
-            operation=None,
-            caller=None,
-            debug_resolution="resolved",
-            git_version=(2, 43, 0),
-            binary_sha256="a" * 64,
-            source={
-                "runner_sha256": "b" * 64,
-                "reverse_sha256": "c" * 64,
-                "test_sha256": "d" * 64,
-                "harness_sha256": "e" * 64,
-            },
-            base_commit="1" * 40,
-            base_tree="2" * 40,
-            base_parents=["3" * 40, "4" * 40],
-        )
 class ReportValidationTests(unittest.TestCase):
     def sample(self) -> dict[str, object]:
         return debugger.make_report(
