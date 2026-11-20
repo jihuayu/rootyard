@@ -103,7 +103,7 @@ fn blob_payload(i: usize) -> (String, Vec<u8>) {
     (format!("blob-{i}.bin"), incompressible_bytes(0x9e37_79b9_7f4a_7c15 ^ (i as u64 + 1), 6 * 1024 * 1024))
 }
 
-async fn boot_source(git: &Path, dir: &Path, url: &str, gid: u64, repo: &str, bucket: &str) -> Result<SourceEnv> {
+async fn boot_source(git: &Path, dir: &Path, url: &str, gid: i64, repo: &str, bucket: &str) -> Result<SourceEnv> {
     let s3 = LoopbackS3::new();
     let store = s3.open_store(bucket)?;
     let group = LiveMtlsRaftGroup::start_three(gid)?;
