@@ -82,6 +82,24 @@ fn bounded_manifest(raw: &[u8]) -> Result<RemoteManifest, Error> {
     serde_json::from_slice(raw).map_err(|_| Error::bad_request())
 }
 
+fn manifest_binding_matches(
+    manifest: &RemoteManifest,
+    checkpoint_id: Uuid,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    captured_revision: i64,
+) -> bool {
+    manifest.schema == 1
+        && manifest.checkpoint_id == checkpoint_id
+        && manifest.repository_id == repository_id
+        && manifest.tenant_id == tenant_id
+        && manifest.captured_revision == captured_revision
+}
+
+fn target_matches(size: u64, sha256: &str, target: &[u8]) -> bool {
+    target.len() as u64 == size && hex::encode(Sha256::digest(target)) == sha256
+}
+
 fn report(cp: Uuid, manifest: &str, size: i64, revision: i64) -> Value {
     json!({
         "checkpoint_id": cp,
@@ -102,7 +120,7 @@ pub(super) async fn load_manifest(
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt(
-            "SELECT state,manifest_digest,manifest_size FROM workspace_checkpoints WHERE id=$1 AND repository_id=$2",
+            "SELECT state,manifest_digest,manifest_size,captured_revision FROM workspace_checkpoints WHERE id=$1 AND repository_id=$2",
             &[&cp, &repo],
         )
         .await
@@ -114,6 +132,7 @@ pub(super) async fn load_manifest(
     }
     let digest: String = row.get::<_, Option<String>>(1).ok_or_else(|| Error::internal("missing remote metadata"))?;
     let size: i64 = row.get::<_, Option<i64>>(2).ok_or_else(|| Error::internal("missing remote metadata"))?;
+    let captured_revision: i64 = row.get(3);
     if !(1..=16 * 1024 * 1024).contains(&size) {
         return Err(Error::internal("invalid remote manifest size"));
     }
@@ -147,11 +166,7 @@ pub(super) async fn load_manifest(
             return Err(err);
         }
     };
-    if manifest.schema != 1
-        || manifest.checkpoint_id != cp
-        || manifest.repository_id != repo
-        || manifest.tenant_id != tenant
-    {
+    if !manifest_binding_matches(&manifest, cp, repo, tenant, captured_revision) {
         return Err(Error::bad_request());
     }
     Ok(manifest)
@@ -229,7 +244,11 @@ pub async fn publish(
             let rel = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
             let file = root_inv.join(rel);
             let target = if entry.kind == "symlink" {
-                Some(STANDARD.encode(fs::read_link(&file).map_err(Error::internal)?.into_os_string().into_vec()))
+                let target = fs::read_link(&file).map_err(Error::internal)?.into_os_string().into_vec();
+                if !target_matches(entry.size, &entry.sha256, &target) {
+                    return Err(Error::internal("workspace symlink target changed during checkpoint capture"));
+                }
+                Some(STANDARD.encode(target))
             } else {
                 None
             };
@@ -426,7 +445,7 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
                     let target = STANDARD
                         .decode(entry.target_base64.as_deref().ok_or_else(Error::bad_request)?)
                         .map_err(|_| Error::bad_request())?;
-                    if target.len() as u64 != entry.size || hex::encode(Sha256::digest(&target)) != entry.sha256 {
+                    if !target_matches(entry.size, &entry.sha256, &target) {
                         return Err(Error::bad_request());
                     }
                     symlink(OsString::from_vec(target), &to).map_err(Error::internal)?;
@@ -466,5 +485,37 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
             stage_guard.cleanup().await;
             Err(err)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(captured_revision: i64) -> RemoteManifest {
+        RemoteManifest {
+            schema: 1,
+            checkpoint_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            captured_revision,
+            entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn manifest_binding_requires_the_committed_capture_revision() {
+        let manifest = manifest(7);
+        assert!(manifest_binding_matches(&manifest, Uuid::nil(), Uuid::nil(), Uuid::nil(), 7));
+        assert!(!manifest_binding_matches(&manifest, Uuid::nil(), Uuid::nil(), Uuid::nil(), 8));
+    }
+
+    #[test]
+    fn target_binding_rejects_a_reread_symlink_that_differs_from_inventory() {
+        let target = b"target-\xff";
+        let digest = hex::encode(Sha256::digest(target));
+        assert!(target_matches(target.len() as u64, &digest, target));
+        assert!(!target_matches(target.len() as u64, &digest, b"target-\xfe"));
+        assert!(!target_matches(target.len() as u64 + 1, &digest, target));
     }
 }

@@ -30,6 +30,72 @@ fn valid_agent(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
+/// Copy one frozen workspace snapshot into a fresh checkpoint tree and return
+/// the verified immutable fingerprint together with the publication guard.
+///
+/// The stored-fingerprint comparison, raw source/compat witness, Git index
+/// check, destination fingerprint check and direct-mode after check all run
+/// inside the single freeze, so no PostgreSQL lock is held over the I/O and the
+/// mount is never read. Any future Blob publisher must consume this returned
+/// copy/fingerprint instead of re-copying the workspace.
+async fn copy_frozen_checkpoint(
+    state: &Arc<AppState>,
+    mutation: &super::blocking::MutationGuard,
+    workspace_id: Uuid,
+    checkpoint_id: Uuid,
+    stored_fp: Option<String>,
+) -> Result<(String, super::snapshot::Published), Error> {
+    let source = service::workspace_repo(state, workspace_id);
+    let dest = service::checkpoint_repo(state, checkpoint_id);
+    let stable_gate = super::mounts::enabled();
+    let state_copy = state.clone();
+    super::blocking::run_mutating(mutation, move |abandoned, cp_fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
+        super::mounts::with_frozen(workspace_id, || {
+            let before_raw = super::snapshot::Raw::load(&source)?
+                .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
+            super::compat::validate_raw(&before_raw)?;
+            let before = before_raw.digest().to_owned();
+            if let Some(ref expected_fp) = stored_fp
+                && &before != expected_fp
+            {
+                return Err(service::conflict());
+            }
+            let before_index = before_raw.raw_file(FsPath::new(".git/index"))?;
+            if abandoned.is_abandoned() {
+                return Err(Error::timeout());
+            }
+            let mut published = super::snapshot::copy(&state_copy, &before_raw, &dest)?;
+            published.attach_fence(cp_fence);
+            if abandoned.is_abandoned() {
+                published.cleanup_sync();
+                return Err(Error::timeout());
+            }
+            let captured = super::snapshot::fingerprint(&dest)?;
+            if before != captured {
+                return Err(service::conflict());
+            }
+            if !stable_gate {
+                let after_raw = super::snapshot::Raw::load(&source)?
+                    .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
+                let after = after_raw.digest().to_owned();
+                let after_index = after_raw.raw_file(FsPath::new(".git/index"))?;
+                if before != after || before_index != after_index {
+                    return Err(service::conflict());
+                }
+            }
+            if abandoned.is_abandoned() {
+                published.cleanup_sync();
+                return Err(Error::timeout());
+            }
+            Ok((before, published))
+        })
+    })
+    .await
+}
+
 pub async fn create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -90,55 +156,7 @@ pub async fn create(
 
     // Phase 2: bounded off-thread frozen snapshot copy with zero PostgreSQL locks held.
     let cp = Uuid::new_v4();
-    let source = service::workspace_repo(&state, id);
-    let dest = service::checkpoint_repo(&state, cp);
-    let stable_gate = super::mounts::enabled();
-    let state_copy = state.clone();
-    let (before, published) = super::blocking::run_mutating(&mutation, move |abandoned, cp_fence| {
-        if abandoned.is_abandoned() {
-            return Err(Error::timeout());
-        }
-        super::mounts::with_frozen(id, || {
-            let before_raw = super::snapshot::Raw::load(&source)?
-                .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
-            super::compat::validate_raw(&before_raw)?;
-            let before = before_raw.digest().to_owned();
-            if let Some(ref expected_fp) = stored_fp
-                && &before != expected_fp
-            {
-                return Err(service::conflict());
-            }
-            let before_index = before_raw.raw_file(FsPath::new(".git/index"))?;
-            if abandoned.is_abandoned() {
-                return Err(Error::timeout());
-            }
-            let mut published = super::snapshot::copy(&state_copy, &before_raw, &dest)?;
-            published.attach_fence(cp_fence);
-            if abandoned.is_abandoned() {
-                published.cleanup_sync();
-                return Err(Error::timeout());
-            }
-            let captured = super::snapshot::fingerprint(&dest)?;
-            if before != captured {
-                return Err(service::conflict());
-            }
-            if !stable_gate {
-                let after_raw = super::snapshot::Raw::load(&source)?
-                    .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
-                let after = after_raw.digest().to_owned();
-                let after_index = after_raw.raw_file(FsPath::new(".git/index"))?;
-                if before != after || before_index != after_index {
-                    return Err(service::conflict());
-                }
-            }
-            if abandoned.is_abandoned() {
-                published.cleanup_sync();
-                return Err(Error::timeout());
-            }
-            Ok((before, published))
-        })
-    })
-    .await?;
+    let (before, published) = copy_frozen_checkpoint(&state, &mutation, id, cp, stored_fp).await?;
 
     // Phase 3: short FOR UPDATE commit transaction; clean up checkpoint tree on pre-COMMIT exit.
     let mut published_opt = Some(published);
