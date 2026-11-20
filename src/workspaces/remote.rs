@@ -216,11 +216,20 @@ pub async fn publish(
         return Err(service::conflict());
     }
 
+    // Local-only unborn checkpoints are classified from the frozen checkpoint
+    // tree itself, before admission or any object upload. A preexisting
+    // committed row returns above and is never reclassified from base_oid.
+    let root = service::checkpoint_repo(&state, cp);
+    let root_check = root.clone();
+    let head_kind = super::blocking::run(move || super::compat::validate_repo(&root_check)).await?;
+    if head_kind == super::compat::HeadKind::Unborn {
+        return Err(Error(StatusCode::CONFLICT, super::compat::CONFLICT_HEAD));
+    }
+
     let admission =
         crate::storage::admission::acquire(&state.pool, repo_id, storage_generation, "workspace_publish", deadline())
             .await?;
     let store = remote_store(&state)?;
-    let root = service::checkpoint_repo(&state, cp);
     let root_inv = root.clone();
     let scanned_items = super::blocking::run(move || {
         let entries = core::inventory(&root_inv).map_err(Error::internal)?;
@@ -443,7 +452,12 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
             if actual != expected {
                 return Err(Error::internal("remote checkpoint inventory mismatch"));
             }
-            super::compat::validate_repo(&root)?;
+            if super::compat::validate_repo(&root)? == super::compat::HeadKind::Unborn {
+                // Remote/cross-host materialization remains committed-only in
+                // this local checkpoint slice. A declared unborn local
+                // workspace is intentionally not replayed from remote storage.
+                return Err(Error(StatusCode::CONFLICT, super::compat::CONFLICT_HEAD));
+            }
             core::sync_tree(&root).map_err(Error::internal)?;
             if let Some(parent) = final_path.parent() {
                 fs::create_dir_all(parent).map_err(Error::internal)?;

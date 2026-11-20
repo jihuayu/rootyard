@@ -273,6 +273,271 @@ pub async fn fence_restored(pool: &deadpool_postgres::Pool) -> Result<(), Error>
     tx.commit().await.map_err(Error::internal)
 }
 
+fn conflict_head() -> Error {
+    Error(StatusCode::CONFLICT, super::compat::CONFLICT_HEAD)
+}
+
+fn probe_unavailable() -> Error {
+    Error(StatusCode::SERVICE_UNAVAILABLE, "workspace Git probe unavailable")
+}
+
+/// Exact HEAD identity admitted from the service-owned source. The unborn target
+/// is carried through the clone instead of being re-derived from clone defaults.
+enum SourceHead {
+    Committed { oid: String },
+    Unborn { target: String },
+}
+
+enum GitProbe {
+    Output(Vec<u8>),
+    /// Only a documented `rev-parse --verify --quiet`/`config --get` exit 1 is
+    /// treated as absence. Timeout, signal and every other failure stay errors.
+    Absent,
+}
+
+enum SourceHeadFile {
+    Symbolic(String),
+    Detached,
+}
+
+fn classify_git_probe(error: anyhow::Error, expected_absent_exit: Option<i32>) -> Result<GitProbe, Error> {
+    if let Some(failed) = error.downcast_ref::<crate::git_http::GitCommandFailed>() {
+        if expected_absent_exit.is_some() && failed.exit == expected_absent_exit {
+            return Ok(GitProbe::Absent);
+        }
+        return Err(probe_unavailable());
+    }
+    if error.to_string().contains("timed out") {
+        return Err(Error::timeout());
+    }
+    Err(probe_unavailable())
+}
+
+/// Probe the exact verified source git directory, never a discovered parent.
+async fn source_git_probe(
+    state: &AppState,
+    source: &FsPath,
+    args: &[&str],
+    limit: usize,
+    expected_absent_exit: Option<i32>,
+) -> Result<GitProbe, Error> {
+    let mut command = state.storage.git(&state.config);
+    command.args(["--no-optional-locks", "--no-replace-objects", "--git-dir"]).arg(source).args(args);
+    match crate::git_http::collect_git_output(command, limit, state.config.git_timeout).await {
+        Ok(output) => Ok(GitProbe::Output(output)),
+        Err(error) => classify_git_probe(error, expected_absent_exit),
+    }
+}
+
+async fn source_git_required(state: &AppState, source: &FsPath, args: &[&str], limit: usize) -> Result<Vec<u8>, Error> {
+    match source_git_probe(state, source, args, limit, None).await? {
+        GitProbe::Output(output) => Ok(output),
+        GitProbe::Absent => Err(probe_unavailable()),
+    }
+}
+
+/// Destination probes keep the workspace Git admission slot and the same clean
+/// environment as ordinary workspace Git, while preserving the exit status.
+async fn dest_git_probe(
+    state: &AppState,
+    repo: &FsPath,
+    args: &[&str],
+    limit: usize,
+    expected_absent_exit: Option<i32>,
+) -> Result<GitProbe, Error> {
+    let _slot = super::git::try_slot(state)?;
+    let mut command = state.storage.git(&state.config);
+    command.args(["--no-optional-locks", "--no-replace-objects", "-C"]).arg(repo).args(args);
+    match crate::git_http::collect_git_output(command, limit, state.config.git_timeout).await {
+        Ok(output) => Ok(GitProbe::Output(output)),
+        Err(error) => classify_git_probe(error, expected_absent_exit),
+    }
+}
+
+async fn dest_git_required(state: &AppState, repo: &FsPath, args: &[&str], limit: usize) -> Result<Vec<u8>, Error> {
+    match dest_git_probe(state, repo, args, limit, None).await? {
+        GitProbe::Output(output) => Ok(output),
+        GitProbe::Absent => Err(probe_unavailable()),
+    }
+}
+
+fn parse_source_head(bytes: &[u8]) -> Result<SourceHeadFile, Error> {
+    if bytes.contains(&0) {
+        return Err(conflict_head());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| conflict_head())?;
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() || trimmed.contains(['\r', '\n']) {
+        return Err(conflict_head());
+    }
+    if let Some(target) = trimmed.strip_prefix("ref: ") {
+        if !super::compat::is_safe_head_ref(target) {
+            return Err(conflict_head());
+        }
+        return Ok(SourceHeadFile::Symbolic(target.to_owned()));
+    }
+    if super::compat::is_valid_sha1_oid(trimmed) {
+        return Ok(SourceHeadFile::Detached);
+    }
+    Err(conflict_head())
+}
+
+fn source_dir_is_empty(path: &FsPath, budget: &mut usize) -> Result<bool, Error> {
+    for entry in fs::read_dir(path).map_err(Error::internal)? {
+        *budget += 1;
+        if *budget > 4096 {
+            return Err(conflict_head());
+        }
+        let entry = entry.map_err(Error::internal)?;
+        let meta = fs::symlink_metadata(entry.path()).map_err(Error::internal)?;
+        if meta.file_type().is_symlink() {
+            return Err(conflict_head());
+        }
+        if meta.is_dir() {
+            if !source_dir_is_empty(&entry.path(), budget)? {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn require_empty_source_dir(path: &FsPath, required: bool, budget: &mut usize) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            if source_dir_is_empty(path, budget)? {
+                Ok(())
+            } else {
+                Err(conflict_head())
+            }
+        }
+        Ok(_) => Err(conflict_head()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(conflict_head()),
+        Err(error) => Err(Error::internal(error)),
+    }
+}
+
+/// A declared unborn source must be a real, independent, genuinely empty bare
+/// repository. The strict no-objects rule applies only here; an already-created
+/// local workspace may legitimately hold staged blobs before its first commit.
+fn validate_unborn_source_layout(source: &FsPath) -> Result<(), Error> {
+    for rel in ["commondir", "gitdir", "shallow", "reftable", "worktrees", "modules"] {
+        match fs::symlink_metadata(source.join(rel)) {
+            Ok(_) => return Err(conflict_head()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::internal(error)),
+        }
+    }
+    let mut budget = 0usize;
+    require_empty_source_dir(&source.join("objects"), true, &mut budget)?;
+    require_empty_source_dir(&source.join("refs"), true, &mut budget)?;
+    require_empty_source_dir(&source.join("info"), false, &mut budget)?;
+    require_empty_source_dir(&source.join("logs"), false, &mut budget)?;
+    let packed = source.join("packed-refs");
+    match fs::symlink_metadata(&packed) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(conflict_head());
+            }
+            let bytes = crate::workspace_lab::core::read_regular(&packed, crate::workspace_lab::core::MAX_MANIFEST)
+                .map_err(Error::internal)?;
+            if super::compat::packed_refs_has_any_ref(&bytes) {
+                return Err(conflict_head());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::internal(error)),
+    }
+    Ok(())
+}
+
+/// Admit the source snapshot as either a committed SHA-1 repository or a
+/// genuinely declared unborn branch. The source is checked before cloning so a
+/// malformed HEAD cannot be normalized by `git clone` into an empty checkout.
+async fn validate_source_head(state: &AppState, source: &FsPath, repo_id: Uuid) -> Result<SourceHead, Error> {
+    let head_bytes =
+        crate::workspace_lab::core::read_regular(&source.join("HEAD"), crate::workspace_lab::core::MAX_MANIFEST)
+            .map_err(|_| conflict_head())?;
+    let head_file = parse_source_head(&head_bytes)?;
+
+    let format = source_git_required(state, source, &["rev-parse", "--show-object-format"], 4096).await?;
+    if String::from_utf8_lossy(&format).trim() != "sha1" {
+        return Err(conflict_head());
+    }
+    let bare = source_git_required(state, source, &["rev-parse", "--is-bare-repository"], 4096).await?;
+    if String::from_utf8_lossy(&bare).trim() != "true" {
+        return Err(conflict_head());
+    }
+    let identity = match source_git_probe(
+        state,
+        source,
+        &["config", "--local", "--no-includes", "--get", "rootyard.repositoryId"],
+        4096,
+        Some(1),
+    )
+    .await?
+    {
+        GitProbe::Output(output) => String::from_utf8(output).map_err(|_| conflict_head())?.trim().to_owned(),
+        GitProbe::Absent => return Err(conflict_head()),
+    };
+    if identity != repo_id.to_string() {
+        return Err(conflict_head());
+    }
+
+    match source_git_probe(state, source, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], 4096, Some(1)).await?
+    {
+        GitProbe::Output(commit) => {
+            let oid = String::from_utf8(commit).map_err(|_| conflict_head())?.trim().to_owned();
+            if !super::compat::is_valid_sha1_oid(&oid) {
+                return Err(conflict_head());
+            }
+            Ok(SourceHead::Committed { oid })
+        }
+        GitProbe::Absent => {
+            let target = match head_file {
+                SourceHeadFile::Symbolic(target) if super::compat::is_safe_unborn_head_ref(&target) => target,
+                _ => return Err(conflict_head()),
+            };
+            validate_unborn_source_layout(source)?;
+            // Structural emptiness above rejects loose refs, broken refs and
+            // object files. `for-each-ref` additionally covers alternate ref
+            // backends without relying on `fsck`, which can report dangling
+            // objects and still exit 0.
+            let refs = source_git_required(state, source, &["for-each-ref", "--format=%(refname)"], 64 * 1024).await?;
+            if !refs.is_empty() {
+                return Err(conflict_head());
+            }
+            match source_git_probe(state, source, &["rev-parse", "--verify", "--quiet", &target], 4096, Some(1)).await?
+            {
+                GitProbe::Absent => {}
+                GitProbe::Output(_) => return Err(conflict_head()),
+            }
+            Ok(SourceHead::Unborn { target })
+        }
+    }
+}
+
+/// The cloned workspace must carry the exact symbolic branch name validated on
+/// the source and must still have no refs. A fallback-master or detached clone is
+/// therefore rejected instead of being mislabeled as a declared unborn branch.
+async fn validate_cloned_unborn(state: &AppState, repo: &FsPath, expected: &str) -> Result<(), Error> {
+    let symbolic = match dest_git_probe(state, repo, &["symbolic-ref", "-q", "HEAD"], 4096, Some(1)).await? {
+        GitProbe::Output(output) => String::from_utf8(output).map_err(|_| conflict_head())?.trim().to_owned(),
+        GitProbe::Absent => return Err(conflict_head()),
+    };
+    if symbolic != expected || !super::compat::is_safe_unborn_head_ref(&symbolic) {
+        return Err(conflict_head());
+    }
+    let refs = dest_git_required(state, repo, &["for-each-ref", "--format=%(refname)"], 64 * 1024).await?;
+    if !refs.is_empty() {
+        return Err(conflict_head());
+    }
+    Ok(())
+}
+
 pub async fn create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -337,7 +602,7 @@ pub async fn create(
     .await?;
     let mut cleanup = Some(super::blocking::DirCleanupGuard::with_fence(dest.clone(), Some(mutation.freeze_guard())));
     let phase2_and_3: Result<(StatusCode, Workspace), Error> = async {
-        {
+        let source_head = {
             let _clone_slot = super::git::try_slot(&state)?;
             let source_lease =
                 read_leases::shared(&state.pool, repo.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
@@ -368,36 +633,71 @@ pub async fn create(
             let source =
                 super::blocking::run(move || state_verify.storage.verify_path(repo_id).map_err(Error::internal))
                     .await?;
-            let mut clone = state.storage.git(&state.config);
-            clone
-                .args(["-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks", "--"])
-                .arg(&source)
-                .arg(&dest);
-            source_lease
-                .guard(crate::git_http::collect_git_output(clone, 4096, state.config.git_timeout))
-                .await?
-                .map_err(Error::internal)?;
+            let source_head = source_lease
+                .guard(async {
+                    let source_head = validate_source_head(&state, &source, repo_id).await?;
+                    let mut clone = state.storage.git(&state.config);
+                    clone
+                        .args(["-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks", "--"])
+                        .arg(&source)
+                        .arg(&dest);
+                    crate::git_http::collect_git_output(clone, 4096, state.config.git_timeout)
+                        .await
+                        .map_err(Error::internal)?;
+                    Ok::<SourceHead, Error>(source_head)
+                })
+                .await??;
             source_lease.ensure_active()?;
-        }
+            source_head
+        };
 
-        let head = String::from_utf8(git(&state, &dest, &["rev-parse", "HEAD"], 4096).await.unwrap_or_default())
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| crate::browse::models::valid_non_zero_oid(value));
+        let head = match dest_git_probe(
+            &state,
+            &dest,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            4096,
+            Some(1),
+        )
+        .await?
+        {
+            GitProbe::Absent => None,
+            GitProbe::Output(bytes) => {
+                let value = String::from_utf8(bytes).map_err(|_| conflict_head())?.trim().to_owned();
+                if !super::compat::is_valid_sha1_oid(&value) {
+                    return Err(conflict_head());
+                }
+                Some(value)
+            }
+        };
         if let Some(base) = &input.base_oid
             && head.as_deref() != Some(base.as_str())
         {
             return Err(conflict());
         }
-        if head.is_none() {
-            return Err(Error(
-                StatusCode::CONFLICT,
-                "only committed SHA-1 repositories (branch or detached HEAD) are supported in workspaces",
-            ));
-        }
-        let tree_listing = git(&state, &dest, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"], 8 * 1024 * 1024).await?;
-        super::compat::validate_tree_listing_no_gitlinks(&tree_listing)?;
-        let base_oid = input.base_oid.clone().or(head);
+        let base_oid = match source_head {
+            SourceHead::Committed { oid } => {
+                let Some(head) = head else { return Err(conflict_head()) };
+                if head != oid {
+                    return Err(conflict_head());
+                }
+                let tree_listing = dest_git_required(
+                    &state,
+                    &dest,
+                    &["ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+                    8 * 1024 * 1024,
+                )
+                .await?;
+                super::compat::validate_tree_listing_no_gitlinks(&tree_listing)?;
+                input.base_oid.clone().or(Some(head))
+            }
+            SourceHead::Unborn { target } => {
+                if head.is_some() {
+                    return Err(conflict_head());
+                }
+                validate_cloned_unborn(&state, &dest, &target).await?;
+                None
+            }
+        };
         let dest_fp = dest.clone();
         let initial_fingerprint = super::blocking::run_mutating(&mutation, move |abandoned, _fence| {
             if abandoned.is_abandoned() {
