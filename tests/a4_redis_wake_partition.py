@@ -539,12 +539,41 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         assert int(fields.get(b"tcp_port", b"0")) == redis.redis_port, \
             "owned Redis TCP port differs from the fixture port"
 
-        client = redis.redis_command("CLIENT", "INFO")
-        assert isinstance(client, bytes), "owned Redis client identity is unavailable"
-        assert re.search(
-            rb"(?:^|\s)laddr=127\.0\.0\.1:" + re.escape(str(redis.redis_port).encode()) + rb"(?:\s|$)",
-            client,
-        ), "owned Redis command socket is not the fixture loopback port"
+        # Redis 6.0.16 on Ubuntu 22.04 has no CLIENT INFO subcommand. Capture
+        # the current connection ID and list only normal clients on that same
+        # connection. This is read-only: the matching ID isolates our peer
+        # endpoint; laddr is used when the server exposes it, while the bind
+        # config, owner PID, run id, tcp_port and loopback peer still guard
+        # older servers.
+        current = []
+
+        def capture_id(command):
+            value = command("CLIENT", "ID")
+            assert type(value) is int and value > 0, "owned Redis client ID is unavailable"
+            current.append(value)
+
+        client = redis.redis_command("CLIENT", "LIST", "TYPE", "normal", before_send=capture_id)
+        assert isinstance(client, bytes), "owned Redis client list is unavailable"
+        assert len(current) == 1, "owned Redis client ID was recorded more than once"
+        matching = []
+        for line in client.splitlines():
+            fields = dict(re.findall(rb"(?:^| )([a-z0-9_-]+)=([^ ]*)", line))
+            if fields.get(b"id") == str(current[0]).encode():
+                matching.append(fields)
+        assert len(matching) == 1, "owned Redis did not expose exactly one current client"
+        fields = matching[0]
+        addr = fields.get(b"addr", b"")
+        peer = re.fullmatch(rb"127\.0\.0\.1:([1-9][0-9]{0,4})", addr)
+        assert peer is not None and int(peer.group(1)) <= 65535, \
+            "owned Redis command socket peer is not loopback"
+        assert re.fullmatch(rb"[0-9]+", fields.get(b"fd", b"")), \
+            "owned Redis command socket descriptor is unavailable"
+        assert fields.get(b"cmd") in (b"client", b"client|list"), \
+            "owned Redis current entry is not the active command"
+        local = fields.get(b"laddr")
+        if local is not None:
+            assert local == b"127.0.0.1:" + str(redis.redis_port).encode(), \
+                "owned Redis command socket is not the fixture loopback port"
         return redis.run_id
 
     def seed_owned_flush_key(self):

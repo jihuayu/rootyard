@@ -6,7 +6,7 @@ import tempfile
 from types import SimpleNamespace
 import threading
 import unittest
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import a4_redis_wake_partition as a4
@@ -773,7 +773,9 @@ class OwnedFlushallTest(unittest.TestCase):
 
 class OwnedRedisOwnershipTest(unittest.TestCase):
     def _harness(self, root, *, bind=b"127.0.0.1", runtime=None, pid=12345,
-                 port=6399, client_port=6399, server_pid=None, server_port=None):
+                 port=6399, client_port=6399, server_pid=None, server_port=None,
+                 laddr=True, addr=b"127.0.0.1:50000", fd=b"9", cmd=b"client|list",
+                 entry_id=None, duplicate=False, client_id=42, client_id_response=None):
         harness = object.__new__(a4.A4RedisWakeHarness)
         harness.redis_started = True
         harness.root = Path(root)
@@ -789,31 +791,63 @@ class OwnedRedisOwnershipTest(unittest.TestCase):
             + b"\r\ntcp_port:" + str(server_port if server_port is not None else port).encode()
             + b"\r\n"
         )
-        client = (
-            b"id=1 addr=127.0.0.1:50000 laddr=127.0.0.1:"
-            + str(client_port).encode() + b" fd=9 name= age=0\n"
-        )
-        redis.redis_command.side_effect = [
-            [b"bind", bind],
-            [b"dir", os.fsencode(str(runtime if runtime is not None else root))],
-            server,
-            client,
-        ]
+        session = {"client_id": None}
+
+        def command(*parts, before_send=None):
+            if parts == ("CONFIG", "GET", "bind"):
+                return [b"bind", bind]
+            if parts == ("CONFIG", "GET", "dir"):
+                return [b"dir", os.fsencode(str(runtime if runtime is not None else root))]
+            if parts == ("INFO", "server"):
+                return server
+            if parts == ("CLIENT", "LIST", "TYPE", "normal"):
+                calls = []
+                def inner(*inner_parts):
+                    calls.append(inner_parts)
+                    return client_id if client_id_response is None else client_id_response
+                before_send(inner)
+                assert calls == [("CLIENT", "ID")]
+                session["client_id"] = calls[0]
+                local = b" laddr=127.0.0.1:" + str(client_port).encode() if laddr else b""
+                line_id = entry_id if entry_id is not None else client_id
+                line = (
+                    b"id=" + str(line_id).encode() + b" addr=" + addr + local
+                    + b" fd=" + fd + b" age=0 cmd=" + cmd + b"\n"
+                )
+                if duplicate:
+                    line += (
+                        b"id=" + str(line_id).encode()
+                        + b" addr=127.0.0.1:50001 fd=10 age=0 cmd=client\n"
+                    )
+                return line
+            raise AssertionError("unexpected Redis command")
+
+        redis.redis_command.side_effect = command
         harness.owned_redis = redis
-        return harness, redis
+        return harness, redis, session
 
     def test_exact_process_socket_and_runtime_are_required_and_proven(self):
         root = self.enterContext(tempfile.TemporaryDirectory())
-        harness, redis = self._harness(root)
+        harness, redis, session = self._harness(root)
         with patch.object(a4, "process_cwd", return_value=Path(root)):
             self.assertEqual(harness.prove_owned_redis(), redis.run_id)
         self.assertEqual(redis.identity.call_count, 1)
+        self.assertEqual(session["client_id"], ("CLIENT", "ID"))
         self.assertEqual(redis.redis_command.call_args_list, [
             call("CONFIG", "GET", "bind"),
             call("CONFIG", "GET", "dir"),
             call("INFO", "server"),
-            call("CLIENT", "INFO"),
+            call("CLIENT", "LIST", "TYPE", "normal", before_send=ANY),
         ])
+        self.assertNotIn(call("CLIENT", "INFO"), redis.redis_command.call_args_list)
+        self.assertNotIn(call("CLIENT", "SETNAME", ANY), redis.redis_command.call_args_list)
+
+    def test_redis_6_0_style_client_list_without_laddr_is_supported(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        harness, redis, session = self._harness(root, laddr=False)
+        with patch.object(a4, "process_cwd", return_value=Path(root)):
+            self.assertEqual(harness.prove_owned_redis(), redis.run_id)
+        self.assertEqual(session["client_id"], ("CLIENT", "ID"))
 
     def test_non_loopback_or_wrong_runtime_and_port_fail_closed(self):
         root = self.enterContext(tempfile.TemporaryDirectory())
@@ -823,11 +857,27 @@ class OwnedRedisOwnershipTest(unittest.TestCase):
             ("runtime", dict(runtime=other), "runtime directory is not fixture-scoped"),
             ("pid", dict(server_pid=54321), "PID differs"),
             ("port", dict(server_port=6398), "TCP port differs"),
-            ("client", dict(client_port=6398), "command socket is not the fixture loopback port"),
+            ("laddr", dict(client_port=6398), "fixture loopback port"),
+            ("addr", dict(addr=b"10.0.0.1:50000"), "socket peer is not loopback"),
+            ("fd", dict(fd=b""), "socket descriptor is unavailable"),
+            ("cmd", dict(cmd=b"publish"), "not the active command"),
+            ("client_id", dict(client_id_response=b""), "client ID is unavailable"),
         )
         for name, options, message in cases:
             with self.subTest(name=name):
-                harness, _ = self._harness(root, **options)
+                harness, _, _ = self._harness(root, **options)
+                with patch.object(a4, "process_cwd", return_value=Path(root)):
+                    with self.assertRaisesRegex(AssertionError, message):
+                        harness.prove_owned_redis()
+
+    def test_missing_or_duplicate_current_connection_fails_closed(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        for options, message in (
+            ({"entry_id": 43}, "exactly one current client"),
+            ({"duplicate": True}, "exactly one current client"),
+        ):
+            with self.subTest(options=options):
+                harness, _, _ = self._harness(root, **options)
                 with patch.object(a4, "process_cwd", return_value=Path(root)):
                     with self.assertRaisesRegex(AssertionError, message):
                         harness.prove_owned_redis()
@@ -835,7 +885,7 @@ class OwnedRedisOwnershipTest(unittest.TestCase):
     def test_foreign_process_cwd_is_refused_before_any_server_query(self):
         root = self.enterContext(tempfile.TemporaryDirectory())
         other = self.enterContext(tempfile.TemporaryDirectory())
-        harness, redis = self._harness(root)
+        harness, redis, _ = self._harness(root)
         with patch.object(a4, "process_cwd", return_value=Path(other)):
             with self.assertRaisesRegex(AssertionError, "runtime is not fixture-scoped"):
                 harness.prove_owned_redis()
@@ -843,7 +893,7 @@ class OwnedRedisOwnershipTest(unittest.TestCase):
 
     def test_exited_process_is_refused_before_any_server_query(self):
         root = self.enterContext(tempfile.TemporaryDirectory())
-        harness, redis = self._harness(root)
+        harness, redis, _ = self._harness(root)
         redis.process.poll = Mock(return_value=1)
         with self.assertRaisesRegex(AssertionError, "exited"):
             harness.prove_owned_redis()
