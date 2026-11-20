@@ -36,7 +36,7 @@ use super::protocol::{
     Hello, MOUNT_OP_DEADLINE, Observe, OkReply, PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, StateReply, read_frame,
     write_frame,
 };
-use crate::workspace_lab::fuse_mount::{MountHandle, MutationGate};
+use crate::workspace_lab::fuse_mount::{MountHandle, MountTeardownClass, MutationGate};
 use crate::workspaces::lazy::Reader;
 use std::{
     collections::HashMap,
@@ -81,6 +81,26 @@ const CLEANUP_QUEUE: usize = 8;
 /// A graceful shutdown may attempt owned teardown, but an independent watchdog
 /// fail-stops the process if that teardown cannot finish in this window.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Reserved fail-stop exits for a typed owner-preserving teardown failure in
+/// the normal shutdown worker. They are outside success 0, generic fail-stop 1
+/// and the panic hook's 101, and are emitted without I/O or formatting.
+const TEARDOWN_IDENTITY_FAILSTOP_EXIT: i32 = 102;
+const TEARDOWN_BUSY_FAILSTOP_EXIT: i32 = 103;
+const TEARDOWN_UNMOUNT_FAILSTOP_EXIT: i32 = 104;
+const TEARDOWN_JOIN_FAILSTOP_EXIT: i32 = 105;
+
+/// Deterministic class-to-exit mapping. The parent decodes these exact codes
+/// back into the same sealed diagnostic classes.
+fn teardown_failstop_exit(class: MountTeardownClass) -> i32 {
+    match class {
+        MountTeardownClass::IdentityOrProbe => TEARDOWN_IDENTITY_FAILSTOP_EXIT,
+        MountTeardownClass::MatchedIdBusy => TEARDOWN_BUSY_FAILSTOP_EXIT,
+        MountTeardownClass::OtherUnmount => TEARDOWN_UNMOUNT_FAILSTOP_EXIT,
+        MountTeardownClass::JoinOrState => TEARDOWN_JOIN_FAILSTOP_EXIT,
+    }
+}
+
 /// If the watchdog cannot inspect frozen-operation state for this many ticks,
 /// a stuck mutex is itself a fail-stop condition.
 const WATCHDOG_STUCK_TICKS: u32 = 20;
@@ -226,10 +246,11 @@ impl State {
     /// Fence first (via the caller), then cancel pending work and unmount one
     /// mount at a time so a slow session join cannot hold the mount registry.
     ///
-    /// Each owned mount uses the consuming `shutdown_and_join`, so this returns
-    /// only after every session teardown completed. `teardown` then exits 0: a
-    /// graceful exit never claims success while an owned unmount, build or
-    /// denied publish is still in flight.
+    /// Each owned mount uses the owner-preserving classified teardown, so this
+    /// returns only after every session teardown completed. A typed failure
+    /// fail-stops immediately with a reserved nonzero exit while the live
+    /// handle is still owned; `teardown` exits 0 only after all mounts and the
+    /// pending-owner barrier completed.
     ///
     /// The pending map is deliberately NOT cleared here: every pending owner
     /// (build, explicit unmount, abort teardown, denied publish) keeps its own
@@ -249,8 +270,10 @@ impl State {
             let mut mounts = lock(&self.mounts);
             mounts.drain().map(|(_, mount)| mount).collect()
         };
-        for mount in mounts {
-            mount.handle.shutdown_and_join();
+        for mut mount in mounts {
+            if let Err(class) = mount.handle.teardown_owned_classified() {
+                failstop(self, "owned FUSE teardown failed", teardown_failstop_exit(class));
+            }
         }
         // A registration that raced `begin_shutdown` is visible here; one that
         // races after the flag is rejected under the pending lock. Either way

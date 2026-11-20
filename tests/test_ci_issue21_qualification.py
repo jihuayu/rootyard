@@ -39,9 +39,14 @@ UPLOAD_ALLOWED_LOG = "test-results/ci-webhook-regressions.log"
 
 # The 163-minute verify/lifecycle budget already contains the 28-minute owned
 # Redis step, so it is not added again.  #304 contributes an independent
-# 12-minute cold tenant LFS gate on owned Garage: 163 + 12 = 175.
+# 12-minute cold tenant LFS gate on owned Garage: 163 + 12 = 175.  The merged
+# workspace FUSE lane contributes three independent phases: a 12-minute
+# fixture, a 30-minute helper/lifecycle acceptance step and a 10-minute legacy
+# service-shutdown step: 175 + 12 + 30 + 10 = 227.
 VERIFY_BASE_BUDGET_MINUTES = 163
 COLD_LFS_BUDGET_MINUTES = 12
+WORKSPACE_FUSE_PHASES_MINUTES = (12, 30, 10)
+WORKSPACE_FUSE_BUDGET_MINUTES = sum(WORKSPACE_FUSE_PHASES_MINUTES)
 
 
 def _lines():
@@ -207,10 +212,16 @@ def _unsafe_upload_paths(paths):
 class WorkflowWiringTest(unittest.TestCase):
     def test_verify_budget_includes_pg_vault_lifecycle_and_owned_redis(self):
         lines = _verify_lines()
-        self.assertEqual(
-            _job_scalar(lines, "timeout-minutes"),
-            str(VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES),
+        expected = (VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES
+                    + WORKSPACE_FUSE_BUDGET_MINUTES)
+        self.assertEqual(expected, 227)
+        self.assertEqual(_job_scalar(lines, "timeout-minutes"), str(expected))
+        composition = (
+            f"{VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES} + "
+            + " + ".join(str(phase) for phase in WORKSPACE_FUSE_PHASES_MINUTES)
+            + f" = {expected}"
         )
+        self.assertIn(composition, "\n".join(lines))
         cold_lfs = _step(COLD_LFS_STEP)
         self.assertEqual(
             cold_lfs["timeout-minutes"], str(COLD_LFS_BUDGET_MINUTES)
@@ -221,6 +232,13 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertEqual(vault["timeout-minutes"], "20")
         redis = _step("Verify browse cache incarnation across restore with owned Redis")
         self.assertEqual(redis["timeout-minutes"], "28")
+        for name, timeout in (
+            ("Start the job-owned workspace FUSE/remote S3 fixture", "12"),
+            ("Exercise original FUSE helper and remote-delete acceptance", "30"),
+            ("Exercise four legacy in-process FUSE service-shutdown cases", "10"),
+        ):
+            with self.subTest(step=name):
+                self.assertEqual(_step(name)["timeout-minutes"], timeout)
         for name in (
             "Exercise repository archive, rename aliases, soft-delete purge, and ownership transfer (#85)",
             "Exercise deleted webhook-claim fence (#85)",
@@ -231,22 +249,28 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIsNone(_step(PANDO_CLI_STEP)["timeout-minutes"])
         self.assertEqual(_step(PANDO_PITR_STEP)["timeout-minutes"], "10")
 
-    def test_python_suite_report_is_source_bound_for_277_and_283_only(self):
+    def test_python_suite_report_is_source_bound_for_258_277_283_only(self):
         suite = _step("Run all Python unit and Tier-5 adversarial contract suites")
         env = suite["env"]
-        checkpoint_selector = (
+        pitr_283_selector = (
             "${{ github.event.pull_request.number == 283 && "
             "'test-results/python-ci-result.json' || '' }}"
         )
+        pitr_258_selector = (
+            "${{ github.event.pull_request.number == 258 && "
+            "'test-results/python-ci-result.json' || '' }}"
+        )
         suite_selector = (
-            "${{ (github.event.pull_request.number == 277 || "
+            "${{ (github.event.pull_request.number == 258 || "
+            "github.event.pull_request.number == 277 || "
             "github.event.pull_request.number == 283) && "
             "'test-results/python-ci-result.json' || '' }}"
         )
-        # The existing #283 checkpoint expression stays byte-for-byte intact.
-        # The full-suite report opts in both exact source-bound heads through
-        # a separate variable and the same bounded target.
-        self.assertEqual(env["ROOTYARD_PYTHON_CI_REPORT"], checkpoint_selector)
+        # Main's #283 PITR checkpoint keeps its exact env/name.  PR258's
+        # previous own report scope is preserved separately, while the
+        # full-suite watchdog report is the additive 258/277/283 union.
+        self.assertEqual(env["ROOTYARD_PYTHON_CI_REPORT"], pitr_283_selector)
+        self.assertEqual(env["ROOTYARD_PYTHON_CI_REPORT_258"], pitr_258_selector)
         self.assertEqual(env["ROOTYARD_PYTHON_SUITE_REPORT"], suite_selector)
         run = suite["run"]
         self.assertIn(
@@ -258,25 +282,33 @@ class WorkflowWiringTest(unittest.TestCase):
             'python3 scripts/run_python_ci_tests.py "${report_args[@]}"', run
         )
         self.assertNotIn('--report-out "$ROOTYARD_PYTHON_CI_REPORT"', run)
+        self.assertNotIn(
+            '--report-out "$ROOTYARD_PYTHON_CI_REPORT_258"', run
+        )
         selector = re.fullmatch(
             r"\$\{\{ \(github\.event\.pull_request\.number == (\d+) \|\| "
+            r"github\.event\.pull_request\.number == (\d+) \|\| "
             r"github\.event\.pull_request\.number == (\d+)\) && "
             r"'([^']+)' \|\| '' \}\}",
             suite_selector,
         )
         self.assertIsNotNone(selector)
-        first, second, target = selector.groups()
+        first, second, third, target = selector.groups()
+        self.assertEqual((int(first), int(second), int(third)), (258, 277, 283))
         for number, expected in (
+            (258, target),
             (277, target),
             (283, target),
+            (257, ""),
             (276, ""),
+            (284, ""),
             (None, ""),
         ):
             with self.subTest(pull_request=number):
                 selected = (
                     target
                     if number is not None
-                    and number in (int(first), int(second))
+                    and number in (int(first), int(second), int(third))
                     else ""
                 )
                 self.assertEqual(selected, expected)

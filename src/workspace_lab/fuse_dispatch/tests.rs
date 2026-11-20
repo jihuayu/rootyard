@@ -63,3 +63,85 @@ fn closed_work_queue_refuses_pops_but_drain_paths_still_clean_up() {
     assert_eq!(queue.pop_ready_for_drain(), None);
     assert_eq!(queue.pop_frozen_for_drain(), None);
 }
+
+#[test]
+fn actor_join_panic_is_a_cached_typed_failure_never_success() {
+    let dispatcher = Dispatcher {
+        shared: Shared::new(),
+        mount_budget: Arc::new(Budget::new(1, 1)),
+        global_budget: Arc::new(Budget::new(1, 1)),
+        gate: MutationGate::new_with_lease(1, i64::MAX).unwrap(),
+        worker: Mutex::new(ActorWorker {
+            handle: Some(std::thread::spawn(|| panic!("injected actor failure"))),
+            outcome: None,
+        }),
+    };
+    assert_eq!(dispatcher.join_actor(), Err(ActorJoinFailure::Panicked));
+    assert_eq!(
+        dispatcher.join_actor(),
+        Err(ActorJoinFailure::Panicked),
+        "a cached actor panic must never become a clean second join"
+    );
+}
+
+#[test]
+fn request_stop_does_not_wait_for_a_blocked_actor_join() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let dispatcher = Dispatcher {
+        shared: Shared::new(),
+        mount_budget: Arc::new(Budget::new(1, 1)),
+        global_budget: Arc::new(Budget::new(1, 1)),
+        gate: MutationGate::new_with_lease(1, i64::MAX).unwrap(),
+        worker: Mutex::new(ActorWorker {
+            handle: Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+            outcome: None,
+        }),
+    };
+    started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    // This would block forever if the quick stop still joined the actor.
+    dispatcher.request_stop();
+    assert!(dispatcher.worker.lock().unwrap().outcome.is_none());
+    release_tx.send(()).unwrap();
+    assert_eq!(dispatcher.join_actor(), Ok(()));
+    assert_eq!(dispatcher.join_actor(), Ok(()));
+}
+
+#[test]
+fn dispatcher_shutdown_waits_for_the_actor_join() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let dispatcher = Dispatcher {
+        shared: Shared::new(),
+        mount_budget: Arc::new(Budget::new(1, 1)),
+        global_budget: Arc::new(Budget::new(1, 1)),
+        gate: MutationGate::new_with_lease(1, i64::MAX).unwrap(),
+        worker: Mutex::new(ActorWorker {
+            handle: Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+            outcome: None,
+        }),
+    };
+    started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let dispatcher = &dispatcher;
+        scope.spawn(move || {
+            dispatcher.shutdown();
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "shutdown must block until the actor join completes"
+        );
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    });
+    assert_eq!(dispatcher.join_actor(), Ok(()));
+}
