@@ -771,11 +771,72 @@ class OwnedFlushallTest(unittest.TestCase):
         ])
 
 
+class ClientRowParserTest(unittest.TestCase):
+    ROW_6016 = (
+        b"id=5 addr=127.0.0.1:56968 fd=7 name= age=0 idle=0 flags=N db=0 sub=0 psub=0 "
+        b"multi=-1 qbuf=48 qbuf-free=32720 argv-mem=20 obl=0 oll=0 omem=0 tot-mem=61492 "
+        b"events=r cmd=client user=default"
+    )
+    ROW_726 = (
+        b"id=4 addr=127.0.0.1:57022 laddr=127.0.0.1:6379 fd=7 name= age=0 idle=0 "
+        b"flags=N db=0 sub=0 psub=0 ssub=0 multi=-1 qbuf=48 qbuf-free=20426 "
+        b"argv-mem=20 multi-mem=0 rbs=16384 rbp=16384 obl=0 oll=0 omem=0 "
+        b"tot-mem=37812 events=r cmd=client|list user=default redir=-1 resp=2 "
+        b"lib-name= lib-ver="
+    )
+
+    def test_actual_6016_and_726_shapes_keep_present_empty_values(self):
+        for row, expected_id, cmd in (
+            (self.ROW_6016, b"5", b"client"),
+            (self.ROW_726, b"4", b"client|list"),
+        ):
+            with self.subTest(row=row):
+                fields = a4.parse_client_row(row)
+                self.assertEqual(fields[b"id"], expected_id)
+                self.assertEqual(fields[b"name"], b"")
+                self.assertEqual(fields[b"cmd"], cmd)
+        seven = a4.parse_client_row(self.ROW_726)
+        self.assertEqual(seven[b"laddr"], b"127.0.0.1:6379")
+        self.assertEqual(seven[b"lib-name"], b"")
+        self.assertEqual(seven[b"lib-ver"], b"")
+
+    def test_duplicate_id_and_addr_with_valid_last_values_are_rejected(self):
+        bad_id = self.ROW_6016.replace(b"id=5", b"id=99 id=5", 1)
+        bad_addr = self.ROW_6016.replace(
+            b"addr=127.0.0.1:56968",
+            b"addr=10.0.0.1:1 addr=127.0.0.1:56968",
+            1,
+        )
+        for row in (bad_id, bad_addr):
+            with self.subTest(row=row):
+                with self.assertRaisesRegex(AssertionError, "duplicate field"):
+                    a4.parse_client_row(row)
+
+    def test_ignored_malformed_tokens_and_rows_are_rejected(self):
+        cases = (
+            (self.ROW_6016 + b" junk", "field is malformed"),
+            (self.ROW_6016 + b" =value", "field is malformed"),
+            (self.ROW_6016.replace(b"addr=127.0.0.1:56968", b"addr"), "field is malformed"),
+            (self.ROW_6016.replace(b" ", b"  ", 1), "row is malformed"),
+            (b" " + self.ROW_6016, "row is malformed"),
+            (self.ROW_6016 + b" ", "row is malformed"),
+            (self.ROW_6016.replace(b"id=5", b"id="), "malformed id"),
+            (self.ROW_6016.replace(b"id=5", b"id=5=6"), "malformed id"),
+            (b"addr=127.0.0.1:56968", "malformed id"),
+            (b"", "row is malformed"),
+        )
+        for row, message in cases:
+            with self.subTest(row=row):
+                with self.assertRaisesRegex(AssertionError, message):
+                    a4.parse_client_row(row)
+
+
 class OwnedRedisOwnershipTest(unittest.TestCase):
     def _harness(self, root, *, bind=b"127.0.0.1", runtime=None, pid=12345,
                  port=6399, client_port=6399, server_pid=None, server_port=None,
                  laddr=True, addr=b"127.0.0.1:50000", fd=b"9", cmd=b"client|list",
-                 entry_id=None, duplicate=False, client_id=42, client_id_response=None):
+                 entry_id=None, duplicate=False, client_id=42, client_id_response=None,
+                 client_line=None):
         harness = object.__new__(a4.A4RedisWakeHarness)
         harness.redis_started = True
         harness.root = Path(root)
@@ -808,6 +869,8 @@ class OwnedRedisOwnershipTest(unittest.TestCase):
                 before_send(inner)
                 assert calls == [("CLIENT", "ID")]
                 session["client_id"] = calls[0]
+                if client_line is not None:
+                    return client_line
                 local = b" laddr=127.0.0.1:" + str(client_port).encode() if laddr else b""
                 line_id = entry_id if entry_id is not None else client_id
                 line = (
@@ -848,6 +911,46 @@ class OwnedRedisOwnershipTest(unittest.TestCase):
         with patch.object(a4, "process_cwd", return_value=Path(root)):
             self.assertEqual(harness.prove_owned_redis(), redis.run_id)
         self.assertEqual(session["client_id"], ("CLIENT", "ID"))
+
+    def test_duplicate_fields_with_valid_last_values_refuse_ownership(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        good = (
+            b"id=42 addr=127.0.0.1:50000 laddr=127.0.0.1:6399 fd=9 "
+            b"age=0 cmd=client|list"
+        )
+        cases = (
+            good.replace(b"id=42", b"id=99 id=42", 1),
+            good.replace(
+                b"addr=127.0.0.1:50000",
+                b"addr=10.0.0.1:1 addr=127.0.0.1:50000",
+                1,
+            ),
+        )
+        for row in cases:
+            with self.subTest(row=row):
+                harness, _, _ = self._harness(root, client_line=row)
+                with patch.object(a4, "process_cwd", return_value=Path(root)):
+                    with self.assertRaisesRegex(AssertionError, "duplicate field"):
+                        harness.prove_owned_redis()
+
+    def test_malformed_tokens_once_ignored_refuse_ownership(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        good = (
+            b"id=42 addr=127.0.0.1:50000 laddr=127.0.0.1:6399 fd=9 "
+            b"age=0 cmd=client|list"
+        )
+        for row, message in (
+            (good + b" junk", "field is malformed"),
+            (good + b" =value", "field is malformed"),
+            (good.replace(b" ", b"  ", 1), "row is malformed"),
+            (good + b"\nid=99 addr=127.0.0.1:50001 fd=10 cmd=client junk", "field is malformed"),
+            (good + b"\nid=99 id=100 addr=127.0.0.1:50001 fd=10 cmd=client", "duplicate field"),
+        ):
+            with self.subTest(row=row):
+                harness, _, _ = self._harness(root, client_line=row)
+                with patch.object(a4, "process_cwd", return_value=Path(root)):
+                    with self.assertRaisesRegex(AssertionError, message):
+                        harness.prove_owned_redis()
 
     def test_non_loopback_or_wrong_runtime_and_port_fail_closed(self):
         root = self.enterContext(tempfile.TemporaryDirectory())

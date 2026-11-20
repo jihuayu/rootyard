@@ -195,6 +195,30 @@ def process_cwd(pid):
     return Path("/proc") / str(pid) / "cwd"
 
 
+CLIENT_ROW_FIELD = re.compile(rb"[a-z0-9_-]+=[^ ]*")
+CLIENT_ROW_ID = re.compile(rb"[0-9]+")
+
+
+def parse_client_row(line):
+    """Parse one CLIENT LIST row without discarding or folding any token."""
+    if not isinstance(line, bytes) or not line:
+        raise AssertionError("owned Redis client row is malformed")
+    tokens = line.split(b" ")
+    if any(not token for token in tokens):
+        raise AssertionError("owned Redis client row is malformed")
+    fields = {}
+    for token in tokens:
+        if not CLIENT_ROW_FIELD.fullmatch(token):
+            raise AssertionError("owned Redis client field is malformed")
+        key, value = token.split(b"=", 1)
+        if key in fields:
+            raise AssertionError("owned Redis client row has a duplicate field")
+        fields[key] = value
+    if not CLIENT_ROW_ID.fullmatch(fields.get(b"id", b"")):
+        raise AssertionError("owned Redis client row has a malformed id")
+    return fields
+
+
 def validate_case_detail(detail):
     """Project a passing detail onto the fixed typed report schema.
 
@@ -557,7 +581,7 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         assert len(current) == 1, "owned Redis client ID was recorded more than once"
         matching = []
         for line in client.splitlines():
-            fields = dict(re.findall(rb"(?:^| )([a-z0-9_-]+)=([^ ]*)", line))
+            fields = parse_client_row(line)
             if fields.get(b"id") == str(current[0]).encode():
                 matching.append(fields)
         assert len(matching) == 1, "owned Redis did not expose exactly one current client"
