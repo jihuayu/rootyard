@@ -71,6 +71,31 @@ def signal_pidfd(fd, sig):
     sender(fd, sig)
 
 
+def wait_capture_state_settled(h, wid, after, timeout=10.0):
+    """Wait until two capture commits have observed the completed writes.
+
+    The sandbox job is already terminal, so its FUSE writes cannot change
+    again.  A scan that started before ``after`` can still commit a partial
+    fingerprint afterwards; the next scan starts only after that commit, sees
+    the final overlay and leaves ``workspace_capture_state`` at the exact
+    fingerprint the checkpoint reconcile/CAS expects.  This is a fixture
+    barrier over the real scanner, not a retry of the product request.
+    """
+    deadline = time.monotonic() + timeout
+    commits = set()
+    while time.monotonic() < deadline:
+        scanned_at = h.sql(
+            "SELECT scanned_at::text FROM workspace_capture_state "
+            f"WHERE workspace_id='{wid}' AND scanned_at > '{after}'::timestamptz")
+        if scanned_at:
+            commits.add(scanned_at)
+            if len(commits) >= 2:
+                return
+        time.sleep(0.1)
+    raise AssertionError(
+        f"workspace {wid} did not settle capture state with two commits after {after}")
+
+
 # The normal-shutdown case keeps the pre-existing five-second service exit
 # bound used by the original SIGKILL case.  A helper-backend proof is required
 # by the C3 matrix, but legacy in-process discovery must not present this as a
@@ -129,17 +154,21 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertEqual(base64.b64decode(visible["content_base64"]),b"normal editor save\n")
                 staged=json.loads(h.expect(f"/api/workspaces/{wid}/files?path=hello.txt&view=index",200,token=h.alice))
                 self.assertEqual(base64.b64decode(staged["content_base64"]),b"normal editor save\n")
-                deadline=time.monotonic()+10
-                while time.monotonic()<deadline:
-                    current=json.loads(h.expect(f"/api/workspaces/{wid}",200,token=h.alice))
-                    if current["revision"]>0:break
-                    time.sleep(.2)
+                # A first capture can contain only a prefix of the job's writes;
+                # the checkpoint's reconcile would then advance the revision
+                # after we read it and reject our CAS.  Wait for the real
+                # scanner to store the final overlay fingerprint first.
+                marker=h.sql("SELECT clock_timestamp()::text")
+                wait_capture_state_settled(h,wid,marker)
+                current=json.loads(h.expect(f"/api/workspaces/{wid}",200,token=h.alice))
                 self.assertGreater(current["revision"],0)
                 event=json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=0",200,token=h.alice))
                 self.assertIn("external_capture",[e["kind"] for e in event["events"]])
                 checkpoint=json.loads(h.expect(f"/api/workspaces/{wid}/checkpoints",201,token=h.alice,
                     method="POST",body={"expected_workspace_revision":current["revision"],"lease_epoch":1},
                     extra_headers={"Idempotency-Key":"live-fuse-checkpoint"}))
+                self.assertEqual(checkpoint["captured_revision"],current["revision"])
+                self.assertEqual(checkpoint["workspace_revision"],current["revision"]+1)
                 self.assertEqual(checkpoint["state"],"local_complete")
                 cid=checkpoint["checkpoint_id"]
                 self.assertEqual((h.root/"data/workspace-service/checkpoints"/cid/"hello.txt").read_bytes(),
