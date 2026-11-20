@@ -19,13 +19,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(super) const CHILD_MODE_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_MODE";
-const CHILD_DB_URL_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_DB_URL";
-const CHILD_PG_SCHEMA_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_PG_SCHEMA";
-const CHILD_ROOT_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_ROOT";
-const CHILD_REPO_ID_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_REPO_ID";
+pub(super) const CHILD_DB_URL_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_DB_URL";
+pub(super) const CHILD_PG_SCHEMA_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_PG_SCHEMA";
+pub(super) const CHILD_ROOT_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_ROOT";
+pub(super) const CHILD_REPO_ID_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_REPO_ID";
 const CHILD_SKIP_JOB_ID_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_SKIP_JOB_ID";
 const CHILD_READY_MARKER_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_READY_MARKER";
-const CHILD_OUT_JSON_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_OUT_JSON";
+pub(super) const CHILD_OUT_JSON_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_OUT_JSON";
 const ENV_BLOB_SAFE_GC_DESTRUCTIVE: &str = "ROOTYARD_BLOB_SAFE_GC_DESTRUCTIVE";
 const MODE_PASS1: &str = "pass1_sigkill_after_one_delete";
 const MODE_PASS2: &str = "pass2_scheduled_runtime";
@@ -194,6 +194,10 @@ fn child_process_entrypoint() {
     let Ok(mode) = std::env::var(CHILD_MODE_ENV) else {
         return;
     };
+    if super::pg_migration_child::is_migration_mode(&mode) {
+        super::pg_migration_child::run_migration_child(&mode).expect("safe-gc migration child process");
+        return;
+    }
     match mode.as_str() {
         MODE_PASS1 | MODE_PASS2 | MODE_PROBE_NO_DELETE => run_child(&mode).expect("safe-gc child process"),
         other => panic!("unknown safe-gc child mode {other}"),

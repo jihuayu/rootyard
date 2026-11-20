@@ -24,6 +24,7 @@ use rootyard::{
         scheduler, worker,
     },
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use uuid::Uuid;
@@ -34,7 +35,7 @@ use super::super::{
         assert_worker_volume_has_no_external_signing_keys, provision_distributed_trust,
         rewrite_legacy_distributed_bundle, seal_test_lane_arm, test_arm_signer, test_dist_lane,
     },
-    isolated_pg_pool_with_schema, pg_child_worker,
+    isolated_pg_pool_with_schema, pg_child_worker, pg_migration_child,
     pg_refcas_merge_fixture::{build_refcas_merge_rig, force_scan_and_schedule, production_refcas_pr_merge},
     provision_pg_refstore_repo,
     raft_voter_cluster::{LiveRaftVoterCluster, resolve_raft_node_bin, resolve_voter_bin},
@@ -227,24 +228,75 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
     );
     assert!(retired.iter().all(|locator| s3.has_key(locator)), "the legacy cold runtime must keep every locator");
 
-    // Step 4: migrate trust + journal under the deployed voters and bind the mTLS Bearer boundary.
-    let crash_err = SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal_with_boundary_hook(
+    // Step 4: physically interrupt migration after trust commit and before journal persist.
+    let legacy_journal_bytes = std::fs::read(&journal)?;
+    let legacy_journal_sha256 = hex::encode(Sha256::digest(&legacy_journal_bytes));
+    let legacy_batch = batch.clone();
+    let repo_id_text = repo_id.to_string();
+    let deletes_before_boundary = s3.state.delete_requests.load(Ordering::SeqCst);
+    let boundary = pg_migration_child::spawn_migration_boundary_sigkill_child(
         &storage_root,
-        &journal,
+        db,
+        &schema,
         repo_id,
         2,
-        trusted_voters.clone(),
-        || Err(SafeGcError::Io("simulated crash after trust commit before journal persist".into())),
+        &journal,
+        &trusted_voters,
     )
-    .unwrap_err();
-    assert!(matches!(crash_err, SafeGcError::Io(_)));
+    .await?;
+    assert_ne!(boundary.pid, std::process::id(), "the migration boundary child must run in a separate OS process");
+    assert_eq!(boundary.signal, Some(libc::SIGKILL), "the boundary child must be reaped from SIGKILL");
+    eprintln!(
+        "migration boundary SIGKILL: pid={} signal={:?} start_time={:?}",
+        boundary.pid, boundary.signal, boundary.marker["start_time"]
+    );
+    assert_eq!(boundary.marker["boundary"].as_str(), Some("trust_committed_before_journal_persist"));
+    assert_eq!(boundary.marker["repo_id"].as_str(), Some(repo_id_text.as_str()));
+    assert_eq!(boundary.marker["journal_sha256_hex"].as_str(), Some(legacy_journal_sha256.as_str()));
+    assert_eq!(boundary.marker["trust_quorum_threshold"].as_u64(), Some(2));
     assert_eq!(SafeGcRepoTrustConfig::load(&storage_root, repo_id)?.quorum_threshold, Some(2));
+    assert_eq!(
+        std::fs::read(&journal)?,
+        legacy_journal_bytes,
+        "SIGKILL after trust commit must leave the legacy journal byte-identical"
+    );
     assert!(matches!(
         DurableSafeGcAuthority::open_with_journal(&journal, None),
         Err(SafeGcError::ArmingRejected(
             "legacy DistributedRefCas journal snapshot requires explicit migration and safe re-arm"
         ))
     ));
+    assert_eq!(
+        s3.state.delete_requests.load(Ordering::SeqCst),
+        deletes_before_boundary,
+        "the post-trust/pre-journal SIGKILL must not issue a provider delete"
+    );
+    assert!(retired.iter().all(|locator| s3.has_key(locator)), "the boundary child must keep every locator");
+
+    // A separate new process opens only the same fixture volume and database.
+    let probe = pg_migration_child::spawn_migrated_fixture_probe_child(
+        &storage_root,
+        db,
+        &schema,
+        repo_id,
+        2,
+        &journal,
+        &trusted_voters,
+    )
+    .await?;
+    assert_ne!(probe.pid, std::process::id(), "the migrated fixture probe must run in a separate OS process");
+    assert_ne!(probe.pid, boundary.pid, "each fresh fixture process must be independently owned");
+    assert_eq!(probe.trust_quorum_threshold, 2);
+    assert_eq!(probe.trusted_voter_count, trusted_voters.len());
+    assert_eq!(probe.journal_sha256_hex, legacy_journal_sha256);
+    eprintln!(
+        "migrated fixture probe: pid={} trust_threshold={} voters={} journal_sha256={}",
+        probe.pid, probe.trust_quorum_threshold, probe.trusted_voter_count, probe.journal_sha256_hex
+    );
+    assert_eq!(
+        probe.legacy_refusal,
+        "legacy DistributedRefCas journal snapshot requires explicit migration and safe re-arm"
+    );
     pool.get()
         .await?
         .execute("UPDATE storage_maintenance_repo_state SET last_scan_at = NULL WHERE repository_id = $1", &[&repo_id])
@@ -252,20 +304,47 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
     let half_pid = pg_child_worker::spawn_cold_runtime_no_delete_child(root, db, &schema, repo_id, &envs).await?;
     assert_ne!(half_pid, std::process::id(), "the half-migrated probe must run in a separate OS process");
     assert_ne!(half_pid, cold, "each cold probe must run in its own OS process");
+    assert_ne!(half_pid, boundary.pid, "the cold runtime must not reuse the killed boundary PID");
+    assert_ne!(half_pid, probe.pid, "the cold runtime must not reuse the fixture probe PID");
+    let deletes_after_half_probe = s3.state.delete_requests.load(Ordering::SeqCst);
     assert_eq!(
-        s3.state.delete_requests.load(Ordering::SeqCst),
-        deletes_before_cold,
+        deletes_after_half_probe, deletes_before_boundary,
         "a half-migrated trust/journal boundary must not delete"
     );
+    eprintln!(
+        "provider delete_requests before boundary={} after half-migrated cold probe={}",
+        deletes_before_boundary, deletes_after_half_probe
+    );
     assert!(retired.iter().all(|locator| s3.has_key(locator)), "the half-migrated probe must keep every locator");
+
+    // Retry the real migration path: it must finish disarmed and preserve the pending batch.
     let (mut trust, report) =
         SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal(&storage_root, &journal, repo_id, 2, trusted_voters)?;
     let auth = cluster.lock().await.voter_client_auth();
     trust.bind_voter_client_auth(&storage_root, auth)?;
     assert!(report.journal_migrated && report.disarmed_for_voter_rearm);
-    assert_eq!(report.preserved_pending_batch_id, Some(batch.batch_id));
-    assert!(report.preserved_deleted_keys.is_empty());
-    assert_eq!(report.preserved_pending_keys, batch.pending_keys);
+    assert_eq!(report.preserved_pending_batch_id, Some(legacy_batch.batch_id));
+    assert_eq!(report.preserved_deleted_keys, legacy_batch.deleted_keys);
+    assert_eq!(report.preserved_pending_keys, legacy_batch.pending_keys);
+    assert_eq!(report.preserved_incarnation_epoch, legacy_batch.incarnation_epoch);
+    assert_eq!(
+        s3.state.delete_requests.load(Ordering::SeqCst),
+        deletes_before_boundary,
+        "retrying migration must not issue a provider delete"
+    );
+    let migrated = DurableSafeGcAuthority::open_with_journal(&journal, None)?.snapshot();
+    assert_eq!(migrated.gc_mode, GcMode::DisabledByDefault);
+    let migrated_batch = migrated.pending_delete.as_ref().context("migration must preserve pending delete")?;
+    assert_eq!(migrated_batch.batch_id, legacy_batch.batch_id);
+    assert_eq!(migrated_batch.incarnation_id, legacy_batch.incarnation_id);
+    assert_eq!(migrated_batch.incarnation_epoch, legacy_batch.incarnation_epoch);
+    assert_eq!(migrated_batch.lease_epoch, legacy_batch.lease_epoch);
+    assert_eq!(migrated_batch.pending_keys, legacy_batch.pending_keys);
+    assert_eq!(migrated_batch.deleted_keys, legacy_batch.deleted_keys);
+    assert_eq!(migrated_batch.proof.incarnation_id, legacy_batch.proof.incarnation_id);
+    assert_eq!(migrated_batch.proof.incarnation_epoch, legacy_batch.proof.incarnation_epoch);
+    assert_eq!(migrated_batch.proof.reader_quiescence, legacy_batch.proof.reader_quiescence);
+    drop(migrated);
     assert_worker_volume_has_no_external_signing_keys(&storage_root, repo_id);
 
     // Step 5: a migrated but still disarmed volume must keep refusing every delete.

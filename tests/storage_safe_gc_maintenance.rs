@@ -4,6 +4,8 @@
 pub mod dist_auth_harness;
 #[path = "storage_safe_gc_support/pg_child_worker.rs"]
 mod pg_child_worker;
+#[path = "storage_safe_gc_support/pg_migration_child.rs"]
+mod pg_migration_child;
 #[path = "storage_safe_gc_support/pg_refcas_cases.rs"]
 mod pg_refcas_cases;
 #[path = "storage_safe_gc_support/pg_refcas_lifecycle_cases.rs"]

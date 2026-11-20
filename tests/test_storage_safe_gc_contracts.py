@@ -61,6 +61,7 @@ RUST_FILES = [
     ROOT / "tests" / "storage_safe_gc_maintenance.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "dist_auth_harness.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_child_worker.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "pg_migration_child.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_merge_fixture.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_migration_cases.rs",
@@ -268,6 +269,14 @@ class StorageSafeGcContractsTest(unittest.TestCase):
         self.assertIn("spawn_pass1_sigkill_child", migration_cases)
         self.assertIn("spawn_pass2_scheduled_runtime_child", migration_cases)
         self.assertIn("migrate_legacy_trust_and_journal", migration_cases)
+        self.assertIn("spawn_migration_boundary_sigkill_child", migration_cases)
+        self.assertIn("spawn_migrated_fixture_probe_child", migration_cases)
+        migration_child = (
+            ROOT / "tests" / "storage_safe_gc_support" / "pg_migration_child.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("migrate_legacy_trust_and_journal_with_boundary_hook", migration_child)
+        self.assertIn("SIGKILL", migration_child)
+        self.assertIn("process_start_time", migration_child)
         voter_auth_cases = (
             ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_voter_auth_cases.rs"
         ).read_text(encoding="utf-8")
@@ -304,7 +313,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn("migrate_legacy_trust_and_journal_with_boundary_hook", journal_migration)
-        self.assertIn("migrate_legacy_trust_and_journal_with_boundary_hook", migration_cases)
+        self.assertIn("migrate_legacy_trust_and_journal_with_boundary_hook", migration_child)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf_raw = WORKFLOW.read_bytes()
