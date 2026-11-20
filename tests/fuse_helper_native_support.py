@@ -737,11 +737,33 @@ mount, status = sys.argv[1], sys.argv[2]
 writes = 0
 attempts = 0
 success_ns = 0
+failed_write_return_ns = 0
+failed_write_fd = -1
+witness_close_fd = -1
+proc_tag = 0
+
+
+def process_tag():
+    try:
+        fields = open("/proc/self/stat", encoding="utf-8").read(
+        ).rsplit(")", 1)[-1].split()
+        starttime = int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return 0
+    value = 14695981039346656037
+    for byte in ("%d:%d" % (os.getpid(), starttime)).encode("ascii"):
+        value ^= byte
+        value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return value
 
 
 def publish(phase, error=0):
     payload = {"phase": phase, "writes": writes, "attempts": attempts,
-               "errno": int(error), "success_ns": success_ns}
+               "errno": int(error), "success_ns": success_ns,
+               "failed_write_return_ns": failed_write_return_ns,
+               "failed_write_fd": failed_write_fd,
+               "witness_close_fd": witness_close_fd,
+               "proc_tag": proc_tag}
     temporary = status + ".tmp"
     with open(temporary, "w", encoding="utf-8") as stream:
         json.dump(payload, stream, separators=(",", ":"))
@@ -759,9 +781,13 @@ try:
         # Name the exact parked descriptor before the barrier so the optional
         # witness adds no environment mutation on the close/error path.
         os.environ["ROOTYARD_TEST_FUSE_WITNESS_CLOSE_FD"] = str(parked)
+        witness_close_fd = parked
     except OSError:
         pass
     publish("ready")
+    # The process identity is read only after readiness is published, so the
+    # terminal-write binding cannot move the readiness marker.
+    proc_tag = process_tag()
     marker = os.open(os.path.join(mount, "gate-target.txt"),
                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -779,7 +805,12 @@ while True:
     try:
         os.write(parked, b"x")
     except OSError as error:
+        # Userspace sample taken immediately after the only failing parked-FD
+        # write returned.  Capture it in memory, then close the exact owned FD
+        # before the status receipt is emitted; this is not a kernel timestamp.
+        failed_write_return_ns = time.monotonic_ns()
         write_errno = error.errno
+        failed_write_fd = parked
         try:
             # Drop the owned parked descriptor before the status publish so it
             # cannot keep the failed mount busy across fsync/rename/exit.
@@ -808,6 +839,12 @@ def writer_status(path):
         return None
     for key in ("writes", "attempts", "errno", "success_ns"):
         if not isinstance(data.get(key), int):
+            return None
+    # The terminal-write fields are optional so an older receipt remains
+    # readable; when present they must still be exact integers.
+    for key in ("failed_write_return_ns", "failed_write_fd",
+                "witness_close_fd", "proc_tag"):
+        if key in data and type(data[key]) is not int:
             return None
     return data
 

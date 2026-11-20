@@ -13,8 +13,10 @@ Everything here is owned by the one test that imports it:
   observes shutdown;
 * the optional bounded busy witness is compiled only into this harness's own
   children and records the exact helper ``umount2(..., 0)`` and parked writer
-  ``close`` ordering; if it cannot be built or injected, projection is
-  ``unknown`` and the original acceptance assertions are unchanged.
+  ``close`` ordering; the writer's single terminal failure path also records
+  one post-return userspace sample for its failed parked-FD write.  If the
+  witness cannot be built or injected, projection is ``unknown`` and the
+  original acceptance assertions are unchanged.
 
 There is no mock Git, fake helper, fake mount or reference implementation in
 this module.  The wrapper holds only the one ``add -- parked.bin`` invocation
@@ -629,7 +631,14 @@ WRITER_CLOSE_STATES = frozenset((
     "overlapping",
     "unknown",
 ))
+TERMINAL_WRITE_STATES = frozenset((
+    "observed_before_busy_entry",
+    "observed_after_busy_return",
+    "overlaps_or_unknown",
+    "unknown",
+))
 UNKNOWN = "unknown"
+MAX_MONOTONIC_NS = 2 ** 63 - 1
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_RECEIPTS = 128
 _FNV_OFFSET = 14695981039346656037
@@ -955,6 +964,115 @@ def project_busy_witness_receipts(witness_dir, *, helper_tag, writer_tag,
         return UNKNOWN, UNKNOWN
     return project_busy_witness(
         helper + writer,
+        helper_tag=helper_tag,
+        writer_tag=writer_tag,
+        expected_mounts=expected_mounts,
+        owned_mounts=owned_mounts,
+    )
+
+
+def _validated_busy_and_close(records, *, helper_tag, writer_tag,
+                              expected_mounts, owned_mounts):
+    """Return the one validated busy/close pair, or ``None``."""
+    target, close_state = project_busy_witness(
+        records,
+        helper_tag=helper_tag,
+        writer_tag=writer_tag,
+        expected_mounts=expected_mounts,
+        owned_mounts=owned_mounts,
+    )
+    if target == UNKNOWN or close_state == UNKNOWN:
+        return None
+    busy = [
+        record for record in records
+        if record["kind"] == "umount"
+        and record["role"] == "helper"
+        and record["proc_tag"] == helper_tag
+        and record["flags"] == 0
+        and record["rc"] == -1
+        and record["errno"] == errno.EBUSY
+    ]
+    closes = [
+        record for record in records
+        if record["kind"] == "close"
+        and record["role"] == "writer"
+        and record["proc_tag"] == writer_tag
+        and record["rc"] == 0
+    ]
+    if len(busy) != 1 or len(closes) != 1:
+        return None
+    return busy[0], closes[0]
+
+
+def project_terminal_write_return(records, status, *, helper_tag, writer_tag,
+                                  expected_mounts, owned_mounts):
+    """Project one terminal failed write-return sample to a closed label.
+
+    The writer takes its sample in userspace immediately after the failing
+    ``write(2)`` returned, so the sample is not the kernel return timestamp.
+    The label is a conservative temporal relation only, never a causal claim.
+    Absent, invalid, incomparable or impossible orderings return ``unknown``;
+    a sample inside the busy call is ``overlaps_or_unknown``.
+    """
+    pair = _validated_busy_and_close(
+        records,
+        helper_tag=helper_tag,
+        writer_tag=writer_tag,
+        expected_mounts=expected_mounts,
+        owned_mounts=owned_mounts,
+    )
+    if pair is None or not isinstance(status, dict):
+        return UNKNOWN
+    busy_record, close = pair
+    if status.get("phase") != "error":
+        return UNKNOWN
+    failed_ns = status.get("failed_write_return_ns")
+    write_errno = status.get("errno")
+    failed_fd = status.get("failed_write_fd")
+    close_fd = status.get("witness_close_fd")
+    proc_tag = status.get("proc_tag")
+    if (type(failed_ns) is not int or not 0 < failed_ns <= MAX_MONOTONIC_NS
+            or type(write_errno) is not int or not 0 < write_errno <= 4095
+            or type(failed_fd) is not int or type(close_fd) is not int
+            or failed_fd < 0 or failed_fd != close_fd
+            or type(proc_tag) is not int or proc_tag != writer_tag):
+        return UNKNOWN
+    # The writer closes the same parked descriptor only after this in-process
+    # return.  A later failure sample than that close entry is impossible.
+    if failed_ns > close["entry_ns"]:
+        return UNKNOWN
+    if failed_ns < busy_record["entry_ns"]:
+        return "observed_before_busy_entry"
+    if failed_ns > busy_record["result_ns"]:
+        return "observed_after_busy_return"
+    return "overlaps_or_unknown"
+
+
+def project_terminal_write_return_receipts(
+        witness_dir, status_path, *, helper_tag, writer_tag,
+        expected_mounts, owned_mounts):
+    """Read the bounded receipts/status and project the terminal write state."""
+    try:
+        directory = Path(witness_dir)
+        helper = parse_witness_receipt(directory / "helper.receipt")
+        writer = parse_witness_receipt(directory / "writer.receipt")
+    except (OSError, TypeError, ValueError):
+        return UNKNOWN
+    if helper is None or writer is None:
+        return UNKNOWN
+    if not _receipt_file_matches(
+            helper, kind="umount", role="helper", tag=helper_tag):
+        return UNKNOWN
+    if not _receipt_file_matches(
+            writer, kind="close", role="writer", tag=writer_tag):
+        return UNKNOWN
+    try:
+        status = support.writer_status(status_path)
+    except (OSError, TypeError, ValueError):
+        return UNKNOWN
+    return project_terminal_write_return(
+        helper + writer,
+        status,
         helper_tag=helper_tag,
         writer_tag=writer_tag,
         expected_mounts=expected_mounts,

@@ -690,17 +690,20 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
         An optional fixture-only preload is bound before SIGTERM to the exact
         helper, the parked writer descriptor and the three route mount IDs.  It
         records the real helper ``umount2(path, 0)`` entry/result and the one
-        successful parked-FD close with the same CLOCK_MONOTONIC source, then
-        projects only fixed ``busy_target``/``writer_close`` values into the
-        failure diagnostic.  If it cannot be built or injected, both stay
-        ``unknown``; it adds no wait/barrier, does not open a mounted path and
-        is never a pass condition.
+        successful parked-FD close with the same CLOCK_MONOTONIC source.  The
+        writer's single terminal failure path also records one post-return
+        userspace sample for the failed parked-FD write.  Only fixed
+        ``busy_target``/``writer_close``/``terminal_write`` values are projected
+        into the failure diagnostic.  If the witness cannot be built or
+        injected, all stay ``unknown``; it adds no wait/barrier, does not open a
+        mounted path and is never a pass condition.
         """
         self._rootyard_diagnostic_phase = "setup"
         self._rootyard_diagnostic_api_exit = None
         self._rootyard_diagnostic_shutdown_outcome = "unknown"
         self._rootyard_diagnostic_busy_target = "unknown"
         self._rootyard_diagnostic_writer_close = "unknown"
+        self._rootyard_diagnostic_terminal_write = "unknown"
         binary, _ = select_runtime_binary()
         self.assertTrue(binary.is_file())
         real_git = shutil.which("git")
@@ -721,6 +724,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             gate_prefix = None
             writer = None
             writer_pidfd = None
+            writer_status = None
             holders = []
             holder_identities = []
             namespace_mounts = []
@@ -1263,6 +1267,18 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                         )
                         self._rootyard_diagnostic_busy_target = target
                         self._rootyard_diagnostic_writer_close = close_state
+                    except BaseException:
+                        pass
+                    try:
+                        self._rootyard_diagnostic_terminal_write = (
+                            normal_shutdown.project_terminal_write_return_receipts(
+                                witness_dir,
+                                writer_status,
+                                helper_tag=witness_binding["helper_tag"],
+                                writer_tag=witness_binding["writer_tag"],
+                                expected_mounts=witness_binding["expected_mounts"],
+                                owned_mounts=witness_binding["owned_mounts"],
+                            ))
                     except BaseException:
                         pass
                 cleanup_failures = []
