@@ -8,6 +8,7 @@ mod tests;
 use self::hydrator::{HYDRATION_PUBLICATION_GRACE, Hydrator, RemoteFetcher, configured_timeout};
 use super::{mounts, remote};
 use crate::{AppState, Error, storage::remote_objects::ObjectKey, workspace_lab::core};
+use axum::http::StatusCode;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,6 +98,26 @@ fn read_manifest(path: &Path) -> Result<LazyManifest, Error> {
     Ok(manifest)
 }
 
+/// Admit a materialized FUSE lower only when its frozen Git metadata is a
+/// committed repository. FUSE restore and cross-host takeover share the same
+/// remote/cross-host contract as `remote::ensure_local`, so a genuinely unborn
+/// local checkpoint must never become a ready lazy lower. This uses the real
+/// `.git` bytes already staged or cached instead of `base_oid`, a path check or
+/// a remote probe; invalid, dangling or malformed metadata therefore fails
+/// closed with the compatibility conflict instead of being normalized.
+///
+/// The warm path deliberately revalidates the cached lower rather than fetching
+/// the remote manifest again. Pre-#317 lazy sidecars have no captured revision
+/// to compare, and an otherwise provably valid ready cache must not require
+/// object-store reachability. The sidecar's checkpoint/tenant binding plus the
+/// actual cached Git tree are the narrow trusted state available to old entries.
+fn validate_committed_materialization(root: &Path) -> Result<(), Error> {
+    if super::compat::validate_repo(root)? == super::compat::HeadKind::Unborn {
+        return Err(Error(StatusCode::CONFLICT, super::compat::CONFLICT_HEAD));
+    }
+    Ok(())
+}
+
 /// Build a sparse immutable lower tree from a verified committed manifest.
 /// Native Git metadata is materialized; worktree bytes remain remote. All local
 /// staging, sparse file setup and fsync work runs on the bounded blocking pool.
@@ -121,6 +142,7 @@ pub(super) async fn prepare(
         }
         let old = read_manifest(&sidecar_check)?;
         if old.checkpoint_id == cp && old.tenant_id == tenant && dest_check.join(".git").is_dir() {
+            validate_committed_materialization(&dest_check)?;
             return Ok(true);
         }
         Err(Error::internal("conflicting sparse workspace baseline"))
@@ -198,6 +220,25 @@ pub(super) async fn prepare(
     }
     .await;
     if let Err(err) = download_outcome {
+        stage_guard.cleanup().await;
+        return Err(err);
+    }
+
+    // Classify the frozen checkpoint HEAD from the staged native Git bytes
+    // before any lower or sidecar can be published. This is the same bounded
+    // compatibility witness used by non-FUSE materialization, so committed
+    // symbolic refs, detached commits and packed refs remain admitted while a
+    // genuinely unborn or damaged repository is refused. The staged tree is
+    // never visible as a workspace.
+    let stage_check = stage.clone();
+    if let Err(err) = super::blocking::run_mutating(mutation, move |abandoned, _fence| {
+        if abandoned.is_abandoned() {
+            return Err(Error::timeout());
+        }
+        validate_committed_materialization(&stage_check)
+    })
+    .await
+    {
         stage_guard.cleanup().await;
         return Err(err);
     }
