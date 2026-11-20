@@ -25,6 +25,13 @@ HOST = ("bash", "cat", "env", "mkdir", "find", "sort", "id", "pwd", "dirname",
         "awk", "mktemp", "mv", "rm")
 PGDG_URL = "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
 PGDG_FINGERPRINT = "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
+NOBLE_SRC_LIST = "/etc/apt/sources.list.d/rootyard-ubuntu-noble-src.list"
+NETWORK_OPTIONS = {
+    "Acquire::http::Timeout": "30",
+    "Acquire::https::Timeout": "30",
+    "Acquire::Retries": "3",
+    "Acquire::http::Pipeline-Depth": "0",
+}
 
 SUDO = """#!{python}
 import json, os, sys
@@ -238,6 +245,54 @@ class NativeAptRegressionTest(unittest.TestCase):
         self.assertEqual((tree / "README").stat().st_uid, os.getuid())
         self.assertEqual((tree / "debian").stat().st_uid, os.getuid())
 
+    def test_prepare_noble_source_refresh_calls_the_scoped_helper(self) -> None:
+        text = LIB.read_text(encoding="utf-8")
+        start = text.index("prepare_ubuntu_archive_source() {")
+        end = text.index("\n}\n", start)
+        function = text[start:end]
+        self.assertIn(
+            "list=/etc/apt/sources.list.d/rootyard-ubuntu-noble-src.list",
+            function,
+        )
+        self.assertIn('apt_update_sources_list "$list"', function)
+        self.assertNotIn("\n  apt_update\n", function)
+
+    def test_noble_source_refresh_uses_only_the_exact_owned_fragment(self) -> None:
+        self._sudo()
+        result = self._run(
+            f'apt_update_sources_list "{NOBLE_SRC_LIST}"\n: > reached'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.tmp / "reached").is_file())
+        (sudo_argv,) = self._calls("sudo")
+        # The fixture records the GNU env form without its leading "env".
+        self.assertEqual(sudo_argv[:2],
+                         ["DEBIAN_FRONTEND=noninteractive", "apt-get"])
+        (argv,) = self._calls("apt-get")
+        self.assertEqual(sudo_argv[2:], argv)
+        command, options = self._apt(argv)
+        self.assertEqual(command, "update")
+        self.assertEqual(argv[-2:], ["update", "--error-on=any"])
+        self.assertEqual(options["Dir::Etc::sourcelist"], NOBLE_SRC_LIST)
+        self.assertEqual(options["Dir::Etc::sourceparts"], "-")
+        self.assertEqual(options["APT::Get::List-Cleanup"], "0")
+        self.assertEqual(
+            {key: value for key, value in options.items()
+             if not key.startswith("Dir::Etc::") and key != "APT::Get::List-Cleanup"},
+            NETWORK_OPTIONS,
+        )
+        # Exactly the network bounds plus the three scope/retention options.
+        self.assertEqual(len(options), len(NETWORK_OPTIONS) + 3)
+
+    def test_noble_source_refresh_failure_is_fatal(self) -> None:
+        self._sudo()
+        result = self._run(
+            f'set -e\napt_update_sources_list "{NOBLE_SRC_LIST}"\n: > reached',
+            FAKE_UPDATE_RC="100",
+        )
+        self.assertEqual(result.returncode, 100, result.stderr)
+        self.assertFalse((self.tmp / "reached").exists())
+
     def test_update_and_install_go_through_sudo_with_same_options(self) -> None:
         self._sudo(SUDO_REJECT)
         rejected = self._run("apt_update && apt_install fuse3")
@@ -259,8 +314,13 @@ class NativeAptRegressionTest(unittest.TestCase):
         self.assertEqual(install_command, "install")
         self.assertEqual(install_args[install_args.index("install") + 1:],
                          ["-y", "--no-install-recommends", "ca-certificates", "fuse3"])
-        self.assertEqual(update_options, install_options)
-        self.assertEqual(len(update_options), 4)
+        self.assertEqual(update_options, NETWORK_OPTIONS)
+        self.assertEqual(install_options, NETWORK_OPTIONS)
+        # The ordinary apt-phase update stays unscoped: it still validates every
+        # inherited image/PGDG index instead of borrowing the Noble fragment.
+        self.assertNotIn("Dir::Etc::sourcelist", update_options)
+        self.assertNotIn("Dir::Etc::sourceparts", update_options)
+        self.assertNotIn("APT::Get::List-Cleanup", update_options)
 
     def test_failures_propagate_and_plain_update_is_not_accepted(self) -> None:
         self._sudo()
