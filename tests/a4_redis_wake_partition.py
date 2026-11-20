@@ -20,6 +20,9 @@ The case proves, with positive evidence:
 * healing reconnects the same worker and a later healthy push is wake-delivered
   before the next poll;
 * duplicate/invalid hints preserve the durable snapshot;
+* a direct FLUSHALL of the proven fixture-owned loopback Redis removes only a
+  unique seeded key and preserves the exact PostgreSQL/ref/object/hold/outbox
+  and claimed-task authority before the unchanged denial/read checks;
 * no legacy ref-index or Ref-CAS projection work appears; and
 * read-only and outside actors are refused without changing authority.
 
@@ -71,6 +74,7 @@ CASE_STAGES = (
     "invalid_hints",
     "redis_cut_pg_fallback",
     "healed_wake",
+    "owned_flushall",
     "denials",
     "final_assertions",
 )
@@ -117,6 +121,53 @@ INVALID_HINT_CODES = (
     "claim_equality",
     "unavailable",
 )
+OWNED_FLUSHALL_CODES = (
+    "baseline_idle",
+    "baseline_snapshot",
+    "baseline_claim",
+    "baseline_operation",
+    "ownership",
+    "seed",
+    "flush",
+    "wipe",
+    "snapshot_equality",
+    "claim_equality",
+    "post_operation",
+    "unavailable",
+)
+# Only fixed booleans, positive integer counts and exact UUIDs belong in a
+# passing report. Any other shape is rejected rather than copied into a report.
+CASE_DETAIL_TYPES = {
+    "external_worker_mode_serving": bool,
+    "no_embedded_consumer_before_external_start": bool,
+    "external_worker_only_claim": bool,
+    "healthy_publish_forwarded": bool,
+    "healthy_delivery_before_periodic_poll": bool,
+    "durable_terminal_ref_object_hold_outbox": bool,
+    "redis_cut_push_acknowledged": bool,
+    "redis_cut_delivery_by_postgres_poll": bool,
+    "redis_cut_no_publish_forwarded": bool,
+    "healed_resubscribe_and_wake_before_poll": bool,
+    "duplicate_and_invalid_hints_preserved_snapshot": bool,
+    "no_legacy_ref_index_or_projection": bool,
+    "read_only_denied": bool,
+    "outside_actor_denied": bool,
+    "authorized_read_after_denials": bool,
+    "owned_flushall_verified": bool,
+    "owned_flushall_loopback_only": bool,
+    "owned_flushall_runtime_scoped": bool,
+    "owned_flushall_seed_removed": bool,
+    "owned_flushall_preserved_snapshot": bool,
+    "owned_flushall_preserved_claim": bool,
+    "owned_flushall_preserved_operation": bool,
+    "healthy_wake_before_poll": bool,
+    "initial_operation": "uuid",
+    "healthy_operation": "uuid",
+    "cut_operation": "uuid",
+    "healed_operation": "uuid",
+    "poll_seconds": "positive_int",
+    "owned_cleanup_completed": bool,
+}
 REPORT_KIND = "rootyard/a4-redis-wake-external-acceptance"
 WORKER_NAME = "rootyard_a4_redis_wake_worker"
 TARGET_KIND = "pg_refstore_core_commit_audit"
@@ -127,6 +178,7 @@ LIMITATIONS = [
     "This opt-in case requires an exact attested binary, matching clean source commit, loopback PostgreSQL 17, owned Redis and an owned Garage/S3 profile; it does not run in the generic gate.",
     "Loopback functional timings are not a scalability benchmark.",
     "A cut relay proves advisory Redis loss and PostgreSQL polling repair; it is not kernel, power-loss, Redis HA or multi-host failover evidence.",
+    "The FLUSHALL witness proves only one newly spawned fixture-owned single-node loopback Redis; it is not failover, replication or production cache evidence.",
     "The fixture uses the real stock Git CLI over Smart HTTP; SSH and non-loopback HTTP are outside this case.",
     "The owned Redis process and relay are single-host test fixtures; production TLS/ACL deployment is not exercised here.",
     "Descendant quiescence is proved only inside the standalone Linux fixture with PR_SET_CHILD_SUBREAPER and a bounded waitpid drain; it is not a production containment mechanism.",
@@ -136,6 +188,37 @@ LIMITATIONS = [
 def need(condition, message):
     if not condition:
         raise ProfileError(message)
+
+
+def process_cwd(pid):
+    """Return the live process working directory without emitting its value."""
+    return Path("/proc") / str(pid) / "cwd"
+
+
+def validate_case_detail(detail):
+    """Project a passing detail onto the fixed typed report schema.
+
+    Unknown fields are dropped. A known field with the wrong type fails the
+    report closed, so no caller-provided string can become report evidence.
+    """
+    if not isinstance(detail, dict):
+        raise AssertionError("A4 case detail is not an object")
+    projected = {}
+    for key, value in detail.items():
+        expected = CASE_DETAIL_TYPES.get(key)
+        if expected is None:
+            continue
+        if expected is bool:
+            if type(value) is not bool:
+                raise AssertionError("A4 case detail field has the wrong type")
+        elif expected == "uuid":
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value):
+                raise AssertionError("A4 case detail field has the wrong type")
+        elif expected == "positive_int":
+            if type(value) is not int or value <= 0:
+                raise AssertionError("A4 case detail field has the wrong type")
+        projected[key] = value
+    return projected
 
 
 class ContainmentError(RuntimeError):
@@ -232,6 +315,7 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         self.repo_create_code = None
         self.worker_startup_code = None
         self.invalid_hints_code = None
+        self.flushall_code = None
 
     # ---- owned processes -------------------------------------------------
     def stop_workers(self):
@@ -423,6 +507,60 @@ class A4RedisWakeHarness(BlobOnlyHarness):
     def redis_command(self, *parts):
         assert self.redis_started and self.owned_redis.process is not None, "owned Redis is not running"
         return self.owned_redis.redis_command(*parts)
+
+    # ---- owned Redis destructive-witness gates ---------------------------
+    def prove_owned_redis(self):
+        """Prove this exact process is the fixture-owned loopback Redis.
+
+        The proof is intentionally read-only and combines the live process with
+        direct loopback queries to the server. FLUSHALL is only ever reached
+        after every assertion here succeeds.
+        """
+        redis = self.owned_redis
+        proc = redis.process
+        assert self.redis_started and proc is not None, "owned Redis process is not running"
+        assert proc.poll() is None, "owned Redis process exited"
+        assert redis.identity() == redis.run_id, "owned Redis identity changed"
+        assert process_cwd(proc.pid).samefile(self.root), "owned Redis runtime is not fixture-scoped"
+
+        bind = redis.redis_command("CONFIG", "GET", "bind")
+        assert bind == [b"bind", b"127.0.0.1"], "owned Redis is not loopback-only"
+        runtime = redis.redis_command("CONFIG", "GET", "dir")
+        assert isinstance(runtime, list) and len(runtime) == 2 and runtime[0] == b"dir", \
+            "owned Redis runtime directory is unavailable"
+        assert Path(os.fsdecode(runtime[1])).samefile(self.root), \
+            "owned Redis runtime directory is not fixture-scoped"
+
+        server = redis.redis_command("INFO", "server")
+        assert isinstance(server, bytes), "owned Redis server identity is unavailable"
+        fields = dict(line.split(b":", 1) for line in server.splitlines() if b":" in line)
+        assert int(fields.get(b"process_id", b"0")) == proc.pid, "owned Redis PID differs from its process"
+        assert fields.get(b"run_id") == redis.run_id, "owned Redis run ID differs"
+        assert int(fields.get(b"tcp_port", b"0")) == redis.redis_port, \
+            "owned Redis TCP port differs from the fixture port"
+
+        client = redis.redis_command("CLIENT", "INFO")
+        assert isinstance(client, bytes), "owned Redis client identity is unavailable"
+        assert re.search(
+            rb"(?:^|\s)laddr=127\.0\.0\.1:" + re.escape(str(redis.redis_port).encode()) + rb"(?:\s|$)",
+            client,
+        ), "owned Redis command socket is not the fixture loopback port"
+        return redis.run_id
+
+    def seed_owned_flush_key(self):
+        """Seed one unique, harmless, non-expiring key in the owned fixture."""
+        key = ("rootyard:a4:test:" + self.schema + ":flush:" + uuid.uuid4().hex).encode("ascii")
+        value = uuid.uuid4().hex.encode("ascii")
+        assert re.fullmatch(rb"[0-9a-f]{32}", value), "flush witness value is not unique"
+        assert self.redis_command("SET", key, value) == b"OK", "flush witness seed was refused"
+        assert self.redis_command("GET", key) == value, "flush witness seed was not persisted"
+        assert self.redis_command("PTTL", key) == -1, "flush witness seed has an expiry"
+        assert self.redis_command("EXISTS", key) == 1, "flush witness seed is absent"
+        return key
+
+    def observe_flushall(self, code):
+        if self.flushall_code is None and code in OWNED_FLUSHALL_CODES:
+            self.flushall_code = code
 
     def publishes(self):
         raw = self.redis_command("INFO", "commandstats")
@@ -830,6 +968,93 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         assert time.monotonic() < second_poll - 1, "heal/resubscribe ran past the next poll window"
         return self.healthy_push(work, repo, second_poll)
 
+    def owned_flushall_witness(self, repo, oid, operation):
+        """Flush only the proven fixture Redis, then prove PostgreSQL authority.
+
+        This witness is additive and runs after every timing-sensitive healthy,
+        cut and healed stage. It never uses the relay or a URL: the destructive
+        call is reached only through the direct fixture-owned process/socket
+        proof below. The existing snapshot covers persisted refs, pack/object
+        memberships, holds/consume receipts, outbox, deliveries and audit, so
+        the before/after equality is the exact PostgreSQL/RefStore authority
+        check. The following denials phase then supplies the unchanged stock
+        authorized read/refusal checks on the post-flush authority.
+        """
+        self.flushall_code = None
+        try:
+            self.settle_worker()
+        except Exception:
+            self.observe_flushall("baseline_idle")
+            raise
+        try:
+            before = self.snapshot(repo["id"])
+        except Exception:
+            self.observe_flushall("baseline_snapshot")
+            raise
+        try:
+            claims = self.claim_rows(repo["id"])
+        except Exception:
+            self.observe_flushall("baseline_claim")
+            raise
+        try:
+            self.assert_claim(operation)
+            self.assert_operation(repo["id"], operation, oid, delivered=True)
+        except Exception:
+            self.observe_flushall("baseline_operation")
+            raise
+        try:
+            self.prove_owned_redis()
+        except Exception:
+            self.observe_flushall("ownership")
+            raise
+        try:
+            key = self.seed_owned_flush_key()
+        except Exception:
+            self.observe_flushall("seed")
+            raise
+        try:
+            # Re-prove immediately before the destructive call. The existing
+            # owned helper also re-checks the process/run id on the exact
+            # command connection that sends FLUSHALL; a changed process, run
+            # id, socket or runtime directory fails closed before that frame.
+            self.prove_owned_redis()
+            self.owned_redis.flushall_owned()
+        except Exception:
+            self.observe_flushall("flush")
+            raise
+        try:
+            assert self.redis_command("EXISTS", key) == 0, "FLUSHALL did not remove the unique seed"
+            assert self.redis_command("DBSIZE") == 0, "FLUSHALL did not empty the owned fixture"
+            self.owned_redis.counts(expected_flushes=1)
+        except Exception:
+            self.observe_flushall("wipe")
+            raise
+        try:
+            assert self.snapshot(repo["id"]) == before, "FLUSHALL changed durable authority"
+        except Exception:
+            self.observe_flushall("snapshot_equality")
+            raise
+        try:
+            assert self.claim_rows(repo["id"]) == claims, "FLUSHALL created or changed a claim"
+        except Exception:
+            self.observe_flushall("claim_equality")
+            raise
+        try:
+            self.assert_claim(operation)
+            self.assert_operation(repo["id"], operation, oid, delivered=True)
+        except Exception:
+            self.observe_flushall("post_operation")
+            raise
+        return dict(
+            owned_flushall_verified=True,
+            owned_flushall_loopback_only=True,
+            owned_flushall_runtime_scoped=True,
+            owned_flushall_seed_removed=True,
+            owned_flushall_preserved_snapshot=True,
+            owned_flushall_preserved_claim=True,
+            owned_flushall_preserved_operation=True,
+        )
+
     def assert_denials(self, repo, work, oid):
         before = self.snapshot(repo["id"])
         remote = self.base + repo["clone_path"]
@@ -902,6 +1127,8 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         second_poll = start + 2 * POLL_SECONDS
         healed_oid, healed_op = self.healed_push(work, repo, second_poll)
         self.assert_ref(remote, TARGET_REF, healed_oid)
+        self.case_stage = "owned_flushall"
+        flush_detail = self.owned_flushall_witness(repo, healed_oid, healed_op)
         self.case_stage = "denials"
         self.assert_denials(repo, work, healed_oid)
         self.case_stage = "final_assertions"
@@ -930,6 +1157,7 @@ class A4RedisWakeHarness(BlobOnlyHarness):
             healed_operation=healed_op,
             poll_seconds=POLL_SECONDS,
             owned_cleanup_completed=True,
+            **flush_detail,
         )
 
 
@@ -1051,6 +1279,7 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None, containment
         harness.setup_partition()
         primary = "case"
         detail = harness.run_case()
+        detail = validate_case_detail(detail)
         primary = "receipt_changed"
         assert build_binding(args.binary, args.expect_commit) == binding, "source/receipt binding changed"
         assert sha256_file(Path(__file__)) == harness_sha256, "acceptance harness changed"
@@ -1081,6 +1310,9 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None, containment
                 if stage == "invalid_hints":
                     code = getattr(harness, "invalid_hints_code", None)
                     case["invalid_hints"] = code if isinstance(code, str) and code in INVALID_HINT_CODES else "unavailable"
+                if stage == "owned_flushall":
+                    code = getattr(harness, "flushall_code", None)
+                    case["owned_flushall"] = code if isinstance(code, str) and code in OWNED_FLUSHALL_CODES else "unavailable"
         if cleanup_error is not None:
             case["cleanup_failed"] = True
         if primary is not None and cleanup_error is not None:

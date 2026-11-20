@@ -122,11 +122,19 @@ than the observation window:
    performs its catch-up scan and becomes idle. Before the following poll,
    perform another push and assert a real publish/forwarded increment and
    wake-delivery before that poll.
-7. Attempt a push with the read-only token and with an unrelated actor; assert
+7. After the healed timing-sensitive stages, prove the live Redis process,
+   loopback socket and runtime directory are the newly spawned fixture-owned
+   ones, seed one unique non-expiring harmless key, and call `FLUSHALL` directly
+   on that owned connection. Assert the seed and database are empty and the
+   `flushall` command counter moved exactly once, then compare the exact durable
+   snapshot and claim trace before/after. The existing denial/authorized-read
+   phase runs next against the post-flush authority. This is one single-node
+   fixture witness, not failover or HA evidence.
+8. Attempt a push with the read-only token and with an unrelated actor; assert
    both fail, the durable snapshot is unchanged, and an authorized read-only
    clone still reproduces the latest acknowledged OID with `fsck --full
    --strict`.
-8. Read back with stock Git (`ls-remote`, clone, `fsck`) and compare the durable
+9. Read back with stock Git (`ls-remote`, clone, `fsck`) and compare the durable
    rows to the pre-hint snapshot. A resubscribe catch-up scan or an embedded local
    Notify is never accepted as healthy steady-state wake evidence; each healthy
    phase requires the publish/forwarded counters and the pre-poll deadline.
@@ -175,8 +183,9 @@ owner for each audit-log insert/lease/delivery. The final delivered row must nam
 another process. The test must also verify auth/refusal behavior with a read-only
 token and an outside/unauthorized actor, and must keep the existing A4 root/hold
 assertions in the post-commit snapshot rather than inventing SQL rows. Redis key
-contents are never used as evidence of authority; the only Redis evidence is the
-fixed hint counter, subscriber count and relay forwarding.
+contents are never used as authority evidence; Redis evidence is limited to the
+fixed hint counters, subscriber count, relay forwarding, and the owned-fixture
+seed/`flushall` counter used only to prove the destructive witness actually ran.
 
 ## Partition and duplicate boundaries
 
@@ -233,6 +242,16 @@ cleanup both fail, the case keeps the primary error and also adds
 `cleanup_error: "cleanup"`; a later cleanup failure can never make the report
 pass. If cleanup fails after an otherwise successful case, the case is failed
 with `error: "cleanup"` and `cleanup_failed: true`.
+
+Passing details are projected onto a fixed typed schema: only exact booleans,
+positive integer counts and canonical UUID operation identifiers are admitted;
+unknown fields are dropped and a known field with the wrong type fails the
+report closed. The additive `owned_flushall` stage reports only closed codes
+(`baseline_idle`, `baseline_snapshot`, `baseline_claim`, `baseline_operation`,
+`ownership`, `seed`, `flush`, `wipe`, `snapshot_equality`, `claim_equality`,
+`post_operation`, `unavailable`) and fixed boolean witness fields such as
+`owned_flushall_verified`; it never emits a path, URL, token, key or Redis
+reply body.
 
 ## Explicit non-goals
 

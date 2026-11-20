@@ -1,6 +1,8 @@
 """Pure tests for the opt-in external A4 Redis wake acceptance harness."""
+import os
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 import threading
 import unittest
@@ -38,6 +40,9 @@ class SourceBindingTest(unittest.TestCase):
         self.assertIn("PR_SET_CHILD_SUBREAPER", script)
         self.assertIn("os.waitpid(-1, os.WNOHANG)", script)
         self.assertIn("containment_factory=LinuxChildSubreaper.install", script)
+        self.assertIn("owned_redis.flushall_owned()", script)
+        self.assertLess(a4.CASE_STAGES.index("healed_wake"), a4.CASE_STAGES.index("owned_flushall"))
+        self.assertLess(a4.CASE_STAGES.index("owned_flushall"), a4.CASE_STAGES.index("denials"))
 
 
 class SnapshotProjectionTest(unittest.TestCase):
@@ -199,6 +204,7 @@ class ReportTest(unittest.TestCase):
             with self.subTest(stage=stage):
                 harness.reset_mock()
                 harness.run_case.side_effect = RuntimeError("fixture-specific") if stage == "case" else None
+                harness.run_case.return_value = {"healthy_wake_before_poll": True}
                 self.build.return_value = {} if stage == "receipt_changed" else self.binding
                 harness.cleanup.side_effect = RuntimeError("cleanup-specific") if stage == "cleanup" else None
                 report = a4.acceptance_report(self.args)
@@ -250,6 +256,63 @@ class ReportTest(unittest.TestCase):
         self.assertNotIn("repo_create", repr(report["cases"]))
         self.assertNotIn("worker_startup", repr(report["cases"]))
         self.assertNotIn("invalid_hints", repr(report["cases"]))
+        self.assertNotIn("owned_flushall", repr(report["cases"]))
+
+    def test_owned_flushall_failure_reports_fixed_code(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private Redis socket")
+        harness.case_stage = "owned_flushall"
+        harness.flushall_code = "ownership"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case",
+            stage="owned_flushall", owned_flushall="ownership",
+        )])
+        self.assertNotIn("private", repr(report))
+
+    def test_owned_flushall_failure_rejects_unknown_or_missing_code(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private Redis socket")
+        harness.case_stage = "owned_flushall"
+        for code in (None, "private/socket", ["ownership"], 7):
+            with self.subTest(code=code):
+                harness.flushall_code = code
+                report = a4.acceptance_report(self.args)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["cases"], [dict(
+                    name=a4.CASE, status="failed", error="case",
+                    stage="owned_flushall", owned_flushall="unavailable",
+                )])
+                self.assertNotIn("private", repr(report))
+
+    def test_passing_detail_is_projected_onto_fixed_typed_schema(self):
+        valid = {
+            "owned_flushall_verified": True,
+            "owned_flushall_preserved_snapshot": True,
+            "poll_seconds": 20,
+            "initial_operation": "11111111-1111-1111-1111-111111111111",
+        }
+        self.assertEqual(a4.validate_case_detail(valid), valid)
+        self.assertEqual(a4.validate_case_detail({"private": "secret"}), {})
+        for field, value in (
+            ("owned_flushall_verified", 1),
+            ("owned_flushall_verified", "true"),
+            ("poll_seconds", True),
+            ("poll_seconds", 0),
+            ("initial_operation", "private/repo"),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(AssertionError):
+                    a4.validate_case_detail({field: value})
+
+    def test_invalid_passing_detail_fails_report_without_echoing_it(self):
+        harness = self.factory.return_value
+        harness.run_case.return_value = {"owned_flushall_verified": "private-detail"}
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(name=a4.CASE, status="failed", error="case")])
+        self.assertNotIn("private", repr(report))
 
     def test_worker_startup_failure_reports_fixed_code(self):
         harness = self.factory.return_value
@@ -455,6 +518,44 @@ class CaseStageTest(unittest.TestCase):
             harness.run_case()
         self.assertEqual(harness.case_stage, "healthy_push")
 
+    def test_real_run_case_runs_owned_flushall_after_heal_before_denials(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.case_stage = None
+        harness.base = ""
+        harness.root = Path("/tmp/a4-stage")
+        harness.alice = object()
+        harness.create = Mock(return_value=({"id": "repo", "clone_path": "/repo"}, None))
+        harness.empty_clone = Mock()
+        harness.configure = Mock()
+        harness.commit_and_push = Mock(return_value=("a" * 40, "11111111-1111-1111-1111-111111111111", None))
+        harness.assert_ref = Mock()
+        harness.assert_no_embedded_delivery = Mock()
+        harness.start_external_worker = Mock(return_value=0.0)
+        harness.healthy_push = Mock(return_value=(
+            "b" * 40, "22222222-2222-2222-2222-222222222222"))
+        harness.duplicate_and_invalid_hints = Mock()
+        harness.cut_fallback_push = Mock(return_value=(
+            "d" * 40, "33333333-3333-3333-3333-333333333333"))
+        events = []
+        harness.healed_push = Mock(side_effect=lambda *_args: events.append("healed") or (
+            "e" * 40, "44444444-4444-4444-4444-444444444444"))
+        harness.owned_flushall_witness = Mock(side_effect=lambda *_args: events.append("flush") or {
+            "owned_flushall_verified": True,
+        })
+        harness.assert_denials = Mock(side_effect=lambda *_args: events.append("denials"))
+        harness.snapshot = Mock(return_value={"legacy_projection": "0", "projection_jobs": "0"})
+
+        detail = harness.run_case()
+
+        self.assertEqual(events, ["healed", "flush", "denials"])
+        harness.owned_flushall_witness.assert_called_once_with(
+            {"id": "repo", "clone_path": "/repo"},
+            "e" * 40,
+            "44444444-4444-4444-4444-444444444444",
+        )
+        self.assertTrue(detail["owned_flushall_verified"])
+        self.assertEqual(harness.case_stage, "final_assertions")
+
     def test_real_run_case_tracks_repo_create_code(self):
         harness = object.__new__(a4.A4RedisWakeHarness)
         harness.case_stage = None
@@ -537,6 +638,217 @@ class InvalidHintsTest(unittest.TestCase):
             call("PUBLISH", harness.channel, b"wrong-version"),
             call("PUBLISH", "rootyard:a4:test:other", b"v1"),
         ])
+
+
+class OwnedFlushallTest(unittest.TestCase):
+    def _harness(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.flushall_code = None
+        harness.schema = "rootyard_e2e_fixture"
+        harness.settle_worker = Mock()
+        harness.snapshot = Mock(return_value="snapshot")
+        harness.claim_rows = Mock(return_value="claims")
+        harness.redis_command = Mock()
+        harness.prove_owned_redis = Mock()
+        harness.owned_redis = Mock()
+        harness.assert_claim = Mock()
+        harness.assert_operation = Mock()
+        return harness
+
+    def _seed(self, harness, after_exists=0, after_size=0):
+        key = b"rootyard:a4:test:" + harness.schema.encode() + b":flush:" + b"a" * 32
+        value = b"b" * 32
+        harness.redis_command.side_effect = [
+            b"OK", value, -1, 1, after_exists, after_size,
+        ]
+        return key, value
+
+    def test_success_flushes_only_after_ownership_and_preserves_exact_authority(self):
+        harness = self._harness()
+        key, value = self._seed(harness)
+        with patch.object(a4.uuid, "uuid4", side_effect=[Mock(hex="a" * 32), Mock(hex="b" * 32)]):
+            detail = harness.owned_flushall_witness({"id": "repo"}, "c" * 40, "operation")
+        self.assertIsNone(harness.flushall_code)
+        self.assertEqual(harness.settle_worker.call_count, 1)
+        self.assertEqual(harness.snapshot.call_args_list, [call("repo"), call("repo")])
+        self.assertEqual(harness.claim_rows.call_args_list, [call("repo"), call("repo")])
+        self.assertEqual(harness.prove_owned_redis.call_count, 2)
+        self.assertEqual(harness.owned_redis.flushall_owned.call_args_list, [call()])
+        self.assertEqual(harness.owned_redis.counts.call_args_list, [call(expected_flushes=1)])
+        self.assertEqual(harness.assert_claim.call_args_list, [call("operation"), call("operation")])
+        self.assertEqual(harness.assert_operation.call_args_list, [
+            call("repo", "operation", "c" * 40, delivered=True),
+            call("repo", "operation", "c" * 40, delivered=True),
+        ])
+        self.assertEqual(harness.redis_command.call_args_list, [
+            call("SET", key, value),
+            call("GET", key),
+            call("PTTL", key),
+            call("EXISTS", key),
+            call("EXISTS", key),
+            call("DBSIZE"),
+        ])
+        self.assertEqual(detail, {
+            "owned_flushall_verified": True,
+            "owned_flushall_loopback_only": True,
+            "owned_flushall_runtime_scoped": True,
+            "owned_flushall_seed_removed": True,
+            "owned_flushall_preserved_snapshot": True,
+            "owned_flushall_preserved_claim": True,
+            "owned_flushall_preserved_operation": True,
+        })
+
+    def test_ownership_failure_never_seeds_or_calls_flushall(self):
+        harness = self._harness()
+        harness.prove_owned_redis.side_effect = AssertionError("private socket detail")
+        with self.assertRaisesRegex(AssertionError, "private socket detail"):
+            harness.owned_flushall_witness({"id": "repo"}, "c" * 40, "operation")
+        self.assertEqual(harness.flushall_code, "ownership")
+        harness.redis_command.assert_not_called()
+        harness.owned_redis.flushall_owned.assert_not_called()
+        self.assertNotIn("private", harness.flushall_code)
+
+    def test_failure_rails_are_closed_and_first_failure_wins(self):
+        cases = {
+            "baseline_idle": lambda harness: setattr(
+                harness.settle_worker, "side_effect", RuntimeError("private")),
+            "baseline_snapshot": lambda harness: setattr(
+                harness.snapshot, "side_effect", RuntimeError("private")),
+            "baseline_claim": lambda harness: setattr(
+                harness.claim_rows, "side_effect", RuntimeError("private")),
+            "baseline_operation": lambda harness: setattr(
+                harness.assert_claim, "side_effect", RuntimeError("private")),
+            "ownership": lambda harness: setattr(
+                harness.prove_owned_redis, "side_effect", RuntimeError("private")),
+            "seed": lambda harness: setattr(
+                harness.redis_command, "side_effect", RuntimeError("private")),
+            "flush": lambda harness: setattr(
+                harness.owned_redis.flushall_owned, "side_effect", RuntimeError("private")),
+            "wipe": lambda harness: self._seed(harness, after_exists=1),
+            "snapshot_equality": lambda harness: setattr(
+                harness.snapshot, "side_effect", ["before", "after"]),
+            "claim_equality": lambda harness: setattr(
+                harness.claim_rows, "side_effect", ["before", "after"]),
+            "post_operation": lambda harness: setattr(
+                harness.assert_operation, "side_effect", [None, RuntimeError("private")]),
+        }
+        self.assertEqual(set(cases), set(a4.OWNED_FLUSHALL_CODES) - {"unavailable"})
+        for expected, configure in cases.items():
+            with self.subTest(code=expected):
+                harness = self._harness()
+                if expected in {"flush", "wipe", "snapshot_equality", "claim_equality", "post_operation"}:
+                    self._seed(harness)
+                configure(harness)
+                with patch.object(a4.uuid, "uuid4", side_effect=[
+                    Mock(hex="a" * 32), Mock(hex="b" * 32),
+                ]):
+                    with self.assertRaises((AssertionError, RuntimeError)):
+                        harness.owned_flushall_witness({"id": "repo"}, "c" * 40, "operation")
+                self.assertEqual(harness.flushall_code, expected)
+
+    def test_seed_key_is_unique_and_non_expiring(self):
+        harness = self._harness()
+        harness.redis_command = Mock(side_effect=[
+            b"OK", b"b" * 32, -1, 1, b"OK", b"d" * 32, -1, 1,
+        ])
+        with patch.object(a4.uuid, "uuid4", side_effect=[
+            Mock(hex="a" * 32), Mock(hex="b" * 32),
+            Mock(hex="c" * 32), Mock(hex="d" * 32),
+        ]):
+            first = harness.seed_owned_flush_key()
+            second = harness.seed_owned_flush_key()
+        self.assertNotEqual(first, second)
+        self.assertIn(b"rootyard:a4:test:rootyard_e2e_fixture:flush:", first)
+        self.assertEqual(harness.redis_command.call_args_list, [
+            call("SET", first, b"b" * 32),
+            call("GET", first),
+            call("PTTL", first),
+            call("EXISTS", first),
+            call("SET", second, b"d" * 32),
+            call("GET", second),
+            call("PTTL", second),
+            call("EXISTS", second),
+        ])
+
+
+class OwnedRedisOwnershipTest(unittest.TestCase):
+    def _harness(self, root, *, bind=b"127.0.0.1", runtime=None, pid=12345,
+                 port=6399, client_port=6399, server_pid=None, server_port=None):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.redis_started = True
+        harness.root = Path(root)
+        process = SimpleNamespace(pid=pid, poll=lambda: None)
+        redis = Mock()
+        redis.process = process
+        redis.run_id = b"a" * 40
+        redis.redis_port = port
+        redis.identity.return_value = redis.run_id
+        server = (
+            b"process_id:" + str(server_pid if server_pid is not None else pid).encode()
+            + b"\r\nrun_id:" + redis.run_id
+            + b"\r\ntcp_port:" + str(server_port if server_port is not None else port).encode()
+            + b"\r\n"
+        )
+        client = (
+            b"id=1 addr=127.0.0.1:50000 laddr=127.0.0.1:"
+            + str(client_port).encode() + b" fd=9 name= age=0\n"
+        )
+        redis.redis_command.side_effect = [
+            [b"bind", bind],
+            [b"dir", os.fsencode(str(runtime if runtime is not None else root))],
+            server,
+            client,
+        ]
+        harness.owned_redis = redis
+        return harness, redis
+
+    def test_exact_process_socket_and_runtime_are_required_and_proven(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        harness, redis = self._harness(root)
+        with patch.object(a4, "process_cwd", return_value=Path(root)):
+            self.assertEqual(harness.prove_owned_redis(), redis.run_id)
+        self.assertEqual(redis.identity.call_count, 1)
+        self.assertEqual(redis.redis_command.call_args_list, [
+            call("CONFIG", "GET", "bind"),
+            call("CONFIG", "GET", "dir"),
+            call("INFO", "server"),
+            call("CLIENT", "INFO"),
+        ])
+
+    def test_non_loopback_or_wrong_runtime_and_port_fail_closed(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        other = self.enterContext(tempfile.TemporaryDirectory())
+        cases = (
+            ("bind", dict(bind=b"0.0.0.0"), "loopback-only"),
+            ("runtime", dict(runtime=other), "runtime directory is not fixture-scoped"),
+            ("pid", dict(server_pid=54321), "PID differs"),
+            ("port", dict(server_port=6398), "TCP port differs"),
+            ("client", dict(client_port=6398), "command socket is not the fixture loopback port"),
+        )
+        for name, options, message in cases:
+            with self.subTest(name=name):
+                harness, _ = self._harness(root, **options)
+                with patch.object(a4, "process_cwd", return_value=Path(root)):
+                    with self.assertRaisesRegex(AssertionError, message):
+                        harness.prove_owned_redis()
+
+    def test_foreign_process_cwd_is_refused_before_any_server_query(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        other = self.enterContext(tempfile.TemporaryDirectory())
+        harness, redis = self._harness(root)
+        with patch.object(a4, "process_cwd", return_value=Path(other)):
+            with self.assertRaisesRegex(AssertionError, "runtime is not fixture-scoped"):
+                harness.prove_owned_redis()
+        redis.redis_command.assert_not_called()
+
+    def test_exited_process_is_refused_before_any_server_query(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        harness, redis = self._harness(root)
+        redis.process.poll = Mock(return_value=1)
+        with self.assertRaisesRegex(AssertionError, "exited"):
+            harness.prove_owned_redis()
+        redis.identity.assert_not_called()
+        redis.redis_command.assert_not_called()
 
 
 class WorkerEnvironmentTest(unittest.TestCase):
