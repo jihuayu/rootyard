@@ -314,6 +314,12 @@ jobs:
               "spawn", "worker_exit_zero", "worker_exit_nonzero", "subscribe", "relay",
               "catch_up", "claim", "durable_binding", "settle_idle", "unavailable",
           }
+          INVALID_HINT_CODES = {
+              "baseline_idle", "baseline_snapshot", "baseline_claim",
+              "duplicate_publish", "wrong_version_publish", "other_channel_publish",
+              "subscriber_recovery", "post_probe_idle", "snapshot_equality",
+              "claim_equality", "unavailable",
+          }
           HEX = re.compile(r"^[0-9a-f]{64}$")
           FAIL = {"preflight", "fixture", "case", "receipt_changed", "cleanup"}
           ROOT = pathlib.Path.cwd()
@@ -405,6 +411,13 @@ jobs:
               return code if isinstance(code, str) and code in WORKER_STARTUP_CODES else "unavailable"
 
 
+          def failed_invalid_hints_code(case):
+              if not isinstance(case, dict) or case.get("status") != "failed" or case.get("stage") != "invalid_hints":
+                  return None
+              code = case.get("invalid_hints")
+              return code if isinstance(code, str) and code in INVALID_HINT_CODES else "unavailable"
+
+
           def case_evidence(case, observations):
               case = case if isinstance(case, dict) else {}
               view = {"name": case.get("name"), "status": case.get("status"), "observations": observations}
@@ -417,6 +430,9 @@ jobs:
               worker_startup = failed_worker_startup_code(case)
               if worker_startup is not None:
                   view["worker_startup"] = worker_startup
+              invalid_hints = failed_invalid_hints_code(case)
+              if invalid_hints is not None:
+                  view["invalid_hints"] = invalid_hints
               return view
 
 

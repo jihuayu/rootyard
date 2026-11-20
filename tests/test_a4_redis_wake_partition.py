@@ -224,6 +224,7 @@ class ReportTest(unittest.TestCase):
         self.assertNotIn("stage", repr(report["cases"]))
         self.assertNotIn("repo_create", repr(report["cases"]))
         self.assertNotIn("worker_startup", repr(report["cases"]))
+        self.assertNotIn("invalid_hints", repr(report["cases"]))
 
     def test_worker_startup_failure_reports_fixed_code(self):
         harness = self.factory.return_value
@@ -318,6 +319,59 @@ class ReportTest(unittest.TestCase):
         )])
         self.assertNotIn("repo_create", repr(report["cases"]))
 
+    def test_invalid_hints_failure_reports_fixed_code(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private SQL row")
+        harness.case_stage = "invalid_hints"
+        harness.invalid_hints_code = "subscriber_recovery"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case",
+            stage="invalid_hints", invalid_hints="subscriber_recovery",
+        )])
+        self.assertNotIn("private", repr(report))
+
+    def test_invalid_hints_failure_reports_closed_unavailable(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private SQL row")
+        harness.case_stage = "invalid_hints"
+        harness.invalid_hints_code = "unavailable"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case",
+            stage="invalid_hints", invalid_hints="unavailable",
+        )])
+        self.assertNotIn("private", repr(report))
+
+    def test_invalid_hints_failure_rejects_unknown_or_missing_code(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private SQL row")
+        harness.case_stage = "invalid_hints"
+        for code in (None, "private/sql/row", ["snapshot_equality"], 7):
+            with self.subTest(code=code):
+                harness.invalid_hints_code = code
+                report = a4.acceptance_report(self.args)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["cases"], [dict(
+                    name=a4.CASE, status="failed", error="case",
+                    stage="invalid_hints", invalid_hints="unavailable",
+                )])
+                self.assertNotIn("private", repr(report))
+
+    def test_invalid_hints_code_not_emitted_for_other_stage(self):
+        harness = self.factory.return_value
+        harness.run_case.side_effect = RuntimeError("private SQL row")
+        harness.case_stage = "healthy_push"
+        harness.invalid_hints_code = "snapshot_equality"
+        report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(
+            name=a4.CASE, status="failed", error="case", stage="healthy_push",
+        )])
+        self.assertNotIn("invalid_hints", repr(report["cases"]))
+
     def test_primary_failure_precedes_cleanup_failure_but_records_it(self):
         harness = self.factory.return_value
         harness.run_case.side_effect = RuntimeError("primary case failure")
@@ -394,6 +448,70 @@ class CaseStageTest(unittest.TestCase):
         harness.repo_create_code = None
         harness.observe_repo_create("private/repo/url")
         self.assertIsNone(harness.repo_create_code)
+
+
+class InvalidHintsTest(unittest.TestCase):
+    def _harness(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.invalid_hints_code = None
+        harness.channel = "rootyard:a4:test:schema"
+        harness.settle_worker = Mock()
+        harness.snapshot = Mock(return_value="snapshot")
+        harness.claim_rows = Mock(return_value="claims")
+        harness.redis_command = Mock()
+        harness.until = Mock()
+        harness.subscriber_count = Mock(return_value=1)
+        return harness
+
+    def test_failure_rails_are_closed_and_first_failure_wins(self):
+        cases = {
+            "baseline_idle": lambda harness: setattr(
+                harness.settle_worker, "side_effect", RuntimeError("private")),
+            "baseline_snapshot": lambda harness: setattr(
+                harness.snapshot, "side_effect", RuntimeError("private")),
+            "baseline_claim": lambda harness: setattr(
+                harness.claim_rows, "side_effect", RuntimeError("private")),
+            "duplicate_publish": lambda harness: setattr(
+                harness.redis_command, "side_effect", RuntimeError("private")),
+            "wrong_version_publish": lambda harness: setattr(
+                harness.redis_command, "side_effect", [None] * 10 + [RuntimeError("private")]),
+            "other_channel_publish": lambda harness: setattr(
+                harness.redis_command, "side_effect", [None] * 11 + [RuntimeError("private")]),
+            "subscriber_recovery": lambda harness: setattr(
+                harness.until, "side_effect", RuntimeError("private")),
+            "post_probe_idle": lambda harness: setattr(
+                harness.settle_worker, "side_effect", [None, RuntimeError("private")]),
+            "snapshot_equality": lambda harness: setattr(
+                harness.snapshot, "side_effect", ["before", "after"]),
+            "claim_equality": lambda harness: setattr(
+                harness.claim_rows, "side_effect", ["before", "after"]),
+        }
+        self.assertEqual(set(cases), set(a4.INVALID_HINT_CODES) - {"unavailable"})
+        for expected, configure in cases.items():
+            with self.subTest(code=expected):
+                harness = self._harness()
+                configure(harness)
+                with patch.object(a4.time, "sleep"):
+                    with self.assertRaises((AssertionError, RuntimeError)):
+                        harness.duplicate_and_invalid_hints({"id": "repo"})
+                self.assertEqual(harness.invalid_hints_code, expected)
+
+    def test_success_keeps_probe_order_and_emits_no_code(self):
+        harness = self._harness()
+        with patch.object(a4.time, "sleep") as sleep:
+            harness.duplicate_and_invalid_hints({"id": "repo"})
+        self.assertIsNone(harness.invalid_hints_code)
+        self.assertEqual(harness.settle_worker.call_count, 2)
+        self.assertEqual(harness.snapshot.call_args_list, [call("repo"), call("repo")])
+        self.assertEqual(harness.claim_rows.call_args_list, [call("repo"), call("repo")])
+        self.assertEqual(harness.until.call_count, 1)
+        self.assertEqual(sleep.call_args_list, [call(0.5)])
+        self.assertEqual(harness.redis_command.call_args_list, [
+            call("PUBLISH", harness.channel, b"v1"),
+        ] * 10 + [
+            call("PUBLISH", harness.channel, b"wrong-version"),
+            call("PUBLISH", "rootyard:a4:test:other", b"v1"),
+        ])
 
 
 class WorkerEnvironmentTest(unittest.TestCase):

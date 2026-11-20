@@ -52,6 +52,7 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         self.case_stages = namespace["CASE_STAGES"]
         self.repo_create_codes = namespace["REPO_CREATE_CODES"]
         self.worker_startup_codes = namespace["WORKER_STARTUP_CODES"]
+        self.invalid_hints_codes = namespace["INVALID_HINT_CODES"]
         self.phase_path = self.runner / "a4" / "native-tools-phase.json"
         self.wrapper_sha = hashlib.sha256(
             (self.workspace / "scripts" / "install_ci_native_tools.sh").read_bytes()
@@ -297,6 +298,43 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
              "worker_startup": "catch_up"}, observations
         )
         self.assertNotIn("worker_startup", passed)
+
+    def test_invalid_hints_evidence_uses_only_whitelisted_codes(self):
+        self.assertEqual(self.invalid_hints_codes, set(a4.INVALID_HINT_CODES))
+        observations = {"owned_cleanup_completed": False}
+        failed = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "invalid_hints",
+             "invalid_hints": "snapshot_equality"}, observations
+        )
+        self.assertEqual(failed["stage"], "invalid_hints")
+        self.assertEqual(failed["invalid_hints"], "snapshot_equality")
+        missing = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "invalid_hints"}, observations
+        )
+        self.assertEqual(missing["invalid_hints"], "unavailable")
+        closed = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "invalid_hints",
+             "invalid_hints": "unavailable"}, observations
+        )
+        self.assertEqual(closed["invalid_hints"], "unavailable")
+        for bad_code in ("private/sql/row", "", 7, ["claim_equality"], {"code": "baseline_idle"}):
+            with self.subTest(code=bad_code):
+                rejected = self.case_evidence(
+                    {"name": a4.CASE, "status": "failed", "stage": "invalid_hints",
+                     "invalid_hints": bad_code}, observations
+                )
+                self.assertEqual(rejected["invalid_hints"], "unavailable")
+                self.assertNotIn("private", repr(rejected))
+        other_stage = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "healthy_push",
+             "invalid_hints": "snapshot_equality"}, observations
+        )
+        self.assertNotIn("invalid_hints", other_stage)
+        passed = self.case_evidence(
+            {"name": a4.CASE, "status": "passed", "stage": "invalid_hints",
+             "invalid_hints": "snapshot_equality"}, observations
+        )
+        self.assertNotIn("invalid_hints", passed)
 
 
 

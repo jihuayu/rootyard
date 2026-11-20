@@ -104,6 +104,19 @@ WORKER_STARTUP_CODES = (
     "settle_idle",
     "unavailable",
 )
+INVALID_HINT_CODES = (
+    "baseline_idle",
+    "baseline_snapshot",
+    "baseline_claim",
+    "duplicate_publish",
+    "wrong_version_publish",
+    "other_channel_publish",
+    "subscriber_recovery",
+    "post_probe_idle",
+    "snapshot_equality",
+    "claim_equality",
+    "unavailable",
+)
 REPORT_KIND = "rootyard/a4-redis-wake-external-acceptance"
 WORKER_NAME = "rootyard_a4_redis_wake_worker"
 TARGET_KIND = "pg_refstore_core_commit_audit"
@@ -218,6 +231,7 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         self.case_stage = None
         self.repo_create_code = None
         self.worker_startup_code = None
+        self.invalid_hints_code = None
 
     # ---- owned processes -------------------------------------------------
     def stop_workers(self):
@@ -718,18 +732,60 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         return oid, operation
 
     def duplicate_and_invalid_hints(self, repo):
-        self.settle_worker()
-        before = self.snapshot(repo["id"])
-        claims = self.claim_rows(repo["id"])
-        for _ in range(10):
-            self.redis_command("PUBLISH", self.channel, b"v1")
-        self.redis_command("PUBLISH", self.channel, b"wrong-version")
-        self.redis_command("PUBLISH", "rootyard:a4:test:other", b"v1")
+        # Record only a closed stage code when this probe fails. Success keeps
+        # every existing assertion and returns without emitting a code.
+        try:
+            self.settle_worker()
+        except Exception:
+            self.observe_invalid_hints("baseline_idle")
+            raise
+        try:
+            before = self.snapshot(repo["id"])
+        except Exception:
+            self.observe_invalid_hints("baseline_snapshot")
+            raise
+        try:
+            claims = self.claim_rows(repo["id"])
+        except Exception:
+            self.observe_invalid_hints("baseline_claim")
+            raise
+        try:
+            for _ in range(10):
+                self.redis_command("PUBLISH", self.channel, b"v1")
+        except Exception:
+            self.observe_invalid_hints("duplicate_publish")
+            raise
+        try:
+            self.redis_command("PUBLISH", self.channel, b"wrong-version")
+        except Exception:
+            self.observe_invalid_hints("wrong_version_publish")
+            raise
+        try:
+            self.redis_command("PUBLISH", "rootyard:a4:test:other", b"v1")
+        except Exception:
+            self.observe_invalid_hints("other_channel_publish")
+            raise
         time.sleep(0.5)
-        self.until(lambda: self.subscriber_count() == 1, "subscriber recovered from invalid hints", 10)
-        self.settle_worker()
-        assert self.snapshot(repo["id"]) == before, "duplicate/invalid hints changed durable authority"
-        assert self.claim_rows(repo["id"]) == claims, "duplicate/invalid hints created a new claim"
+        try:
+            self.until(lambda: self.subscriber_count() == 1, "subscriber recovered from invalid hints", 10)
+        except Exception:
+            self.observe_invalid_hints("subscriber_recovery")
+            raise
+        try:
+            self.settle_worker()
+        except Exception:
+            self.observe_invalid_hints("post_probe_idle")
+            raise
+        try:
+            assert self.snapshot(repo["id"]) == before, "duplicate/invalid hints changed durable authority"
+        except Exception:
+            self.observe_invalid_hints("snapshot_equality")
+            raise
+        try:
+            assert self.claim_rows(repo["id"]) == claims, "duplicate/invalid hints created a new claim"
+        except Exception:
+            self.observe_invalid_hints("claim_equality")
+            raise
 
     def cut_fallback_push(self, work, repo, first_poll):
         self.settle_worker()
@@ -803,6 +859,10 @@ class A4RedisWakeHarness(BlobOnlyHarness):
     def observe_repo_create(self, code):
         if self.repo_create_code is None and code in REPO_CREATE_CODES:
             self.repo_create_code = code
+
+    def observe_invalid_hints(self, code):
+        if self.invalid_hints_code is None and code in INVALID_HINT_CODES:
+            self.invalid_hints_code = code
 
     def _worker_failure_code(self, default):
         try:
@@ -1018,6 +1078,9 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None, containment
                 if stage == "worker_startup":
                     code = getattr(harness, "worker_startup_code", None)
                     case["worker_startup"] = code if isinstance(code, str) and code in WORKER_STARTUP_CODES else "unavailable"
+                if stage == "invalid_hints":
+                    code = getattr(harness, "invalid_hints_code", None)
+                    case["invalid_hints"] = code if isinstance(code, str) and code in INVALID_HINT_CODES else "unavailable"
         if cleanup_error is not None:
             case["cleanup_failed"] = True
         if primary is not None and cleanup_error is not None:
