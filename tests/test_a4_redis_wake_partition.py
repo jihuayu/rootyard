@@ -396,6 +396,25 @@ class CaseStageTest(unittest.TestCase):
         self.assertIsNone(harness.repo_create_code)
 
 
+class WorkerEnvironmentTest(unittest.TestCase):
+    def test_worker_forces_external_schema_mode_only_in_its_child_copy(self):
+        for inherited in (None, "auto"):
+            with self.subTest(inherited=inherited):
+                harness = object.__new__(a4.A4RedisWakeHarness)
+                harness.channel = "rootyard:a4:test:schema"
+                harness.relay = SimpleNamespace(port=6379)
+                harness.env = {"DATABASE_URL": "postgresql://fixture@127.0.0.1/db"}
+                if inherited is not None:
+                    harness.env["ROOTYARD_SCHEMA_MODE"] = inherited
+                parent = dict(harness.env)
+
+                child = harness.worker_env()
+
+                self.assertEqual(child["ROOTYARD_SCHEMA_MODE"], "external")
+                self.assertEqual(harness.env, parent)
+                self.assertIsNot(child, harness.env)
+
+
 class WorkerStartupTest(unittest.TestCase):
     def _harness(self, exit_code=None, subscriber=0, relay_active=0):
         harness = object.__new__(a4.A4RedisWakeHarness)

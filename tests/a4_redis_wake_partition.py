@@ -276,7 +276,11 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         env["DATABASE_URL"] = urllib.parse.urlunsplit(
             db._replace(query=urllib.parse.urlencode(query + [("application_name", WORKER_NAME)]))
         )
+        # The fixture migrates its owned schema once before serving. The serving
+        # process retains the shared startup barrier, so the worker must not
+        # inherit auto/default and request the exclusive migration lock.
         env.update(
+            ROOTYARD_SCHEMA_MODE="external",
             ROOTYARD_WORKER_SCOPE="a4-target-audit",
             ROOTYARD_A4_WAKE_TRANSPORT="redis",
             ROOTYARD_REDIS_URL=f"redis://127.0.0.1:{self.relay.port}/0",
