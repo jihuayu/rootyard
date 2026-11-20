@@ -88,16 +88,16 @@ async fn cancelled_caller_keeps_serialization_lock_until_blocking_raft_apply_fin
     assert!(err.is_cancelled());
     events.lock().unwrap().push("caller-1-cancelled");
     let handle2 = {
-        let (serialize, events) = (serialize.clone(), events.clone());
+        let (serialize, read_events, apply_events) = (serialize.clone(), events.clone(), events.clone());
         tokio::spawn(async move {
             run_serialized_pg_to_raft_step(
                 serialize,
                 || async move {
-                    events.lock().unwrap().push("read-2");
+                    read_events.lock().unwrap().push("read-2");
                     Ok(())
                 },
                 move |()| {
-                    events.lock().unwrap().push("apply-2");
+                    apply_events.lock().unwrap().push("apply-2");
                     Ok(())
                 },
             )
