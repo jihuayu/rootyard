@@ -53,6 +53,7 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         self.repo_create_codes = namespace["REPO_CREATE_CODES"]
         self.worker_startup_codes = namespace["WORKER_STARTUP_CODES"]
         self.invalid_hints_codes = namespace["INVALID_HINT_CODES"]
+        self.owned_flushall_codes = namespace["OWNED_FLUSHALL_CODES"]
         self.phase_path = self.runner / "a4" / "native-tools-phase.json"
         self.wrapper_sha = hashlib.sha256(
             (self.workspace / "scripts" / "install_ci_native_tools.sh").read_bytes()
@@ -236,6 +237,46 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
              "repo_create": "post_status_5xx"}, observations
         )
         self.assertNotIn("repo_create", passed)
+
+
+    def test_owned_flushall_evidence_uses_only_whitelisted_codes(self):
+        self.assertEqual(self.owned_flushall_codes, set(a4.OWNED_FLUSHALL_CODES))
+        observations = {"owned_cleanup_completed": False}
+        failed = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "owned_flushall",
+             "owned_flushall": "ownership"}, observations
+        )
+        self.assertEqual(failed["stage"], "owned_flushall")
+        self.assertEqual(failed["owned_flushall"], "ownership")
+        missing = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "owned_flushall"}, observations
+        )
+        self.assertEqual(missing["owned_flushall"], "unavailable")
+        closed = self.case_evidence(
+            {"name": a4.CASE, "status": "failed", "stage": "owned_flushall",
+             "owned_flushall": "unavailable"}, observations
+        )
+        self.assertEqual(closed["owned_flushall"], "unavailable")
+        for bad_code in ("private/socket/path", "", 7, ["ownership"], {"code": "flush"}):
+            with self.subTest(code=bad_code):
+                rejected = self.case_evidence(
+                    {"name": a4.CASE, "status": "failed", "stage": "owned_flushall",
+                     "owned_flushall": bad_code}, observations
+                )
+                self.assertEqual(rejected["owned_flushall"], "unavailable")
+                self.assertNotIn("private", repr(rejected))
+        for other_stage in ("healthy_push", "healed_wake", "denials"):
+            with self.subTest(cross_stage=other_stage):
+                cross = self.case_evidence(
+                    {"name": a4.CASE, "status": "failed", "stage": other_stage,
+                     "owned_flushall": "ownership"}, observations
+                )
+                self.assertNotIn("owned_flushall", cross)
+        passed = self.case_evidence(
+            {"name": a4.CASE, "status": "passed", "stage": "owned_flushall",
+             "owned_flushall": "ownership"}, observations
+        )
+        self.assertNotIn("owned_flushall", passed)
 
 
     def test_workflow_prepares_public_cluster_authority_before_harness(self):

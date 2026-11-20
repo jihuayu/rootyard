@@ -302,7 +302,7 @@ jobs:
           CASE_STAGES = {
               "repo_create", "empty_clone", "initial_push", "pre_worker_assertions",
               "worker_startup", "healthy_push", "invalid_hints", "redis_cut_pg_fallback",
-              "healed_wake", "denials", "final_assertions",
+              "healed_wake", "owned_flushall", "denials", "final_assertions",
           }
           REPO_CREATE_CODES = {
               "post_send", "post_status_4xx", "post_status_5xx", "post_status_other",
@@ -319,6 +319,12 @@ jobs:
               "duplicate_publish", "wrong_version_publish", "other_channel_publish",
               "subscriber_recovery", "post_probe_idle", "snapshot_equality",
               "claim_equality", "unavailable",
+          }
+          OWNED_FLUSHALL_CODES = {
+              "baseline_idle", "baseline_snapshot", "baseline_claim",
+              "baseline_operation", "ownership", "seed", "flush", "wipe",
+              "snapshot_equality", "claim_equality", "post_operation",
+              "unavailable",
           }
           HEX = re.compile(r"^[0-9a-f]{64}$")
           FAIL = {"preflight", "fixture", "case", "receipt_changed", "cleanup"}
@@ -418,6 +424,13 @@ jobs:
               return code if isinstance(code, str) and code in INVALID_HINT_CODES else "unavailable"
 
 
+          def failed_owned_flushall_code(case):
+              if not isinstance(case, dict) or case.get("status") != "failed" or case.get("stage") != "owned_flushall":
+                  return None
+              code = case.get("owned_flushall")
+              return code if isinstance(code, str) and code in OWNED_FLUSHALL_CODES else "unavailable"
+
+
           def case_evidence(case, observations):
               case = case if isinstance(case, dict) else {}
               view = {"name": case.get("name"), "status": case.get("status"), "observations": observations}
@@ -433,6 +446,9 @@ jobs:
               invalid_hints = failed_invalid_hints_code(case)
               if invalid_hints is not None:
                   view["invalid_hints"] = invalid_hints
+              owned_flushall = failed_owned_flushall_code(case)
+              if owned_flushall is not None:
+                  view["owned_flushall"] = owned_flushall
               return view
 
 
