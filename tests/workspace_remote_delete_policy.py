@@ -38,24 +38,38 @@ logs headers, URLs, tokens or payloads, and neither does the direct S3 read.
 import argparse
 import base64
 from datetime import datetime, timezone
+import errno
 import hashlib
 import hmac
 import http.client
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import sys
+import time
 import traceback
 import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
+import fuse_helper_native_support as support  # noqa: E402
 from lfs_hydration_concurrency import S3ControlProxy  # noqa: E402
+from workspace_capture_acceptance import (  # noqa: E402
+    install_capture_read_gate, wait_capture_gate,
+)
 
 UNSAFE_ENV = "ROOTYARD_WORKSPACE_UNSAFE_REMOTE_DELETE"
 KILL_ENV = "ROOTYARD_WORKSPACE_REMOTE_KILL_AFTER_OBJECTS"
 ORPHAN_NAME = "!orphan.bin"
+PENDING_FUSE_MODE = "fuse-helper"
+EARLY_WRITER_READY_SECONDS = 5.0
+REQUIRED_CASES = (
+    "invalid_optin_rejected_at_startup",
+    "default_retains_failed_remote_cleanup",
+    "exit77_with_pending_fuse_request",
+)
 
 
 def _hmac_sha256(key, message):
@@ -322,6 +336,505 @@ class PolicyHarness(Harness):
         }
 
 
+    def case_exit77_with_pending_fuse_request(self):
+        endpoint = os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT")
+        assert endpoint, "real S3/Garage fixture environment is required"
+        parsed = urllib.parse.urlsplit(endpoint)
+        assert parsed.scheme == "http", "loopback Garage endpoint must be plain HTTP"
+        assert parsed.hostname in ("127.0.0.1", "::1", "localhost"), "loopback Garage required"
+        assert not parsed.path and not parsed.query
+        assert not parsed.username and not parsed.password
+        backend_port = parsed.port or 80
+        with socket.create_connection((parsed.hostname, backend_port), timeout=5):
+            pass
+        proxy = CountingProxy(parsed.hostname, backend_port)
+        proxy.start()
+        harness = PolicyHarness(self.args)
+        # The remote writer is observed through the API process's own user
+        # namespace.  Keep the binary real and isolate only this case's API
+        # process (and its restart) in a private user+mount namespace.
+        harness.server_prefix = ["unshare", "-Urm", "--propagation", "private"]
+        harness.env["ROOTYARD_OBJECT_STORE_ENDPOINT"] = f"http://127.0.0.1:{proxy.port}"
+        harness.env.pop(UNSAFE_ENV, None)
+        harness.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = PENDING_FUSE_MODE
+        try:
+            return harness._exit77_with_pending(proxy)
+        finally:
+            proxy.release_gated()
+            proxy.stop()
+            harness.cleanup()
+
+    def _exit77_with_pending(self, proxy):
+        self.setup()
+        self.api()
+        self.roundtrip()
+        ws = json.loads(self.expect("/api/workspaces", 201, token=self.alice, method="POST",
+            body={"owner": "alice", "repository": "demo", "agent_id": "policy-pending-fuse",
+                  "base_oid": self.second},
+            extra_headers={"Idempotency-Key": "policy-pending-fuse-create"}))
+        wid = ws["id"]
+        current = json.loads(self.expect(f"/api/workspaces/{wid}", 200, token=self.alice))
+        retained = json.loads(self.expect(f"/api/workspaces/{wid}/checkpoints", 201,
+            token=self.alice, method="POST",
+            body={"expected_workspace_revision": current["revision"], "lease_epoch": 1},
+            extra_headers={"Idempotency-Key": "policy-pending-fuse-retained"}))
+        retained_id = retained["checkpoint_id"]
+        assert json.loads(self.expect(f"/api/checkpoints/{retained_id}/publish", 200,
+            token=self.alice, method="POST"))["state"] == "COMMITTED"
+
+        orphan_bytes = os.urandom(48)
+        orphan_sha = hashlib.sha256(orphan_bytes).hexdigest()
+        current = json.loads(self.expect(f"/api/workspaces/{wid}", 200, token=self.alice))
+        self.expect(
+            f"/api/workspaces/{wid}/files?path={urllib.parse.quote(ORPHAN_NAME, safe='')}",
+            200, token=self.alice, method="PUT",
+            body={"content_base64": base64.b64encode(orphan_bytes).decode(),
+                  "expected_entry_version": 0,
+                  "expected_workspace_revision": current["revision"],
+                  "lease_epoch": 1},
+            extra_headers={"Idempotency-Key": "policy-pending-fuse-orphan"})
+        after_write = json.loads(self.expect(f"/api/workspaces/{wid}", 200, token=self.alice))
+        failed = json.loads(self.expect(f"/api/workspaces/{wid}/checkpoints", 201,
+            token=self.alice, method="POST",
+            body={"expected_workspace_revision": after_write["revision"], "lease_epoch": 1},
+            extra_headers={"Idempotency-Key": "policy-pending-fuse-failed"}))
+        failed_id = failed["checkpoint_id"]
+        assert failed["state"] == "local_complete"
+        base_events = int(self.sql(
+            "SELECT count(*) FROM workspace_events "
+            f"WHERE workspace_id='{wid}' AND kind='external_capture'"))
+        base_revision = int(self.sql(f"SELECT revision FROM workspaces WHERE id='{wid}'"))
+
+        self.stop()
+        gate_target = (Path(self.root) / "data/workspace-service/uppers"
+                       / wid / "gate-target.txt")
+        gate_names = ("LD_PRELOAD", "ROOTYARD_TEST_CAPTURE_GATE",
+                      "ROOTYARD_TEST_CAPTURE_TARGET")
+        prior_env = {name: self.env.get(name) for name in gate_names}
+        gate = None
+        holder = None
+        writer = None
+        helper_pid = None
+        helper_identity = None
+        holder_identity = None
+        api_pidfd = helper_pidfd = writer_pidfd = None
+        mount_id = None
+        mountpoint = None
+        old_holder_mount_ns = None
+        old_holder_user_ns = None
+        new_api_pid = None
+        new_api_identity = None
+        new_helper_pid = None
+        new_helper_identity = None
+        new_mount_id = None
+        try:
+            gate = install_capture_read_gate(self, gate_target)
+            self.env[KILL_ENV] = "1"
+            self.start()
+            for name, value in prior_env.items():
+                if value is None:
+                    self.env.pop(name, None)
+                else:
+                    self.env[name] = value
+
+            api_pid = self.proc.pid
+            assert os.getpgid(api_pid) == api_pid, (
+                "production API is not the owned process-group leader")
+            api_identity = support.process_identity(api_pid)
+            assert api_identity is not None, "production API identity is unavailable"
+            assert api_identity["starttime"] > 0
+            api_pidfd = support.open_pidfd(api_pid)
+            api_mount_ns = os.stat(f"/proc/{api_pid}/ns/mnt").st_ino
+            api_user_ns = os.stat(f"/proc/{api_pid}/ns/user").st_ino
+            self_user_ns = os.stat("/proc/self/ns/user").st_ino
+            assert api_mount_ns > 0 and api_user_ns > 0, (
+                "remote publisher API namespace inode is not positive")
+            assert api_user_ns != self_user_ns, (
+                "remote publisher API did not enter an isolated user namespace")
+
+            mountpoint = Path(self.root) / "data/workspace-service/mounts" / wid
+            mount = support.wait_for_fuse_mount(api_pid, mountpoint)
+            mount_id = int(mount["mount_id"])
+            assert mount_id > 0
+            helper_pid = support.find_api_helper_pid(api_pid)
+            helper_identity = support.process_identity(helper_pid)
+            assert helper_identity is not None, "FUSE helper identity is unavailable"
+            assert helper_identity["pgid"] == helper_pid, (
+                "FUSE helper is not in its own owned process group")
+            assert helper_identity["starttime"] > api_identity["starttime"]
+            helper_pidfd = support.open_pidfd(helper_pid)
+
+            holder = support.spawn_api_namespace_holder(api_pid)
+            holder_identity = support.process_identity(holder.pid)
+            assert holder_identity is not None, "API namespace holder identity is unavailable"
+            visible = support.wait_for_fuse_mount(holder.pid, mountpoint, timeout=5)
+            assert int(visible["mount_id"]) == mount_id, (
+                "holder namespace does not see the exact API mount")
+            old_holder_mount_ns = os.stat(f"/proc/{holder.pid}/ns/mnt").st_ino
+            old_holder_user_ns = os.stat(f"/proc/{holder.pid}/ns/user").st_ino
+            assert old_holder_mount_ns > 0, (
+                "API namespace holder mount namespace inode is not positive")
+            assert old_holder_user_ns > 0, (
+                "API namespace holder user namespace inode is not positive")
+            assert old_holder_mount_ns == api_mount_ns, (
+                "API namespace holder did not join the old API mount namespace")
+            assert old_holder_user_ns == api_user_ns, (
+                "API namespace holder did not join the old API user namespace")
+
+            def verify_holder_pinned(stage):
+                current = support.process_identity(holder.pid)
+                assert current is not None and current["state"] != "Z", (
+                    f"API namespace holder died {stage}")
+                assert current["pid"] == holder_identity["pid"], (
+                    f"API namespace holder PID changed {stage}")
+                assert current["starttime"] == holder_identity["starttime"], (
+                    f"API namespace holder starttime changed {stage}")
+                assert os.stat(f"/proc/{holder.pid}/ns/mnt").st_ino == old_holder_mount_ns, (
+                    f"API namespace holder mount namespace inode changed {stage}")
+                assert os.stat(f"/proc/{holder.pid}/ns/user").st_ino == old_holder_user_ns, (
+                    f"API namespace holder user namespace inode changed {stage}")
+                return current
+
+            verify_holder_pinned("during the initial exact-mount observation")
+
+            writer_script = Path(self.root) / "pending-fuse-writer.py"
+            writer_script.write_text(support.PENDING_WRITER_SCRIPT, encoding="utf-8")
+            writer_status = Path(self.root) / "pending-fuse-writer.json"
+            writer = support.spawn_api_namespace_writer(
+                api_pid, writer_script, mountpoint, writer_status)
+            writer_identity = support.process_identity(writer.pid)
+            assert writer_identity is not None, "pending writer identity is unavailable"
+            assert writer_identity["starttime"] > 0
+            writer_pidfd = support.open_pidfd(writer.pid)
+
+            capture_deadline = time.monotonic() + 30.0
+            readiness_deadline = min(
+                capture_deadline,
+                time.monotonic() + EARLY_WRITER_READY_SECONDS,
+            )
+            while True:
+                status = support.writer_status(writer_status) or {}
+                phase = status.get("phase")
+                if phase not in ("ready", "writing", "error", "setup_error"):
+                    phase = "unknown"
+                errno_value = status.get("errno")
+                if not isinstance(errno_value, int) or isinstance(errno_value, bool) or not 0 <= errno_value <= 4095:
+                    errno_value = None
+                attempts = status.get("attempts")
+                if not isinstance(attempts, int) or isinstance(attempts, bool) or not 0 <= attempts <= 1000000000:
+                    attempts = None
+                writes = status.get("writes")
+                if not isinstance(writes, int) or isinstance(writes, bool) or not 0 <= writes <= 1000000000:
+                    writes = None
+                writer_exited = writer.poll() is not None
+                if writer_exited or phase in ("setup_error", "error"):
+                    raise AssertionError(
+                        "pending writer could not reach capture-gate readiness: "
+                        f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
+                if phase == "writing" and gate_target.exists():
+                    break
+                if time.monotonic() >= readiness_deadline:
+                    raise AssertionError(
+                        "pending writer did not reach writing+target readiness: "
+                        f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
+                time.sleep(0.05)
+
+            remaining = capture_deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    "capture gate shared deadline exhausted before wait: "
+                    f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
+            hit = gate.with_suffix(".hit")
+            wait_capture_gate(hit, timeout=remaining)
+            assert not gate.with_suffix(".timeout").exists(), (
+                "capture read gate expired before observation")
+            evidence = support.wait_for_kernel_wait(
+                writer.pid, mountpoint, writer_status, timeout=10)
+            assert not gate.with_suffix(".timeout").exists(), (
+                "capture read gate expired before exit-77 publication")
+            assert evidence["attempts"] == evidence["writes"] + 1
+
+            puts_before = proxy.method_counts.get("PUT", 0)
+            kill_ns = time.time_ns()
+            try:
+                self.http(f"/api/checkpoints/{failed_id}/publish", token=self.alice,
+                          method="POST")
+            except Exception:
+                pass
+            assert self.proc.wait(timeout=10) == 77, (
+                "publication did not exit 77 after a real object upload")
+            put_delta = proxy.method_counts.get("PUT", 0) - puts_before
+            assert put_delta > 0, "exit-77 publication issued no real S3 PUT"
+
+            writer_exit = support.wait_process_exit(writer, timeout=support.EXIT_DEADLINE)
+            assert writer_exit == 23, (
+                f"pending writer exit {writer_exit}, expected errno failure")
+            status = support.writer_status(writer_status)
+            assert status is not None, "pending writer wrote no safe error status"
+            assert status["phase"] == "error"
+            assert status["errno"] in (
+                errno.EIO, errno.ENOTCONN, errno.EROFS,
+                errno.ECONNABORTED, errno.ENOENT), (
+                f"pending writer error {status['errno']} is not an I/O/fence error")
+            assert status["success_ns"] < kill_ns, (
+                "a write succeeded after the exit-77 publication")
+            assert status["writes"] >= evidence["writes"], (
+                "completed-byte count regressed after the parked attempt")
+
+            assert support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE), (
+                "production FUSE helper did not exit after publication exit 77")
+            assert support.wait_for_mount_id_gone(
+                holder.pid, mountpoint, mount_id, support.EXIT_DEADLINE), (
+                f"BLOCKED: {PENDING_FUSE_MODE} did not remove exact owned mount ID "
+                f"{mount_id} before cleanup")
+            state = self.sql(
+                f"SELECT state FROM workspace_checkpoints WHERE id='{failed_id}'")
+            assert state == "local_complete", (
+                f"interrupted checkpoint state {state!r} was falsely confirmed")
+            rows_before = int(self.sql(
+                "SELECT COUNT(*) FROM workspace_remote_staging_objects "
+                f"WHERE checkpoint_id='{failed_id}'"))
+            pending_before = int(self.sql(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT tenant_id,digest "
+                "FROM workspace_remote_staging_objects "
+                f"WHERE checkpoint_id='{failed_id}') pending"))
+            assert rows_before > 0, "the failed real upload left no staging reference"
+            assert pending_before > 0
+            assert int(self.sql(
+                "SELECT COUNT(*) FROM workspace_remote_staging_objects "
+                f"WHERE checkpoint_id='{failed_id}' AND digest='{orphan_sha}'")) > 0, (
+                "failed staging omitted the uploaded unique orphan")
+            assert self.sql(
+                "SELECT COUNT(*) FROM workspace_remote_staging_objects "
+                f"WHERE checkpoint_id='{retained_id}' AND digest='{orphan_sha}'") == "0", (
+                "the first retained checkpoint already referenced the unique orphan")
+            assert int(self.sql(
+                "SELECT count(*) FROM workspace_events "
+                f"WHERE workspace_id='{wid}' AND kind='external_capture'")) == base_events, (
+                "a blocked capture was reported committed after exit 77")
+            assert int(self.sql(f"SELECT revision FROM workspaces WHERE id='{wid}'")) \
+                == base_revision, "workspace revision advanced after exit 77"
+
+            verify_holder_pinned("immediately before the remount restart")
+            old_helper_exit_before_restart = support.wait_pid_gone(
+                helper_pid, support.EXIT_DEADLINE)
+            assert old_helper_exit_before_restart, (
+                "production FUSE helper survived immediately before the remount restart")
+            old_mount_id_absent_before_restart = support.wait_for_mount_id_gone(
+                holder.pid, mountpoint, mount_id, support.EXIT_DEADLINE)
+            assert old_mount_id_absent_before_restart, (
+                f"exact owned mount ID {mount_id} reappeared in the pinned old holder "
+                "namespace before the remount restart")
+
+            # Keep the owned old namespace holder alive across the restart.
+            # Mount IDs are scoped to a mount namespace and may be recycled
+            # after umount, so the pinned namespace is the stable identity.
+            self.stop()
+            self.env.pop(KILL_ENV, None)
+            self.start()
+            new_api_pid = self.proc.pid
+            new_api_identity = support.process_identity(new_api_pid)
+            assert new_api_identity is not None, "restarted API identity is unavailable"
+            assert new_api_identity["state"] != "Z", "restarted API exited during remount"
+            new_api_identity_fresh = (
+                new_api_identity["starttime"] > api_identity["starttime"])
+            assert new_api_identity_fresh, (
+                "restarted API process identity is not fresher than the crashed API")
+            # A new numeric mount ID is not required: proc_pid_mountinfo(5)
+            # permits reuse after umount.  The fresh namespace/process identity
+            # below is the cross-incarnation proof.
+            remount = support.wait_for_fuse_mount(new_api_pid, mountpoint)
+            new_mount_id = int(remount["mount_id"])
+            assert new_mount_id > 0, "restarted API did not expose a positive mount ID"
+
+            holder_after_restart = verify_holder_pinned("across the remount restart")
+            old_holder_identity_stable = (
+                holder_after_restart["pid"] == holder_identity["pid"]
+                and holder_after_restart["starttime"] == holder_identity["starttime"])
+            old_mount_namespace_stable = (
+                os.stat(f"/proc/{holder.pid}/ns/mnt").st_ino == old_holder_mount_ns)
+            old_user_namespace_stable = (
+                os.stat(f"/proc/{holder.pid}/ns/user").st_ino == old_holder_user_ns)
+            assert old_holder_identity_stable, (
+                "pinned old holder process identity changed across the remount restart")
+            assert old_mount_namespace_stable, (
+                "pinned old holder mount namespace inode changed across the remount restart")
+            assert old_user_namespace_stable, (
+                "pinned old holder user namespace inode changed across the remount restart")
+
+            old_helper_still_gone = support.wait_pid_gone(
+                helper_pid, support.EXIT_DEADLINE)
+            assert old_helper_still_gone, (
+                "crashed FUSE helper reappeared or survived after the new remount")
+            old_mount_id_absent_after_remount = support.wait_for_mount_id_gone(
+                holder.pid, mountpoint, mount_id, support.EXIT_DEADLINE)
+            assert old_mount_id_absent_after_remount, (
+                f"crashed exact mount ID {mount_id} remained in the pinned old holder "
+                "namespace after the new remount")
+
+            new_api_mount_ns = os.stat(f"/proc/{new_api_pid}/ns/mnt").st_ino
+            new_api_user_ns = os.stat(f"/proc/{new_api_pid}/ns/user").st_ino
+            assert new_api_mount_ns > 0 and new_api_user_ns > 0, (
+                "restarted API namespace inode is not positive")
+            remount_namespace_distinct = (
+                new_api_mount_ns != old_holder_mount_ns
+                and new_api_user_ns != old_holder_user_ns)
+            assert remount_namespace_distinct, (
+                "restarted API reused the crashed mount/user namespace")
+            assert new_api_mount_ns != old_holder_mount_ns, (
+                "restarted API mount namespace inode equals the pinned old holder")
+            assert new_api_user_ns != old_holder_user_ns, (
+                "restarted API user namespace inode equals the pinned old holder")
+
+            new_helper_pid = support.find_api_helper_pid(new_api_pid)
+            new_helper_identity = support.process_identity(new_helper_pid)
+            assert new_helper_identity is not None, (
+                "restarted FUSE helper identity is unavailable")
+            assert new_helper_identity["state"] != "Z", (
+                "restarted FUSE helper exited immediately")
+            assert new_helper_identity["pgid"] == new_helper_pid, (
+                "restarted FUSE helper is not in its own owned process group")
+            new_helper_identity_fresh = (
+                new_helper_identity["starttime"] > new_api_identity["starttime"]
+                and new_helper_identity["starttime"] > helper_identity["starttime"])
+            assert new_helper_identity_fresh, (
+                "restarted FUSE helper is not a fresh process incarnation")
+
+            holder_final = verify_holder_pinned("after all remount identity checks")
+            old_holder_alive_across_remount = (
+                holder_final is not None and holder_final["state"] != "Z")
+            old_holder_identity_stable = (
+                holder_final["pid"] == holder_identity["pid"]
+                and holder_final["starttime"] == holder_identity["starttime"])
+
+            # The pinned old namespace has now proved the old mount is gone and
+            # the new API lives in a distinct namespace.  The holder may be
+            # reaped explicitly; the finally block still bounds it on failures.
+            support.terminate_process(holder)
+            holder = None
+
+            deletes_before = proxy.method_counts.get("DELETE", 0)
+            abandoned = json.loads(self.expect(f"/api/checkpoints/{failed_id}/abandon", 200,
+                token=self.alice, method="POST"))
+            assert abandoned["state"] == "failed"
+            assert abandoned["objects_collected"] == 0
+            assert abandoned["cleanup_pending"] is True
+            assert abandoned["cleanup_pending_objects"] == pending_before
+            assert proxy.method_counts.get("DELETE", 0) == deletes_before, (
+                "default policy issued an S3 DELETE during pending cleanup")
+            rows_after = int(self.sql(
+                "SELECT COUNT(*) FROM workspace_remote_staging_objects "
+                f"WHERE checkpoint_id='{failed_id}'"))
+            assert rows_after == rows_before, (
+                "default policy discarded retryable staging rows")
+            replay = json.loads(self.expect(f"/api/checkpoints/{failed_id}/abandon", 200,
+                token=self.alice, method="POST"))
+            assert replay["objects_collected"] == 0
+            assert replay["cleanup_pending"] is True
+            assert self.http(f"/api/checkpoints/{failed_id}/publish", token=self.alice,
+                             method="POST")[0] == 409
+            assert not proxy.errors, "loopback proxy recorded a forwarding error"
+
+            return {
+                "qualified_mount_mode": PENDING_FUSE_MODE,
+                "api_pid": api_pid,
+                "api_starttime": api_identity["starttime"],
+                "helper_pid": helper_pid,
+                "helper_starttime": helper_identity["starttime"],
+                "holder_pid": holder_identity["pid"],
+                "holder_starttime": holder_identity["starttime"],
+                "writer_pid": writer_identity["pid"],
+                "writer_starttime": writer_identity["starttime"],
+                "owned_mount_id": mount_id,
+                "remount_mount_id": new_mount_id,
+                "mount_id_recycled": new_mount_id == mount_id,
+                "old_holder_mount_ns_ino": old_holder_mount_ns,
+                "new_api_mount_ns_ino": new_api_mount_ns,
+                "old_holder_user_ns_ino": old_holder_user_ns,
+                "new_api_user_ns_ino": new_api_user_ns,
+                "new_api_pid": new_api_pid,
+                "new_api_starttime": new_api_identity["starttime"],
+                "new_helper_pid": new_helper_pid,
+                "new_helper_starttime": new_helper_identity["starttime"],
+                "new_api_identity_fresh": new_api_identity_fresh,
+                "new_helper_identity_fresh": new_helper_identity_fresh,
+                "remount_namespace_distinct": remount_namespace_distinct,
+                "old_holder_alive_across_remount": old_holder_alive_across_remount,
+                "old_holder_identity_stable": old_holder_identity_stable,
+                "old_mount_namespace_stable": old_mount_namespace_stable,
+                "old_user_namespace_stable": old_user_namespace_stable,
+                "old_helper_exit_before_restart": old_helper_exit_before_restart,
+                "old_mount_id_absent_before_restart":
+                    old_mount_id_absent_before_restart,
+                "old_helper_exit_after_remount": old_helper_still_gone,
+                "old_mount_id_absent_after_remount":
+                    old_mount_id_absent_after_remount,
+                "failed_publication_exit": 77,
+                "pending_writer_exit": writer_exit,
+                "failed_publish_put_delta": put_delta,
+                "pending_writer_errno": status["errno"],
+                "pending_writer_completed_bytes": status["writes"],
+                "pending_kernel_wait": {
+                    "wchan": evidence["wchan"],
+                    "fd_target": evidence["fd_target"],
+                    "plateau_seconds": evidence["plateau_seconds"],
+                },
+                "helper_exit": True,
+                "owned_mount_id_removed": True,
+                "failed_checkpoint_state_before_abandon": state,
+                "staging_rows_retained": rows_after,
+                "cleanup_pending": abandoned["cleanup_pending"],
+                "cleanup_pending_objects": abandoned["cleanup_pending_objects"],
+                "objects_collected": abandoned["objects_collected"],
+                "s3_delete_requests_during_abandon":
+                    proxy.method_counts.get("DELETE", 0) - deletes_before,
+                "retry_replay": "conflict",
+                "unique_orphan_digest": orphan_sha,
+                "unique_orphan_only_in_failed_staging": True,
+                "pitr_proof": False,
+                "limitations": [
+                    "Loopback, single-host PostgreSQL/Garage fixture only.",
+                    "Pending FUSE evidence requires a qualified Linux FUSE host.",
+                    "The full PITR delete broker is unimplemented and not exercised here.",
+                    "A raw PG clone/PITR rollback against the shared bucket remains unsupported.",
+                ],
+            }
+        finally:
+            if gate is not None:
+                gate.with_suffix(".release").touch()
+            for process in (writer, holder):
+                try:
+                    support.terminate_process(process)
+                except Exception:
+                    pass
+            for pid, identity in ((helper_pid, helper_identity),
+                                  (new_helper_pid, new_helper_identity)):
+                if pid is None or identity is None:
+                    continue
+                current = support.process_identity(pid)
+                if (current is not None and current["state"] != "Z"
+                        and current["starttime"] == identity["starttime"]):
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    support.wait_pid_gone(pid, support.EXIT_DEADLINE)
+            support.close_fd(api_pidfd)
+            support.close_fd(helper_pidfd)
+            support.close_fd(writer_pidfd)
+            self.env.pop(KILL_ENV, None)
+            if prior_env:
+                for name, value in prior_env.items():
+                    if value is None:
+                        self.env.pop(name, None)
+                    else:
+                        self.env[name] = value
+            try:
+                self.stop()
+            except Exception:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
@@ -340,6 +853,10 @@ def main():
     try:
         harness.case("invalid_optin_rejected_at_startup", harness.case_invalid_optin)
         harness.case("default_retains_failed_remote_cleanup", harness.case_default_retains)
+        harness.case("exit77_with_pending_fuse_request",
+                     harness.case_exit77_with_pending_fuse_request)
+        if tuple(case["name"] for case in harness.results) != REQUIRED_CASES:
+            raise AssertionError("required case inventory mismatch")
         passed = True
     except Exception:
         print(harness.redact(traceback.format_exc()), file=sys.stderr)
