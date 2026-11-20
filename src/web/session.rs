@@ -467,31 +467,40 @@ pub async fn logout(State(state): State<MetadataState>, headers: HeaderMap) -> R
         // only the exact `kind='browser'` row selected by the presented digest,
         // in the same token-then-`web_sessions` order as
         // `token_management::service::revoke_session`, so this cannot race the
-        // authenticated session writer or session GC. Both revocations commit
-        // together; a database error rolls back before any cookie is cleared.
+        // authenticated session writer or session GC. Only a real false->true
+        // transition writes (and bumps `scope_version`); a replay is a no-op,
+        // while a prior half-revoked state is repaired in either direction.
+        // Both revocations commit together; a database error rolls back before
+        // any cookie is cleared.
         let token = tx
             .query_opt(
-                "SELECT t.id FROM tokens t WHERE t.digest=$1 AND t.kind='browser' FOR UPDATE OF t",
+                "SELECT t.id, t.revoked FROM tokens t WHERE t.digest=$1 AND t.kind='browser' FOR UPDATE OF t",
                 &[&db::digest(&secret)],
             )
             .await
             .map_err(Error::internal)?;
         if let Some(token) = token {
             let token_id: Uuid = token.get("id");
-            let _session_row = tx
-                .query_opt("SELECT 1 FROM web_sessions WHERE token_id=$1 FOR UPDATE", &[&token_id])
+            let token_revoked: bool = token.get("revoked");
+            let session_row = tx
+                .query_opt("SELECT revoked FROM web_sessions WHERE token_id=$1 FOR UPDATE", &[&token_id])
                 .await
                 .map_err(Error::internal)?;
-            tx.execute(
-                "UPDATE tokens SET revoked=true, scope_version=scope_version+1 \
-                  WHERE id=$1 AND kind='browser'",
-                &[&token_id],
-            )
-            .await
-            .map_err(Error::internal)?;
-            tx.execute("UPDATE web_sessions SET revoked=true WHERE token_id=$1", &[&token_id])
+            let session_revoked = session_row.as_ref().map(|row| row.get::<_, bool>("revoked"));
+            if !token_revoked {
+                tx.execute(
+                    "UPDATE tokens SET revoked=true, scope_version=scope_version+1 \
+                      WHERE id=$1 AND kind='browser' AND NOT revoked",
+                    &[&token_id],
+                )
                 .await
                 .map_err(Error::internal)?;
+            }
+            if session_revoked == Some(false) {
+                tx.execute("UPDATE web_sessions SET revoked=true WHERE token_id=$1 AND NOT revoked", &[&token_id])
+                    .await
+                    .map_err(Error::internal)?;
+            }
         }
         tx.commit().await.map_err(Error::internal)?;
     }
