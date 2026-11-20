@@ -46,19 +46,22 @@ impl OriginalProcess {
     }
 }
 
-pub(super) async fn wait_for_original_pair(path: &Path, deadline: Instant) -> (OriginalProcess, OriginalProcess) {
+pub(super) async fn wait_for_original_pair(path: &Path, ready_deadline: Instant) -> (OriginalProcess, OriginalProcess) {
     assert_procfs_live();
     let mut diagnostic = String::from("pid file has not been observed");
     loop {
         assert_procfs_live();
-        if Instant::now() >= deadline {
-            panic!("fixture did not expose a live original process pair before the product deadline: {diagnostic}");
+        if Instant::now() >= ready_deadline {
+            panic!("fixture did not expose a live original process pair before the readiness deadline: {diagnostic}");
         }
         match tokio::fs::read_to_string(path).await {
             Ok(text) => match parse_pids(&text) {
                 Some((leader, descendant)) => match capture_pair(leader, descendant) {
                     Ok(pair) => {
-                        assert!(Instant::now() < deadline, "fixture pair was captured after the product deadline");
+                        assert!(
+                            Instant::now() < ready_deadline,
+                            "fixture pair was captured after the readiness deadline"
+                        );
                         return pair;
                     }
                     Err(reason) => diagnostic = reason,
