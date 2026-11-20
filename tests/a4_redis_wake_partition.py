@@ -485,7 +485,7 @@ class A4RedisWakeHarness(BlobOnlyHarness):
             "deliveries": self.sql(
                 f"SELECT d.consumer || '|' || d.state || '|' || count(*)::text "
                 f"FROM event_deliveries d JOIN outbox_events e USING(event_id) "
-                f"WHERE e.repository_id='{repo}' GROUP BY d.consumer,d.state ORDER BY 1,2"
+                f"WHERE e.repository_id='{repo}' GROUP BY d.consumer,d.state ORDER BY d.consumer,d.state"
             ),
             "audit": self.sql(
                 f"SELECT count(*) FROM audit_events a JOIN outbox_events e USING(event_id) "

@@ -40,6 +40,31 @@ class SourceBindingTest(unittest.TestCase):
         self.assertIn("containment_factory=LinuxChildSubreaper.install", script)
 
 
+class SnapshotProjectionTest(unittest.TestCase):
+    def test_delivery_snapshot_uses_named_order_and_keeps_full_projection(self):
+        repo = "11111111-1111-1111-1111-111111111111"
+        keys = [
+            "repository", "refs", "gate_revision", "operations", "core_events",
+            "holds", "consume_receipts", "memberships", "outbox", "deliveries",
+            "audit", "legacy_projection", "projection_jobs",
+        ]
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.sql = Mock(side_effect=[f"value-{index}" for index in range(len(keys))])
+
+        snapshot = harness.snapshot(repo)
+
+        self.assertEqual(list(snapshot), keys)
+        self.assertEqual(snapshot, {key: f"value-{index}" for index, key in enumerate(keys)})
+        delivery_sql = harness.sql.call_args_list[keys.index("deliveries")].args[0]
+        self.assertEqual(delivery_sql, (
+            "SELECT d.consumer || '|' || d.state || '|' || count(*)::text "
+            "FROM event_deliveries d JOIN outbox_events e USING(event_id) "
+            f"WHERE e.repository_id='{repo}' GROUP BY d.consumer,d.state "
+            "ORDER BY d.consumer,d.state"
+        ))
+        self.assertNotRegex(delivery_sql, r"ORDER BY\s+\d")
+
+
 class HealthyTimingTest(unittest.TestCase):
     def make_harness(self):
         harness = object.__new__(a4.A4RedisWakeHarness)
