@@ -30,6 +30,130 @@ async fn wait_pids(path: &FsPath) -> (i32, i32) {
     panic!("test Git wrapper did not publish its process group");
 }
 
+#[cfg(target_os = "linux")]
+const PROC_FIELDS_THROUGH_STARTTIME: usize = 20;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcState {
+    Gone,
+    Exited,
+    Live,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ProcIdentity {
+    pid: i32,
+    starttime: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcIdentity {
+    fn state(self) -> ProcState {
+        assert_procfs_live();
+        match read_proc_stat(self.pid) {
+            None => ProcState::Gone,
+            Some(stat) if stat.starttime != self.starttime => ProcState::Gone,
+            Some(stat) => stat.state,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ProcStat {
+    state: ProcState,
+    pgrp: i32,
+    starttime: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn capture_original_pair(leader: i32, descendant: i32) -> (ProcIdentity, ProcIdentity) {
+    assert_procfs_live();
+    let leader_stat = read_proc_stat(leader)
+        .unwrap_or_else(|| panic!("original direct child {leader} is not present in procfs before drop"));
+    let descendant_stat = read_proc_stat(descendant)
+        .unwrap_or_else(|| panic!("original TERM-resistant descendant {descendant} is not present in procfs before drop"));
+    assert_eq!(leader_stat.state, ProcState::Live, "original direct child {leader} is {:?}, not live", leader_stat.state);
+    assert_eq!(
+        descendant_stat.state,
+        ProcState::Live,
+        "original TERM-resistant descendant {descendant} is {:?}, not live",
+        descendant_stat.state
+    );
+    assert_eq!(
+        leader_stat.pgrp, leader,
+        "original direct child {leader} is in process group {}, not its own",
+        leader_stat.pgrp
+    );
+    assert_eq!(
+        descendant_stat.pgrp, leader,
+        "original TERM-resistant descendant {descendant} is in process group {}, not leader {leader}",
+        descendant_stat.pgrp
+    );
+    (
+        ProcIdentity { pid: leader, starttime: leader_stat.starttime },
+        ProcIdentity { pid: descendant, starttime: descendant_stat.starttime },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn assert_original_descendant_not_live(descendant: ProcIdentity) {
+    let state = descendant.state();
+    assert!(
+        matches!(state, ProcState::Gone | ProcState::Exited),
+        "original descendant {} (starttime {}) is still live after cancellation: {state:?}",
+        descendant.pid,
+        descendant.starttime
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_procfs_live() {
+    let pid = i32::try_from(std::process::id()).expect("test pid fits i32");
+    match read_proc_stat(pid) {
+        Some(stat) if stat.state == ProcState::Live => {}
+        Some(stat) => panic!("procfs is present but test process {pid} is {:?}", stat.state),
+        None => panic!("procfs is not live: /proc/{pid}/stat is absent"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: i32) -> Option<ProcStat> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match std::fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => {
+            return None;
+        }
+        Err(error) => panic!("cannot read {path}: {error}"),
+    };
+    let (prefix, rest) =
+        stat.rsplit_once(") ").unwrap_or_else(|| panic!("truncated {path}: missing command terminator"));
+    let (stat_pid, _) = prefix.split_once(" (").unwrap_or_else(|| panic!("malformed {path}: missing `pid (` prefix"));
+    let stat_pid = stat_pid.parse::<i32>().unwrap_or_else(|_| panic!("malformed {path}: non-numeric pid"));
+    assert_eq!(stat_pid, pid, "{path} describes pid {stat_pid}, not {pid}");
+    let fields: Vec<_> = rest.split_whitespace().collect();
+    if fields.len() < PROC_FIELDS_THROUGH_STARTTIME {
+        panic!(
+            "truncated {path}: {} fields after comm, need at least {PROC_FIELDS_THROUGH_STARTTIME}",
+            fields.len()
+        );
+    }
+    let state = match fields[0] {
+        "R" | "S" | "D" | "T" | "t" | "W" | "P" | "I" | "K" => ProcState::Live,
+        "Z" | "X" | "x" => ProcState::Exited,
+        other => panic!("unsupported {path} state {other:?}"),
+    };
+    for (index, field) in fields.iter().enumerate().take(19).skip(1) {
+        field.parse::<i64>().unwrap_or_else(|_| panic!("malformed {path}: field {index} {field:?} is not numeric"));
+    }
+    let pgrp = fields[2].parse::<i32>().unwrap_or_else(|_| panic!("malformed {path}: non-numeric process group"));
+    let starttime =
+        fields[19].parse::<u64>().unwrap_or_else(|_| panic!("malformed {path}: non-numeric starttime"));
+    Some(ProcStat { state, pgrp, starttime })
+}
+
 fn command(pidfile: &FsPath) -> Command {
     let mut cmd = base_command(FsPath::new("/bin/sh"));
     cmd.args(["-c", SCRIPT, "sh", pidfile.to_str().unwrap()]);
@@ -85,6 +209,11 @@ async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
             _ = tokio::time::sleep(Duration::from_millis(5)) => {}
         }
     };
+    // Bind the pids to original (pid, starttime) identities while the fixture is
+    // demonstrably live: the direct child is its own group leader and the
+    // TERM-resistant background shell is still in that group.
+    #[cfg(target_os = "linux")]
+    let (_original_leader, original_descendant) = capture_original_pair(leader, grandchild);
     drop(future);
     drop(scratch);
     for _ in 0..100 {
@@ -95,6 +224,12 @@ async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
     }
     assert!(!root.exists(), "the scratch directory outlived the cancelled Git command");
     assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
+    // A killed descendant can remain visible as Z/X until its new parent reaps
+    // it. Quiescence, not disappearance, is the contract; the recorded starttime
+    // keeps PID reuse from being mistaken for a live original.
+    #[cfg(target_os = "linux")]
+    assert_original_descendant_not_live(original_descendant);
+    #[cfg(not(target_os = "linux"))]
     assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
 }
 
