@@ -28,6 +28,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import time
 from typing import Iterable, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,13 @@ MAX_RESULT_BYTES = 8192
 MAX_RESULT_LINES = 48
 MAX_REPORT_BYTES = 16384
 STOP_GRACE_SECONDS = 2
+LIMITATIONS = (
+    "child_exit_status_is_not_read_from_target_memory",
+    "first_reverse_phase_child_exit_wins",
+    "classification_requires_the_exact_unstripped_source_line",
+    "single_case_probe_does_not_refute_the_six_case_failure",
+    "rebuilt_executable_can_differ_from_a_prior_hosted_binary",
+)
 
 NONCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -584,23 +592,54 @@ def _remove(path: Path) -> None:
         pass
 
 
+def _group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def _stop_process_group(process: subprocess.Popen) -> None:
-    """Bounded terminate, kill and reap for the owned GDB session."""
-    if process.poll() is not None:
-        return
+    """Bounded TERM/KILL of the owned process group, even after leader exit."""
+    pgid = process.pid
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
-            os.killpg(process.pid, sig)
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
         except OSError:
+            # Only the owned leader handle is an acceptable fallback.
             try:
                 process.send_signal(sig)
             except OSError:
                 pass
+        deadline = time.monotonic() + STOP_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            leader_exited = process.poll() is not None
+            if _group_exists(pgid):
+                if leader_exited and sig == signal.SIGTERM:
+                    # Remaining members are owned descendants; escalate now.
+                    break
+            else:
+                break
+            try:
+                time.sleep(0.05)
+            except KeyboardInterrupt:
+                pass
+        if not _group_exists(pgid):
+            break
+    for _ in range(2):
         try:
             process.wait(timeout=STOP_GRACE_SECONDS)
-            return
+            break
         except subprocess.TimeoutExpired:
-            continue
+            try:
+                process.kill()
+            except OSError:
+                pass
         except KeyboardInterrupt:
             continue
 
@@ -784,13 +823,7 @@ def make_report(
         "base_tree": base_tree,
         "base_parents": list(base_parents),
         "rebuilt_executable_may_differ_by_build_path": True,
-        "limitations": [
-            "child_exit_status_is_not_read_from_target_memory",
-            "first_reverse_phase_child_exit_wins",
-            "classification_requires_the_exact_unstripped_source_line",
-            "single_case_probe_does_not_refute_the_six_case_failure",
-            "rebuilt_executable_can_differ_from_a_prior_hosted_binary",
-        ],
+        "limitations": list(LIMITATIONS),
     }
 
 
@@ -832,6 +865,38 @@ def validate_report(report: dict[str, object]) -> None:
     require(report["failure_kind"] == "unknown", "report failure kind changed")
     require(report["failure_kind_reason"] == "exit_status_is_local_and_not_read",
             "report failure-kind reason changed")
+    require(isinstance(report["limitations"], list) and tuple(report["limitations"]) == LIMITATIONS,
+            "report limitations are not the closed set")
+    if report["git_version"] is not None:
+        require(isinstance(report["git_version"], list) and len(report["git_version"]) == 3
+                and all(isinstance(part, int) and not isinstance(part, bool) and part >= 0
+                        for part in report["git_version"]),
+                "report Git version is not exactly numeric")
+    if report["binary_sha256"] is not None:
+        require(isinstance(report["binary_sha256"], str)
+                and SHA256_PATTERN.fullmatch(report["binary_sha256"]),
+                "report binary digest is invalid")
+    source = report["source"]
+    if source:
+        require(isinstance(source, dict)
+                and set(source) == {"runner_sha256", "reverse_sha256", "test_sha256", "harness_sha256"}
+                and all(isinstance(value, str) and SHA256_PATTERN.fullmatch(value)
+                        for value in source.values()),
+                "report source binding changed")
+    else:
+        require(isinstance(source, dict), "report source shape changed")
+    base_commit, base_tree = report["base_commit"], report["base_tree"]
+    if base_commit is None:
+        require(base_tree is None and report["base_parents"] == [],
+                "report base binding is incomplete")
+    else:
+        require(isinstance(base_commit, str) and COMMIT_PATTERN.fullmatch(base_commit)
+                and isinstance(base_tree, str) and COMMIT_PATTERN.fullmatch(base_tree),
+                "report base binding is invalid")
+        require(isinstance(report["base_parents"], list) and len(report["base_parents"]) == 2
+                and all(isinstance(parent, str) and COMMIT_PATTERN.fullmatch(parent)
+                        for parent in report["base_parents"]),
+                "report base parents are not the exact two IDs")
     require(report["operation"] is None or report["operation"] in {op.value for op in Operation},
             "report operation is not closed")
     caller = report["caller"]
@@ -847,6 +912,8 @@ def validate_report(report: dict[str, object]) -> None:
                 "report test exit is not a bounded integer")
         require(isinstance(report["binary_sha256"], str)
                 and SHA256_PATTERN.fullmatch(report["binary_sha256"]), "report binary digest is missing")
+        require(report["git_version"] is not None and bool(report["source"]),
+                "report completed provenance is incomplete")
         require(report["test_suite"] == ("failed" if test_exit != 0 else "passed"),
                 "report test suite does not match the runner exit")
     elif phase == RunPhase.RUN_STARTED_INTERRUPTED.value:

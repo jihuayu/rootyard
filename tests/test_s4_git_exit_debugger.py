@@ -60,7 +60,11 @@ if mode in ("interrupt", "interrupt_result"):
                 "exit 101",
                 "signal 0",
             ]) + "\n")
-    child = subprocess.Popen(["sleep", "30"])
+    child = subprocess.Popen([
+        sys.executable,
+        "-c",
+        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+    ])
     pidfile = os.environ.get("FAKE_GDB_PIDFILE")
     if pidfile:
         with open(pidfile, "w", encoding="utf-8") as handle:
@@ -133,6 +137,25 @@ def _pid_gone(pid: int, timeout: float = 5.0) -> bool:
             return True
         time.sleep(0.05)
     return False
+
+
+LEADER_SCRIPT = """import os
+import signal
+import subprocess
+import sys
+import time
+
+pidfile = sys.argv[1]
+child = subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+])
+with open(pidfile, "w", encoding="utf-8") as handle:
+    handle.write(str(child.pid))
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+time.sleep(30)
+"""
 
 
 class ObserverFixture(unittest.TestCase):
@@ -483,6 +506,35 @@ class InstrumentedObserverTests(ObserverFixture):
                         except OSError:
                             pass
 
+    def test_stop_process_group_kills_term_resistant_descendant_after_leader_exit(self) -> None:
+        leader_script = self.base / "leader.py"
+        leader_script.write_text(LEADER_SCRIPT, encoding="utf-8")
+        pidfile = self.base / "descendant.pid"
+        leader = subprocess.Popen(
+            [sys.executable, str(leader_script), str(pidfile)],
+            start_new_session=True,
+        )
+        descendant_pid = None
+        try:
+            _wait_for_path(pidfile)
+            descendant_pid = int(pidfile.read_text(encoding="utf-8").strip())
+            debugger._stop_process_group(leader)
+            self.assertIsNotNone(leader.poll())
+            self.assertTrue(_pid_gone(descendant_pid))
+        finally:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            if leader.poll() is None:
+                leader.kill()
+                leader.wait()
+            if descendant_pid is not None and not _pid_gone(descendant_pid):
+                try:
+                    os.kill(descendant_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
 
 class ReportShapeTests(unittest.TestCase):
     def sample(self) -> dict[str, object]:
@@ -507,5 +559,56 @@ class ReportShapeTests(unittest.TestCase):
             base_tree="2" * 40,
             base_parents=["3" * 40, "4" * 40],
         )
+class ReportValidationTests(unittest.TestCase):
+    def sample(self) -> dict[str, object]:
+        return debugger.make_report(
+            status=debugger.Status.NO_FAILURE_OBSERVED,
+            reason=debugger.Reason.NONE,
+            run_phase=debugger.RunPhase.COMPLETED,
+            test_exit=0,
+            failure_observed=False,
+            operation=None,
+            caller=None,
+            debug_resolution="resolved",
+            git_version=(2, 43, 0),
+            binary_sha256="a" * 64,
+            source={
+                "runner_sha256": "b" * 64,
+                "reverse_sha256": "c" * 64,
+                "test_sha256": "d" * 64,
+                "harness_sha256": "e" * 64,
+            },
+            base_commit="1" * 40,
+            base_tree="2" * 40,
+            base_parents=["3" * 40, "4" * 40],
+        )
+
+    def test_malformed_provenance_and_limits_are_rejected(self) -> None:
+        debugger.validate_report(self.sample())
+        cases = {
+            "schema": ("schema", "other"),
+            "git-short": ("git_version", [2, 43]),
+            "git-string": ("git_version", ["2", 43, 0]),
+            "source-missing": ("source", {"runner_sha256": "b" * 64}),
+            "source-bad": ("source", {
+                "runner_sha256": "b" * 64,
+                "reverse_sha256": "not-a-hash",
+                "test_sha256": "d" * 64,
+                "harness_sha256": "e" * 64,
+            }),
+            "binary": ("binary_sha256", "not-a-hash"),
+            "parents-short": ("base_parents", ["3" * 40]),
+            "parent-bad": ("base_parents", ["3" * 40, "not-a-hash"]),
+            "base-incomplete": ("base_tree", None),
+            "limitations": ("limitations", ["other"]),
+        }
+        for name, (key, value) in cases.items():
+            with self.subTest(name=name):
+                report = self.sample()
+                report[key] = value
+                with self.assertRaises(ValueError):
+                    debugger.validate_report(report)
+
+
 if __name__ == "__main__":
     unittest.main()
