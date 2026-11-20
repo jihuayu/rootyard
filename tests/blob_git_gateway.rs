@@ -445,6 +445,58 @@ fn git_text(output: &GitOutput) -> String {
     format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))
 }
 
+/// Git's destination lines include the fixture's ephemeral port and random
+/// owner/repo name. Recognize only the stock client's own HTTP transport
+/// failure wording, so destination or sideband digits cannot fail a real
+/// report-status.
+fn has_stock_http_error(text: &str, status: &str) -> bool {
+    let rpc_error = format!("RPC failed; HTTP {status} curl ");
+    let url_error = format!("The requested URL returned error: {status}");
+    text.lines().any(|line| {
+        line.strip_prefix("error: ").unwrap_or(line).starts_with(rpc_error.as_str())
+            || line.ends_with(url_error.as_str())
+    })
+}
+
+#[test]
+fn stock_http_errors_distinguish_status_from_destination_digits_and_headers() {
+    // Both status digits can occur in the loopback port and random owner/repo
+    // name while the client still received the real stale-info report-status.
+    for destination in [
+        "http://127.0.0.1:54090/git/owner/race-admission-a503b0000000.git",
+        "http://127.0.0.1:55030/git/owner/race-409f000000.git",
+    ] {
+        let stale = format!(
+            "To {destination}\n\
+             ! [rejected] HEAD -> main (stale info)\n\
+             remote: X-Rootyard-Trace: 409\n\
+             HTTP/1.1 503 Service Unavailable\n\
+             error: failed to push some refs to '{destination}'"
+        );
+        for status in ["409", "503"] {
+            assert!(stale.contains(status));
+            assert!(
+                !has_stock_http_error(&stale, status),
+                "destination/header digits `{status}` were mistaken for a Git transport failure: {stale}"
+            );
+        }
+    }
+    for status in ["409", "503"] {
+        // Stock Git's real curl 22 transport failure still matches, even with
+        // the status digits repeated in the failed destination URL.
+        let rpc = format!(
+            "error: RPC failed; HTTP {status} curl 22 The requested URL returned error: {status}\n\
+             To http://127.0.0.1:54090/git/owner/race-409f000000.git"
+        );
+        assert!(has_stock_http_error(&rpc, status));
+        let access = format!(
+            "fatal: unable to access 'http://127.0.0.1:54090/git/owner/race-409f000000.git/': \
+             The requested URL returned error: {status}"
+        );
+        assert!(has_stock_http_error(&access, status));
+    }
+}
+
 /// A failed client's outcome plus a redacted diagnostic for assertion
 /// messages: no remote URL, URL userinfo, token, credential-bearing profile
 /// value, request header or operation id reaches the message, and each line is
@@ -736,8 +788,15 @@ async fn race_case(case: &Case, git: &'static Git) -> Result<Value> {
     // Raw output feeds the in-memory acceptance checks only.
     let loser_text = git_text(loser_output);
     for forbidden in ["409", "503", "non-fast-forward", "fetch first", "unexpected disconnect", "remote end hung up"] {
+        // Stock Git's destination lines can carry 409/503 in the fixture's
+        // ephemeral port or random owner/repo name, so status digits are only a
+        // transport failure when they appear in Git's own HTTP error wording.
+        let found = match forbidden {
+            "409" | "503" => has_stock_http_error(&loser_text, forbidden),
+            _ => loser_text.contains(forbidden),
+        };
         ensure!(
-            !loser_text.contains(forbidden),
+            !found,
             "loser saw `{forbidden}`, not a report-status: {}",
             redacted_git_output(loser_label, loser_output)
         );
