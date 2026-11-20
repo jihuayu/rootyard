@@ -497,34 +497,29 @@ _PUSH_HTTP_STATUSES = frozenset({
     "500", "501", "502", "503", "504", "505", "506", "507", "508", "510",
     "511",
 })
-# Only whole, anchored Git transport error lines are credible. The URL region is
-# matched as one opaque token, so status-like text inside it is never read as a
-# code. Sideband, proxy, handshake, header and arbitrary-prefix lines fail.
-_PUSH_UNABLE_LINE = re.compile(
-    r"""^fatal: unable to access (?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|\S+): """
-    r"""The requested URL returned error: (\d{3})\s*$""",
+# Fatal access errors can be emitted while discovering refs, before the receive
+# POST, so they never witness request-stage status by themselves. Only an
+# anchored Git RPC failure carrying curl's literal HTTP-error code 22 and its
+# returned-status message is credible. Proxy CONNECT and transport codes (for
+# example curl 56) never match, and duplicated numbers must agree.
+_PUSH_RPC_HTTP_LINE = re.compile(
+    r"^error: RPC failed; (?:HTTP (\d{3}) )?curl 22 "
+    r"The requested URL returned error: (\d{3})\s*$",
     re.IGNORECASE,
 )
-_PUSH_RPC_HTTP_LINE = re.compile(
-    r"^error: RPC failed; HTTP (\d{3}) curl(?:\s.*)?\s*$", re.IGNORECASE)
-_PUSH_RPC_RETURNED = re.compile(
-    r"The requested URL returned error: (\d{3})\s*$", re.IGNORECASE)
 def _push_text(process, name):
     value = getattr(process, name, b"") or b""
     return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
 def _push_http_status(process):
     found = set()
     for line in _push_text(process, "stderr").splitlines():
-        match = _PUSH_UNABLE_LINE.match(line)
-        if match:
-            found.add(match.group(1))
-            continue
         match = _PUSH_RPC_HTTP_LINE.match(line)
-        if match:
-            found.add(match.group(1))
-            returned = _PUSH_RPC_RETURNED.search(line)
-            if returned:
-                found.add(returned.group(1))
+        if not match:
+            continue
+        http_code, returned_code = match.groups()
+        if http_code is not None:
+            found.add(http_code)
+        found.add(returned_code)
     if len(found) == 1:
         status = found.pop()
         if status in _PUSH_HTTP_STATUSES:
