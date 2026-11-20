@@ -460,18 +460,40 @@ pub async fn login(
 pub async fn logout(State(state): State<MetadataState>, headers: HeaderMap) -> Result<Response, Error> {
     let secure = secure_cookie(&headers)?;
     if let Some(secret) = session_token(&headers) {
-        let client = state.pool.get().await.map_err(Error::internal)?;
-        client
-            .execute(
-                "UPDATE web_sessions s SET revoked=true FROM tokens t WHERE t.id=s.token_id AND t.digest=$1",
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        // Logout is intentionally unauthenticated: an already-revoked, expired
+        // or unknown cookie must still clear the browser state. Lock and mutate
+        // only the exact `kind='browser'` row selected by the presented digest,
+        // in the same token-then-`web_sessions` order as
+        // `token_management::service::revoke_session`, so this cannot race the
+        // authenticated session writer or session GC. Both revocations commit
+        // together; a database error rolls back before any cookie is cleared.
+        let token = tx
+            .query_opt(
+                "SELECT t.id FROM tokens t WHERE t.digest=$1 AND t.kind='browser' FOR UPDATE OF t",
                 &[&db::digest(&secret)],
             )
             .await
             .map_err(Error::internal)?;
-        client
-            .execute("UPDATE tokens SET revoked=true WHERE digest=$1 AND kind='browser'", &[&db::digest(&secret)])
+        if let Some(token) = token {
+            let token_id: Uuid = token.get("id");
+            let _session_row = tx
+                .query_opt("SELECT 1 FROM web_sessions WHERE token_id=$1 FOR UPDATE", &[&token_id])
+                .await
+                .map_err(Error::internal)?;
+            tx.execute(
+                "UPDATE tokens SET revoked=true, scope_version=scope_version+1 \
+                  WHERE id=$1 AND kind='browser'",
+                &[&token_id],
+            )
             .await
             .map_err(Error::internal)?;
+            tx.execute("UPDATE web_sessions SET revoked=true WHERE token_id=$1", &[&token_id])
+                .await
+                .map_err(Error::internal)?;
+        }
+        tx.commit().await.map_err(Error::internal)?;
     }
     let mut res = Redirect::to("/web/login").into_response();
     *res.status_mut() = StatusCode::SEE_OTHER;
