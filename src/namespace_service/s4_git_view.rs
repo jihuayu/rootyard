@@ -11,7 +11,7 @@
 //! *before* PostgreSQL is touched, so the projected object id is known when the
 //! one and only transaction opens. Root registration, RBAC, the view row, its
 //! history and the binding then commit together or not at all.
-use super::s4_git_proc::{ScratchDir, git_clone, git_init_bare, git_text, with_scratch};
+use super::s4_git_proc::{ReverseGitStage, ScratchDir, git_clone, git_init_bare, git_text, with_scratch};
 use crate::namespace_service::{handlers, views::{CreateView, View}};
 use crate::ref_store::core::pack_commit::PackArtifactRole;
 use crate::{AppState, Error, db::Identity, members::models::Role, token_scopes::RepoAction};
@@ -27,8 +27,9 @@ async fn run_git(
     repo: &FsPath,
     args: &[&str],
     deadline: tokio::time::Instant,
+    stage: Option<ReverseGitStage>,
 ) -> Result<String, Error> {
-    git_text(git_bin, repo, args, deadline, "Git view projection failed").await
+    git_text(git_bin, repo, args, deadline, "Git view projection failed", stage).await
 }
 
 /// True only for repositories served on `pg_refstore`.
@@ -134,7 +135,7 @@ async fn materialize_packs(
                 .map_err(Error::internal)?;
         }
     }
-    run_git(&state.config.git, &bare, &["update-ref", "refs/heads/main", base_oid], deadline).await?;
+    run_git(&state.config.git, &bare, &["update-ref", "refs/heads/main", base_oid], deadline, None).await?;
     Ok(())
 }
 
@@ -149,14 +150,30 @@ pub(crate) async fn project(
     subdir: &str,
     deadline: tokio::time::Instant,
 ) -> Result<String, Error> {
-    run_git(git_bin, work, &["checkout", "-B", "projected", base], deadline).await?;
-    let remotes = run_git(git_bin, work, &["for-each-ref", "--format=%(refname)", "refs/remotes"], deadline).await?;
+    project_with_stage(git_bin, work, base, subdir, deadline, None).await
+}
+
+pub(crate) async fn project_with_stage(
+    git_bin: &FsPath,
+    work: &FsPath,
+    base: &str,
+    subdir: &str,
+    deadline: tokio::time::Instant,
+    stage: Option<ReverseGitStage>,
+) -> Result<String, Error> {
+    run_git(git_bin, work, &["checkout", "-B", "projected", base], deadline, stage).await?;
+    let remotes =
+        run_git(git_bin, work, &["for-each-ref", "--format=%(refname)", "refs/remotes"], deadline, stage).await?;
     for reference in remotes.lines().filter(|line| !line.is_empty()) {
-        let _ = run_git(git_bin, work, &["update-ref", "-d", reference], deadline).await;
+        // Cleanup is deliberately discarded, so a failure here must not wear
+        // the propagated reverse-runner diagnostic label.
+        let _ = run_git(git_bin, work, &["update-ref", "-d", reference], deadline, None).await;
     }
     if !subdir.is_empty() {
         let path = format!("{base}^{{tree}}:{subdir}");
-        let kind = run_git(git_bin, work, &["cat-file", "-t", &path], deadline).await.map_err(|_| Error::bad_request())?;
+        let kind = run_git(git_bin, work, &["cat-file", "-t", &path], deadline, stage)
+            .await
+            .map_err(|_| Error::bad_request())?;
         if kind.trim() != "tree" {
             return Err(Error::bad_request());
         }
@@ -165,12 +182,25 @@ pub(crate) async fn project(
             work,
             &["filter-branch", "-f", "--subdirectory-filter", subdir, "--", "refs/heads/projected"],
             deadline,
+            stage,
         )
         .await?;
-        let _ = run_git(git_bin, work, &["update-ref", "-d", "refs/original/refs/heads/projected"], deadline).await;
+        // Cleanup is deliberately discarded, so a failure here must not wear
+        // the propagated reverse-runner diagnostic label.
+        let _ = run_git(
+            git_bin,
+            work,
+            &["update-ref", "-d", "refs/original/refs/heads/projected"],
+            deadline,
+            None,
+        )
+        .await;
     }
-    let projected = run_git(git_bin, work, &["rev-parse", "refs/heads/projected"], deadline).await?.trim().to_owned();
-    run_git(git_bin, work, &["symbolic-ref", "HEAD", "refs/heads/projected"], deadline).await?;
+    let projected = run_git(git_bin, work, &["rev-parse", "refs/heads/projected"], deadline, stage)
+        .await?
+        .trim()
+        .to_owned();
+    run_git(git_bin, work, &["symbolic-ref", "HEAD", "refs/heads/projected"], deadline, stage).await?;
     Ok(projected)
 }
 
@@ -191,7 +221,7 @@ pub(crate) async fn verify_mounted_commit(
         captured.producer.release_source_snapshot(&state.pool, snapshot_scope, &snapshot, deadline).await;
         checked.map_err(|_| Error::bad_request())?;
         let commit = format!("{}^{{commit}}", mount.base_oid);
-        run_git(&state.config.git, &tree.bare(), &["cat-file", "-e", &commit], deadline)
+        run_git(&state.config.git, &tree.bare(), &["cat-file", "-e", &commit], deadline, None)
             .await
             .map_err(|_| Error::bad_request())?;
         Ok(())
@@ -226,6 +256,7 @@ pub(super) async fn create(
                 &tree.work(),
                 &["--no-local", "--no-hardlinks", "--no-tags"],
                 deadline,
+                None,
             )
             .await?;
             project(&state.config.git, &tree.work(), &mount.base_oid, &input.subdir, deadline).await
@@ -387,6 +418,7 @@ pub(super) async fn bundle(
             &tree.work(),
             &["--no-local", "--no-hardlinks", "--no-tags"],
             deadline,
+            None,
         )
         .await?;
         let projected = project(&state.config.git, &tree.work(), &view.source_oid, &view.subdir, deadline).await?;
@@ -400,6 +432,7 @@ pub(super) async fn bundle(
             &tree.work(),
             &["bundle", "create", file, "refs/heads/projected", "HEAD"],
             deadline,
+            None,
         )
         .await?;
         fs::read(file).map_err(Error::internal)

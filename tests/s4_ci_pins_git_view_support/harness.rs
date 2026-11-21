@@ -407,17 +407,19 @@ impl Cluster {
 
     pub async fn reverse(&self, view: &str, bundle: &[u8], source_ref: &str) -> Result<Value> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
-        self.post_json(
-            &format!("{}/api/views/{view}/changesets", self.main),
-            &self.owner.token,
-            json!({
+        let response = reqwest::Client::new()
+            .post(format!("{}/api/views/{view}/changesets", self.main))
+            .bearer_auth(&self.owner.token)
+            .json(&json!({
                 "bundle_base64": STANDARD.encode(bundle),
                 "bundle_ref": "refs/heads/projected",
                 "source_ref": source_ref,
                 "message": "reverse fixture merge",
-            }),
-        )
-        .await
+            }))
+            .send().await.map_err(|_| anyhow!("reverse_changeset failure class=transport"))?;
+        let status = response.status();
+        ensure!(status.is_success(), "reverse_changeset failure http_status={}", status.as_u16());
+        response.json().await.map_err(|_| anyhow!("reverse_changeset failure class=json"))
     }
 
     pub async fn post_json(&self, url: &str, token: &str, body: Value) -> Result<Value> {

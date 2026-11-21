@@ -1,5 +1,7 @@
 //! Bounded reverse-import Git helpers sharing the S4 process-group runner.
-use super::s4_git_proc::{GitStdin, META_OUTPUT_CAP, base_command, git_bytes, run_git_bounded};
+use super::s4_git_proc::{
+    GitStdin, META_OUTPUT_CAP, ReverseGitStage, base_command, git_bytes, run_git_bounded,
+};
 use crate::Error;
 use axum::http::StatusCode;
 use std::{
@@ -19,6 +21,7 @@ pub(crate) struct GitInputSpec<'a> {
     pub input: &'a [u8],
     pub actor: Option<&'a str>,
     pub max_out: usize,
+    pub stage: ReverseGitStage,
 }
 
 pub(crate) async fn git_input(
@@ -43,6 +46,7 @@ pub(crate) async fn git_input(
         spec.max_out,
         deadline,
         Error(StatusCode::CONFLICT, "Git View reverse mapping conflict"),
+        Some(spec.stage),
     )
     .await
 }
@@ -61,6 +65,7 @@ pub(crate) async fn new_pack(
         &["rev-list", "--objects", new_oid, "--not", base_oid],
         deadline,
         "Git View reverse mapping conflict",
+        Some(ReverseGitStage::PackWriteIndex),
     )
     .await?;
     let pack = git_input(
@@ -71,6 +76,7 @@ pub(crate) async fn new_pack(
             input: &objects,
             actor: None,
             max_out: MAX_PACK_BYTES + 1,
+            stage: ReverseGitStage::PackWriteIndex,
         },
         deadline,
     )
@@ -89,6 +95,7 @@ pub(crate) async fn new_pack(
         &["index-pack", "-o", idx_text, pack_text],
         deadline,
         "Git View reverse mapping conflict",
+        Some(ReverseGitStage::PackWriteIndex),
     )
     .await?;
     Ok((pack_path, idx_path))
@@ -113,6 +120,7 @@ pub(crate) async fn verify_candidate_budget(
         REVERSE_OUTPUT_CAP,
         deadline,
         Error(StatusCode::CONFLICT, "Git View reverse mapping conflict"),
+        Some(ReverseGitStage::AncestryIntegrity),
     )
     .await?;
     let mut input = Vec::new();
@@ -137,6 +145,7 @@ pub(crate) async fn verify_candidate_budget(
             input: &input,
             actor: None,
             max_out: REVERSE_OUTPUT_CAP,
+            stage: ReverseGitStage::AncestryIntegrity,
         },
         deadline,
     )
@@ -189,7 +198,14 @@ async fn mktree(
     }
     let raw = git_input(
         git_bin,
-        GitInputSpec { repo, args: &["mktree", "-z"], input: &input, actor: None, max_out: META_OUTPUT_CAP },
+        GitInputSpec {
+            repo,
+            args: &["mktree", "-z"],
+            input: &input,
+            actor: None,
+            max_out: META_OUTPUT_CAP,
+            stage: ReverseGitStage::SubtreeRootRebuild,
+        },
         deadline,
     )
     .await?;
@@ -206,8 +222,17 @@ pub(crate) async fn replace_tree(
 ) -> Result<String, Error> {
     let mut index = 0usize;
     let mut current = tree.to_owned();
-    let mut entries =
-        parse_tree(&git_bytes(git_bin, repo, &["ls-tree", "-z", &current], deadline, "Git View reverse mapping conflict").await?)?;
+    let mut entries = parse_tree(
+        &git_bytes(
+            git_bin,
+            repo,
+            &["ls-tree", "-z", &current],
+            deadline,
+            "Git View reverse mapping conflict",
+            Some(ReverseGitStage::SubtreeRootListing),
+        )
+        .await?,
+    )?;
     let mut frames = Vec::new();
     loop {
         let part = parts.get(index).ok_or_else(Error::bad_request)?;
@@ -223,8 +248,17 @@ pub(crate) async fn replace_tree(
         };
         frames.push((entries, key, part.to_string()));
         current = child;
-        entries =
-            parse_tree(&git_bytes(git_bin, repo, &["ls-tree", "-z", &current], deadline, "Git View reverse mapping conflict").await?)?;
+        entries = parse_tree(
+            &git_bytes(
+                git_bin,
+                repo,
+                &["ls-tree", "-z", &current],
+                deadline,
+                "Git View reverse mapping conflict",
+                Some(ReverseGitStage::SubtreeRootListing),
+            )
+            .await?,
+        )?;
         index += 1;
     }
     while let Some((mut parent, key, part)) = frames.pop() {
