@@ -279,6 +279,14 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIsNone(_step(PANDO_CLI_STEP)["timeout-minutes"])
         self.assertEqual(_step(PANDO_PITR_STEP)["timeout-minutes"], "10")
 
+    def test_python_suite_requires_the_live_pitr_unittest(self):
+        suite = _step("Run all Python unit and Tier-5 adversarial contract suites")
+        self.assertIn(
+            "--require-test test_pando_pitr_service.PandoPitrServiceTest."
+            "test_pando_pitr_pg_dump_clone_and_retention_roots",
+            suite["run"],
+        )
+
     def test_python_suite_report_is_source_bound_for_258_277_283_only(self):
         suite = _step("Run all Python unit and Tier-5 adversarial contract suites")
         env = suite["env"]
