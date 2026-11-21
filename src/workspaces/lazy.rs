@@ -98,13 +98,11 @@ fn read_manifest(path: &Path) -> Result<LazyManifest, Error> {
     Ok(manifest)
 }
 
-/// Admit a materialized FUSE lower only when its frozen Git metadata is a
-/// committed repository. FUSE restore and cross-host takeover share the same
-/// remote/cross-host contract as `remote::ensure_local`, so a genuinely unborn
-/// local checkpoint must never become a ready lazy lower. This uses the real
-/// `.git` bytes already staged or cached instead of `base_oid`, a path check or
-/// a remote probe; invalid, dangling or malformed metadata therefore fails
-/// closed with the compatibility conflict instead of being normalized.
+/// Check the frozen Git metadata before admitting a materialized FUSE lower.
+/// Remote restore and cross-host takeover require a committed checkpoint, so
+/// declared unborn HEADs are rejected even on the warm path. The compatibility
+/// check examines the staged or cached `.git` bytes and classifies HEAD from
+/// their reference metadata.
 ///
 /// The warm path deliberately revalidates the cached lower rather than fetching
 /// the remote manifest again. Pre-#317 lazy sidecars have no captured revision
