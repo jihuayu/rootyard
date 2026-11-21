@@ -13,6 +13,12 @@ _BEARER_RE = re.compile(r"(?i)(Bearer\s+)[0-9A-Za-z._~+/=-]{8,}")
 _PG_URL_RE = re.compile(r"postgres(?:ql)?://[^\s\"'<>]+")
 
 OUTCOME_CLASSES: tuple[str, ...] = ("committed_success", "typed_refusal", "unknown_outcome")
+REFUSAL_RECEIPT_CLASSES: tuple[str, ...] = (
+    "admitted_base_superseded",
+    "per_ref_cas_rejected",
+    "other_durable_rejection",
+    "unresolved",
+)
 
 
 def percentile_stats(samples_ms: list[float]) -> dict[str, Any]:
@@ -163,6 +169,21 @@ def validate_tier(tier: dict[str, Any]) -> None:
         _require(
             first_counts["committed_success"] <= final_success <= total,
             "same_repo committed_success must be between first-attempt successes and total_ops",
+        )
+    if "first_refusal_receipts" in same_repo:
+        receipts = same_repo["first_refusal_receipts"]
+        _require(
+            isinstance(receipts, dict) and set(receipts) == set(REFUSAL_RECEIPT_CLASSES),
+            "same_repo.first_refusal_receipts must contain exactly the four receipt classes",
+        )
+        _require("first_attempt_outcomes" in same_repo, "same_repo.first_refusal_receipts requires first_attempt_outcomes")
+        receipt_counts = {
+            cls: _check_nonneg_int(receipts[cls], f"same_repo.first_refusal_receipts.{cls}")
+            for cls in REFUSAL_RECEIPT_CLASSES
+        }
+        _require(
+            sum(receipt_counts.values()) == same_repo["first_attempt_outcomes"]["typed_refusal"],
+            "same_repo.first_refusal_receipts must partition first_attempt_outcomes.typed_refusal",
         )
 
     cas = tier.get("cas_race")
@@ -348,6 +369,15 @@ def render_summary_markdown(report: dict[str, Any]) -> str:
                 f"{first['typed_refusal']} refused and {first['unknown_outcome']} unknown. "
                 f"{same_repo['committed_success']} / {same_repo['total_ops']} succeeded including retries."
             )
+            if "first_refusal_receipts" in same_repo:
+                receipts = same_repo["first_refusal_receipts"]
+                first_attempt_lines.append(
+                    f"- Compute tier {tier['compute_processes']} first-refusal receipts "
+                    f"admitted_base_superseded={receipts['admitted_base_superseded']}, "
+                    f"per_ref_cas_rejected={receipts['per_ref_cas_rejected']}, "
+                    f"other_durable_rejection={receipts['other_durable_rejection']}, "
+                    f"unresolved={receipts['unresolved']}."
+                )
     if first_attempt_lines:
         lines.extend(["", "## Same-Repository First Attempts", "", *first_attempt_lines])
     lines.append("")

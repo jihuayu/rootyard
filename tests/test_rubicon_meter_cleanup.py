@@ -240,7 +240,7 @@ def _run_case(
         stack.enter_context(patch("rubicon_workload.runner.ResourceSampler", return_value=sampler))
         stack.enter_context(patch("rubicon_workload.runner._phase_seed", new=_fake_seed))
         stack.enter_context(patch("rubicon_workload.runner._phase_concurrent_overlap", new=_fake_noop))
-        stack.enter_context(patch("rubicon_workload.runner._phase_same_repo_mixed", new=_fake_noop))
+        stack.enter_context(patch("rubicon_workload.runner._phase_same_repo_mixed", new=lambda *a, **k: ({}, [])))
         stack.enter_context(patch("rubicon_workload.runner._phase_cas_race", new=_fake_noop))
         stack.enter_context(patch("rubicon_workload.runner._phase_atomic_subset", new=_fake_noop))
         stack.enter_context(patch("rubicon_workload.runner._phase_fault_and_audit", new=_fake_fault))
