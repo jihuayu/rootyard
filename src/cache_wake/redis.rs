@@ -498,12 +498,19 @@ pub struct RedisWake {
 }
 
 impl RedisWake {
-    /// Read the existing legacy wake settings when present. `ROOTYARD_REDIS_URL`
-    /// enables ACL/TLS URLs; the older `ROOTYARD_REDIS_ADDRESS` remains a
-    /// loopback-only plaintext compatibility path. `ROOTYARD_WAKE_CHANNEL`
-    /// retains its existing default and validation.
+    /// Read the existing generic wake settings. `ROOTYARD_REDIS_URL` enables
+    /// ACL/TLS URLs; the older `ROOTYARD_REDIS_ADDRESS` remains a loopback-only
+    /// plaintext compatibility path. `ROOTYARD_WAKE_CHANNEL` retains its
+    /// existing default and validation.
     pub fn from_env() -> Result<Self> {
-        let channel = std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
+        let channel = super::generic_wake_channel_from_env()?;
+        Self::from_env_with_channel(channel)
+    }
+
+    /// Read the shared endpoint settings but use an explicitly selected channel
+    /// namespace. The A4 producer/subscriber uses this so the generic outbox
+    /// channel can never enroll it.
+    pub fn from_env_with_channel(channel: String) -> Result<Self> {
         let url = match std::env::var("ROOTYARD_REDIS_URL") {
             Ok(url) => url,
             Err(_) => {
