@@ -118,9 +118,8 @@ redis = { version = "=0.32.7", optional = true, default-features = false,
 ```
 
 The pin is exact and must be validated by the build owner when regenerating
-`Cargo.lock`. This increment was authored without network access, so the pin,
-feature names and lockfile were not build-verified here. Do not hand-edit
-`Cargo.lock`.
+`Cargo.lock`. The hosted `state-redis` jobs cited under Verification build and
+exercise this pin; do not hand-edit `Cargo.lock`.
 
 The `redis` crate (redis-rs) is a mature async client. This work adds no
 hand-written RESP parser, raw TCP client or TLS implementation. Configure cache
@@ -273,8 +272,7 @@ Keep the existing `ROOTYARD_OUTBOX_WORKER=false` + generic `rootyard worker`
 roles separate. The A4 scope is a separate queue/namespace, not a replacement for
 the generic outbox consumers. The real PG17/Garage/Redis A4 acceptance (actual
 serve-blob HTTP/stock Git, exact-once target audit, partition fallback and
-post-heal wake before poll) is a separate gate and is not claimed by the source
-tests in this worktree.
+post-heal wake before poll) is documented under Verification.
 
 ## Wake compatibility and configuration
 
@@ -321,8 +319,7 @@ publisher stop ownership, conditional external consumer removal, post-commit
 trigger ordering and the absence of legacy consumer/projection enrollment. The
 opt-in external acceptance entry point and its pure timing/report/cleanup guards
 live in `tests/a4_redis_wake_partition.py` and
-`tests/test_a4_redis_wake_partition.py`; they do not replace the required native
-PASSED report. Redis unit
+`tests/test_a4_redis_wake_partition.py`. Redis unit
 tests cover bounded-read length/corruption as a miss, cheap pre-encode oversize
 rejection, whole-deadline permit wait and refusal to operate without a validated
 server contract. Real-Redis contract tests are `#[ignore]`d and require a
@@ -339,8 +336,8 @@ Missing `ROOTYARD_TEST_REDIS_URL` panics the explicitly selected contract test;
 it is never reported as a successful real-Redis run. Do not point this at a
 shared or production cache.
 
-Root validation includes source-bound real Redis7.4.2 tests on a disposable
-loopback instance:21 unit cases, six real cases over plaintext and again over
+Root validation includes source-bound real Redis 7.4.2 tests on a disposable
+loopback instance: 21 unit cases, six real cases over plaintext and again over
 verified private-CA TLS, rejection with an untrusted CA and success after
 restoring trust. Cases cover bounded reads, FLUSHALL, ACL rejection, unsafe
 policy rejection/restoration, advisory wake and real driver teardown after
@@ -349,19 +346,32 @@ executable, fixture version and case counts in
 `evidence/state-services/cache-wake/redis-contract.json`.
 
 HA/Sentinel/Cluster, PG failover, production performance and least-privilege
-production ACLs remain pending. The `serve-blob`/A4 advisory producer and
-subscriber wiring is implemented behind the explicit variables above, but the
-real PG17/Garage/Redis external A4 acceptance remains pending: the opt-in entry
-point is `tests/a4_redis_wake_partition.py` with pure tests in
-`tests/test_a4_redis_wake_partition.py`. Its preflight reads the owned loopback
+production ACLs remain pending. The hosted runs below use controlled owned
+fixtures. The `serve-blob`/A4 advisory producer and subscriber wiring is
+implemented behind the explicit variables above. The opt-in entry point is
+`tests/a4_redis_wake_partition.py` with pure tests in
+`tests/test_a4_redis_wake_partition.py`; its preflight reads the owned loopback
 fixture's `server_version_num` through the trusted existing `psql` and rejects
-any major other than 17 before effects; the report carries closed
+any major other than 17 before effects, and the report carries closed
 `postgres_major`/`postgres_server_version_num` evidence. Its standalone `main`
 also uses a test-only Linux child-subreaper plus bounded `waitpid` drain to prove
-no adopted service/worker descendant remains before schema/scratch cleanup; this
-is fixture containment, not a production mechanism. No native PASSED report is
-claimed in this worktree. This increment keeps #111 open for that run and never makes
-Redis a hard quota or authority. The default build still needs no Redis.
+no adopted service/worker descendant remains before schema/scratch cleanup.
+
+- The #330 run bound artifact `14691675720` to
+  `191b3d1fb9d6ebcac6c2d76034323fa25548d163` and tree
+  `7e0cc00e8cff4c28b85a005b4b144a685b47f9bc`. Its PG17, Garage and Redis
+  case passed with zero skips. The fixture witnessed an external disconnect,
+  PG polling fallback, renewed Redis wake, and durable state equality after a
+  single-node `FLUSHALL`. Owned cleanup completed.
+  [Hosted external wake](https://github.com/jihuayu/rootyard/actions/runs/44864400941/job/136724710584)
+- The #336 run bound artifact `14691691326` to
+  `02bac9ff568bf1ba5d17ef4cf9f7677f01ed1846` and tree
+  `4cdd2d9675281a9d3a47e7fec26c330e7329cfcf`. Its controlled primary-loss
+  and replica-promotion case passed with zero skips. The same worker used PG
+  polling during the outage and resumed Redis wake after promotion. The
+  report verifies durable references, objects, holds and outbox state and
+  confirms owned cleanup.
+  [Hosted replica promotion](https://github.com/jihuayu/rootyard/actions/runs/44864701501/job/136725666012)
 
 The full ignored real-Redis suite includes destructive FLUSHALL and CONFIG SET
 checks. Run it only against a disposable, task-owned instance and explicitly set
@@ -386,6 +396,7 @@ after repeated deadlines and an explicit caller abort, followed by recovery.
 `scripts/check_redis_contract.py` owns a disposable Docker `redis:7.2.6`
 fixture and runs the source-bound six-case plaintext, TLS, untrusted-CA and
 restored-trust contract. The separate `.github/workflows/redis-contract.yml`
-job wraps it with all-target `state-redis` Clippy and report upload. Remote CI
-execution is pending in this worktree; no remote PASSED result is claimed.
-See [owned real-Redis contract gate](redis-contract-gate.md).
+job wraps it with all-target `state-redis` Clippy and report upload. A hosted run
+of this job has passed for this candidate; the closed report, artifact and case
+counts are recorded in the
+[owned real-Redis contract gate](redis-contract-gate.md).
