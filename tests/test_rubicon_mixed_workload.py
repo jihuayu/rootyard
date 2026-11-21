@@ -256,6 +256,36 @@ class RubiconReportValidationTests(unittest.TestCase):
         md = render_summary_markdown(report)
         self.assertIn("Rubicon Mixed Workload", md)
         self.assertIn("`16420261116`", md)
+        self.assertNotIn("Same-Repository First Attempts", md)
+
+    def test_reports_first_attempts_separately_from_successes_after_retries(self) -> None:
+        report = _valid_sample_report()
+        same_repo = report["tiers"][0]["same_repo_mixed_concurrency"]
+        same_repo["first_attempt_outcomes"] = {"committed_success": 1, "typed_refusal": 1, "unknown_outcome": 1}
+        same_repo["contention_retries"] = 3
+
+        validate_report(report)
+        md = render_summary_markdown(report)
+        self.assertIn("1 / 3 first-attempt successes, 1 refused and 1 unknown", md)
+        self.assertIn("3 / 3 succeeded including retries.", md)
+
+    def test_rejects_inconsistent_first_attempt_outcomes(self) -> None:
+        for first, final, error in (
+            (None, 3, "must contain"),
+            ({"committed_success": 3, "typed_refusal": 0}, 3, "must contain"),
+            ({"committed_success": True, "typed_refusal": 1, "unknown_outcome": 1}, 3, "non-negative int"),
+            ({"committed_success": 1, "typed_refusal": 3, "unknown_outcome": -1}, 3, "non-negative int"),
+            ({"committed_success": 1, "typed_refusal": 1, "unknown_outcome": 0}, 3, "must partition"),
+            ({"committed_success": 2, "typed_refusal": 1, "unknown_outcome": 0}, 1, "must be between"),
+            ({"committed_success": 1, "typed_refusal": 2, "unknown_outcome": 0}, 4, "must be between"),
+        ):
+            with self.subTest(first=first, final=final):
+                report = _valid_sample_report()
+                same_repo = report["tiers"][0]["same_repo_mixed_concurrency"]
+                same_repo["first_attempt_outcomes"] = first
+                same_repo["committed_success"] = final
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_report(report)
 
     def test_rejects_false_success_during_fault_window_and_unverified_audit(self) -> None:
         bad_fault = _valid_sample_report()
