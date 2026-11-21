@@ -6,6 +6,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      fsck_diagnostics:
+        description: "Publish bounded S4 reverse fsck diagnostics (test-only)"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: s4-ci-pins-git-view-${{ github.workflow }}-${{ github.ref }}
@@ -110,9 +116,157 @@ jobs:
         run: |
           cargo test --locked --lib namespace_service::
 
+      - name: Prepare optional bounded fsck diagnostics
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.fsck_diagnostics }}
+        run: |
+          set -euo pipefail
+          diag_root="$(mktemp -d "$RUNNER_TEMP/rootyard-s4-fsck-diagnostics.XXXXXX")"
+          chmod 700 "$diag_root"
+          diag_file="$diag_root/fsck-diagnostics.jsonl"
+          : > "$diag_file"
+          chmod 600 "$diag_file"
+          test -f "$diag_file"
+          test ! -L "$diag_file"
+          test -O "$diag_file"
+          wrapper="$GITHUB_WORKSPACE/tests/s4_ci_pins_git_view_support/git_fsck_diagnostic.py"
+          test -x "$wrapper"
+          {
+            printf 'ROOTYARD_TEST_GIT=%s\n' "$wrapper"
+            printf 'ROOTYARD_S4_FSCK_DIAGNOSTIC=%s\n' "$diag_file"
+            printf 'ROOTYARD_S4_FSCK_DIAGNOSTIC_DIR=%s\n' "$diag_root"
+          } >> "$GITHUB_ENV"
+
       - name: Run PG17 S4 checkout, revocation and GitView acceptance
         run: |
           cargo test --locked --test s4_ci_pins_git_view -- --ignored --test-threads=1
+
+      - name: Publish optional bounded fsck diagnostics
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.fsck_diagnostics }}
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/s4-ci-pins-git-view
+          python3 - "$ROOTYARD_S4_FSCK_DIAGNOSTIC" "$ROOTYARD_S4_FSCK_DIAGNOSTIC_DIR" <<'PY'
+          from __future__ import annotations
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          MAX_BYTES = 64 * 1024
+          MAX_RECORDS = 1024
+          SCHEMA = "rootyard-s4-git-fsck-diagnostic-v1"
+          CATEGORIES = frozenset({
+              "fatal", "error", "warning", "notice", "invalid_object",
+              "missing_object", "broken_link", "dangling", "unknown",
+          })
+          SOURCE_KEYS = {"schema", "kind", "exit_code", "signal", "categories", "truncated"}
+
+
+          def fail(message: str) -> None:
+              print("fsck diagnostic collection failed: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          raw_source = os.environ.get("ROOTYARD_S4_FSCK_DIAGNOSTIC", "")
+          raw_root = os.environ.get("ROOTYARD_S4_FSCK_DIAGNOSTIC_DIR", "")
+          if not raw_source or not raw_root:
+              fail("run-owned diagnostic path is absent")
+          source = Path(raw_source)
+          root = Path(raw_root)
+          runner_temp = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
+          if not source.is_absolute() or not root.is_absolute() or not runner_temp.is_dir():
+              fail("diagnostic paths are not absolute run-owned paths")
+          try:
+              root_resolved = root.resolve(strict=True)
+          except OSError:
+              fail("run-owned diagnostic directory is unreadable")
+          if source.parent.resolve() != root_resolved or runner_temp not in root_resolved.parents:
+              fail("diagnostic path escaped the run-owned directory")
+          try:
+              lstat = os.lstat(source)
+          except OSError:
+              fail("diagnostic output is absent or unreadable")
+          if stat.S_ISLNK(lstat.st_mode):
+              fail("diagnostic output is a symlink")
+          try:
+              fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+          except OSError:
+              fail("diagnostic output is unreadable or unsafe")
+          try:
+              info = os.fstat(fd)
+              if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                      or info.st_nlink != 1 or info.st_size > MAX_BYTES):
+                  fail("diagnostic output is not a bounded owned regular file")
+              with os.fdopen(fd, "rb") as stream:
+                  fd = -1
+                  data = stream.read(MAX_BYTES + 1)
+          finally:
+              if fd >= 0:
+                  os.close(fd)
+          if len(data) > MAX_BYTES:
+              fail("diagnostic output exceeds the byte bound")
+          if not data:
+              fail("diagnostic output is empty")
+          if not data.endswith(b"\n"):
+              fail("diagnostic output lacks a final newline")
+          try:
+              lines = data.decode("utf-8").splitlines()
+          except UnicodeDecodeError:
+              fail("diagnostic output is not UTF-8")
+          if len(lines) > MAX_RECORDS:
+              fail("diagnostic output exceeds the record bound")
+          records = []
+          for line in lines:
+              try:
+                  record = json.loads(line)
+              except json.JSONDecodeError:
+                  fail("diagnostic record is not JSON")
+              if not isinstance(record, dict) or set(record) != SOURCE_KEYS:
+                  fail("diagnostic record shape is not canonical")
+              if record["schema"] != SCHEMA or record["kind"] != "namespace_reverse_fsck":
+                  fail("diagnostic record identity is not canonical")
+              code = record["exit_code"]
+              sig = record["signal"]
+              if code is not None and (type(code) is not int or not 0 <= code <= 255):
+                  fail("diagnostic exit status is not finite")
+              if sig is not None and (type(sig) is not int or not 1 <= sig <= 64):
+                  fail("diagnostic signal is not finite")
+              if code is None and sig is None:
+                  fail("diagnostic record has no finite status")
+              if type(record["truncated"]) is not bool:
+                  fail("diagnostic truncation marker is not boolean")
+              categories = record["categories"]
+              if not isinstance(categories, dict) or any(name not in CATEGORIES for name in categories):
+                  fail("diagnostic category is not allowlisted")
+              if any(type(count) is not int or not 1 <= count <= 65535 for count in categories.values()):
+                  fail("diagnostic category count is not finite")
+              records.append(record)
+
+          output = b"".join(
+              (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+              for record in records
+          )
+          destination = Path("test-results/s4-ci-pins-git-view/fsck-diagnostics.jsonl")
+          try:
+              out_fd = os.open(
+                  destination,
+                  os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                  0o600,
+              )
+          except OSError:
+              fail("bounded evidence destination is unsafe")
+          try:
+              view = memoryview(output)
+              while view:
+                  written = os.write(out_fd, view)
+                  if written <= 0:
+                      fail("bounded evidence write failed")
+                  view = view[written:]
+          finally:
+              os.close(out_fd)
+          print(f"fsck diagnostics validated: {len(records)} record(s), {len(output)} bytes")
+          PY
 
       - name: Upload S4 acceptance evidence
         if: always()
