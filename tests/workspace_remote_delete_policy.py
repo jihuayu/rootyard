@@ -400,10 +400,6 @@ class PolicyHarness(Harness):
             extra_headers={"Idempotency-Key": "policy-pending-fuse-failed"}))
         failed_id = failed["checkpoint_id"]
         assert failed["state"] == "local_complete"
-        base_events = int(self.sql(
-            "SELECT count(*) FROM workspace_events "
-            f"WHERE workspace_id='{wid}' AND kind='external_capture'"))
-        base_revision = int(self.sql(f"SELECT revision FROM workspaces WHERE id='{wid}'"))
 
         self.stop()
         gate_target = (Path(self.root) / "data/workspace-service/uppers"
@@ -554,6 +550,19 @@ class PolicyHarness(Harness):
                 "capture read gate expired before exit-77 publication")
             assert evidence["attempts"] == evidence["writes"] + 1
 
+            # Sample the durable state only during the proven kernel freeze, in
+            # one read-only snapshot.  Captures committed before the gate are
+            # independent writes, not evidence about this blocked request.
+            observation_sql = (
+                "SELECT (SELECT count(*) FROM workspace_events "
+                f"WHERE workspace_id='{wid}' AND kind='external_capture'), "
+                f"revision FROM workspaces WHERE id='{wid}'")
+            base_events, base_revision = (
+                int(value) for value in self.sql(observation_sql).split("|"))
+            assert not gate.with_suffix(".timeout").exists(), (
+                "capture read gate expired after baseline sampling before "
+                "exit-77 publication")
+
             puts_before = proxy.method_counts.get("PUT", 0)
             kill_ns = time.time_ns()
             try:
@@ -563,6 +572,8 @@ class PolicyHarness(Harness):
                 pass
             assert self.proc.wait(timeout=10) == 77, (
                 "publication did not exit 77 after a real object upload")
+            assert not gate.with_suffix(".timeout").exists(), (
+                "capture read gate expired during exit-77 publication")
             put_delta = proxy.method_counts.get("PUT", 0) - puts_before
             assert put_delta > 0, "exit-77 publication issued no real S3 PUT"
 
@@ -608,12 +619,12 @@ class PolicyHarness(Harness):
                 "SELECT COUNT(*) FROM workspace_remote_staging_objects "
                 f"WHERE checkpoint_id='{retained_id}' AND digest='{orphan_sha}'") == "0", (
                 "the first retained checkpoint already referenced the unique orphan")
-            assert int(self.sql(
-                "SELECT count(*) FROM workspace_events "
-                f"WHERE workspace_id='{wid}' AND kind='external_capture'")) == base_events, (
+            after_events, after_revision = (
+                int(value) for value in self.sql(observation_sql).split("|"))
+            assert after_events == base_events, (
                 "a blocked capture was reported committed after exit 77")
-            assert int(self.sql(f"SELECT revision FROM workspaces WHERE id='{wid}'")) \
-                == base_revision, "workspace revision advanced after exit 77"
+            assert after_revision == base_revision, (
+                "workspace revision advanced after exit 77")
 
             verify_holder_pinned("immediately before the remount restart")
             old_helper_exit_before_restart = support.wait_pid_gone(
