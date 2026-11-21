@@ -94,7 +94,10 @@ fn parse_cache_environment(raw: Result<String, std::env::VarError>) -> Result<St
     }
 }
 
-fn cache_environment() -> Result<String, Error> {
+/// The one cluster/environment scope shared by the legacy browse and Blob
+/// gateway read caches. Only an absent variable selects the documented default;
+/// a present malformed value is a fixed internal error, never a raw echo.
+pub(crate) fn cache_environment() -> Result<String, Error> {
     parse_cache_environment(std::env::var("ROOTYARD_CACHE_ENVIRONMENT")).map_err(Error::internal)
 }
 
