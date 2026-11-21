@@ -28,7 +28,7 @@ from pack_compression_eval.multi_repo_diagnostics import (  # noqa: E402
     sanitize_multi_repo_completed,
     sanitize_multi_repo_group,
 )
-from pack_compression_eval.pack_matrix import CANDIDATE_CONFIGS  # noqa: E402
+from pack_compression_eval.pack_matrix import CANDIDATE_CONFIGS, LIVE_COMPARISON_CONFIG_NAMES  # noqa: E402
 from pack_compression_eval.telemetry import percentile_stats  # noqa: E402
 
 SENTINEL = "SENTINEL_SECRET_multi_repo_completed_7d31"
@@ -59,6 +59,7 @@ def raw_group(
                 "client_invocation_end_ms": ends[ordinal],
                 "push_verified": True,
                 "first_attempt": True,
+                "retry_count": 0,
                 "environment": SENTINEL,
                 "raw_git": SENTINEL,
                 "payload": SENTINEL,
@@ -193,7 +194,7 @@ class MultiRepoCompletedProjectionTest(unittest.TestCase):
             variant = raw_group()
             variant[field] = value
             bad.append(variant)
-        for field in ("push_verified", "first_attempt"):
+        for field in ("push_verified", "first_attempt", "retry_count"):
             missing = raw_group()
             missing["push_samples"][0].pop(field)
             bad.append(missing)
@@ -201,6 +202,10 @@ class MultiRepoCompletedProjectionTest(unittest.TestCase):
                 variant = raw_group()
                 variant["push_samples"][0][field] = value
                 bad.append(variant)
+        for value in (0.0, "0"):
+            variant = raw_group()
+            variant["push_samples"][0]["retry_count"] = value
+            bad.append(variant)
         bad.extend(
             (
                 raw_group(starts=(1.0, 2.0, 3.0)),
@@ -238,11 +243,14 @@ class MultiRepoCompletedProjectionTest(unittest.TestCase):
         self.assertNotIn(SENTINEL, encoded)
         self.assertNotIn("raw", encoded)
 
-    def test_projection_limit_and_unknown_configs(self) -> None:
-        groups = [raw_group(spec.name) for spec in CANDIDATE_CONFIGS[: MULTI_REPO_COMPLETED_LIMIT + 1]]
+    def test_projection_binds_to_live_cohort_and_limit(self) -> None:
+        groups = [raw_group(name) for name in LIVE_COMPARISON_CONFIG_NAMES]
         records = sanitize_multi_repo_completed(groups)
+        self.assertEqual(len(records), 4)
         self.assertEqual(len(records), MULTI_REPO_COMPLETED_LIMIT)
-        self.assertEqual([record["config_name"] for record in records], [spec.name for spec in CANDIDATE_CONFIGS[:MULTI_REPO_COMPLETED_LIMIT]])
+        self.assertEqual([record["config_name"] for record in records], list(LIVE_COMPARISON_CONFIG_NAMES))
+        offline = next(spec.name for spec in CANDIDATE_CONFIGS if spec.name not in LIVE_COMPARISON_CONFIG_NAMES)
+        self.assertEqual(sanitize_multi_repo_completed([raw_group(offline)]), [])
         self.assertEqual(sanitize_multi_repo_completed([raw_group("baseline")]), [])
         self.assertEqual(sanitize_multi_repo_completed("not-a-list"), [])
 

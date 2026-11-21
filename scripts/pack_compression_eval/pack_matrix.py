@@ -136,6 +136,13 @@ CANDIDATE_CONFIGS: tuple[PackConfigSpec, ...] = (
     ),
 )
 
+LIVE_COMPARISON_CONFIG_NAMES: tuple[str, ...] = (
+    "rootyard_default",
+    "zlib_store_c0",
+    "wide_window_c6_w50_t2",
+    "deep_archive_c9_w50_d100",
+)
+
 
 def list_all_object_oids(git_bin: str | Path, bare_dir: Path, env: dict[str, str]) -> dict[str, str]:
     """Return {oid: object_type} for all objects present in bare_dir."""

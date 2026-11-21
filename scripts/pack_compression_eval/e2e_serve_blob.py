@@ -54,7 +54,7 @@ from .live_server import (
 )
 from .multi_repo import run_multi_repo_first_pushes
 from .multi_repo_diagnostics import MULTI_REPO_COMPLETED_FIELD, sanitize_multi_repo_completed
-from .pack_matrix import CANDIDATE_CONFIGS
+from .pack_matrix import CANDIDATE_CONFIGS, LIVE_COMPARISON_CONFIG_NAMES
 from .report import FETCH_MEASUREMENT_NOTES
 from .s3_meter import SOCKET_IO_TIMEOUT_SECONDS, S3MeterProxy
 from .telemetry import ResourceSampler, percentile_stats, query_pg_refstore_stats, sum_dir_bytes
@@ -140,8 +140,8 @@ def run_live_serve_blob_eval(
 
         askpass = write_askpass_script(work_root / "askpass.sh")
         archetype_specs: list[tuple[str, str]] = [(arch, "sha1") for arch in DATASET_ARCHETYPES] + [("text_history", "sha256")]
-        compare_names = ("rootyard_default", "zlib_store_c0", "wide_window_c6_w50_t2", "deep_archive_c9_w50_d100")
-        compare_specs = [s for s in CANDIDATE_CONFIGS if s.name in compare_names]
+        specs_by_name = {spec.name: spec for spec in CANDIDATE_CONFIGS}
+        compare_specs = [specs_by_name[name] for name in LIVE_COMPARISON_CONFIG_NAMES]
 
         # Pre-create all tenant user/token pairs BEFORE starting serve-blob so `create-user`
         # (`db::migrate`) never contends against serve-blob's PostgreSQL lifecycle barrier.

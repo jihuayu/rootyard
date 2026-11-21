@@ -11,12 +11,12 @@ from collections.abc import Mapping
 import math
 from typing import Any
 
-from .pack_matrix import CANDIDATE_CONFIGS
+from .pack_matrix import LIVE_COMPARISON_CONFIG_NAMES
 from .telemetry import percentile_stats
 
 MULTI_REPO_COMPLETED_FIELD = "multi_repo_completed"
-MULTI_REPO_COMPLETED_LIMIT = 4
-MULTI_REPO_CONFIG_NAMES = frozenset(spec.name for spec in CANDIDATE_CONFIGS)
+MULTI_REPO_COMPLETED_LIMIT = len(LIVE_COMPARISON_CONFIG_NAMES)
+MULTI_REPO_CONFIG_NAMES = frozenset(LIVE_COMPARISON_CONFIG_NAMES)
 _MAX_FAILURE_MS = (1 << 53) - 1
 _MAX_S3_COUNT = (1 << 63) - 1
 _S3_FIELDS = ("get_requests", "get_bytes", "put_requests", "put_bytes")
@@ -51,7 +51,10 @@ def _raw_values(item: Mapping[str, Any]) -> tuple[list[Any], list[Any], list[Any
         if "first_attempt_only" in item and item.get("first_attempt_only") is not True:
             return None
         if not all(
-            sample.get("push_verified") is True and sample.get("first_attempt") is True
+            sample.get("push_verified") is True
+            and sample.get("first_attempt") is True
+            and type(sample.get("retry_count")) is int
+            and sample.get("retry_count") == 0
             for sample in samples
         ):
             return None
