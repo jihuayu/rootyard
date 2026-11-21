@@ -89,9 +89,18 @@ pub(crate) async fn git_input(
     // Git receive-pack places incoming objects in a quarantine directory
     // until the pre-receive hook accepts the update. Forward only these two
     // Git-managed paths; the rest of the hook environment remains cleared.
-    for name in ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"] {
-        if let Some(value) = std::env::var_os(name) {
-            cmd.env(name, value);
+    if let Some((obj_dir, alt_dirs)) = super::blob_proof_publication::prod_routes::active_push_quarantine_dirs() {
+        if let Some(v) = obj_dir {
+            cmd.env("GIT_OBJECT_DIRECTORY", v);
+        }
+        if let Some(v) = alt_dirs {
+            cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", v);
+        }
+    } else {
+        for name in ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
         }
     }
     cmd.arg("-c")
@@ -186,6 +195,32 @@ pub async fn validate_new_refs(
     .await
 }
 
+/// Callable by the native `browse::policy::validate_hook` pre-receive hook, forwarding the
+/// trusted admitted [`crate::journal::Operation`] (`actor_id`, `actor_name`, `idempotency`)
+/// and live relational `tenant_id` directly to S4 LFS pointer attestation when active.
+pub async fn validate_new_refs_for_hook<C: GenericClient + Sync>(
+    client: &C,
+    db_url: &str,
+    git_dir: &Path,
+    data_root: &Path,
+    git_bin: &Path,
+    timeout: Duration,
+    tenant_id: Uuid,
+    op: &crate::journal::Operation,
+    changes: &[RefChange],
+) -> Result<(), Error> {
+    if let Some(gate) = super::blob_proof_publication::active_blob_gate() {
+        let _ = super::blob_proof_publication::prod_validate_and_attest_hook(
+            &gate, db_url, git_dir, data_root, timeout, tenant_id, op, changes,
+        )
+        .await
+        .map_err(super::blob_proof_publication::prod_routes::to_app_error)?;
+        return Ok(());
+    }
+    validate_new_refs_with_client(client, git_dir, data_root, git_bin, timeout, op.repository_id, tenant_id, changes)
+        .await
+}
+
 /// Callable by the synchronous Git pre-receive hook before any ref moves.
 pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
     client: &C,
@@ -197,6 +232,14 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
     tenant_id: Uuid,
     changes: &[RefChange],
 ) -> Result<(), Error> {
+    if let Some(gate) = super::blob_proof_publication::active_blob_gate() {
+        let _ = super::blob_proof_publication::prod_validate_and_attest_push(
+            &gate, git_dir, data_root, timeout, repo_id, tenant_id, changes,
+        )
+        .await
+        .map_err(super::blob_proof_publication::prod_routes::to_app_error)?;
+        return Ok(());
+    }
     let deadline = tokio::time::Instant::now() + timeout;
     let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let max_lfs_bytes = std::env::var("ROOTYARD_LFS_POINTER_VERIFY_BYTES")

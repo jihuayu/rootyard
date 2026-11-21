@@ -515,6 +515,10 @@ pub enum RefStoreError {
     },
     /// Gate initialization parameters differ from the durable gate.
     GateConflict,
+    /// The authoritative restore incarnation changed after the caller captured
+    /// its trusted authorization. No new commit may be acknowledged under the
+    /// old request contract.
+    RestoreIncarnationMismatch,
     /// A terminal operation/result is immutable and cannot be changed.
     TerminalImmutable,
     Unsupported(&'static str),
@@ -614,6 +618,9 @@ impl fmt::Display for RefStoreError {
                 write!(formatter, "operation {operation_id} is durably pending; outcome is unknown")
             }
             Self::GateConflict => formatter.write_str("ref-store core gate parameters conflict with the durable gate"),
+            Self::RestoreIncarnationMismatch => {
+                formatter.write_str("restore incarnation changed after the trusted authorization capture")
+            }
             Self::TerminalImmutable => formatter.write_str("terminal operation result is immutable"),
             Self::Unsupported(capability) => write!(formatter, "ref-store capability is unsupported: {capability}"),
             Self::Timeout => formatter.write_str("ref-store transaction deadline expired"),
@@ -819,5 +826,13 @@ mod tests {
         let timeout = RefStoreError::Timeout;
         assert!(!timeout.is_conflict());
         assert!(!timeout.to_string().contains("unknown"), "{timeout}");
+    }
+
+    #[test]
+    fn restore_incarnation_mismatch_is_typed_and_not_a_public_anchor() {
+        let error = RefStoreError::RestoreIncarnationMismatch;
+        assert!(!error.is_conflict());
+        assert!(error.to_string().contains("restore incarnation"));
+        assert!(!error.to_string().contains("unknown"));
     }
 }

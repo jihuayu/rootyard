@@ -39,6 +39,7 @@ mod operation;
 mod process_guard;
 mod protocol;
 mod publish;
+mod read_cache;
 mod read_session;
 mod receive;
 pub(crate) mod repo_session;

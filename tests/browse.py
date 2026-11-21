@@ -477,13 +477,32 @@ class BrowseHarness(MixedRefPolicyCases, Harness):
                 events.append(event)
         return events
 
-    def _wait_deadline_git_start(self, log, timeout=10):
+    def _wait_deadline_git_start(self, log, timeout=10, request=None):
+        """Wait for a real wrapper event, preferring it over request completion.
+
+        A deadline request can finish before any Git child starts.  Once the
+        request future is done, re-read the log before deciding so a start
+        written just before completion still wins.  If there is still no event,
+        surface the request's existing failure, or, for an otherwise expected
+        result, state that no start was recorded.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             events = self._deadline_git_events(log)
             if events:
                 return events
+            if request is not None and request.done():
+                break
             time.sleep(0.02)
+        events = self._deadline_git_events(log)
+        if events:
+            return events
+        if request is not None and request.done():
+            request.result()
+            raise AssertionError(
+                "first deadline request completed before any armed Git "
+                "start was recorded"
+            )
         raise AssertionError("armed Git wrapper never recorded a delayed start")
 
     @staticmethod
@@ -576,7 +595,7 @@ class BrowseHarness(MixedRefPolicyCases, Harness):
             started = time.monotonic()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 slow = pool.submit(self.document, path, 504)
-                self._wait_deadline_git_start(log)
+                self._wait_deadline_git_start(log, request=slow)
                 busy_status, busy_body, _ = self.http(path, token=self.alice)
                 assert busy_status == 503, (
                     "second request while the first Git slot is held: expected "

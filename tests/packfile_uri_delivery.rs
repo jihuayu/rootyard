@@ -341,7 +341,13 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
         let pre_bytes = pre_rev.bytes().await?;
         ensure!(hex::encode(&pre_bytes[pre_bytes.len() - pack_fmt.oid_hex_len() / 2..]) == *signed_pack_hash);
 
-        db.pool.get().await?.execute("DELETE FROM tokens WHERE id = $1", &[&owner.identity.token_id]).await?;
+        let revoked = db
+            .pool
+            .get()
+            .await?
+            .execute("UPDATE tokens SET revoked=true WHERE id=$1 AND revoked=false", &[&owner.identity.token_id])
+            .await?;
+        ensure!(revoked == 1, "expected exactly one live owner token to revoke, got {revoked}");
         let post_rev = pinned_client.get(signed_url).send().await?;
         ensure!(
             post_rev.status() == reqwest::StatusCode::FORBIDDEN,

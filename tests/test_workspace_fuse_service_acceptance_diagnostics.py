@@ -26,6 +26,7 @@ from workspace_fuse_service_acceptance import (
     SHUTDOWN_OUTCOME_UNKNOWN,
     SOURCE_PATHS,
     WorkspaceFuseDiagnosticResult,
+    _api_exit,
     _bounded_int,
     _busy_target,
     _child_exit,
@@ -36,6 +37,7 @@ from workspace_fuse_service_acceptance import (
     _http_status,
     _report_payload,
     _source_location,
+    _terminal_write,
     _unknown_diagnostic,
     _writer_close,
     project_shutdown_outcome,
@@ -156,10 +158,16 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
                 self.assertIsNone(
                     record["child_exit"],
                     "a service exit must never be relabelled as a child exit")
+                expected = (
+                    value if type(value) is int
+                    and -255 <= value <= 255 else None)
+                self.assertEqual(record["api_exit"], expected)
 
         no_attribute = _case(REQUIRED_CASES[2])
         self.assertIsNone(_diagnostic_record(
             no_attribute, AssertionError("synthetic"), None)["child_exit"])
+        self.assertIsNone(_diagnostic_record(
+            no_attribute, AssertionError("synthetic"), None)["api_exit"])
 
         # Only a real CalledProcessError code belongs in child_exit.
         test._rootyard_diagnostic_api_exit = 7
@@ -167,12 +175,31 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             3, ["secret-argv"], output=b"secret")
         self.assertEqual(_diagnostic_record(
             test, original, None)["child_exit"], 3)
+        self.assertEqual(_diagnostic_record(
+            test, original, None)["api_exit"], 7)
 
         invalid = subprocess.CalledProcessError(True, ["secret-argv"])
         self.assertIsNone(_diagnostic_record(
             test, invalid, None)["child_exit"])
         self.assertIsNone(_diagnostic_record(
             test, AssertionError("synthetic"), None)["child_exit"])
+
+    def test_api_exit_is_distinct_from_helper_and_child_exit(self):
+        test = _case(REQUIRED_CASES[2])
+        test._rootyard_diagnostic_primary_phase = "joins"
+        test._rootyard_diagnostic_api_exit = 103
+        test._rootyard_diagnostic_shutdown_outcome = "helper_child_exit_103"
+        record = _diagnostic_record(test, AssertionError("synthetic"), None)
+        self.assertEqual(record["api_exit"], 103)
+        self.assertEqual(record["shutdown_outcome"], "helper_child_exit_103")
+        self.assertIsNone(record["child_exit"])
+        for value in (-256, 10 ** 6, True, False, "103", 103.0, None):
+            test._rootyard_diagnostic_api_exit = value
+            poisoned = _diagnostic_record(
+                test, AssertionError("synthetic"), None)
+            self.assertIsNone(poisoned["api_exit"])
+            self.assertEqual(poisoned["shutdown_outcome"],
+                             "helper_child_exit_103")
 
     def test_api_exit_poison_value_or_payload_is_never_serialized(self):
         class _Poison:
@@ -203,12 +230,14 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
 
         self.assertEqual(poison.calls, 0)
         self.assertIsNone(record["child_exit"])
+        self.assertIsNone(record["api_exit"])
         self.assertNotIn(SECRET, json.dumps(record))
 
         test._rootyard_diagnostic_api_exit = {"payload": poison}
         payload_record = _diagnostic_record(test, _HiddenError(), None)
         self.assertEqual(poison.calls, 0)
         self.assertIsNone(payload_record["child_exit"])
+        self.assertIsNone(payload_record["api_exit"])
         self.assertNotIn(SECRET, json.dumps(payload_record))
 
     def test_child_exit_fallback_removed_keeps_other_fields_and_pass_state(self):
@@ -229,9 +258,11 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             "http_status": None,
             "errno": None,
             "child_exit": None,
+            "api_exit": 1,
             "shutdown_outcome": "unknown",
             "busy_target": "unknown",
             "writer_close": "unknown",
+            "terminal_write": "unknown",
         })
         self.assertEqual(set(record), set(_unknown_diagnostic()))
 
@@ -476,27 +507,35 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
         self.assertIsNone(unknown["http_status"])
         self.assertIsNone(unknown["errno"])
         self.assertIsNone(unknown["child_exit"])
+        self.assertIsNone(unknown["api_exit"])
         self.assertEqual(unknown["shutdown_outcome"], SHUTDOWN_OUTCOME_UNKNOWN)
         self.assertEqual(unknown["busy_target"], "unknown")
         self.assertEqual(unknown["writer_close"], "unknown")
+        self.assertEqual(unknown["terminal_write"], "unknown")
 
     def test_busy_witness_fields_accept_only_closed_values(self):
         test = _case(REQUIRED_CASES[2])
         self.assertEqual(_busy_target(test), "unknown")
         self.assertEqual(_writer_close(test), "unknown")
+        self.assertEqual(_terminal_write(test), "unknown")
         test._rootyard_diagnostic_busy_target = "writer"
         test._rootyard_diagnostic_writer_close = "completed_before_unmount_entry"
+        test._rootyard_diagnostic_terminal_write = "observed_after_busy_return"
         self.assertEqual(_busy_target(test), "writer")
         self.assertEqual(_writer_close(test), "completed_before_unmount_entry")
+        self.assertEqual(_terminal_write(test), "observed_after_busy_return")
         for value in (SECRET, "writer ", "OTHER", 1, True, None, ["writer"]):
             test._rootyard_diagnostic_busy_target = value
             test._rootyard_diagnostic_writer_close = value
+            test._rootyard_diagnostic_terminal_write = value
             self.assertEqual(_busy_target(test), "unknown")
             self.assertEqual(_writer_close(test), "unknown")
+            self.assertEqual(_terminal_write(test), "unknown")
         record = _diagnostic_record(test, AssertionError("synthetic"), None)
         self.assertNotIn(SECRET, json.dumps(record))
         self.assertEqual(record["busy_target"], "unknown")
         self.assertEqual(record["writer_close"], "unknown")
+        self.assertEqual(record["terminal_write"], "unknown")
 
     def test_result_captures_before_unittest_formats_the_exception(self):
         result = WorkspaceFuseDiagnosticResult(io.StringIO(), False, 0)

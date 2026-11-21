@@ -33,9 +33,12 @@ jobs:
     # no separate job minutes. The bind, stop and upload steps keep no
     # independent cap of their own, and no existing step cap is inflated: the
     # helper step cap stays 30.
-    # 175 + 12 + 30 + 10 = 227. Keep this bounded; raising it further must not
-    # be used to hide a regression inside one individual step.
-    timeout-minutes: 227
+    # 175 + 12 + 30 + 10 = 227 for main's live workspace/FUSE budget.
+    # PR #321 adds the independent #29 bounded owned-Garage named witness at
+    # 22 minutes, with its own 540s start and 90s stop lifecycle deadlines:
+    # 227 + 22 = 249. Keep this bounded; raising it further must not be used to
+    # hide a regression inside one individual step.
+    timeout-minutes: 249
     services:
       postgres:
         image: postgres:17
@@ -280,6 +283,68 @@ jobs:
           ) >/dev/null 2>&1
           [[ -f "$staged_report" && ! -L "$staged_report" && -s "$staged_report" ]]
           report_json="$(<"$staged_report")"
+      # Separate #29-owned Garage/bucket/scratch scope. Do not reuse the live
+      # #85 fixture, keys, environment file or cleanup trap.
+      - name: "Prove #29 tenant-scoped remote checkpoint restore/fork refusal on owned Garage"
+        # Opt-in finite lifecycle: every Docker/Garage call in start shares a
+        # 540s deadline and every one in stop shares a 90s deadline, with a 5s
+        # kill-after per call. Reserving both possible stop windows (failed-start
+        # self cleanup and the repeated finalizer stop), the 480s named test with
+        # its 15s kill-after, and 30s of final shell/file checks:
+        # 545 + 495 + 95 + 95 + 30 = 1260s (21m). The 22-minute allowance keeps
+        # one minute of headroom. The start deadline includes the existing pull,
+        # startup and independent S3-probe budgets.
+        timeout-minutes: 22
+        env:
+          ROOTYARD_WORKSPACE_MOUNT_MODE: direct
+          ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT: "540"
+          ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT: "90"
+        run: |
+          set -euo pipefail
+          umask 077
+          final_report="test-results/workspace-remote-auth.json"
+          [[ ! -e "$final_report" && ! -L "$final_report" ]]
+          scratch="$(mktemp -d "${RUNNER_TEMP:?}/issue29-remote-cas.XXXXXX")"
+          garage_dir="$scratch/garage"
+          object_store_env="$scratch/object-store.env"
+          staged_report="$scratch/report.json"
+          fixture_started=0
+          finalize() {
+            local status=$?
+            trap - EXIT
+            if [[ "$fixture_started" == 1 && ! -d "$garage_dir" ]] ||
+               ! scripts/owned_garage_fixture.sh stop --directory "$garage_dir" >/dev/null 2>&1 ||
+               [[ -e "$garage_dir" || -L "$garage_dir" || -e "$object_store_env" || -L "$object_store_env" ]]; then
+              echo "Owned #29 Garage cleanup failed." >&2
+              exit 1
+            fi
+            rm -f -- "$staged_report"
+            rmdir -- "$scratch"
+            if [[ "$status" == 0 ]]; then
+              printf '%s\n' "$report_json" >"$final_report"
+            fi
+            exit "$status"
+          }
+          trap finalize EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          ROOTYARD_FIXTURE_PULL_TIMEOUT=120 scripts/owned_garage_fixture.sh start \
+            --directory "$garage_dir" --output-env "$object_store_env" \
+            --bucket-prefix rootyard-issue29-remote-cas >/dev/null 2>&1
+          fixture_started=1
+          (
+            set -a
+            source "$object_store_env"
+            set +a
+            timeout --signal=INT --kill-after=15 480 python3 scripts/run_named_unittest.py \
+              --test tests.test_workspace_remote.WorkspaceRemoteTest.test_commit_retry_and_restore_without_source_volume \
+              --binary "$ROOTYARD_BIN" \
+              --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+              --expect-commit "$GITHUB_SHA" \
+              --report "$staged_report"
+          )
+          [[ -f "$staged_report" && ! -L "$staged_report" && -s "$staged_report" ]]
+          report_json="$(<"$staged_report")"
       - name: Exercise deleted webhook-claim fence (#85)
         timeout-minutes: 10
         run: ROOTYARD_EXPECTED_SOURCE_COMMIT="$GITHUB_SHA" python3 tests/repository_lifecycle_deleted_claim_acceptance.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle-deleted-claim.json
@@ -288,7 +353,7 @@ jobs:
         run: python3 tests/repository_lifecycle_acceptance.py --binary "$ROOTYARD_BIN" --build-receipt "$ROOTYARD_BUILD_RECEIPT" --expected-source-commit "$GITHUB_SHA" --report test-results/repository-lifecycle-issue85-literal.json
       - name: Run all Python unit and Tier-5 adversarial contract suites
         # Full discovery stays unfiltered; the runner adds per-test progress and
-        # periodic stderr thread stacks without changing exit semantics.
+        # periodic stderr thread stacks and requires the live PITR result.
         env:
           ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 283 && 'test-results/python-ci-result.json' || '' }}
           ROOTYARD_PYTHON_CI_REPORT_258: ${{ github.event.pull_request.number == 258 && 'test-results/python-ci-result.json' || '' }}
@@ -298,7 +363,8 @@ jobs:
           if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then
             report_args=(--report-out "$ROOTYARD_PYTHON_SUITE_REPORT" --expected-commit="${GITHUB_SHA:-}")
           fi
-          python3 scripts/run_python_ci_tests.py "${report_args[@]}"
+          python3 scripts/run_python_ci_tests.py "${report_args[@]}" \
+            --require-test test_pando_pitr_service.PandoPitrServiceTest.test_pando_pitr_pg_dump_clone_and_retention_roots
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary "$ROOTYARD_BIN" --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror
@@ -921,6 +987,7 @@ jobs:
             --report webhook_pr_sync=test-results/webhook-pr-sync.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
             --report workspace_capture=test-results/workspace-capture.json \
+            --report workspace_remote_auth=test-results/workspace-remote-auth.json \
             --report workspace_legacy_service=test-results/workspace-legacy-service.json \
             --report repository_pagination=test-results/repository-pagination.json \
             --report organization_pagination=test-results/organization-pagination.json \
@@ -1005,6 +1072,8 @@ jobs:
             --harness tests/ci_webhook_regressions.py \
             --harness tests/backup_audit_sequence_legacy.py \
             --harness tests/workspace_capture_acceptance.py \
+            --harness scripts/run_named_unittest.py \
+            --harness tests/test_workspace_remote.py \
             --harness tests/workspace_legacy_fuse_shutdown_acceptance.py \
             --harness tests/workspace_legacy_fuse_shutdown_support.py \
             --harness tests/workspace_legacy_fuse_shutdown_fixtures.py \
@@ -1077,6 +1146,7 @@ jobs:
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_sse_reconnect_and_retention_gap_uses_live_revision \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing \
+            --require-case workspace_remote_auth=tests.test_workspace_remote.WorkspaceRemoteTest.test_commit_retry_and_restore_without_source_volume \
             --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_normal_legacy_sigterm_join_evidence_and_exact_unmount \
             --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_partial_reconcile_failure_cleans_earlier_owned_mount \
             --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_post_reconcile_api_bind_failure_cleans_owned_mount \

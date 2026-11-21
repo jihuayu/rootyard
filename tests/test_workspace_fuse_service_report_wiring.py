@@ -23,8 +23,9 @@ GENERIC_RUNNER = ROOT / "scripts/run_python_ci_tests.py"
 # on owned Garage + 28 full Redis qualification (including restore/FLUSHALL,
 # partition, failover, and cleanup/manifest binding) + 40 Pando package gates:
 # 175. The merged job keeps it and adds only this branch's independent FUSE
-# phases.
+# phases plus PR #321's independent #29 remote-CAS witness.
 MAIN_VERIFY_BUDGET = 175
+REMOTE_CAS_BUDGET = 22
 
 C5 = "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_api_sigkill_with_pending_kernel_writer"
 EXISTING_REQUIRED = (
@@ -143,10 +144,17 @@ class WorkspaceFuseServiceReportWiringTest(unittest.TestCase):
         self.assertIn("--report test-results/workspace-fuse-service.json", " ".join(helper.split()))
         self.assertIn(f"--require-case workspace_fuse_service={C5}", self.manifest)
         self.assertEqual(_cap(helper), 30)
-        # The merged verify job keeps main's 175-minute budget and adds only
-        # those three phases; keeping 175 alone would under-budget the lane.
-        self.assertIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET + sum(phases)}", verify)
+        # The merged verify job keeps main's 175-minute budget, adds only
+        # those three FUSE phases, then adds PR #321's independent #29
+        # remote-CAS witness. Keeping 175 or 227 alone would under-budget the
+        # merged job.
+        main_cap = MAIN_VERIFY_BUDGET + sum(phases)
+        self.assertEqual(main_cap, 227)
+        merged_cap = main_cap + REMOTE_CAS_BUDGET
+        self.assertEqual(merged_cap, 249)
+        self.assertIn(f"    timeout-minutes: {merged_cap}", verify)
         self.assertNotIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET}", verify)
+        self.assertNotIn(f"    timeout-minutes: {main_cap}", verify)
         # No pre-existing main step cap is inflated by this branch; the Redis
         # step already holds main's 28-minute promotion allowance.
         self.assertEqual(_cap(redis), 28)

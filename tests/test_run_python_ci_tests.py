@@ -153,7 +153,7 @@ class DiagnosticsRunnerTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(source), encoding="utf-8")
 
-    def run_fixture(self) -> tuple[int, str]:
+    def run_fixture(self, **options: object) -> tuple[int, str]:
         output = io.StringIO()
         # Inject a no-op diagnostics control: this fixture run must never
         # start a thread in the outer full-suite test process.
@@ -167,6 +167,7 @@ class DiagnosticsRunnerTest(unittest.TestCase):
             disable_fatal_handler=mock.Mock(),
             is_fatal_handler_enabled=mock.Mock(return_value=True),
             marker_write=lambda payload: len(payload),
+            **options,
         )
         factory.assert_called_once_with(
             runner.TRACEBACK_INTERVAL_SECONDS, None
@@ -278,6 +279,107 @@ class DiagnosticsRunnerTest(unittest.TestCase):
         self.assertIn("test_skips", output)
         self.assertIn("Ran 2 tests", output)
         self.assertIn("skipped=1", output)
+
+    def test_required_pass_succeeds_with_unrelated_skip(self) -> None:
+        self.write("test_runner_fixture_required_pass.py", """
+            import unittest
+            class RequiredPass(unittest.TestCase):
+                def test_required_pass(self): pass
+                def test_unrelated_skip(self): self.skipTest("fixture skip")
+        """)
+
+        code, output = self.run_fixture(
+            required_tests=[
+                "test_runner_fixture_required_pass.RequiredPass.test_required_pass"
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("test_required_pass", output)
+        self.assertIn("test_unrelated_skip", output)
+        self.assertIn("Ran 2 tests", output)
+        self.assertIn("skipped=1", output)
+        self.assertNotIn(runner.REQUIRED_TESTS_MISSING, output)
+
+    def test_required_skip_and_class_setup_skip_fail_the_gate(self) -> None:
+        self.write("test_runner_fixture_required_skip.py", """
+            import unittest
+            class RequiredMethodSkip(unittest.TestCase):
+                @unittest.skip("fixture required skip")
+                def test_required_skip(self): pass
+
+            class RequiredClassSetupSkip(unittest.TestCase):
+                @classmethod
+                def setUpClass(cls):
+                    raise unittest.SkipTest("fixture class setup skip")
+                def test_required_class_setup(self): pass
+        """)
+
+        code, output = self.run_fixture(
+            required_tests=[
+                "test_runner_fixture_required_skip.RequiredMethodSkip.test_required_skip",
+                "test_runner_fixture_required_skip.RequiredClassSetupSkip.test_required_class_setup",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("Ran 1 test", output)
+        self.assertIn("skipped=2", output)
+        self.assertIn(f"{runner.REQUIRED_TESTS_MISSING}: 2", output)
+
+    def test_absent_required_test_fails_the_gate_without_echoing_its_id(self) -> None:
+        self.write("test_runner_fixture_required_absent.py", """
+            import unittest
+            class Present(unittest.TestCase):
+                def test_present(self): pass
+        """)
+        required_id = (
+            "test_runner_fixture_required_absent.Required.test_absent_UNTRUSTED"
+        )
+
+        code, output = self.run_fixture(required_tests=[required_id])
+        self.assertEqual(code, 1)
+        self.assertIn("Ran 1 test", output)
+        self.assertIn("OK", output)
+        self.assertIn(f"{runner.REQUIRED_TESTS_MISSING}: 1", output)
+        self.assertNotIn(required_id, output)
+
+    def test_genuine_suite_failure_takes_priority_over_required_gate(self) -> None:
+        self.write("test_runner_fixture_required_failure.py", """
+            import unittest
+            class Failure(unittest.TestCase):
+                def test_fails(self): self.fail("fixture failure")
+        """)
+
+        code, output = self.run_fixture(
+            required_tests=[
+                "test_runner_fixture_required_failure.Failure.test_absent"
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED (failures=1)", output)
+        self.assertNotIn(runner.REQUIRED_TESTS_MISSING, output)
+
+    def test_cli_passes_repeated_exact_required_test_ids_to_run(self) -> None:
+        with (
+            mock.patch.object(runner, "_restore_repo_root_import_context"),
+            mock.patch.object(runner, "run", return_value=0) as run_runner,
+        ):
+            code = runner.main(
+                [
+                    "--require-test",
+                    "tests.fixture.First.test_one",
+                    "--require-test",
+                    "tests.fixture.Second.test_two",
+                ]
+            )
+        self.assertEqual(code, 0)
+        run_runner.assert_called_once_with(
+            report_out=None,
+            expected_commit=None,
+            required_tests=[
+                "tests.fixture.First.test_one",
+                "tests.fixture.Second.test_two",
+            ],
+        )
 
     def test_failure_exits_one_and_keeps_the_failing_case_in_progress_log(self) -> None:
         self.write("test_runner_fixture_failure.py", """

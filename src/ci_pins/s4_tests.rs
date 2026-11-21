@@ -24,6 +24,9 @@ use self::fixture::wait_pids;
 #[cfg(target_os = "linux")]
 #[path = "s4_tests/proc_identity.rs"]
 mod proc_identity;
+#[cfg(target_os = "linux")]
+#[path = "s4_tests/final_wait.rs"]
+mod final_wait;
 
 fn sample_grant(target: &str) -> S4ClosureGrant {
     let packs = "b".repeat(64);
@@ -205,47 +208,6 @@ sh -c 'printf "%s %s\n" "$1" "$2" > "$3"' sh "$$" "$!" "$0.pids"
 trap "" TERM; while :; do sleep 1; done
 "#;
 
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes() {
-    use self::proc_identity::{ProcState, wait_for_original_pair};
-    use super::s4_authority::{DisposableCiView, run_git_dir_bounded};
-    use std::os::unix::fs::PermissionsExt;
-    let view = DisposableCiView::create().expect("disposable view");
-    let root = view.path().to_path_buf();
-    let wrapper = root.join("git");
-    std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
-    // This awaits the fixture's pid file under the product's own deadline, then proves
-    // both original processes are live and that the stdout write ends are already closed.
-    let pids = wrapper.with_extension("pids");
-    let observed = wait_for_original_pair(&pids, deadline);
-    let call = run_git_dir_bounded(
-        &wrapper,
-        None,
-        &[],
-        deadline,
-        || super::Error(StatusCode::CONFLICT, "failed"),
-        Some(view.hold()),
-    );
-    let (result, (leader, descendant)) = tokio::join!(call, observed);
-    let error = result.unwrap_err();
-    assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
-    assert!(root.exists(), "the disposable view vanished before the final wait was confirmed");
-    // The direct leader is our child; a zombie here means cleanup did not reap it.
-    assert_eq!(leader.state(), ProcState::Gone, "the original direct leader was not reaped");
-    // A descendant killed during cleanup may remain visible as Z/X until its new parent
-    // reaps it. The production contract is quiescence, not disappearance.
-    let descendant_state = descendant.state();
-    assert!(
-        matches!(descendant_state, ProcState::Gone | ProcState::Exited),
-        "the original descendant is still live after the timeout: {descendant_state:?}"
-    );
-    drop(view);
-    assert!(!root.exists());
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn expired_timeout_cleanup_hands_scratch_to_reaper_until_group_exits() {
@@ -314,7 +276,12 @@ async fn spawn_reaper_failure_bounds_caller_and_reaps_without_zombies() {
     let wrapper = root.join("git");
     std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
-    let mut cmd = tokio::process::Command::new(&wrapper);
+    // Execute a trusted shell against the closed fixture instead of this
+    // freshly written inode: a concurrent fork can briefly inherit the write
+    // descriptor and Linux then rejects the exec with ETXTBSY. `$0` remains
+    // the script path, so process-group and PID publication are unchanged.
+    let mut cmd = tokio::process::Command::new("/bin/sh");
+    cmd.arg(&wrapper);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
     let child = cmd.spawn().expect("spawn wrapper");
     let pid = child.id().and_then(|id| i32::try_from(id).ok()).expect("wrapper pid");

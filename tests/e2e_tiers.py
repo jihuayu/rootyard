@@ -6991,20 +6991,73 @@ class SchemaBoundaryIntegrationFixture:
                 f"src/backup/catalog.rs FORMAT {fmt} != "
                 f"CURRENT_BACKUP_FORMAT {schema_baseline.CURRENT_BACKUP_FORMAT}"
             )
-
-        # The current format must consume the newest frozen catalog triplet.
-        arm_match = re.search(schema_baseline.backup_format_arm(fmt) + r"\s*\[(.*?)\n\s*\],", catalog_src, re.DOTALL)
-        if arm_match is None:
-            raise AssertionError(f"src/backup/catalog.rs has no catalog mapping for format {fmt}")
-        includes = re.findall(r'include_str!\("([^"]+)"\)', arm_match.group(1))
-        suffixes = ("catalog.json", "restored_catalog.json", "upgraded_catalog.json")
-        expected_includes = [f"../../schema/{schema_baseline.LATEST_PREFIX}_{s}" for s in suffixes]
-        if includes != expected_includes:
+        paired_match = re.search(r"const FORMAT_PAIRED: u32 = (\d+);", catalog_src)
+        if paired_match is None:
+            raise AssertionError("src/backup/catalog.rs FORMAT_PAIRED constant missing")
+        paired = int(paired_match.group(1))
+        if paired != schema_baseline.CURRENT_BLOB_BACKUP_FORMAT:
             raise AssertionError(
-                f"backup format {fmt} must consume the latest frozen catalogs {expected_includes}, got {includes}"
+                f"src/backup/catalog.rs FORMAT_PAIRED {paired} != "
+                f"CURRENT_BLOB_BACKUP_FORMAT {schema_baseline.CURRENT_BLOB_BACKUP_FORMAT}"
             )
-        if not re.search(schema_baseline.backup_format_arm(fmt) + r"\s*Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)", catalog_src):
-            raise AssertionError(f"backup format {fmt} must accept every SCHEMA_VERSIONS migration")
+        if fmt == paired:
+            raise AssertionError(f"backup metadata and paired formats must be distinct, both are {fmt}")
+
+        # The current formats must alias the current schema catalog and prefix.
+        # Keep that mutable expectation, then separately pin the immutable
+        # schema151 contracts for formats 29 and 30 so a future tag/schema bump
+        # cannot drop coverage of the old mappings.
+        def source_contract(preserved: int, schema_version: int) -> tuple[str, ...]:
+            suffixes = ("catalog.json", "restored_catalog.json", "upgraded_catalog.json")
+            expected_includes = [
+                f"../../schema/{schema_version:03d}_{suffix}" for suffix in suffixes
+            ]
+            expected_versions = (
+                "Ok(crate::db::SCHEMA_VERSIONS.iter().copied()"
+                f".filter(|version| *version <= {schema_version}).collect())"
+            )
+            arm_match = re.search(
+                schema_baseline.backup_format_arm(preserved) + r"\s*\[(.*?)\n\s*\],", catalog_src, re.DOTALL
+            )
+            if arm_match is None:
+                raise AssertionError(f"src/backup/catalog.rs has no catalog mapping for format {preserved}")
+            includes = re.findall(r'include_str!\("([^"]+)"\)', arm_match.group(1))
+            if includes != expected_includes:
+                raise AssertionError(
+                    f"backup format {preserved} must consume the schema "
+                    f"{schema_version} catalogs {expected_includes}, got {includes}"
+                )
+            if not re.search(
+                schema_baseline.backup_format_arm(preserved) + r"\s*" + re.escape(expected_versions), catalog_src
+            ):
+                raise AssertionError(
+                    f"backup format {preserved} must freeze the schema "
+                    f"{schema_version} SCHEMA_VERSIONS prefix in order"
+                )
+            return tuple(includes)
+
+        current_contracts = {
+            preserved: source_contract(preserved, schema_baseline.CURRENT_SCHEMA_VERSION)
+            for preserved in (fmt, paired)
+        }
+        if current_contracts[fmt] != current_contracts[paired]:
+            raise AssertionError(
+                f"backup formats {fmt} and {paired} must share the identical schema "
+                f"{schema_baseline.CURRENT_SCHEMA_VERSION} catalog contract"
+            )
+        frozen_contracts = {
+            preserved: source_contract(preserved, schema_version)
+            for preserved, schema_version in (
+                (29, schema_baseline.FROZEN_FORMAT29_SCHEMA_VERSION),
+                (30, schema_baseline.FROZEN_FORMAT30_SCHEMA_VERSION),
+            )
+        }
+        if frozen_contracts[29] != frozen_contracts[30]:
+            raise AssertionError(
+                "backup formats 29 and 30 must share the immutable schema "
+                f"{schema_baseline.FROZEN_FORMAT29_SCHEMA_VERSION}/{schema_baseline.FROZEN_FORMAT30_SCHEMA_VERSION} "
+                "catalog contract"
+            )
 
         # catalog::relations() is the single source of the locked relation list:
         # ordinary tables only, returned in lexicographic order.
@@ -7056,7 +7109,7 @@ class SchemaBoundaryIntegrationFixture:
             if needle not in postgres_src:
                 raise AssertionError(f"src/backup/postgres.rs must verify catalog relation parity ({needle})")
 
-        catalog_file = (catalog_path.parent / includes[0]).resolve()
+        catalog_file = (catalog_path.parent / current_contracts[fmt][0]).resolve()
         if not catalog_file.is_file():
             raise AssertionError(f"backup consumes missing catalog fixture {catalog_file}")
         catalog_json = json.loads(catalog_file.read_text(encoding="utf-8"))
