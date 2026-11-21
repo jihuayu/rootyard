@@ -34,19 +34,28 @@ PG_STEP = "Run the 17 ignored Pando Local PostgreSQL producer cases"
 PANDO_CLI_STEP = "Exercise Pando object store delta resolution, graph traversal, and differential export"
 PANDO_PITR_STEP = "Exercise live Pando PITR fencing, retention roots, and pg_dump clone safety"
 COLD_LFS_STEP = "Qualify #85 cold tenant LFS retention on owned Garage"
+REMOTE_CAS_STEP = "Prove #29 tenant-scoped remote checkpoint restore/fork refusal on owned Garage"
 UPLOAD_STEP = "Upload end-to-end report"
 UPLOAD_ALLOWED_LOG = "test-results/ci-webhook-regressions.log"
 
 # The 163-minute verify/lifecycle budget already contains the 28-minute owned
 # Redis step, so it is not added again.  #304 contributes an independent
-# 12-minute cold tenant LFS gate on owned Garage: 163 + 12 = 175.  The merged
+# 12-minute cold tenant LFS gate on owned Garage: 163 + 12 = 175.  The #258
 # workspace FUSE lane contributes three independent phases: a 12-minute
 # fixture, a 30-minute helper/lifecycle acceptance step and a 10-minute legacy
-# service-shutdown step: 175 + 12 + 30 + 10 = 227.
+# service-shutdown step: 175 + 12 + 30 + 10 = 227.  #29 contributes an
+# independent 22-minute bounded owned-Garage named witness: 227 + 22 = 249.
 VERIFY_BASE_BUDGET_MINUTES = 163
 COLD_LFS_BUDGET_MINUTES = 12
 WORKSPACE_FUSE_PHASES_MINUTES = (12, 30, 10)
 WORKSPACE_FUSE_BUDGET_MINUTES = sum(WORKSPACE_FUSE_PHASES_MINUTES)
+MAIN_VERIFY_BUDGET_MINUTES = (
+    VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES
+    + WORKSPACE_FUSE_BUDGET_MINUTES
+)
+REMOTE_CAS_BUDGET_MINUTES = 22
+REMOTE_CAS_START_LIFECYCLE_SECONDS = 540
+REMOTE_CAS_STOP_LIFECYCLE_SECONDS = 90
 
 
 def _lines():
@@ -212,19 +221,40 @@ def _unsafe_upload_paths(paths):
 class WorkflowWiringTest(unittest.TestCase):
     def test_verify_budget_includes_pg_vault_lifecycle_and_owned_redis(self):
         lines = _verify_lines()
-        expected = (VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES
-                    + WORKSPACE_FUSE_BUDGET_MINUTES)
-        self.assertEqual(expected, 227)
+        self.assertEqual(MAIN_VERIFY_BUDGET_MINUTES, 227)
+        expected = MAIN_VERIFY_BUDGET_MINUTES + REMOTE_CAS_BUDGET_MINUTES
+        self.assertEqual(expected, 249)
         self.assertEqual(_job_scalar(lines, "timeout-minutes"), str(expected))
-        composition = (
+        main_composition = (
             f"{VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES} + "
             + " + ".join(str(phase) for phase in WORKSPACE_FUSE_PHASES_MINUTES)
-            + f" = {expected}"
+            + f" = {MAIN_VERIFY_BUDGET_MINUTES}"
         )
-        self.assertIn(composition, "\n".join(lines))
+        self.assertIn(main_composition, "\n".join(lines))
+        aggregate_composition = (
+            f"{MAIN_VERIFY_BUDGET_MINUTES} + {REMOTE_CAS_BUDGET_MINUTES} = "
+            f"{expected}"
+        )
+        self.assertIn(aggregate_composition, "\n".join(lines))
         cold_lfs = _step(COLD_LFS_STEP)
         self.assertEqual(
             cold_lfs["timeout-minutes"], str(COLD_LFS_BUDGET_MINUTES)
+        )
+        self.assertNotIn("ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT",
+                         cold_lfs["env"])
+        self.assertNotIn("ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT",
+                         cold_lfs["env"])
+        remote_cas = _step(REMOTE_CAS_STEP)
+        self.assertEqual(
+            remote_cas["timeout-minutes"], str(REMOTE_CAS_BUDGET_MINUTES)
+        )
+        self.assertEqual(
+            remote_cas["env"].get("ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT"),
+            str(REMOTE_CAS_START_LIFECYCLE_SECONDS),
+        )
+        self.assertEqual(
+            remote_cas["env"].get("ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT"),
+            str(REMOTE_CAS_STOP_LIFECYCLE_SECONDS),
         )
         pg = _step(PG_STEP)
         self.assertEqual(pg["timeout-minutes"], "10")

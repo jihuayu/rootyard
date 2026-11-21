@@ -15,7 +15,7 @@ pub mod validation;
 #[cfg(test)]
 mod unit_recovery_tests;
 #[cfg(test)]
-mod unit_tests;
+pub(crate) mod unit_tests;
 
 pub use coordinator::{AuthorityCommitOutcome, InProcessRefCasBackend, MergeAuthorityBackend, PullRemoteMergeProducer};
 pub use git_pack::{PrepareMergeInput, PreparedMergeCandidate, prepare_merge_candidate};

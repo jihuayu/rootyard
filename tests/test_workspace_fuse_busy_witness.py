@@ -21,6 +21,7 @@ from workspace_normal_shutdown_support import (
     BUSY_TARGETS,
     MAX_RECEIPT_BYTES,
     MAX_RECEIPTS,
+    TERMINAL_WRITE_STATES,
     UNKNOWN,
     WRITER_CLOSE_STATES,
     fnv1a64,
@@ -29,6 +30,8 @@ from workspace_normal_shutdown_support import (
     process_tag,
     project_busy_witness,
     project_busy_witness_receipts,
+    project_terminal_write_return,
+    project_terminal_write_return_receipts,
 )
 
 
@@ -79,6 +82,33 @@ def _close(*, entry=100, result=900, rc=0, error=0, tag=WRITER_TAG):
     }
 
 
+def _status(**overrides):
+    status = {
+        "phase": "error",
+        "writes": 3,
+        "attempts": 4,
+        "errno": errno.EIO,
+        "success_ns": 500,
+        "failed_write_return_ns": 2500,
+        "failed_write_fd": 7,
+        "witness_close_fd": 7,
+        "proc_tag": WRITER_TAG,
+    }
+    status.update(overrides)
+    return status
+
+
+def _project_terminal(records, status):
+    return project_terminal_write_return(
+        records,
+        status,
+        helper_tag=HELPER_TAG,
+        writer_tag=WRITER_TAG,
+        expected_mounts=EXPECTED,
+        owned_mounts=OWNED,
+    )
+
+
 def _project(records):
     return project_busy_witness(
         records,
@@ -120,6 +150,66 @@ class BusyWitnessProjectionTest(unittest.TestCase):
         self.assertEqual(WRITER_CLOSE_STATES, frozenset((
             "completed_before_unmount_entry", "began_after_busy_return",
             "overlapping", "unknown")))
+        self.assertEqual(TERMINAL_WRITE_STATES, frozenset((
+            "observed_before_busy_entry", "observed_after_busy_return",
+            "overlaps_or_unknown", "unknown")))
+
+    def test_terminal_write_return_is_a_conservative_temporal_relation(self):
+        records = [_umount(entry=1000, result=2000),
+                   _close(entry=3000, result=3100)]
+        self.assertEqual(
+            _project_terminal(records, _status(failed_write_return_ns=900)),
+            "observed_before_busy_entry")
+        self.assertEqual(
+            _project_terminal(records, _status(failed_write_return_ns=2500)),
+            "observed_after_busy_return")
+        # Equal samples and samples inside the busy call are uncertain.
+        for sample in (1000, 1500, 2000):
+            with self.subTest(sample=sample):
+                self.assertEqual(
+                    _project_terminal(
+                        records, _status(failed_write_return_ns=sample)),
+                    "overlaps_or_unknown")
+        # The parked FD is closed only after this in-process return; a sample
+        # after that close entry is impossible rather than a new relation.
+        self.assertEqual(
+            _project_terminal(records, _status(failed_write_return_ns=3001)),
+            UNKNOWN)
+
+    def test_terminal_write_rejects_absent_invalid_or_mismatched_evidence(self):
+        records = [_umount(), _close(entry=3000, result=3100)]
+        for status in (
+                None, "error", {}, _status(phase="writing"),
+                _status(failed_write_return_ns=0),
+                _status(failed_write_return_ns=True),
+                _status(failed_write_return_ns="2500"),
+                _status(failed_write_return_ns=2 ** 63),
+                _status(errno=0),
+                _status(errno=4096),
+                _status(failed_write_fd=-1),
+                _status(failed_write_fd=8),
+                _status(witness_close_fd=8),
+                _status(proc_tag=process_tag(9999, 9999)),
+                _status(proc_tag=True)):
+            with self.subTest(status=status):
+                self.assertEqual(_project_terminal(records, status), UNKNOWN)
+
+    def test_terminal_write_requires_the_same_bound_busy_and_close_pair(self):
+        status = _status(failed_write_return_ns=2500)
+        self.assertEqual(_project_terminal([_close()], status), UNKNOWN)
+        self.assertEqual(_project_terminal([_umount()], status), UNKNOWN)
+        self.assertEqual(
+            _project_terminal([_umount(), _close(entry=3000, result=3100),
+                               _close(entry=3200, result=3300)], status),
+            UNKNOWN)
+        self.assertEqual(
+            _project_terminal([_umount(), _close(rc=-1, error=errno.EIO),
+                               _close(entry=3000, result=3100)], status),
+            UNKNOWN)
+        self.assertEqual(
+            _project_terminal([_umount(mount_id=99, path=OTHER_PATH),
+                               _close(entry=3000, result=3100)], status),
+            UNKNOWN)
 
     def test_successful_close_before_entry_is_the_clear_writer_case(self):
         self.assertEqual(
@@ -371,6 +461,68 @@ class BusyWitnessReceiptParserTest(unittest.TestCase):
         self.assertIn(state, WRITER_CLOSE_STATES)
         self.assertEqual((target, state), ("writer", "completed_before_unmount_entry"))
 
+    def test_terminal_write_receipts_are_bounded_and_backward_compatible(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            _write_private(directory / "helper.receipt", _line(_umount()))
+            _write_private(
+                directory / "writer.receipt",
+                _line(_close(entry=3000, result=3100)))
+            status_path = directory / "writer.json"
+            status_path.write_text(json.dumps(_status()), encoding="utf-8")
+            self.assertEqual(
+                project_terminal_write_return_receipts(
+                    directory,
+                    status_path,
+                    helper_tag=HELPER_TAG,
+                    writer_tag=WRITER_TAG,
+                    expected_mounts=EXPECTED,
+                    owned_mounts=OWNED,
+                ),
+                "observed_after_busy_return")
+            # An older writer receipt without the new fields stays readable
+            # but cannot contribute a terminal-write relation.
+            status_path.write_text(json.dumps({
+                "phase": "error", "writes": 3, "attempts": 4,
+                "errno": errno.EIO, "success_ns": 500,
+            }), encoding="utf-8")
+            self.assertEqual(
+                project_terminal_write_return_receipts(
+                    directory,
+                    status_path,
+                    helper_tag=HELPER_TAG,
+                    writer_tag=WRITER_TAG,
+                    expected_mounts=EXPECTED,
+                    owned_mounts=OWNED,
+                ),
+                UNKNOWN)
+            # Missing or swapped receipts remain unknown.
+            self.assertEqual(
+                project_terminal_write_return_receipts(
+                    directory / "absent",
+                    status_path,
+                    helper_tag=HELPER_TAG,
+                    writer_tag=WRITER_TAG,
+                    expected_mounts=EXPECTED,
+                    owned_mounts=OWNED,
+                ),
+                UNKNOWN)
+            _write_private(
+                directory / "helper.receipt",
+                _line(_close(entry=3000, result=3100)))
+            _write_private(directory / "writer.receipt", _line(_umount()))
+            status_path.write_text(json.dumps(_status()), encoding="utf-8")
+            self.assertEqual(
+                project_terminal_write_return_receipts(
+                    directory,
+                    status_path,
+                    helper_tag=HELPER_TAG,
+                    writer_tag=WRITER_TAG,
+                    expected_mounts=EXPECTED,
+                    owned_mounts=OWNED,
+                ),
+                UNKNOWN)
+
     def test_swapped_valid_receipt_files_are_unknown(self):
         with tempfile.TemporaryDirectory() as root:
             # Both records carry the expected tags, but the file roles are
@@ -488,6 +640,40 @@ class BusyWitnessSourceContractTest(unittest.TestCase):
         end = text.find("\n}\n", start)
         self.assertNotEqual(end, -1, marker)
         return text[start:end]
+
+    def test_writer_status_old_receipt_stays_readable_and_new_types_are_exact(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "writer.json"
+            path.write_text(json.dumps({
+                "phase": "error", "writes": 3, "attempts": 4,
+                "errno": errno.EIO, "success_ns": 500,
+            }), encoding="utf-8")
+            self.assertIsNotNone(normal_shutdown.support.writer_status(path))
+            status = _status()
+            path.write_text(json.dumps(status), encoding="utf-8")
+            self.assertEqual(
+                normal_shutdown.support.writer_status(path)["proc_tag"],
+                WRITER_TAG)
+            for key in ("failed_write_return_ns", "failed_write_fd",
+                        "witness_close_fd", "proc_tag"):
+                bad = dict(status)
+                bad[key] = True
+                path.write_text(json.dumps(bad), encoding="utf-8")
+                self.assertIsNone(
+                    normal_shutdown.support.writer_status(path), key)
+
+    def test_writer_terminal_sample_is_in_memory_before_close_and_receipt(self):
+        script = normal_shutdown.support.PENDING_WRITER_SCRIPT
+        block = script[script.index(
+            "        # Userspace sample taken immediately"):]
+        sample = block.index("failed_write_return_ns = time.monotonic_ns()")
+        close = block.index("os.close(parked)")
+        receipt = block.index('publish("error", write_errno)')
+        self.assertLess(sample, close)
+        self.assertLess(close, receipt)
+        self.assertIn("failed_write_fd = parked", block)
+        self.assertNotIn("fsync", block[:sample])
+        self.assertNotIn("json.dump", block[:sample])
 
     def test_forwarded_hooks_do_not_use_lazy_resolution_or_formatting(self):
         text = self.SOURCE.read_text(encoding="utf-8")

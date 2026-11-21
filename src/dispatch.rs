@@ -19,6 +19,113 @@ use crate::observability::{
 };
 
 type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Explicit worker topology selectors. The generic scope preserves its existing
+/// `audit-log,ref-index` and Ref-CAS projection scans. The A4 scope restricts
+/// the scan to the dedicated target evidence kind, uses the A4 wake namespace,
+/// and never enables legacy consumers or projection jobs.
+pub const WORKER_SCOPE_ENV: &str = "ROOTYARD_WORKER_SCOPE";
+pub const A4_WORKER_SCOPE: &str = "a4-target-audit";
+/// A4 wake selection is deliberately separate from the generic outbox wake.
+/// Setting the generic variables can never enroll this producer/subscriber.
+pub const A4_WAKE_TRANSPORT_ENV: &str = "ROOTYARD_A4_WAKE_TRANSPORT";
+pub const A4_WAKE_CHANNEL_ENV: &str = "ROOTYARD_A4_WAKE_CHANNEL";
+/// Placement of the standalone A4 consumer. `embedded` is the default; the
+/// explicit `external` value removes the in-process consumer so a separately
+/// supervised `ROOTYARD_WORKER_SCOPE=a4-target-audit` process is the only one
+/// that can claim the target audit rows.
+pub const A4_WORKER_MODE_ENV: &str = "ROOTYARD_A4_WORKER_MODE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerScope {
+    Generic,
+    A4TargetAudit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum A4WorkerMode {
+    Embedded,
+    External,
+}
+
+impl A4WorkerMode {
+    /// True only for the default placement. External placement must not keep a
+    /// dormant local consumer that could claim the healthy push or fallback.
+    pub const fn runs_embedded_worker(self) -> bool {
+        matches!(self, Self::Embedded)
+    }
+}
+
+/// The fixed A4 advisory namespace. It contains the exact durable target-audit
+/// kind and is never derived from a repository, operation, token or payload.
+pub fn a4_wake_channel() -> String {
+    format!("rootyard:a4:{}:v1", crate::events::TARGET_AUDIT_KIND)
+}
+
+/// Resolve the installation-selected A4 channel. Only a truly absent variable
+/// selects the A4 default; a present empty, invalid or non-Unicode value fails
+/// closed. The A4 namespace must also differ from the actual generic wake
+/// channel, including the generic default, so one configured Generic worker can
+/// never consume A4 hints or vice versa.
+pub fn a4_wake_channel_from_env() -> Result<String> {
+    let explicit = env_text(A4_WAKE_CHANNEL_ENV)?;
+    let generic = crate::cache_wake::generic_wake_channel_from_env()?;
+    a4_wake_channel_for(explicit.as_deref(), &generic)
+}
+
+fn a4_wake_channel_for(explicit: Option<&str>, generic: &str) -> Result<String> {
+    let channel = match explicit {
+        Some(value) => value.to_owned(),
+        None => a4_wake_channel(),
+    };
+    crate::cache_wake::validate_wake_channel(&channel)?;
+    ensure!(channel.as_str() != generic, "A4 wake channel must differ from the generic wake channel");
+    Ok(channel)
+}
+
+pub fn worker_scope_from_env() -> Result<WorkerScope> {
+    let raw = env_text(WORKER_SCOPE_ENV)?;
+    worker_scope(raw.as_deref())
+}
+
+fn worker_scope(raw: Option<&str>) -> Result<WorkerScope> {
+    match raw {
+        None | Some("generic") => Ok(WorkerScope::Generic),
+        Some(A4_WORKER_SCOPE) => Ok(WorkerScope::A4TargetAudit),
+        Some(_) => bail!("{WORKER_SCOPE_ENV} must be generic or {A4_WORKER_SCOPE}"),
+    }
+}
+
+pub fn a4_worker_mode_from_env() -> Result<A4WorkerMode> {
+    let raw = env_text(A4_WORKER_MODE_ENV)?;
+    a4_worker_mode(raw.as_deref())
+}
+
+fn a4_worker_mode(raw: Option<&str>) -> Result<A4WorkerMode> {
+    match raw {
+        None | Some("embedded") => Ok(A4WorkerMode::Embedded),
+        Some("external") => Ok(A4WorkerMode::External),
+        Some(_) => bail!("{A4_WORKER_MODE_ENV} must be embedded or external"),
+    }
+}
+
+/// Read one new A4-specific variable with strict presence semantics. Only
+/// `VarError::NotPresent` means "use the documented default"; present empty,
+/// malformed and non-Unicode values are refusals. The error names the variable
+/// but never includes its value.
+fn env_text(name: &str) -> Result<Option<String>> {
+    env_text_from(name, std::env::var(name))
+}
+
+fn env_text_from(name: &str, raw: std::result::Result<String, std::env::VarError>) -> Result<Option<String>> {
+    match raw {
+        Ok(value) if value.is_empty() => bail!("{name} must not be empty"),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid Unicode"),
+    }
+}
+
 /// Implementations carry only a hint to rescan PG. They cannot supply a Claim,
 /// mark a delivery complete, choose a repository, or execute a business effect.
 pub trait WakeTransport: Send + Sync {
@@ -66,15 +173,42 @@ impl Settings {
         }
     }
 
-    pub fn from_env() -> Result<Self> {
-        fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
-            let value = match std::env::var(name) {
-                Ok(v) => v.parse().with_context(|| format!("invalid {name}"))?,
-                Err(_) => default,
-            };
-            ensure!((min..=max).contains(&value), "{name} outside supported range");
-            Ok(value)
+    /// Standalone serving keeps its bounded Memory cache and PG target-audit
+    /// scan. The only production opt-in here is the explicitly selected A4
+    /// advisory transport; generic wake variables are never read.
+    pub fn standalone_from_env() -> Result<Self> {
+        let mut settings = Self::standalone();
+        settings.transport = a4_transport_from_env()?;
+        Ok(settings)
+    }
+
+    /// Explicit external A4 worker. It scans only the target audit evidence
+    /// kind and never enables Ref-CAS projection jobs or legacy consumers.
+    pub fn a4_target_audit() -> Self {
+        Self {
+            poll: Duration::from_secs(1),
+            batch: 64,
+            lease_seconds: 60,
+            consumers: vec![crate::events::TARGET_AUDIT_CONSUMER.to_owned()],
+            transport: None,
+            target_audit_only: true,
+            projection_jobs: false,
         }
+    }
+
+    /// Read only the shared worker bounds and the A4-specific wake transport.
+    /// `ROOTYARD_WORKER_CONSUMERS`, `ROOTYARD_WAKE_TRANSPORT` and
+    /// `ROOTYARD_WAKE_CHANNEL` are deliberately ignored in this scope.
+    pub fn a4_target_audit_from_env() -> Result<Self> {
+        let mut settings = Self::a4_target_audit();
+        settings.poll = Duration::from_millis(number_strict("ROOTYARD_WORKER_POLL_MS", 5000, 50, 60_000)?);
+        settings.batch = number_strict("ROOTYARD_WORKER_BATCH", 64, 1, 1000)? as i64;
+        settings.lease_seconds = number_strict("ROOTYARD_WORKER_LEASE_SECONDS", 60, 1, 3600)? as i64;
+        settings.transport = a4_transport_from_env()?;
+        Ok(settings)
+    }
+
+    pub fn from_env() -> Result<Self> {
         let consumers =
             std::env::var("ROOTYARD_WORKER_CONSUMERS").unwrap_or_else(|_| crate::events::CONSUMERS.join(","));
         let consumers: Vec<String> = consumers.split(',').map(str::to_owned).collect();
@@ -98,8 +232,7 @@ impl Settings {
                         .context("ROOTYARD_REDIS_ADDRESS is required")?
                         .parse()
                         .context("Redis address must be a loopback socket address")?;
-                    let channel =
-                        std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
+                    let channel = crate::cache_wake::generic_wake_channel_from_env()?;
                     Some(Arc::new(RedisWake::new(address, channel)?))
                 }
             }
@@ -125,6 +258,52 @@ impl Settings {
         })
     }
 }
+
+/// Existing generic numeric read. It intentionally retains the legacy
+/// non-Unicode fallback for the generic worker path; the A4 path uses the
+/// strict variant below.
+fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
+    let raw = std::env::var(name).ok();
+    number_from_setting(name, raw.as_deref(), default, min, max)
+}
+
+fn number_strict(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
+    let raw = env_text(name)?;
+    number_from_setting(name, raw.as_deref(), default, min, max)
+}
+
+fn number_from_setting(name: &str, raw: Option<&str>, default: u64, min: u64, max: u64) -> Result<u64> {
+    let value = match raw {
+        Some(value) => value.parse().with_context(|| format!("invalid {name}"))?,
+        None => default,
+    };
+    ensure!((min..=max).contains(&value), "{name} outside supported range");
+    Ok(value)
+}
+
+fn a4_transport_from_env() -> Result<Option<Arc<dyn WakeTransport>>> {
+    let raw = env_text(A4_WAKE_TRANSPORT_ENV)?;
+    a4_transport_from_setting(raw.as_deref())
+}
+
+fn a4_transport_from_setting(raw: Option<&str>) -> Result<Option<Arc<dyn WakeTransport>>> {
+    match raw {
+        None | Some("poll") | Some("memory") => Ok(None),
+        Some("redis") => {
+            #[cfg(feature = "state-redis")]
+            {
+                let channel = a4_wake_channel_from_env()?;
+                Ok(Some(Arc::new(crate::cache_wake::RedisWake::from_env_with_channel(channel)?)))
+            }
+            #[cfg(not(feature = "state-redis"))]
+            {
+                bail!("A4 Redis wake requires building with feature 'state-redis'")
+            }
+        }
+        Some(_) => bail!("{A4_WAKE_TRANSPORT_ENV} must be poll, memory or redis"),
+    }
+}
+
 /// Runs independently of native Git, volume locks, and journal reconciliation.
 /// A fixed interval remains active even when no transport exists or it fails.
 pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: CancellationToken) {
@@ -488,6 +667,90 @@ mod tests {
         assert!(settings.target_audit_only);
         assert!(!settings.projection_jobs);
         assert!(settings.transport.is_none());
+    }
+    #[test]
+    fn a4_scope_excludes_legacy_consumers_and_projection_jobs() {
+        let settings = Settings::a4_target_audit();
+        assert_eq!(settings.consumers, vec![crate::events::TARGET_AUDIT_CONSUMER.to_owned()]);
+        assert!(settings.target_audit_only);
+        assert!(!settings.projection_jobs);
+        assert!(settings.transport.is_none());
+    }
+    #[test]
+    fn a4_channel_is_namespaced_valid_and_contains_the_target_kind() {
+        let channel = a4_wake_channel();
+        assert!(channel.starts_with("rootyard:a4:"));
+        assert!(channel.contains(crate::events::TARGET_AUDIT_KIND));
+        crate::cache_wake::validate_wake_channel(&channel).unwrap();
+    }
+    #[test]
+    fn worker_scope_defaults_only_when_missing_and_rejects_empty_or_unknown() {
+        assert_eq!(worker_scope(None).unwrap(), WorkerScope::Generic);
+        assert_eq!(worker_scope(Some("generic")).unwrap(), WorkerScope::Generic);
+        assert_eq!(worker_scope(Some(A4_WORKER_SCOPE)).unwrap(), WorkerScope::A4TargetAudit);
+        assert!(worker_scope(Some("")).is_err());
+        assert!(worker_scope(Some("a4")).is_err());
+        assert!(worker_scope(Some("legacy")).is_err());
+    }
+    #[test]
+    fn a4_worker_mode_defaults_only_when_missing_and_rejects_empty_or_unknown() {
+        assert_eq!(a4_worker_mode(None).unwrap(), A4WorkerMode::Embedded);
+        assert_eq!(a4_worker_mode(Some("embedded")).unwrap(), A4WorkerMode::Embedded);
+        assert_eq!(a4_worker_mode(Some("external")).unwrap(), A4WorkerMode::External);
+        assert!(a4_worker_mode(Some("")).is_err());
+        assert!(a4_worker_mode(Some("disabled")).is_err());
+        assert!(a4_worker_mode(Some("Redis")).is_err());
+        assert!(A4WorkerMode::Embedded.runs_embedded_worker());
+        assert!(!A4WorkerMode::External.runs_embedded_worker());
+    }
+    #[test]
+    fn a4_transport_defaults_only_when_missing_and_rejects_empty_or_unrelated() {
+        assert!(a4_transport_from_setting(None).unwrap().is_none());
+        assert!(a4_transport_from_setting(Some("poll")).unwrap().is_none());
+        assert!(a4_transport_from_setting(Some("memory")).unwrap().is_none());
+        assert!(a4_transport_from_setting(Some("")).is_err());
+        assert!(a4_transport_from_setting(Some("kafka")).is_err());
+        assert!(a4_transport_from_setting(Some("redis ")).is_err());
+    }
+    #[test]
+    fn a4_channel_cannot_alias_the_generic_channel_or_default() {
+        let a4 = a4_wake_channel();
+        let generic = crate::cache_wake::GENERIC_WAKE_CHANNEL_DEFAULT;
+        assert_ne!(a4.as_str(), generic);
+        assert_eq!(a4_wake_channel_for(None, generic).unwrap(), a4);
+        assert!(a4_wake_channel_for(None, &a4).is_err());
+        assert!(a4_wake_channel_for(Some(generic), generic).is_err());
+        assert!(a4_wake_channel_for(Some(a4.as_str()), generic).is_ok());
+        assert!(a4_wake_channel_for(Some(""), generic).is_err());
+        assert!(a4_wake_channel_for(Some("has space"), generic).is_err());
+    }
+    #[test]
+    fn strict_env_presence_rejects_empty_and_non_unicode_without_echoing() {
+        assert_eq!(env_text_from("ROOTYARD_TEST_STRICT", Err(std::env::VarError::NotPresent)).unwrap(), None);
+        assert!(env_text_from("ROOTYARD_TEST_STRICT", Ok(String::new())).is_err());
+        let error = env_text_from(
+            "ROOTYARD_TEST_STRICT",
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from("private-value"))),
+        )
+        .expect_err("non-Unicode must be refused");
+        let text = format!("{error}");
+        assert!(text.contains("ROOTYARD_TEST_STRICT"));
+        assert!(!text.contains("private-value"));
+    }
+    #[test]
+    fn strict_a4_numbers_default_only_when_missing_and_reject_bad_values() {
+        assert_eq!(number_from_setting("ROOTYARD_TEST_NUMBER", None, 5, 1, 10).unwrap(), 5);
+        assert_eq!(number_from_setting("ROOTYARD_TEST_NUMBER", Some("7"), 5, 1, 10).unwrap(), 7);
+        assert!(number_from_setting("ROOTYARD_TEST_NUMBER", Some(""), 5, 1, 10).is_err());
+        assert!(number_from_setting("ROOTYARD_TEST_NUMBER", Some("0"), 5, 1, 10).is_err());
+        assert!(number_from_setting("ROOTYARD_TEST_NUMBER", Some("11"), 5, 1, 10).is_err());
+        assert!(number_from_setting("ROOTYARD_TEST_NUMBER", Some("not-a-number"), 5, 1, 10).is_err());
+    }
+    #[cfg(not(feature = "state-redis"))]
+    #[test]
+    fn a4_redis_requires_the_explicit_state_redis_feature() {
+        let error = a4_transport_from_setting(Some("redis")).err().expect("redis must be refused");
+        assert!(format!("{error}").contains("state-redis"));
     }
     #[tokio::test]
     async fn failed_adapter_is_cancellable() {

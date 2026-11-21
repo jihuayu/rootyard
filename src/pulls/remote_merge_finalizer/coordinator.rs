@@ -1,12 +1,11 @@
-//! Coordinator orchestration separating pre-CAS validation/pending intent persistence
-//! from authoritative Ref-CAS commit execution and monotonic receipt projection (`Refs #156`).
+//! Coordinator orchestration: pre-CAS validation, authoritative Ref-CAS commit, projection (`Refs #156`).
 
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::ref_store::contract::{OperationLookup, OperationState};
@@ -16,6 +15,8 @@ use crate::ref_store::core::state_machine::{
 };
 use crate::ref_store::core::terminal::{CommitRejectCode, CommitTerminal, RefCommitResult};
 use crate::ref_store::projector::DecisionGrantKeyring;
+use crate::storage_lifecycle::safe_gc::pg_maintenance_dist::register_live_sm_cutpoint_source;
+use crate::storage_lifecycle::safe_gc::{RefCasCommitCutpointPublisher, SafeGcError};
 
 use super::projector::{MergeReceiptStore, PullMergeReceiptProjector};
 use super::types::{
@@ -24,57 +25,47 @@ use super::types::{
 };
 use super::validation::{validate_merge_inputs_and_preconditions, verify_pull_remote_authz_grant};
 
-pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, RemoteMergeError>> + Send + 'a>>;
+#[path = "coordinator_outcome.rs"]
+mod coordinator_outcome;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AuthorityCommitOutcome {
-    Committed {
-        log_index: u64,
-        log_term: u64,
-        gate_revision: i64,
-        merged_oid: String,
-        terminal_digest: String,
-        replayed: bool,
-    },
-    Rejected {
-        log_index: Option<u64>,
-        log_term: Option<u64>,
-        reject_code: CommitRejectCode,
-        actual_base_oid: Option<String>,
-        terminal_digest: Option<String>,
-        reason: String,
-    },
-    Cancelled {
-        log_index: Option<u64>,
-        log_term: Option<u64>,
-        reason: String,
-    },
-    UnknownPending {
-        reason: String,
-    },
-}
+use coordinator_outcome::canonical_terminal_digest;
+pub use coordinator_outcome::{
+    AuthorityCommitOutcome, BackendFuture, MergeAuthorityBackend, map_sm_error_to_outcome,
+};
 
-pub trait MergeAuthorityBackend: Send + Sync {
-    fn install_and_commit_scoped<'a>(
-        &'a self,
-        repository_id: Uuid,
-        base_ref: &'a str,
-        install: InstallScopedDecisionCommand,
-        commit: CommitScopedRefsCommand,
-    ) -> BackendFuture<'a, AuthorityCommitOutcome>;
-
-    fn query_operation_outcome<'a>(
-        &'a self,
-        repository_id: Uuid,
-        operation_id: Uuid,
-        base_ref: &'a str,
-    ) -> BackendFuture<'a, Option<AuthorityCommitOutcome>>;
-
-    fn read_ref_oid<'a>(
-        &'a self,
-        repository_id: Uuid,
-        ref_name: &'a str,
-    ) -> BackendFuture<'a, Option<String>>;
+/// Maps an immutable [`CommitTerminal`] into [`AuthorityCommitOutcome`] from `terminal.refs`.
+pub fn map_commit_receipt_to_outcome(
+    log_id: AppliedLogId,
+    base_ref: &str,
+    terminal: &CommitTerminal,
+    replayed: bool,
+    diagnostic_live_base_oid: Option<String>,
+) -> Result<AuthorityCommitOutcome, RemoteMergeError> {
+    let terminal_digest = canonical_terminal_digest(terminal);
+    if terminal.is_committed() {
+        let merged_oid = terminal
+            .refs
+            .iter()
+            .find_map(|r| match r {
+                RefCommitResult::Applied { name, new_oid, .. } if name.as_str() == base_ref => new_oid.clone(),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                RemoteMergeError::Equivocation(format!(
+                    "committed Ref-CAS terminal missing Applied new_oid for `{base_ref}`"
+                ))
+            })?;
+        return Ok(AuthorityCommitOutcome::Committed {
+            log_index: log_id.index, log_term: log_id.term, gate_revision: terminal.revision,
+            merged_oid, terminal_digest, replayed,
+        });
+    }
+    let reject_code = terminal.rejection.as_ref().map_or(CommitRejectCode::PolicyDenied, |r| r.code);
+    let reason = format!("ref-cas rejected `{base_ref}` with {}", reject_code.as_str());
+    Ok(AuthorityCommitOutcome::Rejected {
+        log_index: Some(log_id.index), log_term: Some(log_id.term), reject_code,
+        actual_base_oid: diagnostic_live_base_oid, terminal_digest: Some(terminal_digest), reason,
+    })
 }
 
 pub fn original_operation_log_id(
@@ -98,6 +89,8 @@ pub struct InProcessRefCasBackend {
     sm: Arc<Mutex<RefCasStateMachine>>,
     next_index: Arc<Mutex<u64>>,
     op_log_ids: Arc<Mutex<BTreeMap<(Uuid, Uuid), AppliedLogId>>>,
+    cutpoint_publisher: Option<RefCasCommitCutpointPublisher>,
+    abort_after_install_once: Arc<AtomicBool>,
 }
 
 impl InProcessRefCasBackend {
@@ -107,6 +100,8 @@ impl InProcessRefCasBackend {
             sm: Arc::new(Mutex::new(sm)),
             next_index: Arc::new(Mutex::new(next)),
             op_log_ids: Arc::new(Mutex::new(BTreeMap::new())),
+            cutpoint_publisher: None,
+            abort_after_install_once: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -124,6 +119,50 @@ impl InProcessRefCasBackend {
         *guard = idx.saturating_add(1);
         AppliedLogId { term: 1, index: idx }
     }
+
+    pub fn with_safe_gc_cutpoint_publisher(
+        mut self,
+        storage_root: impl Into<std::path::PathBuf>,
+        group_id: i64,
+    ) -> Result<Self, SafeGcError> {
+        self.cutpoint_publisher = Some(RefCasCommitCutpointPublisher::new(storage_root, group_id)?);
+        Ok(self)
+    }
+
+    /// Injects one durable install-to-commit abort so callers can observe the in-flight decision.
+    pub fn set_abort_after_install_once(&self, enabled: bool) {
+        self.abort_after_install_once.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Publish the running state machine as the safe-GC production cutpoint authority.
+    pub fn register_safe_gc_repo(&self, repository_id: Uuid) {
+        if let Some(publisher) = &self.cutpoint_publisher {
+            register_live_sm_cutpoint_source(publisher.storage_root(), repository_id, publisher.group_id(), &self.sm);
+        }
+    }
+
+    fn publish_cutpoint(&self, repository_id: Uuid, sm: &RefCasStateMachine) -> Result<(), SafeGcError> {
+        let Some(publisher) = &self.cutpoint_publisher else {
+            return Ok(());
+        };
+        publisher.publish_committed_state(repository_id, sm, &[])?;
+        register_live_sm_cutpoint_source(publisher.storage_root(), repository_id, publisher.group_id(), &self.sm);
+        Ok(())
+    }
+
+    pub fn apply_repo_command(
+        &self,
+        repository_id: Uuid,
+        cmd: RefCasCommand,
+    ) -> Result<ApplyResponse, RemoteMergeError> {
+        let log_id = self.next_log_id();
+        let mut sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
+        let response =
+            sm.apply(log_id, cmd).map_err(|e| RemoteMergeError::RemoteAuthzDenied(e.to_string()))?;
+        self.publish_cutpoint(repository_id, &sm)
+            .map_err(|e| RemoteMergeError::Io(format!("Ref-CAS apply/publish cutpoint failed: {e}")))?;
+        Ok(response)
+    }
 }
 
 impl MergeAuthorityBackend for InProcessRefCasBackend {
@@ -135,6 +174,7 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
         commit: CommitScopedRefsCommand,
     ) -> BackendFuture<'a, AuthorityCommitOutcome> {
         Box::pin(async move {
+            self.register_safe_gc_repo(repository_id);
             let dec_id = commit.commit.decision_id;
             let install_idx = self.next_log_id();
             {
@@ -147,9 +187,23 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                     }) if Some(decision_id) == dec_id => {}
                     Err(err) => {
                         let actual_base_oid = sm.read_refs(repository_id).get(base_ref).cloned();
+                        let _ = self.publish_cutpoint(repository_id, &sm);
                         return Ok(map_sm_error_to_outcome(Some(install_idx), err, actual_base_oid));
                     }
                 }
+            }
+            // Seal the installed-but-not-committed decision before the commit point so a
+            // process crash in this window can never leave Safe GC reading an older cut.
+            {
+                let sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
+                self.publish_cutpoint(repository_id, &sm).map_err(|e| {
+                    RemoteMergeError::Io(format!("publish install-to-commit cutpoint failed: {e}"))
+                })?;
+            }
+            if self.abort_after_install_once.swap(false, Ordering::SeqCst) {
+                return Ok(AuthorityCommitOutcome::UnknownPending {
+                    reason: "injected abort after install before Ref-CAS commit".into(),
+                });
             }
             let op_id = commit.commit.request.identity.operation_id;
             let commit_idx = self.next_log_id();
@@ -158,7 +212,11 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                 Ok(ApplyResponse::RefsCommitted(receipt)) => {
                     let stored_idx = match original_operation_log_id(&sm, repository_id, op_id) {
                         Some(orig) => {
-                            self.op_log_ids.lock().unwrap_or_else(|e| e.into_inner()).entry((repository_id, op_id)).or_insert(orig);
+                            self.op_log_ids
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .entry((repository_id, op_id))
+                                .or_insert(orig);
                             orig
                         }
                         None if receipt.replayed => {
@@ -167,16 +225,22 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                             ));
                         }
                         None => {
-                            self.op_log_ids.lock().unwrap_or_else(|e| e.into_inner()).insert((repository_id, op_id), commit_idx);
+                            self.op_log_ids
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert((repository_id, op_id), commit_idx);
                             commit_idx
                         }
                     };
                     let diag_base = sm.read_refs(repository_id).get(base_ref).cloned();
+                    self.publish_cutpoint(repository_id, &sm)
+                        .map_err(|e| RemoteMergeError::Io(format!("publish Ref-CAS cutpoint snapshot failed: {e}")))?;
                     map_commit_receipt_to_outcome(stored_idx, base_ref, &receipt.terminal, receipt.replayed, diag_base)
                 }
                 Ok(other) => Err(RemoteMergeError::Equivocation(format!("unexpected RefCas response: {other:?}"))),
                 Err(err) => {
                     let diag_base = sm.read_refs(repository_id).get(base_ref).cloned();
+                    let _ = self.publish_cutpoint(repository_id, &sm);
                     Ok(map_sm_error_to_outcome(Some(commit_idx), err, diag_base))
                 }
             }
@@ -202,13 +266,26 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                     .copied()
                     .unwrap_or_else(|| sm.last_applied().unwrap_or(AppliedLogId { term: 1, index: 1 }))
             });
+            if sm.has_cancel_tombstone(repository_id, operation_id)
+                && !matches!(&lookup, OperationLookup::Known(record) if record.state() == OperationState::Committed)
+            {
+                return Ok(Some(AuthorityCommitOutcome::Cancelled {
+                    log_index: Some(log_id.index),
+                    log_term: Some(log_id.term),
+                    reason: "operation cancelled by tombstone in RefCasStateMachine".into(),
+                }));
+            }
             match lookup {
                 OperationLookup::Unknown => {
-                    if sm.has_cancel_tombstone(repository_id, operation_id) {
-                        return Ok(Some(AuthorityCommitOutcome::Cancelled {
-                            log_index: Some(log_id.index),
-                            log_term: Some(log_id.term),
-                            reason: "operation cancelled by tombstone in RefCasStateMachine".into(),
+                    let snapshot = sm.snapshot().map_err(|e| RemoteMergeError::RemoteAuthzDenied(e.to_string()))?;
+                    let installed = snapshot.body.decisions.iter().any(|decision| {
+                        decision.repository_id == repository_id
+                            && decision.operation_id == operation_id
+                            && decision.state == SmDecisionState::Open
+                    });
+                    if installed {
+                        return Ok(Some(AuthorityCommitOutcome::UnknownPending {
+                            reason: "decision installed but Ref-CAS commit not applied".into(),
                         }));
                     }
                     Ok(None)
@@ -238,110 +315,12 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
         })
     }
 
-    fn read_ref_oid<'a>(
-        &'a self,
-        repository_id: Uuid,
-        ref_name: &'a str,
-    ) -> BackendFuture<'a, Option<String>> {
+    fn read_ref_oid<'a>(&'a self, repository_id: Uuid, ref_name: &'a str) -> BackendFuture<'a, Option<String>> {
         Box::pin(async move {
             let sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
             Ok(sm.read_refs(repository_id).get(ref_name).cloned())
         })
     }
-}
-
-/// Maps an immutable [`CommitTerminal`] receipt into [`AuthorityCommitOutcome`].
-/// For committed terminals, `merged_oid` is always extracted from `terminal.refs`
-/// rather than mutable live ref state so recovery and replay survive later advances.
-pub fn map_commit_receipt_to_outcome(
-    log_id: AppliedLogId,
-    base_ref: &str,
-    terminal: &CommitTerminal,
-    replayed: bool,
-    diagnostic_live_base_oid: Option<String>,
-) -> Result<AuthorityCommitOutcome, RemoteMergeError> {
-    let terminal_digest = canonical_terminal_digest(terminal);
-    if terminal.is_committed() {
-        let merged_oid = terminal
-            .refs
-            .iter()
-            .find_map(|r| match r {
-                RefCommitResult::Applied { name, new_oid, .. } if name == base_ref => new_oid.clone(),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                RemoteMergeError::Equivocation(format!(
-                    "committed Ref-CAS terminal missing Applied new_oid for `{base_ref}`"
-                ))
-            })?;
-        return Ok(AuthorityCommitOutcome::Committed {
-            log_index: log_id.index,
-            log_term: log_id.term,
-            gate_revision: terminal.revision,
-            merged_oid,
-            terminal_digest,
-            replayed,
-        });
-    }
-    let reject_code = terminal
-        .rejection
-        .as_ref()
-        .map_or(CommitRejectCode::PolicyDenied, |r| r.code);
-    let reason = format!("ref-cas rejected `{base_ref}` with {}", reject_code.as_str());
-    Ok(AuthorityCommitOutcome::Rejected {
-        log_index: Some(log_id.index),
-        log_term: Some(log_id.term),
-        reject_code,
-        actual_base_oid: diagnostic_live_base_oid,
-        terminal_digest: Some(terminal_digest),
-        reason,
-    })
-}
-
-pub fn map_sm_error_to_outcome(
-    log_id: Option<AppliedLogId>,
-    err: StateMachineError,
-    actual_base_oid: Option<String>,
-) -> AuthorityCommitOutcome {
-    let idx = log_id.map(|id| id.index);
-    let term = log_id.map(|id| id.term);
-    match err {
-        StateMachineError::AuthzFloorViolation { .. }
-        | StateMachineError::ScopeClosingOrClosed { .. }
-        | StateMachineError::DecisionExpired { .. } => AuthorityCommitOutcome::Cancelled {
-            log_index: idx,
-            log_term: term,
-            reason: err.to_string(),
-        },
-        StateMachineError::DecisionDigestMismatch { reason, .. } => AuthorityCommitOutcome::Rejected {
-            log_index: idx,
-            log_term: term,
-            reject_code: CommitRejectCode::RevisionMismatch,
-            actual_base_oid,
-            terminal_digest: None,
-            reason: reason.to_owned(),
-        },
-        StateMachineError::Store(crate::ref_store::contract::RefStoreError::Cancelled { .. }) => {
-            AuthorityCommitOutcome::Cancelled {
-                log_index: idx,
-                log_term: term,
-                reason: err.to_string(),
-            }
-        }
-        other => AuthorityCommitOutcome::Rejected {
-            log_index: idx,
-            log_term: term,
-            reject_code: CommitRejectCode::PolicyDenied,
-            actual_base_oid,
-            terminal_digest: None,
-            reason: other.to_string(),
-        },
-    }
-}
-
-fn canonical_terminal_digest(terminal: &CommitTerminal) -> String {
-    let bytes = serde_json::to_vec(terminal).unwrap_or_default();
-    hex::encode(Sha256::digest(&bytes))
 }
 
 /// Producer orchestrating validation -> durable `PendingMerge` intent -> Raft Ref-CAS sole
@@ -366,50 +345,29 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
     ) -> Result<MergeAttemptOutcome, RemoteMergeError> {
         validate_merge_inputs_and_preconditions(spec, pull)?;
         let validated = verify_pull_remote_authz_grant(spec, pull, self.keyring)?;
-
         if matches!(fault, MergeFaultInjection::DisconnectBeforePendingInsert) {
-            return Err(RemoteMergeError::PgDatabase(
-                "injected PG disconnect before pending merge insert".into(),
-            ));
+            return Err(RemoteMergeError::PgDatabase("injected PG disconnect before pending merge insert".into()));
         }
-
         let pending = PendingMergeRecord {
-            attempt_id: spec.attempt_id,
-            operation_id: spec.operation_id,
-            decision_id: spec.decision_id,
-            tenant_id: spec.tenant_id,
-            repository_id: spec.repository_id,
-            pull_number: spec.pull_number,
-            base_ref: spec.base_ref.clone(),
-            expected_head_oid: spec.expected_head_oid.clone(),
-            expected_base_oid: spec.expected_base_oid.clone(),
-            candidate_target_oid: spec.candidate_target_oid.clone(),
-            expected_version: spec.expected_version,
-            expected_storage_generation: spec.expected_storage_generation,
-            strategy: spec.strategy,
-            authz_epoch: spec.grant.payload.authz_epoch,
-            pack_sha256: spec.pack_sha256.clone(),
-            facts_digest: validated.binding_digest,
-            state: PullMergeState::PendingMerge,
-            commit_log_index: None,
-            commit_log_term: None,
-            merged_oid: None,
-            terminal_digest: None,
-            reject_reason: None,
+            attempt_id: spec.attempt_id, operation_id: spec.operation_id, decision_id: spec.decision_id,
+            tenant_id: spec.tenant_id, repository_id: spec.repository_id, pull_number: spec.pull_number,
+            base_ref: spec.base_ref.clone(), expected_head_oid: spec.expected_head_oid.clone(),
+            expected_base_oid: spec.expected_base_oid.clone(), candidate_target_oid: spec.candidate_target_oid.clone(),
+            expected_version: spec.expected_version, expected_storage_generation: spec.expected_storage_generation,
+            strategy: spec.strategy, authz_epoch: spec.grant.payload.authz_epoch, pack_sha256: spec.pack_sha256.clone(),
+            facts_digest: validated.binding_digest, state: PullMergeState::PendingMerge, commit_log_index: None,
+            commit_log_term: None, merged_oid: None, terminal_digest: None, reject_reason: None,
         };
         self.projector.record_pending(&pending).await?;
-
         if matches!(fault, MergeFaultInjection::DisconnectAfterPendingBeforeCas) {
             return Err(RemoteMergeError::UnknownOutcome(
                 "coordinator disconnected after recording PendingMerge before Ref-CAS submit".into(),
             ));
         }
-
         let cas_outcome = self
             .authority
             .install_and_commit_scoped(spec.repository_id, &spec.base_ref, validated.install_cmd, validated.commit_cmd)
             .await?;
-
         if matches!(
             fault,
             MergeFaultInjection::CoordinatorTimeoutAfterCasBeforeProjection
@@ -419,7 +377,6 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
                 "coordinator timeout / PG disconnect after Ref-CAS submit before projection commit".into(),
             ));
         }
-
         self.apply_cas_outcome(spec, &pending, cas_outcome, update_forge_pulls).await
     }
 
@@ -432,12 +389,7 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
     ) -> Result<MergeAttemptOutcome, RemoteMergeError> {
         match outcome {
             AuthorityCommitOutcome::Committed {
-                log_index,
-                log_term,
-                gate_revision,
-                merged_oid,
-                terminal_digest,
-                replayed,
+                log_index, log_term, gate_revision, merged_oid, terminal_digest, replayed,
             } => {
                 if merged_oid != spec.candidate_target_oid {
                     return Err(RemoteMergeError::Equivocation(format!(
@@ -446,16 +398,11 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
                     )));
                 }
                 let receipt = pending.into_committed_receipt(
-                    merged_oid,
-                    log_index,
-                    log_term,
-                    gate_revision,
-                    terminal_digest,
-                    replayed,
+                    merged_oid, log_index, log_term, gate_revision, terminal_digest, replayed,
                 );
-                self.projector
-                    .project_committed(&receipt, pending.expected_storage_generation, pending.expected_version, update_forge_pulls)
-                    .await?;
+                self.projector.project_committed(
+                    &receipt, pending.expected_storage_generation, pending.expected_version, update_forge_pulls,
+                ).await?;
                 Ok(MergeAttemptOutcome::Committed(receipt))
             }
             AuthorityCommitOutcome::Cancelled { log_index, log_term, reason } => {
@@ -464,19 +411,13 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
                 Err(RemoteMergeError::RevokedAuthorization(reason))
             }
             AuthorityCommitOutcome::Rejected {
-                log_index,
-                log_term,
-                reject_code,
-                actual_base_oid,
-                terminal_digest,
-                reason,
+                log_index, log_term, reject_code, actual_base_oid, terminal_digest, reason,
             } => {
                 let rej = pending.into_rejected_receipt(log_index, log_term, reason.clone(), terminal_digest);
                 self.projector.project_rejected(&rej).await?;
                 if matches!(reject_code, CommitRejectCode::OldOidMismatch | CommitRejectCode::RevisionMismatch) {
                     return Err(RemoteMergeError::TargetRefMoved {
-                        ref_name: spec.base_ref.clone(),
-                        expected_base_oid: spec.expected_base_oid.clone(),
+                        ref_name: spec.base_ref.clone(), expected_base_oid: spec.expected_base_oid.clone(),
                         actual_base_oid,
                     });
                 }

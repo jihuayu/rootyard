@@ -130,6 +130,7 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
         }
     }
     scheduled += schedule_pando(state, policy).await?;
+    scheduled += super::safe_gc::pg_maintenance::schedule_pg_refstore(state, policy).await?;
     Ok(scheduled)
 }
 

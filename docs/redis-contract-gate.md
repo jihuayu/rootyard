@@ -1,9 +1,9 @@
 # Owned real-Redis contract gate
 
-Status: runner and separate CI job added; remote CI has **not** executed this job
-in this worktree. This document makes no remote-PASSED claim. The existing local
-root evidence in `evidence/state-services/cache-wake/redis-contract.json` is
-from an earlier 7.4.2-owned fixture and remains the only executed evidence.
+The [hosted CI job](#ci-job) passed on the replica-promotion candidate.
+The historical local report in
+`evidence/state-services/cache-wake/redis-contract.json` records the earlier
+owned Redis 7.4.2 fixture.
 
 `scripts/check_redis_contract.py` is the reproducible optional gate for the
 `state-redis` feature. It is intentionally independent of the ordinary verify
@@ -72,6 +72,13 @@ pinned Rust toolchain, native prerequisites used by the existing CI
 with `state-redis` and denied warnings, the prebuilt build, the owned fixture
 gate, and an always-uploaded report. The existing
 `.github/workflows/ci.yml` verify flow is not changed.
+
+Artifact `14690808966` records six passing plaintext cases, six passing TLS
+cases, the expected untrusted-CA refusal, and a pass after restoring trust,
+with zero skips. The Redis 7.2.6 run and build receipt bind to preview
+`4d292b05f7c2b852ab55707ba62d056272eeb74f` and tree
+`4cdd2d9675281a9d3a47e7fec26c330e7329cfcf`.
+[Hosted Redis contract](https://github.com/jihuayu/rootyard/actions/runs/44864706589/job/136725683353)
 
 Local invocation (requires Docker, OpenSSL and the official image; the
 executable and receipt must already exist):

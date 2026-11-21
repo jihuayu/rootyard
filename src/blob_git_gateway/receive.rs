@@ -1,17 +1,9 @@
-//! Smart-HTTP `git-receive-pack`: immutable operation probe, quarantine, real
-//! native ingestion, then the durable PostgreSQL commit.
+//! Smart-HTTP `git-receive-pack`: immutable operation probe, quarantine, real native ingestion, then the durable PostgreSQL commit.
 //!
-//! Ordering is deliberate:
-//!
-//! 1. spool the bounded (decoded) wire body and parse the command prefix;
-//! 2. compute the producer request digest and query the migration-138 operation
-//!    registry **before** any native child or A3/A4 write: a durable terminal is
-//!    replayed from its persisted receipt, a pending operation is an unknown
-//!    outcome (`503`), and only an unknown operation proceeds;
-//! 3. build the sealed local view, run native `receive-pack` and stage pairs;
-//! 4. `prepare -> select -> verify -> commit`; a `report-status` is generated
-//!    only from the durable terminal, never from a caller boolean, a local Git
-//!    view or a broad error class.
+//! Ordering is deliberate: spool the bounded body and parse the prefix; compute the producer digest and query the
+//! migration-138 operation registry **before** any native child or A3/A4 write (a durable terminal replays from its
+//! persisted receipt, a pending operation is an unknown `503`, only an unknown one proceeds); build the sealed view,
+//! run native `receive-pack`, stage pairs; then `prepare -> select -> verify -> commit`, rendering `report-status` only from the terminal.
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -49,9 +41,8 @@ use crate::{
 
 const MAX_NEW_PACKS: usize = 8;
 
-/// Every refusal of this route is rendered with `GatewayError::git`, so the
-/// push endpoint keeps its Smart HTTP `Basic` challenge; only the success and
-/// `report-status` answers below are built directly.
+/// Every refusal is rendered with `GatewayError::git`, so the push endpoint keeps its Smart HTTP
+/// `Basic` challenge; only the success/`report-status` answers below are built directly.
 pub(super) async fn receive_pack(
     state: State<Arc<BlobGitState>>,
     path: AxumPath<(String, String)>,
@@ -83,9 +74,7 @@ async fn receive_pack_authorized(
     let repository_id = serving.gate.repository_id();
     let format = serving.gate.object_format();
 
-    // Worst-case inbound reservation before a single body byte is read. For a
-    // gzip/x-gzip body this is also the decoded ceiling the native spooler
-    // enforces; the lease is held until this handler returns.
+    // Worst-case inbound reservation, also the decoded gzip ceiling, held until this handler returns.
     let _lease = state.reserve_bytes(state.limits().max_request_bytes)?;
     let _workspace = state.reserve_workspace(state.limits().max_request_bytes)?;
     let work = state.temp_dir("receive")?;
@@ -131,6 +120,7 @@ async fn receive_pack_authorized(
         }
         Claim::Replay(terminal) => {
             materialize_durable_gateway_receipt(receipt_args(false)).await?;
+            paired_write_raft_gate(&state, repository_id, terminal.is_committed()).await?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             return committed_response(CommittedResponse {
@@ -148,12 +138,10 @@ async fn receive_pack_authorized(
         }
         Claim::Fresh => {}
     }
-    // Reclaim sweeping is a fresh-admission side effect only: a pending, cancelled or replayed
-    // claim must never mutate the local reclaim ledger or delete a remote staging object.
+    // A pending, cancelled or replayed claim must never mutate the reclaim ledger or a staging object.
     let _ = sweep_gateway_reclaim_ledger(state.pool(), state.scratch_root(), backend_hex, deadline).await;
 
-    // Real sealed read view; verify authority snapshot closure before building
-    // the native Git view so base packs never skip closure verification.
+    // Sealed read view; the authority snapshot closure is verified before any base pack is used.
     let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
     let closure_ctx =
         match verify_gateway_authority_closure(&serving.gate, &identity, refs.handle.as_ref(), &refs.refs, backend_hex)
@@ -215,14 +203,14 @@ async fn receive_pack_authorized(
         &pair_summaries,
     )?;
 
+    paired_write_raft_gate(&state, repository_id, false).await?;
     let published =
         publish::push(&state, &serving, &identity, operation, digest, &request, &pairs, mode, deadline).await;
     match published {
-        // Only the persisted (fresh or replayed) core terminal is rendered as a
-        // Git report-status. Mixed/accepted-subset terminals are replayed
-        // exactly as recorded.
+        // Only the persisted terminal is rendered as a Git report-status; mixed and accepted-subset terminals replay as recorded.
         Ok(PushOutcome::Terminal(terminal)) => {
             materialize_durable_gateway_receipt(receipt_args(true)).await?;
+            paired_write_raft_gate(&state, repository_id, terminal.is_committed()).await?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             committed_response(CommittedResponse {
@@ -268,6 +256,24 @@ async fn receive_pack_authorized(
             Err(error)
         }
     }
+}
+
+/// Refuse a paired write while frozen; once the durable terminal is committed, mirror the exact PostgreSQL -> Raft delta into the database-bound live cluster before responding.
+async fn paired_write_raft_gate(
+    state: &BlobGitState,
+    repository_id: Uuid,
+    committed: bool,
+) -> Result<(), GatewayError> {
+    let outcome = if committed {
+        crate::maintenance::paired_raft_backup::startup_wiring::mirror_gateway_push_to_paired_raft(
+            state.pool(),
+            repository_id,
+        )
+        .await
+    } else {
+        crate::maintenance::paired_raft_backup::startup_wiring::check_paired_write_unfrozen(state.pool()).await
+    };
+    outcome.map_err(|_| GatewayError::OutcomeUnknown)
 }
 
 fn repository_name(raw: &str) -> Result<&str, GatewayError> {
@@ -392,21 +398,14 @@ fn refused<E>(_: E) -> GatewayError {
     GatewayError::Unavailable(COMMITTED_SESSION_UNAVAILABLE)
 }
 
-/// Render the `report-status` of a durable terminal that is already fully
-/// encoded into `body` (no session/DB work happens here, so a replayed or
-/// freshly committed terminal that is *not* committed stays token-free).
+/// Render the `report-status` of an already encoded durable terminal. With a key set, a committed
+/// terminal additionally gets exactly one fresh writable lookup taken only after the whole body
+/// exists, issuing a session from the opaque committed-write proof bound to its exact revision; the
+/// lookup's own bounded connection is released before returning. Any such failure is the fixed
+/// retryable [`COMMITTED_SESSION_UNAVAILABLE`], never a token-free `200`.
 ///
-/// With a key set configured, a committed terminal additionally gets exactly
-/// one fresh writable lookup taken only now, after the whole body exists, and
-/// a session signed from the opaque committed-write proof bound to the
-/// terminal's exact revision. The lookup's own bounded connection is released
-/// before this returns, so nothing database- or access-related outlives the
-/// response. Any final lookup/proof/issue failure is the fixed retryable
-/// [`COMMITTED_SESSION_UNAVAILABLE`]; a token-free `200` is never returned when
-/// a key set is configured. Without a key set no extra lookup happens.
-/// Everything one committed push response needs after the durable terminal
-/// exists. Bundling it keeps the async boundary readable without suppressing
-/// Clippy's argument-count lint.
+/// Everything one committed push response needs after the durable terminal exists; bundling it keeps
+/// the async boundary readable without suppressing Clippy's argument-count lint.
 struct CommittedResponse<'a> {
     state: &'a BlobGitState,
     identity: &'a crate::db::Identity,
