@@ -192,7 +192,7 @@ pub(super) async fn prepare(
             store
                 .get_to_file(obj_key, &to, *size, tokio::time::Instant::now() + Duration::from_secs(120))
                 .await
-                .map_err(Error::internal)?;
+                .map_err(remote::remote_read_error)?;
         }
         Ok(())
     }
