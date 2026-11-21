@@ -25,6 +25,8 @@ pub mod quarantine;
 pub mod retention;
 #[path = "storage_lifecycle/rubicon_compaction.rs"]
 pub mod rubicon_compaction;
+#[path = "storage_lifecycle/safe_gc.rs"]
+pub mod safe_gc;
 #[path = "storage_lifecycle/scheduler.rs"]
 pub mod scheduler;
 #[path = "storage_lifecycle/worker.rs"]

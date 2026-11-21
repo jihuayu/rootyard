@@ -56,8 +56,10 @@ EVIDENCE = (
 # qualification (13 build, 5 restore/flush, 3 partition, 4 failover, 3 cleanup
 # and manifest binding), and +40 for the Pando package gates: 175. This branch
 # adds no main-side step, so the merged job cap must be exactly this baseline
-# plus the independent workspace FUSE phases.
+# plus the independent workspace FUSE phases and the independent PR #321 #29
+# remote-CAS witness.
 MAIN_VERIFY_BUDGET = 175
+REMOTE_CAS_BUDGET = 22
 @dataclass
 class Step:
     name: str = ""
@@ -487,16 +489,25 @@ class FailureIsolatedFeatureLaneTest(unittest.TestCase):
         # keeps its own cap. C5 runs inside the 30-minute helper step, so it
         # shares that cap instead of reserving separate job minutes.
         self.assertEqual(fuse_phases, (12, 30, 10))
-        merged_cap = MAIN_VERIFY_BUDGET + sum(fuse_phases)
-        self.assertEqual(merged_cap, 227)
+        main_cap = MAIN_VERIFY_BUDGET + sum(fuse_phases)
+        self.assertEqual(main_cap, 227)
+        self.assertIn(
+            f"{MAIN_VERIFY_BUDGET} + {' + '.join(str(phase) for phase in fuse_phases)} = {main_cap}",
+            verify,
+            "the job comment must derive main's cap from the added phases",
+        )
+        merged_cap = main_cap + REMOTE_CAS_BUDGET
+        self.assertEqual(merged_cap, 249)
         self.assertIn(f"    timeout-minutes: {merged_cap}", verify)
         self.assertIn(
-            f"{MAIN_VERIFY_BUDGET} + {' + '.join(str(phase) for phase in fuse_phases)} = {merged_cap}",
+            f"{main_cap} + {REMOTE_CAS_BUDGET} = {merged_cap}",
             verify,
-            "the job comment must derive the cap from main's budget and the added phases",
+            "the job comment must add the independent #29 witness to main's cap",
         )
-        # Keeping main's 175 alone would silently under-budget the new phases.
+        # Keeping main's 175, or main's 227 without the independent #29
+        # witness, would silently under-budget the merged job.
         self.assertNotIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET}", verify)
+        self.assertNotIn(f"    timeout-minutes: {main_cap}", verify)
         self.assertIsNone(self.by_id["cargo_all_targets"].timeout)
         fuse = self.by_name["Bind workspace FUSE and remote-delete evidence to the built binary"]
         legacy = self.by_name["Bind legacy FUSE evidence independently to the built binary"]

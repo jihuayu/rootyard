@@ -38,6 +38,11 @@ fail() {
 # after start()'s frame has unwound, where function-local values are gone.
 rootyard_fixture_owned=0
 
+# Opt-in absolute deadline for one start or stop invocation. Zero is the stock
+# behavior: every call runs directly, exactly as before. #29 sets the two
+# lifecycle variables so setup and cleanup each have a finite window.
+fixture_deadline=0
+
 on_start_exit() {
   local status=$? cleanup_status=0
   trap - EXIT
@@ -65,6 +70,40 @@ bounded_integer() {
   printf '%s' "$value"
 }
 
+optional_bounded_integer() {
+  local name=$1 value=$2 minimum=$3 maximum=$4
+  if [ -z "$value" ]; then
+    return 0
+  fi
+  bounded_integer "$name" "$value" "$minimum" "$maximum"
+}
+
+# Run one external command under the opt-in absolute deadline. With no deadline
+# this is an exact pass-through. `grace` bounds how long a command that ignores
+# TERM may survive after the deadline; callers still fail closed on its status.
+# This bounds the local client, not a daemon-side operation that outlives it.
+bounded_call() {
+  local grace=$1
+  shift
+  if [ "$fixture_deadline" -eq 0 ]; then
+    "$@"
+    return
+  fi
+  local left=$((fixture_deadline - SECONDS))
+  [ "$left" -ge 1 ] || fail "fixture lifecycle deadline expired before command"
+  timeout --signal=TERM --kill-after="$grace" "$left" "$@"
+}
+
+exit_with_status() {
+  local status=$1
+  shift
+  case "$status" in
+    124 | 137) status=1 ;;
+  esac
+  echo "owned garage fixture: $*" >&2
+  exit "$status"
+}
+
 # A cold runner has no cached image, so `docker image inspect` would fail before
 # the digest check ever runs. Warm the cache first, but only with the pinned
 # digest reference: an explicit --image that is absent locally is refused rather
@@ -73,12 +112,18 @@ bounded_integer() {
 # start created. Pull output is logged inside the owned directory and never
 # echoed, so registry/credential chatter cannot reach the job log.
 ensure_image() {
-  if docker image inspect --format '{{.Id}}' "$image" >/dev/null 2>&1; then
+  local inspect_status=0
+  bounded_call 5 docker image inspect --format '{{.Id}}' "$image" >/dev/null 2>&1 \
+    || inspect_status=$?
+  if [ "$inspect_status" -eq 0 ]; then
     return 0
+  fi
+  if [ "$fixture_deadline" -ne 0 ] && [ "$inspect_status" -ne 1 ]; then
+    fail "docker image inspect did not complete within the lifecycle budget"
   fi
   [ "$image" = "$pinned_image" ] \
     || fail "image $image is absent locally and only the pinned digest reference may be pulled"
-  local timeout_seconds attempts attempt=1 status=0
+  local timeout_seconds attempts attempt=1 status=0 effective_timeout left
   timeout_seconds=$(bounded_integer ROOTYARD_FIXTURE_PULL_TIMEOUT \
     "${ROOTYARD_FIXTURE_PULL_TIMEOUT:-300}" 1 1800)
   attempts=$(bounded_integer ROOTYARD_FIXTURE_PULL_ATTEMPTS \
@@ -90,7 +135,13 @@ ensure_image() {
   chmod 600 "$pull_log"
   while :; do
     status=0
-    timeout --signal=TERM --kill-after=10 "$timeout_seconds" docker pull "$image" \
+    effective_timeout=$timeout_seconds
+    if [ "$fixture_deadline" -ne 0 ]; then
+      left=$((fixture_deadline - SECONDS))
+      [ "$left" -ge 1 ] || fail "fixture lifecycle deadline expired before image pull"
+      [ "$left" -lt "$effective_timeout" ] && effective_timeout=$left
+    fi
+    timeout --signal=TERM --kill-after=10 "$effective_timeout" docker pull "$image" \
       >"$pull_log" 2>&1 || status=$?
     if [ "$status" -eq 0 ]; then
       break
@@ -195,14 +246,14 @@ remove_owned_output() {
 verify_owned_container() {
   local cid=$1 nonce=$2
   local actual kind label_nonce label_path label_uid label_name
-  actual=$(docker inspect --type container --format '{{.Id}}' "$cid" 2>/dev/null) \
+  actual=$(bounded_call 5 docker inspect --type container --format '{{.Id}}' "$cid" 2>/dev/null) \
     || fail "sentinel container $cid is absent or unreadable; refusing cleanup"
   [ "$actual" = "$cid" ] || fail "sentinel container id $cid resolved to $actual; refusing cleanup"
-  kind=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.kind"}}' "$cid" 2>/dev/null || true)
-  label_nonce=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.nonce"}}' "$cid" 2>/dev/null || true)
-  label_path=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.directory"}}' "$cid" 2>/dev/null || true)
-  label_uid=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.uid"}}' "$cid" 2>/dev/null || true)
-  label_name=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.name"}}' "$cid" 2>/dev/null || true)
+  kind=$(bounded_call 5 docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.kind"}}' "$cid" 2>/dev/null || true)
+  label_nonce=$(bounded_call 5 docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.nonce"}}' "$cid" 2>/dev/null || true)
+  label_path=$(bounded_call 5 docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.directory"}}' "$cid" 2>/dev/null || true)
+  label_uid=$(bounded_call 5 docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.uid"}}' "$cid" 2>/dev/null || true)
+  label_name=$(bounded_call 5 docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.name"}}' "$cid" 2>/dev/null || true)
   [ "$kind" = "owned-garage" ] || fail "container $cid lacks the owned-fixture label; refusing cleanup"
   [ "$label_nonce" = "$nonce" ] || fail "container $cid nonce does not match the sentinel; refusing cleanup"
   [ "$label_path" = "$directory" ] || fail "container $cid path does not match the sentinel; refusing cleanup"
@@ -212,6 +263,15 @@ verify_owned_container() {
 }
 
 stop() {
+  local stop_lifecycle
+  stop_lifecycle=$(optional_bounded_integer ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT \
+    "${ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT:-}" 1 600)
+  fixture_deadline=0
+  if [ -n "$stop_lifecycle" ]; then
+    command -v timeout >/dev/null 2>&1 \
+      || fail "timeout(1) is required to bound the opt-in stop lifecycle"
+    fixture_deadline=$((SECONDS + stop_lifecycle))
+  fi
   [ -n "$directory" ] || fail "--directory is required"
   directory=$(canonical_fixture_path "$directory")
   if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
@@ -236,7 +296,8 @@ stop() {
   if [ -n "$cid" ]; then
     command -v docker >/dev/null 2>&1 || fail "docker is required to remove the owned container"
     verify_owned_container "$cid" "$nonce"
-    docker rm -f -- "$cid" >/dev/null || fail "docker could not remove owned container $cid"
+    bounded_call 5 docker rm -f -- "$cid" >/dev/null \
+      || fail "docker could not remove owned container $cid"
   fi
   remove_owned_output "$env"
   rm -rf -- "$directory"
@@ -268,6 +329,13 @@ start() {
   # timeout after the owned container was created.
   command -v timeout >/dev/null 2>&1 \
     || fail "timeout(1) is required to bound the Garage node-id and RPC startup probes"
+  local start_lifecycle
+  start_lifecycle=$(optional_bounded_integer ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT \
+    "${ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT:-}" 1 1800)
+  fixture_deadline=0
+  if [ -n "$start_lifecycle" ]; then
+    fixture_deadline=$((SECONDS + start_lifecycle))
+  fi
   [ -n "$image" ] || fail "--image is required"
   [ -n "$directory" ] || fail "--directory is required"
   [ -n "$output" ] || fail "--output-env is required"
@@ -297,13 +365,18 @@ start() {
   trap on_start_exit EXIT
   local image_id repo_digests version_line
   ensure_image
-  image_id=$(docker image inspect --format '{{.Id}}' "$image") \
+  image_id=$(bounded_call 5 docker image inspect --format '{{.Id}}' "$image") \
     || fail "cannot inspect $image"
-  repo_digests=$(docker image inspect --format '{{join .RepoDigests "\n"}}' "$image")
+  repo_digests=$(bounded_call 5 docker image inspect --format '{{join .RepoDigests "\n"}}' "$image") \
+    || exit_with_status $? "cannot inspect $image"
   printf '%s\n' "$repo_digests" | grep -Fxq "dxflrs/garage@${expected_digest}" \
     || fail "image $image does not carry the required digest ${expected_digest}"
-  # The real Garage 2.1.0 image prints "garage v2.1.0 [features: ...]".
-  version_line=$(docker run --rm "$image" /garage --version) || fail "cannot execute $image"
+  # The real Garage 2.1.0 image prints "garage v2.1.0 [features: ...]". This
+  # disposable container is not recorded in the sentinel: if the bounded client
+  # is killed after Docker accepted it, its identity is unknown and cleanup must
+  # neither guess by name nor delete an unverified container.
+  version_line=$(bounded_call 5 docker run --rm "$image" /garage --version) \
+    || fail "cannot execute $image within the lifecycle budget"
   if [[ ! "$version_line" =~ ^garage[[:space:]]v2\.1\.0([[:space:]]\[features:.*\])?$ ]]; then
     fail "image $image is not exactly Garage 2.1.0: $version_line"
   fi
@@ -337,7 +410,11 @@ TOML
   mkdir -p "$directory/meta" "$directory/data"
 
   local container_id
-  container_id=$(docker create --rm \
+  # A bounded create can be killed after the daemon accepted it but before the
+  # id was acknowledged. The sentinel then keeps its empty container_id and stop
+  # fails closed: it removes only the owned directory/env file, never a container
+  # guessed by name and never a second fixture.
+  container_id=$(bounded_call 5 docker create --rm \
     --name "$name" \
     --label "rootyard.fixture.kind=owned-garage" \
     --label "rootyard.fixture.nonce=$nonce" \
@@ -348,10 +425,12 @@ TOML
     -p "127.0.0.1:${port}:3900" \
     -v "$directory/garage.toml:/etc/garage.toml:ro" \
     -v "$directory:/var/lib/garage" \
-    "$image")
+    "$image") \
+    || exit_with_status $? "docker create did not acknowledge an owned container id"
   write_sentinel "$container_id" "$name" "$nonce"
   verify_owned_container "$container_id" "$nonce"
-  docker start "$container_id" >/dev/null
+  bounded_call 5 docker start "$container_id" >/dev/null \
+    || exit_with_status $? "docker could not start owned container $container_id"
 
   local garage=(docker exec "$container_id" /garage -c /etc/garage.toml)
   # One absolute startup budget is shared by the node-id wait and the RPC
@@ -361,13 +440,20 @@ TOML
   startup_seconds=$(bounded_integer ROOTYARD_FIXTURE_STARTUP_TIMEOUT \
     "${ROOTYARD_FIXTURE_STARTUP_TIMEOUT:-60}" 1 300)
   local deadline=$((SECONDS + startup_seconds))
+  within_lifecycle() {
+    [ "$fixture_deadline" -eq 0 ] || [ "$SECONDS" -lt "$fixture_deadline" ]
+  }
   remaining() {
-    local left=$((deadline - SECONDS))
+    local left=$((deadline - SECONDS)) life
+    if [ "$fixture_deadline" -ne 0 ]; then
+      life=$((fixture_deadline - SECONDS))
+      [ "$life" -lt "$left" ] && left=$life
+    fi
     [ "$left" -ge 1 ] || left=1
     printf '%s' "$left"
   }
   local node="" line left
-  while [ "$SECONDS" -lt "$deadline" ]; do
+  while [ "$SECONDS" -lt "$deadline" ] && within_lifecycle; do
     left=$(remaining)
     line=$(timeout --signal=TERM --kill-after=5 "$left" "${garage[@]}" node id 2>/dev/null | head -n 1 || true)
     if [[ "$line" =~ ^([0-9a-f]{64})@[^[:space:]]+$ ]]; then
@@ -388,7 +474,7 @@ TOML
   # mutation only after a successful handshake (never retried, since a status
   # failure cannot prove the layout is untouched).
   local rpc_ready=0
-  while [ "$SECONDS" -lt "$deadline" ]; do
+  while [ "$SECONDS" -lt "$deadline" ] && within_lifecycle; do
     left=$(remaining)
     if timeout --signal=TERM --kill-after=5 "$left" "${garage[@]}" status >/dev/null 2>&1; then
       rpc_ready=1
@@ -399,8 +485,10 @@ TOML
   [ "$rpc_ready" = "1" ] \
     || fail "Garage RPC did not accept a read-only 'garage status' handshake within the ${startup_seconds}s startup budget"
 
-  "${garage[@]}" layout assign -z dc1 -c 1G "$node" >/dev/null
-  "${garage[@]}" layout apply --version 1 >/dev/null
+  bounded_call 5 "${garage[@]}" layout assign -z dc1 -c 1G "$node" >/dev/null \
+    || exit_with_status $? "Garage layout assign did not complete within the lifecycle budget"
+  bounded_call 5 "${garage[@]}" layout apply --version 1 >/dev/null \
+    || exit_with_status $? "Garage layout apply did not complete within the lifecycle budget"
 
   local key_name="rootyard-ci-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${nonce:0:12}"
   local bucket="${bucket_prefix}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${nonce:0:8}"
@@ -408,29 +496,33 @@ TOML
   # Garage 2.1.0 `key create NAME` prints an aligned table, so a naive prefix
   # strip keeps the column padding and the S3 client then signs with a padded
   # key id (the 400 "0 matching keys" failure). The raw output is never shown.
-  created=$("${garage[@]}" key create "$key_name")
+  created=$(bounded_call 5 "${garage[@]}" key create "$key_name") \
+    || exit_with_status $? "Garage key create did not complete within the lifecycle budget"
   access=$(key_table_field "Key ID" "$created")
   secret=$(key_table_field "Secret key" "$created")
   check_credential "access key id" "$access" 16 128
   check_credential "secret key" "$secret" 32 256
   [ "$access" != "$secret" ] || fail "Garage key creation returned one value for both credentials"
 
-  "${garage[@]}" bucket create "$bucket" >/dev/null
-  "${garage[@]}" bucket allow --read --write --owner --key "$access" "$bucket" >/dev/null
+  bounded_call 5 "${garage[@]}" bucket create "$bucket" >/dev/null \
+    || exit_with_status $? "Garage bucket create did not complete within the lifecycle budget"
+  bounded_call 5 "${garage[@]}" bucket allow --read --write --owner --key "$access" "$bucket" >/dev/null \
+    || exit_with_status $? "Garage bucket allow did not complete within the lifecycle budget"
 
   local probe_timeout="${ROOTYARD_FIXTURE_PROBE_TIMEOUT:-60}"
   case "$probe_timeout" in
     '' | *[!0-9]*) fail "ROOTYARD_FIXTURE_PROBE_TIMEOUT must be a whole number of seconds" ;;
   esac
   ROOTYARD_FIXTURE_ACCESS_KEY="$access" ROOTYARD_FIXTURE_SECRET_KEY="$secret" \
-    python3 "$(dirname "$0")/owned_object_store_env.py" \
+    bounded_call 5 python3 "$(dirname "$0")/owned_object_store_env.py" \
       --output "$output" \
       --endpoint "http://127.0.0.1:${port}" \
       --bucket "$bucket" \
       --region "$region" \
       --require-bucket-prefix "${bucket_prefix}-" \
       --probe-timeout "$probe_timeout" \
-      --summary "$directory/fixture-summary.json" >/dev/null
+      --summary "$directory/fixture-summary.json" >/dev/null \
+    || exit_with_status $? "S3 readiness probe did not complete within the lifecycle budget"
 
   python3 - "$directory/garage-image.json" "$image" "$image_id" "$expected_digest" "$version_line" <<'PY'
 import json, sys

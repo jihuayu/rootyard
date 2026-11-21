@@ -21,3 +21,5 @@ use std::sync::Arc;
 pub fn routes() -> Router<Arc<AppState>> {
     routes::routes()
 }
+
+pub mod blob_proof_publication;

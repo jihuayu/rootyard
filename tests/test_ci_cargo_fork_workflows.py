@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Static contracts for the formal Rust CI CargoFork wiring.
 
-These tests read workflow text, parse YAML, and statically parse Python test
-sources with ``ast``; they never run a workflow, Cargo, a container, a database
-or a network request.
+These tests read workflow text, parse YAML, statically parse Python test
+sources with ``ast``, and exercise the local workspace receipt helper with
+synthetic unittest logs. They never run a workflow, Cargo, a container, a
+database or a network request.
 """
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import re
 import shlex
+import subprocess
+import sys
+import tempfile
 import textwrap
 import unittest
 import warnings
@@ -478,6 +484,95 @@ class CargoForkWorkflowTest(unittest.TestCase):
             text,
         )
 
+    def test_issue88_remote_detached_is_opt_in_and_pinned(self) -> None:
+        text = self.workflow("native-kernel-acceptance.yml")
+        self.assertIn(
+            "      workspace_remote_detached:\n"
+            "        description: \"Also run the #88 detached-HEAD/inert-LFS remote checkpoint witness on the attested build\"\n"
+            "        required: false\n"
+            "        default: false\n"
+            "        type: boolean\n",
+            text,
+        )
+        self.assertIn("if: ${{ always() && inputs.fuse_compat }}", text)
+        self.assertIn("if: ${{ always() && inputs.workspace_remote_detached }}", text)
+        self.assertEqual(
+            text.count("if: ${{ inputs.fuse_compat || inputs.workspace_remote_detached }}"),
+            2,
+        )
+        self.assertIn("workspace-remote-detached:", text)
+        self.assertIn("python3 tests/workspace_remote_detached_witness.py -v", text)
+        self.assertIn("ROOTYARD_TEST_ISSUE88_REMOTE_DETACHED_WITNESS: \"1\"", text)
+        self.assertIn("ROOTYARD_TEST_FUSE_BACKEND: fuse", text)
+        self.assertIn(
+            "test_detached_inert_lfs_remote_publish_and_fresh_root_restore", text
+        )
+        self.assertIn("scripts/owned_garage_fixture.sh start", text)
+        self.assertIn("scripts/owned_garage_fixture.sh stop", text)
+        self.assertIn("scripts/workspace_remote_detached_receipt.py", text)
+        self.assertIn("REMOTE_DB: rootyard_issue88_remote_", text)
+        self.assertIn("physical_multi_host", text)
+        self.assertIn("id: remote_pin", text)
+        self.assertIn("if: steps.remote_verify.outcome == 'success'", text)
+        self.assertIn("if: steps.remote_pin.outcome == 'success'", text)
+        self.assertIn("witness_bytes_unavailable", text)
+
+        # Ownership boundary: the existing cgroup and local FUSE jobs do not
+        # acquire the remote witness, its gate, its receipt or its Garage.
+        cgroup = text[text.index("  native-kernel-cgroup:"):text.index("  workspace-fuse-compat:")]
+        fuse = text[text.index("  workspace-fuse-compat:"):text.index("  workspace-remote-detached:")]
+        remote = text[text.index("  workspace-remote-detached:"):]
+        for name, body in (("cgroup", cgroup), ("fuse", fuse)):
+            for marker in (
+                "ROOTYARD_TEST_ISSUE88_REMOTE_DETACHED_WITNESS",
+                "tests/workspace_remote_detached_witness.py",
+                "scripts/workspace_remote_detached_receipt.py",
+                "scripts/owned_garage_fixture.sh",
+                "workspace-remote-detached-receipt",
+            ):
+                with self.subTest(job=name, marker=marker):
+                    self.assertNotIn(marker, body)
+        self.assertIn("if: ${{ always() && inputs.fuse_compat }}", fuse)
+        self.assertIn("python3 tests/workspace_fuse_compat_witness.py -v", fuse)
+        self.assertNotIn("FUSE_DB", remote)
+        self.assertNotIn("tests/workspace_fuse_compat_witness.py", remote)
+        self.assertNotIn("scripts/workspace_fuse_compat_receipt.py", remote)
+
+        for pinned in (
+            "bfbfc195e3457a18463ffa7eb13d98f5bc95430c027fbe68508584a068b1edc1",
+            "c8075efe514ecec8fb695852abcbc18ea53ce582",
+            "sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a",
+            "ROOTYARD_TEST_FUSE_COMPAT_WITNESS: \"1\"",
+            "python3 tests/workspace_fuse_compat_witness.py -v",
+        ):
+            with self.subTest(pinned=pinned):
+                self.assertIn(pinned, text)
+
+        witness = (ROOT / "tests" / "workspace_remote_detached_witness.py").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(witness).hexdigest(),
+            "bfbfc195e3457a18463ffa7eb13d98f5bc95430c027fbe68508584a068b1edc1",
+        )
+        self.assertEqual(
+            hashlib.sha1(b"blob %d\0" % len(witness) + witness).hexdigest(),
+            "c8075efe514ecec8fb695852abcbc18ea53ce582",
+        )
+        helper = (ROOT / "scripts" / "workspace_remote_detached_receipt.py").read_text(
+            encoding="utf-8"
+        )
+        for pinned in (
+            "EXPECTED_TEST_SHA256 = \"bfbfc195e3457a18463ffa7eb13d98f5bc95430c027fbe68508584a068b1edc1\"",
+            "EXPECTED_TEST_BLOB_SHA1 = \"c8075efe514ecec8fb695852abcbc18ea53ce582\"",
+            "EXPECTED_GARAGE_IMAGE_DIGEST = (",
+            "sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a",
+            "TEST_CASE = \"test_detached_inert_lfs_remote_publish_and_fresh_root_restore\"",
+            "GATE = \"ROOTYARD_TEST_ISSUE88_REMOTE_DETACHED_WITNESS=1\"",
+            "BACKEND = \"ROOTYARD_TEST_FUSE_BACKEND=fuse\"",
+            "\"physical_multi_host\": False",
+        ):
+            with self.subTest(helper_pinned=pinned):
+                self.assertIn(pinned, helper)
+
     def test_ci_consumes_immutable_batch_artifacts(self) -> None:
         text = self.workflow("ci.yml")
         self.assertIn(
@@ -942,6 +1037,122 @@ class CloneKitToolSetupContractTest(unittest.TestCase):
         self.assertIn("timeout-minutes: 45", text)
         self.assertIn("name: ci-clonekit-evidence", text)
         self.assertIn("path: test-results/ci-clonekit/", text)
+
+
+class WorkspaceRemoteDetachedReceiptTest(unittest.TestCase):
+    """Pure local receipt checks: exact case, metadata, and fail-closed paths."""
+
+    HARNESS = "tests/workspace_remote_detached_witness.py"
+    WORKFLOW = ".github/workflows/native-kernel-acceptance.yml"
+    CASE = "test_detached_inert_lfs_remote_publish_and_fresh_root_restore"
+    GARAGE = "sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a"
+    OK_LOG = (
+        CASE
+        + " (__main__.WorkspaceRemoteDetachedWitnessTest."
+        + CASE
+        + ") ... ok\n\n"
+        + "----------------------------------------------------------------------\n"
+        + "Ran 1 test in 4.981s\n\nOK\n"
+    )
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="issue88-receipt-unit-")
+        self.root = Path(self.temporary.name)
+        self.binary = self.root / "rootyard"
+        self.binary.write_bytes(b"binary")
+        self.build = self.root / "rootyard.build.json"
+        self.build.write_text('{"build": true}\n', encoding="utf-8")
+        self.log = self.root / "unittest.log"
+        self.output = self.root / "receipt.json"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def receipt(
+        self,
+        text: str | None = None,
+        *,
+        exit_code: int = 0,
+        harness: str = HARNESS,
+        workflow: str = WORKFLOW,
+        test_case: str = CASE,
+        garage: str = GARAGE,
+        blocked: bool = False,
+        classification: str = "blocked",
+    ) -> tuple[subprocess.CompletedProcess[str], dict]:
+        self.log.write_text(self.OK_LOG if text is None else text, encoding="utf-8")
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "workspace_remote_detached_receipt.py"),
+            "--output", str(self.output),
+            "--raw-log", str(self.log),
+            "--exit-code", str(exit_code),
+            "--source-commit", "a" * 40,
+            "--source-tree", "b" * 40,
+            "--binary", str(self.binary),
+            "--build-receipt", str(self.build),
+            "--harness", harness,
+            "--workflow", workflow,
+            "--test-case", test_case,
+            "--database-name", "db",
+            "--pg-version", "17.11",
+            "--dev-fuse", "character special file mode=666",
+            "--unshare-status", "unshare -Urm: ok",
+            "--bwrap-status", "bubblewrap 0.9.0",
+            "--fusermount-version", "fusermount3 version: 3.10.5",
+            "--garage-version", "2.1.0",
+            "--garage-image-digest", garage,
+        ]
+        if blocked:
+            command.extend(["--blocked", "--classification", classification])
+        completed = subprocess.run(
+            command, cwd=ROOT, text=True, capture_output=True, timeout=10
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed, json.loads(self.output.read_text(encoding="utf-8"))
+
+    def test_exact_case_passes_and_receipt_is_bounded(self) -> None:
+        completed, receipt = self.receipt()
+        self.assertEqual(receipt["status"], "passed", receipt)
+        self.assertEqual(receipt["tests_run"], 1)
+        self.assertEqual(receipt["skipped"], 0)
+        self.assertEqual(receipt["failures"], 0)
+        self.assertEqual(receipt["errors"], 0)
+        self.assertIs(receipt["expected_case_selected"], True)
+        self.assertEqual(receipt["case_outcome"], "ok")
+        self.assertEqual(receipt["selection"]["gate"], "ROOTYARD_TEST_ISSUE88_REMOTE_DETACHED_WITNESS=1")
+        self.assertEqual(receipt["selection"]["backend"], "ROOTYARD_TEST_FUSE_BACKEND=fuse")
+        self.assertIs(receipt["harness_pinned"], True)
+        self.assertIs(receipt["data_roots"]["independent"], True)
+        self.assertIs(receipt["data_roots"]["physical_multi_host"], False)
+        self.assertNotIn("generated_unix", receipt)
+        rendered = json.dumps(receipt)
+        self.assertNotIn("http://", rendered)
+        self.assertNotIn("postgresql://", rendered)
+        self.assertNotIn("Ran 1 test", rendered)
+        self.assertNotIn("Ran 1 test", completed.stdout + completed.stderr)
+
+    def test_negative_cases_fail_closed(self) -> None:
+        cases = {
+            "skipped": (self.OK_LOG.replace("OK\n", "OK (skipped=1)\n"), {}),
+            "wrong_case": ("another_case (__main__.X.test) ... ok\nRan 1 test in 0.1s\n\nOK\n", {}),
+            "two_tests": (self.OK_LOG.replace("Ran 1 test", "Ran 2 tests"), {}),
+            "nonzero_exit": (self.OK_LOG, {"exit_code": 1}),
+            "wrong_harness": (self.OK_LOG, {"harness": "README.md"}),
+            "wrong_workflow": (self.OK_LOG, {"workflow": "README.md"}),
+            "wrong_garage": (self.OK_LOG, {"garage": "sha256:" + "0" * 64}),
+        }
+        for name, (text, options) in cases.items():
+            with self.subTest(case=name):
+                _, receipt = self.receipt(text, **options)
+                self.assertEqual(receipt["status"], "failed", receipt)
+                self.assertNotEqual(receipt["status"], "passed", receipt)
+        with self.subTest(case="blocked"):
+            _, receipt = self.receipt(
+                blocked=True, classification="fuse_preflight_unavailable"
+            )
+            self.assertEqual(receipt["status"], "blocked")
+            self.assertEqual(receipt["classification"], "fuse_preflight_unavailable")
 
 
 if __name__ == "__main__":
