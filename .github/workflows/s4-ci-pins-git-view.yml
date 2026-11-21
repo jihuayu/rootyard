@@ -103,16 +103,23 @@ jobs:
           cargo clippy --locked --all-targets --features pando-lab -- -D warnings
 
       - name: Run S4 pin and authority unit tests
+        id: s4_pin_units
         run: |
           cargo test --locked --lib ci_pins::
 
       - name: Run namespace view unit tests
+        id: namespace_view_units
         run: |
           cargo test --locked --lib namespace_service::
 
       - name: Run PG17 S4 checkout, revocation and GitView acceptance
         run: |
           cargo test --locked --test s4_ci_pins_git_view -- --ignored --test-threads=1
+
+      - name: Run ignored Git View reverse diagnostic fixture after unit failure
+        if: ${{ failure() && !cancelled() && (steps.s4_pin_units.outcome == 'failure' || steps.namespace_view_units.outcome == 'failure') }}
+        run: |
+          cargo test --locked --test s4_ci_pins_git_view -- s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree --exact --ignored --test-threads=1
 
       - name: Upload S4 acceptance evidence
         if: always()
