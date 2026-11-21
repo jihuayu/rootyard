@@ -189,6 +189,7 @@ type Frozen = (Vec<RepoBackupRegistrationSpec>, DurableFreezeHandle);
 async fn freeze_source(pool: &deadpool_postgres::Pool, raft: &mut MtlsLiveRaftBackend, url: &str) -> Result<Frozen> {
     let specs = load_pg_repo_backup_specs(&**pool.get().await?).await?;
     ensure!(specs.len() == 1, "the fixture must own exactly one source repository");
+    super::format30_helpers::settle_target_audit_deliveries(pool).await?;
     let req = DurableFreezeRequest {
         fenced_deleter_epoch: 11,
         app_fence_seq: 3,

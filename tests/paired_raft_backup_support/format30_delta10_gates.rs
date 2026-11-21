@@ -161,6 +161,7 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
             src_snap.body.refs.iter().find(|r| r.repository_id == repo_id).map(|r| r.refs.len()).unwrap_or(0);
         ensure!(src_refs as i64 == REF_COUNT, "receive.rs must mirror every pushed ref into the source Raft cluster");
         let specs = load_pg_repo_backup_specs(&**pool.get().await?).await?;
+        super::format30_helpers::settle_target_audit_deliveries(&pool).await?;
         ensure!(specs.len() == 1 && !specs[0].expected_packs.is_empty(), "the source must own one pack closure");
         let data_dir = dir.path().join("gate10-vol");
         init_volume_dir(&data_dir)?;

@@ -19,6 +19,7 @@ use rootyard::blob_git_gateway::{BlobGitConfig, BlobGitState, router};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::config::Config;
 use rootyard::db::{self, Identity};
+use rootyard::events;
 use rootyard::maintenance::paired_raft_backup::{
     DurableRaftBackend, MtlsLiveRaftBackend, MtlsRaftClusterConfig, PairedBackupError,
 };
@@ -82,6 +83,27 @@ pub fn make_backup_config(database_url: String, data_dir: PathBuf, git: PathBuf)
         max_pending_deliveries: 10_000,
         outbox_worker: false,
         metrics_bind: None,
+    }
+}
+
+/// Settle only the target-audit deliveries produced by this fixture's real pushes.
+/// The standalone consumer scope keeps legacy consumers, unknown operations and
+/// unrelated pending work visible to the pre-freeze and cutpoint guards.
+pub async fn settle_target_audit_deliveries(pool: &Pool) -> Result<()> {
+    let owner = Uuid::new_v4();
+    loop {
+        let settled = events::worker_once_with_lease_scoped(
+            pool,
+            events::TARGET_AUDIT_CONSUMER,
+            Some(events::TARGET_AUDIT_KIND),
+            owner,
+            100,
+            60,
+        )
+        .await?;
+        if settled == 0 {
+            return Ok(());
+        }
     }
 }
 

@@ -170,6 +170,7 @@ async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<
             "the normal Smart-HTTP push must mirror itself into the live 3-voter Raft cluster"
         );
         let specs = load_pg_repo_backup_specs(&**pool.get().await?).await?;
+        super::format30_helpers::settle_target_audit_deliveries(&pool).await?;
         ensure!(specs.len() == 1, "the source repository must yield exactly one backup spec");
         let data_dir = dir.path().join("gate7-vol");
         init_volume_dir(&data_dir)?;

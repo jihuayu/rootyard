@@ -36,7 +36,6 @@ use rootyard::ref_store::{
 };
 const COLLAB_INSERT: &str =
     "INSERT INTO public.repository_collaborators(repository_id, tenant_id, user_id, role) VALUES($1, $2, $3, 'read')";
-
 pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> Result<()> {
     verify_mtls_auth_and_quorum_faults()?;
     let base_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
@@ -128,6 +127,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         }
         ensure_raft_ref_mirrored(&raft1, repo_id, "refs/heads/main", &pushed_oids[1])?;
         let specs = load_pg_repo_backup_specs(&**src_pool.get().await?).await?;
+        super::format30_helpers::settle_target_audit_deliveries(&src_pool).await?;
         ensure!(specs.len() == 1 && specs[0].expected_packs.len() == 2 && pushed_oids.len() == 2);
         let pre_ledger =
             super::format30_ledger_gates::capture_pre_backup_ledger_proof(&src_pool, repo_id, &gate).await?;

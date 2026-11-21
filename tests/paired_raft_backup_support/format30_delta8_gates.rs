@@ -133,6 +133,7 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
             "the mirrored create+delete pushes must leave the live Raft gate with exactly zero refs"
         );
         let specs = load_pg_repo_backup_specs(&**pool.get().await?).await?;
+        super::format30_helpers::settle_target_audit_deliveries(&pool).await?;
         ensure!(
             specs.len() == 1 && !specs[0].expected_packs.is_empty(),
             "a ref-less repository must keep its active pack closure"
