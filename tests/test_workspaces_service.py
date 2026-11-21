@@ -128,6 +128,85 @@ class WorkspaceServiceTest(unittest.TestCase):
         built = h.run([str(build_bin)], cwd=restored)
         self.assertEqual(built.stdout, b"v2 unstaged\n")
 
+    def test_intent_to_add_survives_checkpoint_restore(self):
+        """Capture the file before add -N so the index change gets its own revision."""
+        binary, _ = select_runtime_binary()
+        h = Harness(argparse.Namespace(binary=str(binary), keep=False))
+        try:
+            h.setup(); h.api(); h.roundtrip()
+            ws = json.loads(h.expect("/api/workspaces", 201, token=h.alice, method="POST",
+                body={"owner":"alice","repository":"demo","agent_id":"intent","base_oid":h.second},
+                extra_headers={"Idempotency-Key":"intent-create"}))
+            wid = ws["id"]
+            repo = h.root / "data/workspace-service/workspaces" / wid
+            intent_bytes = b"benign intent-to-add payload\n"
+
+            def wait_capture(after):
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    events = json.loads(h.expect(
+                        f"/api/workspaces/{wid}/events?after_revision={after}", 200,
+                        token=h.alice)).get("events", [])
+                    for event in events:
+                        if event["kind"] == "external_capture" and event["revision"] > after:
+                            return event["revision"]
+                    time.sleep(0.1)
+                self.fail(f"no external_capture after revision {after}")
+
+            # Two ordinary native writes must produce two distinct captures. The
+            # file-only revision is durable before add -N starts, so the later
+            # capture can only include the native index change.
+            (repo / "intent.txt").write_bytes(intent_bytes)
+            file_revision = wait_capture(ws["revision"])
+            self.assertGreater(file_revision, ws["revision"])
+            h.git("add", "--intent-to-add", "intent.txt", cwd=repo)
+            index_revision = wait_capture(file_revision)
+            self.assertGreater(index_revision, file_revision)
+            current = json.loads(h.expect(f"/api/workspaces/{wid}", 200, token=h.alice))
+            self.assertEqual(current["revision"], index_revision)
+
+            # Store the exact raw index before any read that could refresh it.
+            source_index = (repo / ".git/index").read_bytes()
+
+            def witness(path):
+                return (
+                    h.git("--no-optional-locks", "status", "--porcelain=v1", "-z",
+                          cwd=path).stdout,
+                    h.git("--no-optional-locks", "diff", "--cached", "--name-only", "-z",
+                          cwd=path).stdout.split(b"\0"),
+                    h.git("--no-optional-locks", "diff", "--name-only", "-z",
+                          cwd=path).stdout.split(b"\0"))
+
+            source_status, source_cached, source_unstaged = witness(repo)
+            self.assertEqual(source_status, b" A intent.txt\0")
+            self.assertNotIn(b"intent.txt", source_cached)
+            self.assertIn(b"intent.txt", source_unstaged)
+            self.assertEqual((repo / "intent.txt").read_bytes(), intent_bytes)
+
+            cp = json.loads(h.expect(f"/api/workspaces/{wid}/checkpoints", 201, token=h.alice,
+                method="POST", body={"expected_workspace_revision": index_revision,
+                                     "lease_epoch": ws["lease_epoch"]},
+                extra_headers={"Idempotency-Key": "intent-checkpoint"}))
+            self.assertEqual(cp["captured_revision"], index_revision)
+            self.assertEqual(cp["state"], "local_complete")
+
+            h.stop(hard=True); h.start()
+
+            restored = json.loads(h.expect(f"/api/checkpoints/{cp['checkpoint_id']}/restore", 201,
+                token=h.alice, method="POST", body={"agent_id": "intent-restored"},
+                extra_headers={"Idempotency-Key": "intent-restore"}))
+            self.assertNotEqual(restored["id"], wid)
+            copy = h.root / "data/workspace-service/workspaces" / restored["id"]
+            restored_index = (copy / ".git/index").read_bytes()
+            restored_status, restored_cached, restored_unstaged = witness(copy)
+            self.assertEqual(restored_index, source_index)
+            self.assertEqual(restored_status, source_status)
+            self.assertEqual(restored_cached, source_cached)
+            self.assertEqual(restored_unstaged, source_unstaged)
+            self.assertEqual((copy / "intent.txt").read_bytes(), intent_bytes)
+        finally:
+            h.cleanup()
+
     def test_create_edit_checkpoint_fork_restore_restart(self):
         binary, _ = select_runtime_binary()
         h = Harness(argparse.Namespace(binary=str(binary), keep=False))
