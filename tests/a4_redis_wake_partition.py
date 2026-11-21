@@ -533,26 +533,31 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         return self.owned_redis.redis_command(*parts)
 
     # ---- owned Redis destructive-witness gates ---------------------------
-    def prove_owned_redis(self):
+    def prove_owned_redis(self, redis=None, root=None):
         """Prove this exact process is the fixture-owned loopback Redis.
 
         The proof is intentionally read-only and combines the live process with
         direct loopback queries to the server. FLUSHALL is only ever reached
-        after every assertion here succeeds.
+        after every assertion here succeeds. The optional instance/root form is
+        used by the additive replica-promotion fixture so each owned server is
+        proved independently without changing the default witness.
         """
-        redis = self.owned_redis
+        if redis is None:
+            redis = self.owned_redis
+        if root is None:
+            root = self.root
         proc = redis.process
         assert self.redis_started and proc is not None, "owned Redis process is not running"
         assert proc.poll() is None, "owned Redis process exited"
         assert redis.identity() == redis.run_id, "owned Redis identity changed"
-        assert process_cwd(proc.pid).samefile(self.root), "owned Redis runtime is not fixture-scoped"
+        assert process_cwd(proc.pid).samefile(root), "owned Redis runtime is not fixture-scoped"
 
         bind = redis.redis_command("CONFIG", "GET", "bind")
         assert bind == [b"bind", b"127.0.0.1"], "owned Redis is not loopback-only"
         runtime = redis.redis_command("CONFIG", "GET", "dir")
         assert isinstance(runtime, list) and len(runtime) == 2 and runtime[0] == b"dir", \
             "owned Redis runtime directory is unavailable"
-        assert Path(os.fsdecode(runtime[1])).samefile(self.root), \
+        assert Path(os.fsdecode(runtime[1])).samefile(root), \
             "owned Redis runtime directory is not fixture-scoped"
 
         server = redis.redis_command("INFO", "server")

@@ -905,6 +905,20 @@ class OwnedRedisOwnershipTest(unittest.TestCase):
         self.assertNotIn(call("CLIENT", "INFO"), redis.redis_command.call_args_list)
         self.assertNotIn(call("CLIENT", "SETNAME", ANY), redis.redis_command.call_args_list)
 
+    def test_explicit_owned_instance_and_root_override_the_default_witness(self):
+        default_root = self.enterContext(tempfile.TemporaryDirectory())
+        explicit_root = self.enterContext(tempfile.TemporaryDirectory())
+        harness, explicit_redis, _ = self._harness(explicit_root)
+        _, default_redis, _ = self._harness(default_root)
+        harness.owned_redis = default_redis
+        harness.root = Path(default_root)
+        with patch.object(a4, "process_cwd", return_value=Path(explicit_root)):
+            self.assertEqual(
+                harness.prove_owned_redis(explicit_redis, Path(explicit_root)),
+                explicit_redis.run_id,
+            )
+        default_redis.redis_command.assert_not_called()
+
     def test_redis_6_0_style_client_list_without_laddr_is_supported(self):
         root = self.enterContext(tempfile.TemporaryDirectory())
         harness, redis, session = self._harness(root, laddr=False)
