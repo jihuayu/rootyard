@@ -35,6 +35,7 @@ __all__ = [
     "clone_and_fsck",
     "create_repo",
     "exercise_browse",
+    "fetch_and_fsck",
     "push_with_pack_config",
     "query_repo_pg_pack_bytes",
     "resolve_live_env",
@@ -372,3 +373,46 @@ def clone_and_fsck(git_bin: str, remote_url: str, dest: Path, env: dict[str, str
     if fsck.returncode != 0:
         raise RuntimeError(f"cloned repo fsck failed: {fsck.stderr.decode(errors='replace')[:300]}")
     return ms
+
+
+def fetch_and_fsck(
+    git_bin: str,
+    remote_url: str,
+    dest: Path,
+    env: dict[str, str],
+    expected_oid: str,
+    object_format: str,
+    *,
+    context: dict[str, Any],
+) -> float:
+    """Time a stock Git fetch into a fresh bare client, then verify its exact commit."""
+    main_ref = "refs/heads/main"
+    try:
+        dest.mkdir()
+        init, _ = run_git(git_bin, ["init", "--bare", "--quiet", f"--object-format={object_format}"], dest, env)
+        if init.returncode:
+            raise LiveEvalFailure(git_failure_record(context, failure_class="git_fetch", returncode=init.returncode))
+        fetch, elapsed = run_git(
+            git_bin,
+            ["-c", "credential.helper=", "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
+             remote_url, f"{main_ref}:{main_ref}"],
+            dest,
+            env,
+        )
+        if fetch.returncode:
+            raise LiveEvalFailure(git_failure_record(
+                context, failure_class="git_fetch", returncode=fetch.returncode, elapsed_ms=elapsed, stderr=fetch.stderr,
+            ))
+        ack, _ = run_git(git_bin, ["rev-parse", "--verify", f"{main_ref}^{{commit}}"], dest, env)
+        if ack.returncode or ack.stdout.strip() != expected_oid.encode("ascii"):
+            raise LiveEvalFailure(git_failure_record(
+                context, failure_class="fetch_ack_mismatch", returncode=ack.returncode,
+            ))
+        fsck, _ = run_git(git_bin, ["fsck", "--full", "--strict"], dest, env)
+        if fsck.returncode:
+            raise LiveEvalFailure(git_failure_record(context, failure_class="fetch_fsck", returncode=fsck.returncode))
+    except subprocess.TimeoutExpired:
+        raise LiveEvalFailure(git_failure_record(context, failure_class="git_timeout")) from None
+    except OSError:
+        raise LiveEvalFailure(git_failure_record(context, failure_class="git_spawn")) from None
+    return elapsed

@@ -18,9 +18,9 @@ from typing import Any
 from .capacity import sanitize_capacity
 from .cleanup_diagnostics import sanitize_cleanup
 from .concurrent_outcomes import (
-    FAILURE_CLASSES,
+    FAILURE_CLASSES as PUSH_FAILURE_CLASSES,
     HTTP_SUBPHASES,
-    PHASES,
+    PHASES as PUSH_PHASES,
     PUSH_REF_VERDICTS,
     finite_elapsed_ms,
     finite_http_subphase,
@@ -32,11 +32,12 @@ from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
 from .pack_matrix import CANDIDATE_CONFIGS
 
 FAILURE_SCHEMA = "rootyard/pando-pack-compression-eval-failure/v1"
-FAILURE_STATUS = "failed"
 OBJECT_FORMAT_SET = frozenset(OBJECT_FORMATS)
 ARCHETYPE_SET = frozenset(DATASET_ARCHETYPES)
 CONFIG_SET = frozenset(("baseline",) + tuple(spec.name for spec in CANDIDATE_CONFIGS))
+PHASES = PUSH_PHASES + ("baseline_fetch", "candidate_fetch")
 PROGRESS_PHASES = PHASES + ("none", "baseline_reads", "candidate_reads")
+FAILURE_CLASSES = PUSH_FAILURE_CLASSES + ("git_fetch", "fetch_ack_mismatch", "fetch_fsck")
 RECEIPT_SCHEMAS = frozenset(("rootyard/native-build-receipt/v2", "v1", "v2"))
 MODES = ("full", "git-only")
 SCALES = ("quick", "full")
@@ -46,6 +47,7 @@ COMPLETED_KEYS = (
     "baseline_wave_pushes_completed",
     "cold_clone_samples_completed",
     "warm_clone_samples_completed",
+    "cold_fetch_samples_completed", "warm_fetch_samples_completed",
     "browse_requests_completed",
     "candidate_configs_completed",
     "candidate_pushes_completed",
@@ -294,7 +296,7 @@ def build_failure_record(
         "schema_version": FAILURE_SCHEMA,
         "issue": "#178",
         "passed": False,
-        "status": FAILURE_STATUS,
+        "status": "failed",
         "mode": _choice(mode, MODES),
         "scale": _choice(scale, SCALES),
         "seed": _optional_int(seed),

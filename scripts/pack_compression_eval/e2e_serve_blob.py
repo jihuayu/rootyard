@@ -37,6 +37,7 @@ from .failure_diagnostics import (
     push_context,
     sanitize_s3_snapshot,
 )
+from .live_reads import measure_baseline_reads, measure_fetches
 from .live_server import (
     ServeBlobOwner,
     append_search_path,
@@ -52,6 +53,7 @@ from .live_server import (
     verify_binary_receipt,
 )
 from .pack_matrix import CANDIDATE_CONFIGS
+from .report import FETCH_MEASUREMENT_NOTES
 from .s3_meter import S3MeterProxy
 from .telemetry import ResourceSampler, percentile_stats, query_pg_refstore_stats, sum_dir_bytes
 
@@ -224,48 +226,16 @@ def run_live_serve_blob_eval(
         )
         sampler.set_pids([proc.pid], new_epoch=True)
 
-        proxy.reset_counters()
-        cold_clone_ms: list[float] = []
-        cold_browse_ms: list[float] = []
-        for idx, entry in enumerate(repos):
-            ro_tok = entry["ro"]["token"]
-            git_ro_env = build_git_http_env(run_env, askpass, entry["ro"]["username"], ro_tok)
-            remote_url = base_url + entry["repo"]["clone_path"]
-            cold_clone_ms.append(clone_and_fsck(git_bin, remote_url, work_root / f"cold-clone-{idx}", git_ro_env))
-            progress["completed"]["cold_clone_samples_completed"] += 1
-            browse_samples = exercise_browse(
-                base_url, entry["repo"]["owner"], entry["repo"]["name"], ro_tok,
-                entry["seed_oid"], entry["head_oid"], entry["browse_path"],
-            )
-            cold_browse_ms.extend(browse_samples)
-            progress["completed"]["browse_requests_completed"] += len(browse_samples)
-            progress["last_completed_phase"] = "baseline_reads"
-        cold_read_s3 = proxy.snapshot()
-
-        proxy.reset_counters()
-        warm_clone_ms: list[float] = []
-        warm_browse_ms: list[float] = []
-        for idx, entry in enumerate(repos):
-            ro_tok = entry["ro"]["token"]
-            git_ro_env = build_git_http_env(run_env, askpass, entry["ro"]["username"], ro_tok)
-            remote_url = base_url + entry["repo"]["clone_path"]
-            for rep in range(2):
-                warm_clone_ms.append(clone_and_fsck(git_bin, remote_url, work_root / f"warm-clone-{idx}-{rep}", git_ro_env))
-                progress["completed"]["warm_clone_samples_completed"] += 1
-                browse_samples = exercise_browse(
-                    base_url, entry["repo"]["owner"], entry["repo"]["name"], ro_tok,
-                    entry["seed_oid"], entry["head_oid"], entry["browse_path"],
-                )
-                warm_browse_ms.extend(browse_samples)
-                progress["completed"]["browse_requests_completed"] += len(browse_samples)
-                progress["last_completed_phase"] = "baseline_reads"
-        warm_read_s3 = proxy.snapshot()
+        baseline_reads = measure_baseline_reads(git_bin, base_url, repos, work_root, run_env, askpass, proxy, progress)
+        # Clone and Browse have finished, so they cannot warm the new fetch server.
+        base_url, baseline_fetch = measure_fetches(
+            git_bin, repos, work_root, run_env, askpass, proxy, progress,
+            config="baseline", owner=server_owner, sampler=sampler, start=start_owned,
+        )
 
         # Phase 2: Candidate compacted single-pack serving comparison on live serve-blob + PG17 + Garage S3.
-        target_arches = ("text_history", "similar_files", "compressed_media", "large_binary", "small_deltas")
-        eval_targets = [r for r in repos if r["archetype"] in target_arches and r["object_format"] == "sha1"]
-        if scale == "quick":
-            eval_targets = eval_targets[:3]
+        # Quick runs exercise both object formats with three representative repositories.
+        eval_targets = repos if scale == "full" else repos[:2] + repos[-1:]
         candidate_serving: list[dict[str, Any]] = []
         for s_idx, spec in enumerate(compare_specs):
             cmp_rw, cmp_ro = cmp_tenants[s_idx]
@@ -328,6 +298,14 @@ def run_live_serve_blob_eval(
                 progress["completed"]["warm_clone_samples_completed"] += 1
                 progress["last_completed_phase"] = "candidate_reads"
             read_s3 = proxy.snapshot()
+            fetch_targets = [
+                {**target, "repo": candidate, "ro": cmp_ro}
+                for candidate, target in zip(cmp_repos, eval_targets, strict=True)
+            ]
+            base_url, candidate_fetch = measure_fetches(
+                git_bin, fetch_targets, work_root, run_env, askpass, proxy, progress,
+                config=spec.name, owner=server_owner, sampler=sampler, start=start_owned,
+            )
             progress["completed"]["candidate_reads_completed"] += 1
             progress["completed"]["candidate_configs_completed"] += 1
             candidate_serving.append(
@@ -337,6 +315,7 @@ def run_live_serve_blob_eval(
                     "cold_clone_stats": percentile_stats(c_cold_ms),
                     "warm_clone_stats": percentile_stats(c_warm_ms),
                     "browse_stats": percentile_stats(c_browse_ms),
+                    **candidate_fetch,
                     "serving_pack_bytes": serving_sum,
                     "coexisting_non_gc_bytes": coexist_sum,
                     "physical_savings_claimed": False,
@@ -418,6 +397,7 @@ def run_live_serve_blob_eval(
         sampler.sample_once()
         return {
             "executed": True,
+            "fetch_method": FETCH_MEASUREMENT_NOTES,
             "binary": receipt_info,
             "pg_schema": schema,
             "uncompacted_baseline": {
@@ -432,13 +412,9 @@ def run_live_serve_blob_eval(
                     for r in repos
                 ],
                 "push_stats": percentile_stats(multi_push_latencies),
-                "cold_clone_stats": percentile_stats(cold_clone_ms),
-                "cold_browse_stats": percentile_stats(cold_browse_ms),
-                "warm_clone_stats": percentile_stats(warm_clone_ms),
-                "warm_browse_stats": percentile_stats(warm_browse_ms),
                 "s3_push": baseline_push_s3,
-                "s3_cold_read": cold_read_s3,
-                "s3_warm_read": warm_read_s3,
+                **baseline_reads,
+                **baseline_fetch,
             },
             "candidate_serving_comparison": candidate_serving,
             "concurrent_push_and_browse": {

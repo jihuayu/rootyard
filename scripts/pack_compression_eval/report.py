@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
 from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
+from .telemetry import percentile_stats
 
 _TOKEN_RE = re.compile(r"ryt_[0-9A-Za-z_-]{16,}")
 _BEARER_RE = re.compile(r"(?i)(Bearer\s+)[0-9A-Za-z._~+/=-]{8,}")
 _PG_URL_RE = re.compile(r"postgres(?:ql)?://[^\s\"'<>]+")
+
+
+FETCH_MEASUREMENT_NOTES = {
+    "transport": "stock_git_smart_http",
+    "ref": "refs/heads/main",
+    "cold": "first_fetch_per_repo_after_owned_server_restart_with_clean_scratch",
+    "warm": "second_fetch_per_repo_in_same_server_process",
+    "client": "new_empty_bare_client_explicit_object_format",
+    "timed_operation": "git_fetch_only",
+    "verification": "exact_expected_oid_and_strict_fsck",
+    "os_page_cache_isolated": False,
+    "physical_store_cache_claimed": False,
+}
 
 
 def redact_text(value: Any, secrets: tuple[str, ...] | list[str]) -> str:
@@ -166,6 +181,38 @@ def build_recommendations(
     }
 
 
+
+def _validate_fetch_group(
+    group: dict[str, Any], label: str, cohort: list[tuple[str, str]],
+) -> None:
+    samples = group.get("fetch_samples")
+    _require(isinstance(samples, list) and len(samples) == len(cohort), f"{label} fetch cohort size mismatch")
+    for ordinal, (sample, (archetype, object_format)) in enumerate(zip(samples, cohort, strict=True)):
+        _require(
+            isinstance(sample, dict)
+            and type(sample.get("repo_ordinal")) is int
+            and sample["repo_ordinal"] == ordinal
+            and (sample.get("archetype"), sample.get("object_format")) == (archetype, object_format),
+            f"{label} fetch cohort mismatch at repository {ordinal}",
+        )
+    for temperature in ("cold", "warm"):
+        durations = [sample.get(f"{temperature}_fetch_ms") for sample in samples]
+        _require(
+            all(type(value) in (int, float) and 0 <= value < math.inf for value in durations),
+            f"{label} {temperature} fetch duration invalid",
+        )
+        _require(
+            group.get(f"{temperature}_fetch_stats") == percentile_stats(durations),
+            f"{label} {temperature} fetch statistics do not match samples",
+        )
+        s3 = group.get(f"s3_fetch_{temperature}")
+        _require(isinstance(s3, dict) and s3.get("observed") is True, f"{label} {temperature} fetch S3 evidence missing")
+        _require(
+            all(type(s3.get(field)) is int and s3[field] >= 0 for field in ("get_requests", "get_bytes")),
+            f"{label} {temperature} fetch S3 counts invalid",
+        )
+
+
 def validate_report(report: dict[str, Any], secrets: list[str] | tuple[str, ...] = ()) -> None:
     """Fail-closed validation of Issue #178 report structure, truthfulness, and secret hygiene."""
     _require(report.get("schema_version") == "rootyard/pando-pack-compression-eval/v1", "invalid schema_version")
@@ -201,8 +248,15 @@ def validate_report(report: dict[str, Any], secrets: list[str] | tuple[str, ...]
         _require(e2e.get("physical_savings_claimed") is False, "serve-blob must not claim unverified physical savings")
         conc = e2e.get("concurrent_push_and_browse") or {}
         _require(conc.get("acked_verified") == conc.get("acked_total") and conc.get("acked_total", 0) > 0, "E2E ACK verification incomplete")
-        for row in e2e.get("candidate_serving_comparison") or []:
+        _require(e2e.get("fetch_method") == FETCH_MEASUREMENT_NOTES, "fetch measurement method missing or invalid")
+        baseline = [(archetype, "sha1") for archetype in DATASET_ARCHETYPES] + [("text_history", "sha256")]
+        _validate_fetch_group(e2e.get("uncompacted_baseline") or {}, "baseline", baseline)
+        candidate_cohort = baseline if report.get("scale") == "full" else baseline[:2] + baseline[-1:]
+        candidates = e2e.get("candidate_serving_comparison") or []
+        _require(bool(candidates), "candidate serving fetch coverage missing")
+        for row in candidates:
             _require(row.get("physical_savings_claimed") is False, "candidate serving must not claim unverified physical savings")
+            _validate_fetch_group(row, row["config_name"], candidate_cohort)
     else:
         _require(e2e is None, "git-only mode must leave e2e_serve_blob null")
 
@@ -264,6 +318,22 @@ def render_summary_markdown(report: dict[str, Any]) -> str:
                 f"{ps['p50_ms']}/{ps['p95_ms']} | {cs['p50_ms']}/{cs['p95_ms']} | {ws['p50_ms']}/{ws['p95_ms']} | "
                 f"{bs['p50_ms']}/{bs['p95_ms']} | {put_s3['put_requests']}/{put_s3['put_bytes']} | "
                 f"{read_s3['get_requests']}/{read_s3['get_bytes']} |"
+            )
+
+        lines.extend([
+            "", "## Smart HTTP fetch with fresh clients", "",
+            "| Config | Repositories | Cold P50/P95/P99 (ms) | Warm P50/P95/P99 (ms) | Cold S3 GET (reqs/B) | Warm S3 GET (reqs/B) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        groups = [("baseline", e2e["uncompacted_baseline"])]
+        groups.extend((row["config_name"], row) for row in e2e["candidate_serving_comparison"])
+        for config, row in groups:
+            cold, warm = row["cold_fetch_stats"], row["warm_fetch_stats"]
+            cold_s3, warm_s3 = row["s3_fetch_cold"], row["s3_fetch_warm"]
+            lines.append(
+                f"| `{config}` | {cold['count']} | {cold['p50_ms']}/{cold['p95_ms']}/{cold['p99_ms']} | "
+                f"{warm['p50_ms']}/{warm['p95_ms']}/{warm['p99_ms']} | "
+                f"{cold_s3['get_requests']}/{cold_s3['get_bytes']} | {warm_s3['get_requests']}/{warm_s3['get_bytes']} |"
             )
     lines.extend(["", "## Correctness & Safety Gates", ""])
     for fmt, res in report["correctness"]["formats"].items():
