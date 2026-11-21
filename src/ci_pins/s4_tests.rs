@@ -331,7 +331,12 @@ async fn spawn_reaper_failure_bounds_caller_and_reaps_without_zombies() {
     let wrapper = root.join("git");
     std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
-    let mut cmd = tokio::process::Command::new(&wrapper);
+    // Execute a trusted shell against the closed fixture instead of this
+    // freshly written inode: a concurrent fork can briefly inherit the write
+    // descriptor and Linux then rejects the exec with ETXTBSY. `$0` remains
+    // the script path, so process-group and PID publication are unchanged.
+    let mut cmd = tokio::process::Command::new("/bin/sh");
+    cmd.arg(&wrapper);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
     let child = cmd.spawn().expect("spawn wrapper");
     let pid = child.id().and_then(|id| i32::try_from(id).ok()).expect("wrapper pid");

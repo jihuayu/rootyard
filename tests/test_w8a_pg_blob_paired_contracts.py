@@ -22,6 +22,7 @@ LIMITS = {
     "src/bin/rootyard-w8a-backup.rs": 95,
     "src/db.rs": 440,
     "src/events.rs": 470,
+    "src/events/consumer.rs": 260,
     "src/mirror.rs": 139,
     "tests/w8a_pg_blob_paired_restore.rs": 465,
     "tests/w8a_pg_blob_support/s3.rs": 330,
@@ -130,7 +131,7 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
         self.assertIn("ensure_database_available", runtime, "db.rs does not enforce the database restore marker")
         self.assertIn("verify_mirror_database_available", runtime, "db.rs lost the mirror startup guard")
         self.assertIn("verify_mirror_database_available", files["src/mirror.rs"], "mirror.rs skips the DB restore guard")
-        self.assertIn("ref_store_serving_repositories", files["src/events.rs"])
+        self.assertIn("ref_store_serving_repositories", files["src/events/consumer.rs"])
 
         integration = files["tests/w8a_pg_blob_paired_restore.rs"]
         for token in [
@@ -191,6 +192,7 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
             self.assertIn(token, workflow, f"workflow paths missing {token}")
         for token in ["'src/db.rs'", "'src/events.rs'", "'src/mirror.rs'"]:
             self.assertIn(token, workflow, f"workflow paths missing {token}")
+        self.assertIn("'src/events/**'", workflow, "workflow paths missing moved event sources")
 
 
 if __name__ == "__main__":

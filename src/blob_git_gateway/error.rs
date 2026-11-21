@@ -180,6 +180,12 @@ impl From<crate::ref_store::RefStoreError> for GatewayError {
             // refusal but not a Git report; the caller resolves it by operation.
             Ref::Cancelled { .. } => Self::Conflict("operation is durably cancelled"),
             Ref::TerminalImmutable => Self::Conflict("operation result is already terminal"),
+            // A restore changed the cluster incarnation after this request was
+            // authorized. The final A4 transaction rolled back atomically; do
+            // not turn this into a superseded-publication rejection.
+            Ref::RestoreIncarnationMismatch => {
+                Self::Unavailable("repository authority changed; retry the same operation")
+            }
             Ref::MetadataGateVersionMismatch => Self::Conflict("repository gate changed; retry"),
             Ref::UnknownOperation { .. } => Self::Internal("metadata operation was refused"),
             _ => Self::Internal("metadata operation was refused"),
