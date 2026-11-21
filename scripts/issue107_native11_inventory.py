@@ -16,6 +16,16 @@ TARGET_ORDER = (
     'ref_store_decision_subset',
 )
 
+# The hosted native workflow executes this reviewed A4 row in its separate
+# exact four-suite step. It is deliberately outside the fixed 167-case
+# inventory: only an explicit hosted listing opt-in may accept this one extra
+# row, while default listing and execution remain the original selectors.
+HOSTED_KNOWN_EXTRA_CASES = {
+    'ref_store_decision_subset': (
+        'decision_subset_support::cases_f::a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit',
+    ),
+}
+
 TARGETS = {
     'ref_store_operations': {
         "source": 'tests/ref_store_operations.rs',

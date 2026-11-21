@@ -31,6 +31,37 @@ where
     }
 }
 
+/// Lock and read the authoritative `public.cluster_authority` restore
+/// incarnation `FOR SHARE NOWAIT`.
+///
+/// This is the same singleton the initial serving lookup captured. It is called
+/// as the first lock of the final A4 transaction, before the operation/
+/// repository/gate/usage prefix, so it cannot form a cycle with a restore fence.
+/// Exactly one non-nil singleton row is required. Lock contention is a typed
+/// retryable `Timeout`; the caller's absolute deadline remains the outer bound.
+pub(crate) async fn public_cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<Uuid, RefStoreError> {
+    let rows = match tx
+        .query("SELECT incarnation FROM public.cluster_authority WHERE singleton=true FOR SHARE NOWAIT", &[])
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) => return Err(RefStoreError::Timeout),
+        Err(error) => return Err(db_error(error)),
+    };
+    let [row] = rows.as_slice() else {
+        return Err(RefStoreError::Database(format!(
+            "cluster authority has {} singleton incarnation rows, expected exactly one",
+            rows.len()
+        )));
+    };
+    let incarnation: Uuid =
+        row.try_get(0).map_err(|_| RefStoreError::Database("cluster authority row has no uuid incarnation".into()))?;
+    if incarnation.is_nil() {
+        return Err(RefStoreError::Database("cluster authority incarnation is nil".into()));
+    }
+    Ok(incarnation)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PgRefStore;
 
