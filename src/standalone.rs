@@ -1,12 +1,15 @@
 //! Minimal serving lifecycle, with independent HTTP draining and worker stop.
-//! Storage adapters construct routes; this path opens no GitFS volume or external wake.
-//! Browser sign-in is enabled on the standalone service, so the shared bounded
-//! browser-session GC loop runs here under its own cancellation token.
+//! Storage adapters construct routes; this path opens no GitFS volume. Its
+//! default is local Notify + an embedded PostgreSQL target-audit consumer. An
+//! explicit mode may remove that consumer for a separately supervised A4
+//! worker, and an explicit A4 variable may attach the advisory Redis publisher
+//! without changing the committed response. Browser sign-in is enabled on the
+//! standalone service, so the shared bounded browser-session GC loop runs here
+//! under its own token.
 use anyhow::{Result, anyhow};
 use axum::response::IntoResponse;
 use deadpool_postgres::Pool;
 use std::{future::IntoFuture, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 mod config;
 pub(crate) mod session_keyring;
@@ -51,12 +54,12 @@ pub async fn run_from_env() -> Result<()> {
     let cache =
         crate::cache_wake::ServingCache::standalone_memory().map_err(|_| anyhow!("invalid cache configuration"))?;
     state = state.with_cache(Arc::new(cache));
-    // One advisory local signal set for this process. It is shared by the
-    // gateway's fresh-commit trigger and the embedded PG worker; it carries no
-    // event payload and never affects the committed response.
+    // One advisory signal set for this process. The local permit wakes the
+    // embedded PG target-audit worker; the remote permit is consumed only by
+    // the explicit opt-in publisher. It carries no event payload and never
+    // affects the committed response.
     let dispatch = crate::dispatch::Signals::default();
     state = state.with_dispatch(dispatch.clone());
-    let wake = dispatch.local.clone();
     if let Some(sessions) = sessions {
         state = state.with_sessions(sessions);
     }
@@ -74,7 +77,7 @@ pub async fn run_from_env() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
-    let res = serve(router, pool, bind, check, wake).await;
+    let res = serve(router, pool, bind, check, dispatch).await;
     crate::maintenance::paired_raft_backup::shutdown_installed_peer_attestation_daemon();
     res
 }
@@ -94,8 +97,17 @@ async fn serve(
     pool: Pool,
     bind: SocketAddr,
     check: impl std::future::Future<Output = anyhow::Error>,
-    wake: Arc<Notify>,
+    dispatch: crate::dispatch::Signals,
 ) -> Result<()> {
+    // The default remains local Notify + embedded PG scan. External placement
+    // is explicit and removes this process's A4 consumer entirely; the publisher
+    // remains optional and independent of the external worker's PG ticker.
+    let mode = crate::dispatch::a4_worker_mode_from_env().map_err(|_| anyhow!("invalid A4 worker mode"))?;
+    let settings = crate::dispatch::Settings::standalone_from_env()
+        .map_err(|_| anyhow!("invalid A4 advisory wake configuration"))?;
+    let transport = settings.transport.clone();
+    let wake = dispatch.local.clone();
+    let remote = dispatch.remote.clone();
     let hard_stop = CancellationToken::new();
     let request_stop = hard_stop.clone();
     let router = router.layer(axum::middleware::from_fn(
@@ -113,14 +125,20 @@ async fn serve(
     ));
     let listener =
         tokio::net::TcpListener::bind(bind).await.map_err(|_| anyhow!("could not bind Blob service listener"))?;
-    let worker_stop = CancellationToken::new();
+    let dispatch_stop = CancellationToken::new();
     let server_stop = CancellationToken::new();
-    let mut worker = tokio::spawn(crate::dispatch::worker(
-        pool.clone(),
-        crate::dispatch::Settings::standalone(),
-        wake,
-        worker_stop.clone(),
-    ));
+    let mut worker = if mode.runs_embedded_worker() {
+        Some(tokio::spawn(crate::dispatch::worker(pool.clone(), settings, wake, dispatch_stop.clone())))
+    } else {
+        // No dormant local consumer: the independent A4 worker owns every
+        // target-audit claim and keeps its own mandatory PG ticker.
+        None
+    };
+    // A publish failure or a lost hint only delays the existing PG poll. The
+    // committed response above already completed; this task never owns a
+    // terminal, outbox row or retry decision. It shares the one dispatch stop
+    // token so shutdown cancels subscription-free publishes promptly.
+    let mut publisher = tokio::spawn(crate::dispatch::publisher(transport, remote, dispatch_stop.clone()));
     // The one shared browser-session GC loop. It needs only PostgreSQL and is
     // stopped and awaited on every exit path below.
     let session_gc_stop = CancellationToken::new();
@@ -134,17 +152,30 @@ async fn serve(
         Signal,
         Barrier(anyhow::Error),
     }
-    let reason = tokio::select! {
-        result = &mut serving => Stop::Listener(result),
-        _ = &mut worker => Stop::Worker,
-        _ = shutdown() => Stop::Signal,
-        error = check => Stop::Barrier(error),
+    let reason = {
+        // The optional worker future is pending forever in external placement,
+        // so the listener, signal and barrier remain the only stop sources there.
+        let worker_exit = async {
+            match worker.as_mut() {
+                Some(worker) => {
+                    let _ = worker.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(worker_exit);
+        tokio::select! {
+            result = &mut serving => Stop::Listener(result),
+            _ = &mut worker_exit => Stop::Worker,
+            _ = shutdown() => Stop::Signal,
+            error = check => Stop::Barrier(error),
+        }
     };
     // A worker panic and a normal worker exit both close admission first, then
     // drain active HTTP work. Neither path exposes a panic payload or drops
     // the server before signaling graceful shutdown.
     server_stop.cancel();
-    worker_stop.cancel();
+    dispatch_stop.cancel();
     let worker_failed = matches!(&reason, Stop::Worker);
     let result = match reason {
         Stop::Listener(result) => result.map_err(|_| anyhow!("Blob service listener failed")),
@@ -171,12 +202,23 @@ async fn serve(
             }
         }
     }
-    if !worker.is_finished() {
-        match tokio::time::timeout(Duration::from_secs(5), &mut worker).await {
+    if let Some(worker) = worker.as_mut()
+        && !worker.is_finished()
+    {
+        match tokio::time::timeout(Duration::from_secs(5), &mut *worker).await {
             Ok(_) => {}
             Err(_) => {
                 worker.abort();
                 let _ = worker.await;
+            }
+        }
+    }
+    if !publisher.is_finished() {
+        match tokio::time::timeout(Duration::from_secs(5), &mut publisher).await {
+            Ok(_) => {}
+            Err(_) => {
+                publisher.abort();
+                let _ = publisher.await;
             }
         }
     }

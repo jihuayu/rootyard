@@ -121,6 +121,7 @@ pub async fn create_lock(
     headers: HeaderMap,
     Json(input): Json<NewLock>,
 ) -> Res {
+    let _ = super::blob_proof_publication::prod_routes::enforce_blob_gate_if_requested()?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let repo = models::normalize_repo_name(&repo_raw)?;
     if !valid_path(&input.path) || !valid_lock_ref(input.reference.as_ref()) {
@@ -180,6 +181,7 @@ pub async fn list_locks(
     Query(query): Query<ListQuery>,
     headers: HeaderMap,
 ) -> Res {
+    let _ = super::blob_proof_publication::prod_routes::enforce_blob_gate_if_requested()?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let repo = models::normalize_repo_name(&repo_raw)?;
     let limit = query.limit.unwrap_or(100);
@@ -217,6 +219,7 @@ pub async fn verify_locks(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Res {
+    let _ = super::blob_proof_publication::prod_routes::enforce_blob_gate_if_requested()?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let repo = models::normalize_repo_name(&repo_raw)?;
     let input = if body.is_empty() {
@@ -269,6 +272,7 @@ pub async fn unlock(
     headers: HeaderMap,
     Json(input): Json<UnlockRequest>,
 ) -> Res {
+    let _ = super::blob_proof_publication::prod_routes::enforce_blob_gate_if_requested()?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let repo = models::normalize_repo_name(&repo_raw)?;
     if !valid_lock_ref(input.reference.as_ref()) {

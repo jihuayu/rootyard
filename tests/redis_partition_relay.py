@@ -93,6 +93,10 @@ class RedisPartitionRelay:
                 upstream.close()
                 del self.sessions[threading.current_thread()]
 
+    def failure(self):
+        with self.lock:
+            return self.failed
+
     def counts(self):
         with self.lock:
             assert not self.failed, "Owned relay failed"
