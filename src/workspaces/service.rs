@@ -458,10 +458,16 @@ fn validate_unborn_source_layout(source: &FsPath) -> Result<(), Error> {
 /// genuinely declared unborn branch. The source is checked before cloning so a
 /// malformed HEAD cannot be normalized by `git clone` into an empty checkout.
 async fn validate_source_head(state: &AppState, source: &FsPath, repo_id: Uuid) -> Result<SourceHead, Error> {
-    let head_bytes =
-        crate::workspace_lab::core::read_regular(&source.join("HEAD"), crate::workspace_lab::core::MAX_MANIFEST)
-            .map_err(|_| conflict_head())?;
-    let head_file = parse_source_head(&head_bytes)?;
+    let head_source = source.to_path_buf();
+    let head_file = super::blocking::run(move || {
+        let head_bytes = crate::workspace_lab::core::read_regular(
+            &head_source.join("HEAD"),
+            crate::workspace_lab::core::MAX_MANIFEST,
+        )
+        .map_err(|_| conflict_head())?;
+        parse_source_head(&head_bytes)
+    })
+    .await?;
 
     let format = source_git_required(state, source, &["rev-parse", "--show-object-format"], 4096).await?;
     if String::from_utf8_lossy(&format).trim() != "sha1" {
@@ -501,7 +507,8 @@ async fn validate_source_head(state: &AppState, source: &FsPath, repo_id: Uuid) 
                 SourceHeadFile::Symbolic(target) if super::compat::is_safe_unborn_head_ref(&target) => target,
                 _ => return Err(conflict_head()),
             };
-            validate_unborn_source_layout(source)?;
+            let unborn_source = source.to_path_buf();
+            super::blocking::run(move || validate_unborn_source_layout(&unborn_source)).await?;
             // Structural emptiness above rejects loose refs, broken refs and
             // object files. `for-each-ref` additionally covers alternate ref
             // backends without relying on `fsck`, which can report dangling
