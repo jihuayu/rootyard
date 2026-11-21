@@ -38,6 +38,7 @@ EXPECTED_CASES = (
     "unsupported_legacy_repository_format_is_explicitly_refused",
     "missing_database_url_is_explicit_refusal_without_listener",
     "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
+    "unavailable_postgres_refuses_startup_and_preserves_authority",
 )
 DEPENDENCIES = (
     "blob_only_service.py",
@@ -623,7 +624,8 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         listener = ast.get_source_segment(self.harness, functions["_listener_absent"])
         self.assertIn("probe.connect((host, int(port)))", listener)
         self.assertEqual(provisioning.STARTUP_REFUSAL_REASONS,
-                         ("DATABASE_URL is required", "invalid Blob profile"))
+                         ("DATABASE_URL is required", "invalid Blob profile",
+                          "could not open the lifecycle barrier session"))
 
         # The child must be the actual public CLI, not a fake handler. `serve`
         # reaches Config::from_env before the listener; `serve-blob` reaches the
@@ -657,11 +659,28 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
             "pub fn with_root", 1)[0]
         self.assertNotIn("ROOTYARD_OBJECT_STORE_ENDPOINT", from_env)
 
+    def test_unavailable_postgres_has_a_child_only_endpoint_and_fixed_reason(self) -> None:
+        functions = {
+            node.name: node for node in ast.walk(ast.parse(self.harness)) if isinstance(node, ast.FunctionDef)
+        }
+        case = ast.get_source_segment(
+            self.harness, functions["unavailable_postgres_refuses_startup_and_preserves_authority"])
+        self.assertIn('owned.bind(("127.0.0.1", 0))', case)
+        self.assertNotIn(".listen(", case)
+        self.assertIn("database_url=dsn", case)
+        self.assertNotIn("self.env", case)
+        helper = ast.get_source_segment(self.harness, functions["_startup_refusal"])
+        self.assertIn('overrides["DATABASE_URL"] = database_url', helper)
+        source = (ROOT / "src" / "standalone.rs").read_text(encoding="utf-8")
+        self.assertIn('anyhow!("could not open the lifecycle barrier session")', source)
+
     def test_closed_startup_reason_projection_only_returns_fixed_literals(self) -> None:
         cases = (
             (b"Error: DATABASE_URL is required\n\nCaused by:\n    environment variable not found\n",
              "DATABASE_URL is required"),
             (b"Error: invalid Blob profile\n", "invalid Blob profile"),
+            (b"Error: could not open the lifecycle barrier session\n",
+             "could not open the lifecycle barrier session"),
         )
         for raw, expected in cases:
             with self.subTest(reason=expected):
@@ -719,6 +738,7 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertEqual(EXPECTED_CASES[7:], (
             "missing_database_url_is_explicit_refusal_without_listener",
             "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
+            "unavailable_postgres_refuses_startup_and_preserves_authority",
         ))
 
     def _run_failing_backend_case(self, harness):
