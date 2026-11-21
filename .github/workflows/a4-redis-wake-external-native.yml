@@ -1,11 +1,13 @@
 name: A4 Redis wake external native acceptance
 
-# Experimental, opt-in native qualification for issue #111. This is a single
-# exact-branch push gate, intentionally separate from the PR/main/native gates.
+# Experimental, opt-in native qualification for issue #111. This is a dedicated
+# exact-branch push gate for the historical single-node case and the external
+# promotion case, intentionally separate from the PR/main/native gates.
 on:
   push:
     branches:
       - codex/goal-issue111-a4-redis-external-native-20261119
+      - codex/goal-issue111-a4-external-promotion-20261121
 
 permissions:
   contents: read
@@ -20,7 +22,8 @@ jobs:
     # Python process so its PR_SET_CHILD_SUBREAPER owns only this fixture tree.
     if: >-
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/codex/goal-issue111-a4-redis-external-native-20261119' &&
+      (github.ref == 'refs/heads/codex/goal-issue111-a4-redis-external-native-20261119' ||
+       github.ref == 'refs/heads/codex/goal-issue111-a4-external-promotion-20261121') &&
       github.repository == 'jihuayu/rootyard' &&
       github.event.repository.full_name == 'jihuayu/rootyard' &&
       github.event.deleted != true
@@ -44,6 +47,7 @@ jobs:
     env:
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_a4_wake
       A4_EXPECTED_BRANCH: codex/goal-issue111-a4-redis-external-native-20261119
+      A4_PROMOTION_BRANCH: codex/goal-issue111-a4-external-promotion-20261121
       A4_EXPECTED_REPOSITORY: jihuayu/rootyard
     steps:
       - uses: actions/checkout@v4
@@ -62,8 +66,13 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = "push"
-          test "$GITHUB_REF" = "refs/heads/$A4_EXPECTED_BRANCH"
-          test "$GITHUB_REF_NAME" = "$A4_EXPECTED_BRANCH"
+          expected_branch="$A4_EXPECTED_BRANCH"
+          case "$GITHUB_REF_NAME" in
+            "$A4_EXPECTED_BRANCH" | "$A4_PROMOTION_BRANCH") expected_branch="$GITHUB_REF_NAME" ;;
+            *) echo "unexpected A4 qualification ref" >&2; exit 1 ;;
+          esac
+          test "$GITHUB_REF" = "refs/heads/$expected_branch"
+          test "$GITHUB_REF_NAME" = "$expected_branch"
           test "$GITHUB_REPOSITORY" = "$A4_EXPECTED_REPOSITORY"
           case "$GITHUB_SHA" in
             '' | *[!0-9a-f]*) echo "GITHUB_SHA is not lowercase 40-hex" >&2; exit 1 ;;
@@ -225,6 +234,7 @@ jobs:
 
       - name: Run real external A4 acceptance
         id: harness
+        if: github.ref == 'refs/heads/codex/goal-issue111-a4-redis-external-native-20261119'
         timeout-minutes: 30
         shell: bash
         run: |
@@ -256,6 +266,39 @@ jobs:
           printf 'A4 harness exit status: %s\n' "$status"
           exit "$status"
 
+      - name: Run real external A4 replica promotion acceptance
+        id: promotion_harness
+        if: github.ref == 'refs/heads/codex/goal-issue111-a4-external-promotion-20261121'
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/a4-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal
+          export ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_DELETE=disabled
+          export ROOTYARD_BLOB_ROOT="a4-redis-promotion-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_GIT="$(command -v git)"
+          export ROOTYARD_TEST_REDIS_SERVER="/usr/bin/redis-server"
+          set +e
+          # Direct standalone invocation keeps the harness signal and exit status.
+          python3 tests/a4_redis_external_promotion.py \
+            --binary "$RUNNER_TEMP/a4-native/rootyard" \
+            --git "$ROOTYARD_GIT" \
+            --expect-commit "$GITHUB_SHA" \
+            --report "$RUNNER_TEMP/a4/promotion-report.json"
+          status=$?
+          set -e
+          printf 'A4 promotion harness exit status: %s\n' "$status"
+          exit "$status"
+
       - name: Stop owned Garage S3 fixture
         id: garage_stop
         if: always()
@@ -284,7 +327,7 @@ jobs:
           exit "$status"
 
       - name: Write typed acceptance evidence
-        if: always()
+        if: always() && github.ref == 'refs/heads/codex/goal-issue111-a4-redis-external-native-20261119'
         timeout-minutes: 5
         shell: bash
         env:
@@ -608,13 +651,222 @@ jobs:
               raise SystemExit(1)
           PY
 
+      - name: Write typed external A4 promotion evidence
+        id: promotion_evidence
+        if: always() && github.ref == 'refs/heads/codex/goal-issue111-a4-external-promotion-20261121'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          HARNESS_OUTCOME: ${{ steps.promotion_harness.outcome }}
+          GARAGE_START_OUTCOME: ${{ steps.garage_start.outcome }}
+          GARAGE_OUTCOME: ${{ steps.garage_stop.outcome }}
+        run: |
+          set -euo pipefail
+          promotion_out="$GITHUB_WORKSPACE/test-results/a4-promotion"
+          mkdir -p "$promotion_out"
+          manifest="$RUNNER_TEMP/a4/promotion-manifest.json"
+          report="$RUNNER_TEMP/a4/promotion-report.json"
+          status=passed
+          stage=""
+          if [ "$GARAGE_START_OUTCOME" != "success" ]; then
+            status=failed
+            stage=garage_setup
+          elif [ "$HARNESS_OUTCOME" != "success" ]; then
+            status=failed
+            stage=harness
+          elif [ "$GARAGE_OUTCOME" != "success" ]; then
+            status=failed
+            stage=garage_cleanup
+          elif [ ! -f "$report" ]; then
+            status=failed
+            stage=report_missing
+          elif ! python3 scripts/native_report_manifest.py --mode job \
+              --binary "$RUNNER_TEMP/a4-native/rootyard" \
+              --build-receipt "$RUNNER_TEMP/a4-native/rootyard.build.json" \
+              --expect-commit "$GITHUB_SHA" \
+              --fixture postgres=postgres:17 \
+              --harness tests/a4_redis_external_promotion.py \
+              --harness tests/a4_redis_wake_partition.py \
+              --harness tests/redis_partition_relay.py \
+              --harness tests/backup_recovery_cache.py \
+              --report "promotion=$report" \
+              --require-case "promotion=real_a4_external_redis_replica_promotion" \
+              --manifest-out "$manifest" >/dev/null 2>&1; then
+            status=failed
+            stage=binding
+          fi
+          set +e
+          python3 -I - "$status" "$stage" "$manifest" "$report" "$GITHUB_SHA" "$A4_SOURCE_TREE" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          SCHEMA = "rootyard/a4-external-promotion-failure/v1"
+          STAGES = {
+              "garage_setup", "harness", "garage_cleanup", "report_missing",
+              "binding", "witness", "cleanup",
+          }
+          OUT = pathlib.Path("test-results") / "a4-promotion"
+          sys.path.insert(0, str(pathlib.Path("tests").resolve()))
+
+
+          def load(path):
+              try:
+                  raw = path.read_bytes()
+                  return raw, json.loads(raw.decode("utf-8"))
+              except (OSError, UnicodeError, ValueError):
+                  return None, None
+
+
+          def text(value):
+              return value if isinstance(value, str) else None
+
+
+          def write(path, payload, *, raw=False):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              temporary = path.with_suffix(path.suffix + ".tmp")
+              temporary.write_bytes(payload if raw else (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+              temporary.replace(path)
+
+
+          def failure(report, stage):
+              write(OUT / "evidence.json", {
+                  "schema": SCHEMA,
+                  "status": "failed",
+                  "stage": stage if stage in STAGES else "witness",
+                  "source": {
+                      "head": text(report.get("source_head")),
+                      "tree": text(report.get("source_tree")),
+                  },
+                  "cleanup": {
+                      "harness_outcome": text(os.environ.get("HARNESS_OUTCOME")),
+                      "garage_start_outcome": text(os.environ.get("GARAGE_START_OUTCOME")),
+                      "garage_outcome": text(os.environ.get("GARAGE_OUTCOME")),
+                      "postgres_container": "job-owned",
+                  },
+              })
+              try:
+                  (OUT / "report.json").unlink()
+              except FileNotFoundError:
+                  pass
+
+
+          def main():
+              status, stage, manifest_path, report_path, commit, tree = sys.argv[1:7]
+              _, manifest = load(pathlib.Path(manifest_path))
+              report_raw, report = load(pathlib.Path(report_path))
+              manifest = manifest if isinstance(manifest, dict) else {}
+              report = report if isinstance(report, dict) else {}
+              passed = status == "passed" and stage == ""
+              if passed:
+                  try:
+                      import a4_redis_external_promotion as promotion
+                      case = report["cases"][0]
+                      detail = case["detail"]
+                      projected = promotion.validate_case_detail(detail)
+                      if projected != detail:
+                          raise AssertionError("detail is not the exact typed schema")
+                      promotion.require_promotion_witness(projected)
+                      if projected.get("owned_cleanup_completed") is not True:
+                          raise AssertionError("cleanup witness")
+                      harnesses = manifest["harnesses"]
+                      if manifest.get("kind") != "rootyard/native-acceptance-job-manifest":
+                          raise AssertionError("manifest kind")
+                      if manifest.get("status") != "passed" or manifest.get("source_commit") != commit:
+                          raise AssertionError("manifest source")
+                      if report.get("source_head") != commit or report.get("source_tree") != tree:
+                          raise AssertionError("report source")
+                      if report.get("source_inputs_sha256") != manifest.get("source_inputs_sha256"):
+                          raise AssertionError("source inputs")
+                      if report.get("binary_sha256") != manifest.get("binary_sha256"):
+                          raise AssertionError("binary")
+                      if report.get("build_receipt_sha256") != (manifest.get("build_receipt") or {}).get("sha256"):
+                          raise AssertionError("receipt")
+                      if report.get("harness_sha256") != harnesses.get("tests/a4_redis_external_promotion.py"):
+                          raise AssertionError("harness")
+                      if report.get("fixture_harness_sha256") != harnesses.get("tests/a4_redis_wake_partition.py"):
+                          raise AssertionError("fixture harness")
+                      if report.get("kind") != promotion.REPORT_KIND or report.get("passed") is not True:
+                          raise AssertionError("report state")
+                      if report.get("measurement_kind") != "native_execution" or report.get("simulated_fields") is not False:
+                          raise AssertionError("measurement")
+                      if report.get("qualification_kind") != "clean-candidate":
+                          raise AssertionError("qualification")
+                      if report.get("postgres_major") != 17 or not isinstance(report.get("postgres_server_version_num"), int):
+                          raise AssertionError("postgres")
+                      if not 170000 <= report["postgres_server_version_num"] <= 179999:
+                          raise AssertionError("postgres")
+                      if report.get("expected_cases") != [promotion.CASE]:
+                          raise AssertionError("expected cases")
+                      if report.get("case_count") != 1 or report.get("expected_count") != 1:
+                          raise AssertionError("counts")
+                      if report.get("skips") != 0 or report.get("pending_cases") != []:
+                          raise AssertionError("skips")
+                      if report.get("cleanup_failed") is not None or report.get("cleanup_error") is not None:
+                          raise AssertionError("cleanup")
+                      if case.get("name") != promotion.CASE or case.get("status") != "passed":
+                          raise AssertionError("case")
+                  except Exception:
+                      passed = False
+                      stage = "cleanup" if (
+                          report.get("cleanup_failed") is True or report.get("cleanup_error") is not None
+                      ) else "witness"
+              if passed:
+                  write(OUT / "report.json", report_raw, raw=True)
+                  try:
+                      (OUT / "evidence.json").unlink()
+                  except FileNotFoundError:
+                      pass
+              else:
+                  failure(report, stage)
+              print("A4 promotion evidence: " + ("passed" if passed else "failed"))
+              return 0 if passed else 1
+
+
+          try:
+              raise SystemExit(main())
+          except SystemExit:
+              raise
+          except Exception:
+              failure({}, "witness")
+              print("A4 promotion evidence failed closed", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+          result=$?
+          set -e
+          if [ "$result" -eq 0 ] && [ "$status" = "passed" ]; then
+            echo "report_staged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "report_staged=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$result"
+
       - name: Upload closed report and typed evidence
-        if: always()
+        if: always() && github.ref == 'refs/heads/codex/goal-issue111-a4-redis-external-native-20261119'
         uses: actions/upload-artifact@v4
         with:
           name: a4-redis-wake-external-native-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             test-results/a4/report.json
             test-results/a4/evidence.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload sanitized external A4 promotion report
+        if: always() && github.ref == 'refs/heads/codex/goal-issue111-a4-external-promotion-20261121' && steps.promotion_evidence.outputs.report_staged == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: a4-redis-external-promotion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/a4-promotion/report.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload closed external A4 promotion failure evidence
+        if: always() && github.ref == 'refs/heads/codex/goal-issue111-a4-external-promotion-20261121' && steps.promotion_evidence.outputs.report_staged != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: a4-redis-external-promotion-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/a4-promotion/evidence.json
           if-no-files-found: error
           retention-days: 7
