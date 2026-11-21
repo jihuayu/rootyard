@@ -3,6 +3,8 @@
 mod blocking;
 #[path = "workspaces/capture.rs"]
 pub mod capture;
+#[path = "workspaces/capture_watch.rs"]
+mod capture_watch;
 #[path = "workspaces/checkpoints.rs"]
 mod checkpoints;
 #[path = "workspaces/cleanup.rs"]

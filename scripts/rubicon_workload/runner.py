@@ -39,7 +39,14 @@ from .corpus import (
     run_git,
     write_askpass_script,
 )
-from .report import compute_overlap_metrics, percentile_stats, redact_text, validate_report
+from .report import (
+    OUTCOME_CLASSES,
+    REFUSAL_RECEIPT_CLASSES,
+    compute_overlap_metrics,
+    percentile_stats,
+    redact_text,
+    validate_report,
+)
 from .workloads import (
     METER_BOUNDARY_WAIT_SECONDS,
     ResourceSampler,
@@ -758,6 +765,93 @@ def _phase_concurrent_overlap(
     return {"scope": "cross_repo_distinct_repositories", **compute_overlap_metrics(intervals)}
 
 
+def _canonical_uuid(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("uuid must be text")
+    parsed = str(uuid.UUID(value))
+    if parsed != value:
+        raise ValueError("uuid must be canonical")
+    return parsed
+
+
+def _query_first_refusal_receipts(
+    pg_url: str,
+    base_env: dict[str, str],
+    repository_id: str,
+    observations: list[tuple[int, str]],
+) -> dict[str, int]:
+    """Project finite verdicts from this run's repository and first operations."""
+    counts = dict.fromkeys(REFUSAL_RECEIPT_CLASSES, 0)
+    if not observations:
+        return counts
+    try:
+        repo = _canonical_uuid(repository_id)
+        expected = {ordinal: _canonical_uuid(op_id) for ordinal, op_id in observations}
+        if len(expected) != len(observations) or any(type(ordinal) is not int or ordinal not in range(3) for ordinal in expected):
+            raise ValueError("invalid first-attempt branch ordinal")
+    except (TypeError, ValueError):
+        counts["unresolved"] = len(observations)
+        return counts
+
+    # All interpolated values are canonical UUIDs or an integer in 0..2.
+    values = ", ".join(
+        f"({ordinal}, '{op_id}'::uuid, 'refs/heads/same_branch_{ordinal}')"
+        for ordinal, op_id in sorted(expected.items())
+    )
+    sql = f"""WITH expected(ordinal, operation_id, ref_name) AS (VALUES {values}),
+verdicts AS (
+  SELECT e.ordinal, CASE
+    WHEN o.state = 'rejected'
+     AND o.terminal_result->>'kind' = 'rejected'
+     AND o.terminal_result->>'repository_id' = '{repo}'
+     AND jsonb_typeof(o.terminal_result->'refs') = 'array'
+     AND o.terminal_result->'refs'->1 IS NULL
+     AND o.terminal_result->'refs'->0->>'outcome' = 'not_applied'
+     AND o.terminal_result->'refs'->0->>'name' = e.ref_name
+     AND jsonb_typeof(o.terminal_result->'refs'->0->'reason') = 'string'
+     AND jsonb_typeof(o.terminal_result->'rejection'->'code') = 'string'
+     AND o.terminal_result->'rejection'->>'code' <> ''
+    THEN CASE
+      WHEN o.terminal_result->'refs'->0->>'reason' = 'old_oid_mismatch'
+       AND o.terminal_result->'rejection'->>'code' = 'revision_mismatch'
+       AND o.terminal_result->'rejection'->>'detail' = 'admitted base was superseded'
+        THEN 'admitted_base_superseded'
+      WHEN o.terminal_result->'refs'->0->>'reason' = 'old_oid_mismatch'
+       AND o.terminal_result->'rejection'->>'code' = 'no_ref_applied'
+       AND o.terminal_result->'rejection'->>'detail' IN ('all_rejected', 'no ref accepted')
+        THEN 'per_ref_cas_rejected'
+      ELSE 'other_durable_rejection'
+    END
+    ELSE 'unresolved'
+  END AS verdict
+  FROM expected e
+  LEFT JOIN ref_store_operations o
+    ON o.repository_id = '{repo}'::uuid AND o.operation_id = e.operation_id
+)
+SELECT json_agg(verdict ORDER BY ordinal) FROM verdicts;"""
+    try:
+        proc = subprocess.run(
+            ["psql", "--dbname", pg_url, "-X", "-v", "ON_ERROR_STOP=1", "-At", "-c", sql],
+            env=base_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        verdicts = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
+        verdicts = None
+    if (
+        not isinstance(verdicts, list)
+        or len(verdicts) != len(expected)
+        or any(not isinstance(verdict, str) or verdict not in counts for verdict in verdicts)
+    ):
+        counts["unresolved"] = len(expected)
+        return counts
+    for verdict in verdicts:
+        counts[verdict] += 1
+    return counts
+
+
 def _phase_same_repo_mixed(
     n_procs: int,
     seed: int,
@@ -770,11 +864,11 @@ def _phase_same_repo_mixed(
     repos: dict[str, dict[str, Any]],
     records: list[dict[str, Any]],
     acked: list[dict[str, Any]],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[tuple[int, str]]]:
     """Exercise concurrent independent-ref pushes, read/Browse, and PG SELECTs on ONE repository."""
     entry = repos["small_deltas"]
     branches = 3
-    prepared: list[tuple[Path, str, str, dict[str, str]]] = []
+    prepared: list[tuple[Path, str, str, dict[str, str], str]] = []
     for idx in range(branches):
         wdir = tier_dir / f"same-{idx}"
         env = build_git_env(base_env, askpass, entry["rw"])
@@ -791,21 +885,31 @@ def _phase_same_repo_mixed(
             pre["git"],
             env,
         )
-        prepared.append((wdir, f"refs/heads/same_branch_{idx}", new_oid, env))
+        prepared.append((wdir, f"refs/heads/same_branch_{idx}", new_oid, env, str(uuid.uuid4())))
 
     barrier = threading.Barrier(branches + 2)
     intervals: list[tuple[int, int]] = []
     lock = threading.Lock()
     stop_readers = threading.Event()
     counters = {"committed_success": 0, "contention_retries": 0, "read_browse_ops": 0, "maintenance_pg_select_ops": 0}
+    first_attempt_outcomes = dict.fromkeys(OUTCOME_CLASSES, 0)
+    refusal_candidates: list[tuple[int, str]] = []
 
     def _push_worker(idx: int) -> None:
-        wdir, ref_name, new_oid, env = prepared[idx]
+        wdir, ref_name, new_oid, env, op_id = prepared[idx]
         try:
             barrier.wait(timeout=30)
             s_ns = time.monotonic_ns()
-            proc, ms = run_git(pre["git"], ["push", "--porcelain", "origin", f"HEAD:{ref_name}"], wdir, env)
+            proc, ms = run_git(
+                pre["git"],
+                ["-c", f"http.extraHeader=X-Rootyard-Operation: {op_id}", "push", "--porcelain", "origin", f"HEAD:{ref_name}"],
+                wdir,
+                env,
+            )
             e_ns = time.monotonic_ns()
+        except subprocess.TimeoutExpired:
+            barrier.abort()
+            raise RuntimeError("first same-repository push timed out") from None
         except BaseException:
             barrier.abort()
             raise
@@ -813,6 +917,9 @@ def _phase_same_repo_mixed(
         retries = 0
         with lock:
             intervals.append((s_ns, e_ns))
+            first_attempt_outcomes[outcome] += 1
+            if outcome == "typed_refusal":
+                refusal_candidates.append((idx, op_id))
             _record_op(records, "same_repo_push", entry["ds_class"], outcome, ms, "measured")
         for attempt in range(3):
             if outcome == "committed_success":
@@ -887,12 +994,16 @@ def _phase_same_repo_mixed(
         stop_readers.set()
         _collect_barrier_futures([rf, mf])
 
-    return {
-        "scope": "same_repository_distinct_refs",
-        "repo": entry["info"]["name"],
-        **compute_overlap_metrics(intervals),
-        **counters,
-    }
+    return (
+        {
+            "scope": "same_repository_distinct_refs",
+            "repo": entry["info"]["name"],
+            **compute_overlap_metrics(intervals),
+            "first_attempt_outcomes": first_attempt_outcomes,
+            **counters,
+        },
+        refusal_candidates,
+    )
 
 
 def _phase_cas_race(
@@ -1180,7 +1291,7 @@ def _run_tier(
         bases = [item[1] for item in fleet]
         repos = _phase_seed(n_procs, config, pre, base_env, users, bases, tier_dir, askpass, records, acked)
         overlap = _phase_concurrent_overlap(n_procs, config, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
-        same_repo = _phase_same_repo_mixed(n_procs, config.seed, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
+        same_repo, refusal_candidates = _phase_same_repo_mixed(n_procs, config.seed, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
         cas = _phase_cas_race(n_procs, config.seed, pre, base_env, bases, tier_dir, askpass, repos, records, acked)
         atomic = _phase_atomic_subset(pre, base_env, bases, askpass, repos, records, acked)
         fleet, ci_info, cold_warm = _phase_cold_warm_and_ci(
@@ -1201,6 +1312,11 @@ def _run_tier(
         )
         if s3_proxy and s3_before_tier
         else {"observed": False}
+    )
+    same_repo["first_refusal_receipts"] = (
+        _query_first_refusal_receipts(pg_url, base_env, repos["small_deltas"]["info"]["id"], refusal_candidates)
+        if refusal_candidates
+        else dict.fromkeys(REFUSAL_RECEIPT_CLASSES, 0)
     )
     outcomes = {
         "total_ops": len(records),

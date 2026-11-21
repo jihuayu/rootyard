@@ -13,6 +13,12 @@ _BEARER_RE = re.compile(r"(?i)(Bearer\s+)[0-9A-Za-z._~+/=-]{8,}")
 _PG_URL_RE = re.compile(r"postgres(?:ql)?://[^\s\"'<>]+")
 
 OUTCOME_CLASSES: tuple[str, ...] = ("committed_success", "typed_refusal", "unknown_outcome")
+REFUSAL_RECEIPT_CLASSES: tuple[str, ...] = (
+    "admitted_base_superseded",
+    "per_ref_cas_rejected",
+    "other_durable_rejection",
+    "unresolved",
+)
 
 
 def percentile_stats(samples_ms: list[float]) -> dict[str, Any]:
@@ -146,10 +152,39 @@ def validate_tier(tier: dict[str, Any]) -> None:
         _check_nonneg_int(same_repo.get("max_concurrent_overlap"), "same_repo.max_concurrent_overlap") >= 2,
         "same_repo_mixed_concurrency failed to demonstrate simultaneous overlap >= 2",
     )
-    _require(
-        _check_nonneg_int(same_repo.get("committed_success"), "same_repo.committed_success") >= 1,
-        "same_repo_mixed_concurrency committed no branch",
-    )
+    final_success = _check_nonneg_int(same_repo.get("committed_success"), "same_repo.committed_success")
+    _require(final_success >= 1, "same_repo_mixed_concurrency committed no branch")
+    if "first_attempt_outcomes" in same_repo:
+        first = same_repo["first_attempt_outcomes"]
+        _require(
+            isinstance(first, dict) and set(first) == set(OUTCOME_CLASSES),
+            "same_repo.first_attempt_outcomes must contain the three outcome classes",
+        )
+        total = _check_nonneg_int(same_repo.get("total_ops"), "same_repo.total_ops")
+        first_counts = {
+            cls: _check_nonneg_int(first[cls], f"same_repo.first_attempt_outcomes.{cls}")
+            for cls in OUTCOME_CLASSES
+        }
+        _require(sum(first_counts.values()) == total, "same_repo.first_attempt_outcomes must partition total_ops")
+        _require(
+            first_counts["committed_success"] <= final_success <= total,
+            "same_repo committed_success must be between first-attempt successes and total_ops",
+        )
+    if "first_refusal_receipts" in same_repo:
+        receipts = same_repo["first_refusal_receipts"]
+        _require(
+            isinstance(receipts, dict) and set(receipts) == set(REFUSAL_RECEIPT_CLASSES),
+            "same_repo.first_refusal_receipts must contain exactly the four receipt classes",
+        )
+        _require("first_attempt_outcomes" in same_repo, "same_repo.first_refusal_receipts requires first_attempt_outcomes")
+        receipt_counts = {
+            cls: _check_nonneg_int(receipts[cls], f"same_repo.first_refusal_receipts.{cls}")
+            for cls in REFUSAL_RECEIPT_CLASSES
+        }
+        _require(
+            sum(receipt_counts.values()) == same_repo["first_attempt_outcomes"]["typed_refusal"],
+            "same_repo.first_refusal_receipts must partition first_attempt_outcomes.typed_refusal",
+        )
 
     cas = tier.get("cas_race")
     _require(isinstance(cas, dict), "tier.cas_race missing")
@@ -323,6 +358,28 @@ def render_summary_markdown(report: dict[str, Any]) -> str:
             f"{cw['cold_clone']['p50_ms']} | {cw['warm_clone']['p50_ms']} | "
             f"{rss_str} | {disk_str} | {st['serving_pack_bytes']} / {st['coexisting_pack_bytes']} | {s3_str} |"
         )
+    first_attempt_lines = []
+    for tier in report["tiers"]:
+        same_repo = tier["same_repo_mixed_concurrency"]
+        if "first_attempt_outcomes" in same_repo:
+            first = same_repo["first_attempt_outcomes"]
+            first_attempt_lines.append(
+                f"- Compute tier {tier['compute_processes']} recorded "
+                f"{first['committed_success']} / {same_repo['total_ops']} first-attempt successes, "
+                f"{first['typed_refusal']} refused and {first['unknown_outcome']} unknown. "
+                f"{same_repo['committed_success']} / {same_repo['total_ops']} succeeded including retries."
+            )
+            if "first_refusal_receipts" in same_repo:
+                receipts = same_repo["first_refusal_receipts"]
+                first_attempt_lines.append(
+                    f"- Compute tier {tier['compute_processes']} first-refusal receipts "
+                    f"admitted_base_superseded={receipts['admitted_base_superseded']}, "
+                    f"per_ref_cas_rejected={receipts['per_ref_cas_rejected']}, "
+                    f"other_durable_rejection={receipts['other_durable_rejection']}, "
+                    f"unresolved={receipts['unresolved']}."
+                )
+    if first_attempt_lines:
+        lines.extend(["", "## Same-Repository First Attempts", "", *first_attempt_lines])
     lines.append("")
     lines.append("## Scaling & Bottleneck Observations")
     for note in report["scaling_comparison"]["bottlenecks"]:
