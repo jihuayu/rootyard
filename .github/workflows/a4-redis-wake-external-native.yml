@@ -1,0 +1,620 @@
+name: A4 Redis wake external native acceptance
+
+# Experimental, opt-in native qualification for issue #111. This is a single
+# exact-branch push gate, intentionally separate from the PR/main/native gates.
+on:
+  push:
+    branches:
+      - codex/goal-issue111-a4-redis-external-native-20261119
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a4-redis-wake-external-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  a4-redis-wake-native:
+    # Dedicated runner VM, not a container. The harness runs as a standalone
+    # Python process so its PR_SET_CHILD_SUBREAPER owns only this fixture tree.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/goal-issue111-a4-redis-external-native-20261119' &&
+      github.repository == 'jihuayu/rootyard' &&
+      github.event.repository.full_name == 'jihuayu/rootyard' &&
+      github.event.deleted != true
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    services:
+      # Job-owned and disposable. There is deliberately no post-run database
+      # drop: if harness cleanup cannot resolve descendants, the container is
+      # still bounded by job teardown and the result stays red.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_a4_wake
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_a4_wake"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_a4_wake
+      A4_EXPECTED_BRANCH: codex/goal-issue111-a4-redis-external-native-20261119
+      A4_EXPECTED_REPOSITORY: jihuayu/rootyard
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify exact push and clean checkout
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_REF" = "refs/heads/$A4_EXPECTED_BRANCH"
+          test "$GITHUB_REF_NAME" = "$A4_EXPECTED_BRANCH"
+          test "$GITHUB_REPOSITORY" = "$A4_EXPECTED_REPOSITORY"
+          case "$GITHUB_SHA" in
+            '' | *[!0-9a-f]*) echo "GITHUB_SHA is not lowercase 40-hex" >&2; exit 1 ;;
+          esac
+          test "${#GITHUB_SHA}" -eq 40
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          tree="$(git rev-parse HEAD^{tree})"
+          case "$tree" in
+            '' | *[!0-9a-f]*) echo "checkout tree is not lowercase 40-hex" >&2; exit 1 ;;
+          esac
+          test "${#tree}" -eq 40
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          echo "A4_SOURCE_TREE=$tree" >> "$GITHUB_ENV"
+          echo "clean exact checkout verified"
+
+      - name: Install reviewed native tools
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance "$RUNNER_TEMP/a4-native-tools.json" \
+            --phase-record "$RUNNER_TEMP/a4/native-tools-phase.json"
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned Rust 1.99.1
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+
+      - name: Restore pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+
+      - name: Install pinned CargoFork 1.101.0 (64a6ee6a)
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record "$RUNNER_TEMP/a4-cargo-fork.json"
+
+      - name: Verify pinned CargoFork, Git, Redis, and PostgreSQL 17
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+          test "$(command -v git)" = "$RUNNER_TEMP/rootyard-ci-native/bin/git"
+          git --version | grep -Eq '^git version 2\.43\.'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          test "$(command -v redis-server)" = "/usr/bin/redis-server"
+          test "$(dpkg-query -W -f='${Status}' redis-server)" = "install ok installed"
+          redis-server --version | grep -Eq '^Redis server v=[0-9]+\.[0-9]+\.[0-9]+ '
+          psql --version | grep -Eq '^psql \(PostgreSQL\) 17\.'
+          pg_isready -h 127.0.0.1 -p 55432 -U rootyard -d rootyard_a4_wake
+
+      - name: Build exact state-redis binary and adjacent v2 receipt
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a4-native" "$RUNNER_TEMP/a4"
+          unset CARGO_BUILD_JOBS CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          # The harness preflight calls the canonical build_binding before any
+          # fixture effect and validates the exact command/features/adjacent v2
+          # receipt, so this workflow does not duplicate that validator.
+          python3 scripts/build_native.py \
+            --features state-redis \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            --output "$RUNNER_TEMP/a4-native/rootyard" \
+            > "$RUNNER_TEMP/a4-native/build-summary.json"
+          test -x "$RUNNER_TEMP/a4-native/rootyard"
+          test -f "$RUNNER_TEMP/a4-native/rootyard.build.json"
+
+      - name: Prepare the public serving schema
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/a4-native/rootyard"
+          log="$RUNNER_TEMP/a4/public-migrate.log"
+          test -x "$binary"
+          # The harness migrates only its random search_path schema. The
+          # standalone GET authorization reads public.cluster_authority, so the
+          # job-owned database needs the production public migration first, as
+          # in the reviewed standalone Blob gate. Keep diagnostics private.
+          set +e
+          env DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL" "$binary" migrate >"$log" 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "A4 public serving schema migration failed" >&2
+            exit "$status"
+          fi
+          set +e
+          authority="$(psql "$ROOTYARD_TEST_DATABASE_URL" -X -t -A -v ON_ERROR_STOP=1 \
+            -c "SELECT to_regclass('public.cluster_authority') IS NOT NULL" 2>>"$log")"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "A4 public serving schema check failed" >&2
+            exit "$status"
+          fi
+          if [ "$authority" != "t" ]; then
+            echo "A4 public serving schema is incomplete" >&2
+            exit 1
+          fi
+          rm -f -- "$log"
+
+      - name: Start owned Garage S3 fixture
+        id: garage_start
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a4"
+          garage_log="$RUNNER_TEMP/a4/garage-start.log"
+          set +e
+          {
+            scripts/owned_garage_fixture.sh start \
+              --directory "$RUNNER_TEMP/a4-garage" \
+              --output-env "$RUNNER_TEMP/a4-object-store.env" \
+              --bucket-prefix rootyard-a4-wake --region garage &&
+            cp "$RUNNER_TEMP/a4-garage/garage-image.json" "$RUNNER_TEMP/a4/garage-image.json" &&
+            touch "$RUNNER_TEMP/a4/garage-started"
+          } >"$garage_log" 2>&1
+          status=$?
+          set -e
+          rm -f -- "$garage_log"
+          case "$status" in
+            '' | *[!0-9]*) status=1 ;;
+          esac
+          if [ "$status" -gt 255 ]; then
+            status=1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "owned Garage setup failed" >&2
+            exit "$status"
+          fi
+
+      - name: Run real external A4 acceptance
+        id: harness
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/a4-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal
+          export ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_DELETE=disabled
+          export ROOTYARD_BLOB_ROOT="a4-redis-wake-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_GIT="$(command -v git)"
+          export ROOTYARD_TEST_REDIS_SERVER="/usr/bin/redis-server"
+          set +e
+          # Direct standalone invocation: no pipe/tee/container wrapper, so the
+          # harness keeps its own signal and exit status.
+          python3 tests/a4_redis_wake_partition.py \
+            --binary "$RUNNER_TEMP/a4-native/rootyard" \
+            --git "$ROOTYARD_GIT" \
+            --expect-commit "$GITHUB_SHA" \
+            --report "$RUNNER_TEMP/a4/report.json"
+          status=$?
+          set -e
+          printf 'A4 harness exit status: %s\n' "$status"
+          exit "$status"
+
+      - name: Stop owned Garage S3 fixture
+        id: garage_stop
+        if: always()
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          garage_dir="$RUNNER_TEMP/a4-garage"
+          object_env="$RUNNER_TEMP/a4-object-store.env"
+          started="$RUNNER_TEMP/a4/garage-started"
+          if [ -e "$started" ] && [ ! -e "$garage_dir" ] && [ ! -L "$garage_dir" ]; then
+            echo "owned Garage state is missing after a successful start" >&2
+            exit 1
+          fi
+          status=0
+          if [ -e "$garage_dir" ] || [ -L "$garage_dir" ]; then
+            scripts/owned_garage_fixture.sh stop --directory "$garage_dir" || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            rm -f -- "$object_env" "$started"
+          fi
+          if [ -e "$garage_dir" ] || [ -L "$garage_dir" ] || [ -e "$object_env" ] || [ -L "$object_env" ] || [ -e "$started" ] || [ -L "$started" ]; then
+            echo "owned Garage cleanup did not close the fixture" >&2
+            exit 1
+          fi
+          exit "$status"
+
+      - name: Write typed acceptance evidence
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        env:
+          HARNESS_OUTCOME: ${{ steps.harness.outcome }}
+          GARAGE_START_OUTCOME: ${{ steps.garage_start.outcome }}
+          GARAGE_OUTCOME: ${{ steps.garage_stop.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, sys
+
+          SCHEMA = "rootyard/a4-redis-wake-external-native-evidence/v1"
+          CASE = "real_a4_redis_wake_external_pg_fallback"
+          KIND = "rootyard/a4-redis-wake-external-acceptance"
+          CASE_STAGES = {
+              "repo_create", "empty_clone", "initial_push", "pre_worker_assertions",
+              "worker_startup", "healthy_push", "invalid_hints", "redis_cut_pg_fallback",
+              "healed_wake", "owned_flushall", "denials", "final_assertions",
+          }
+          REPO_CREATE_CODES = {
+              "post_send", "post_status_4xx", "post_status_5xx", "post_status_other",
+              "post_shape", "get_send", "get_status_4xx", "get_status_5xx", "get_status_other",
+              "get_shape", "get_terminal_state", "get_timeout", "identity_mismatch",
+              "backend_mismatch", "object_format_mismatch", "clone_path_mismatch",
+          }
+          WORKER_STARTUP_CODES = {
+              "spawn", "worker_exit_zero", "worker_exit_nonzero", "subscribe", "relay",
+              "catch_up", "claim", "durable_binding", "settle_idle", "unavailable",
+          }
+          INVALID_HINT_CODES = {
+              "baseline_idle", "baseline_snapshot", "baseline_claim",
+              "duplicate_publish", "wrong_version_publish", "other_channel_publish",
+              "subscriber_recovery", "post_probe_idle", "snapshot_equality",
+              "claim_equality", "unavailable",
+          }
+          OWNED_FLUSHALL_CODES = {
+              "baseline_idle", "baseline_snapshot", "baseline_claim",
+              "baseline_operation", "ownership", "seed", "flush", "wipe",
+              "snapshot_equality", "claim_equality", "post_operation",
+              "unavailable",
+          }
+          HEX = re.compile(r"^[0-9a-f]{64}$")
+          FAIL = {"preflight", "fixture", "case", "receipt_changed", "cleanup"}
+          ROOT = pathlib.Path.cwd()
+          TMP = pathlib.Path(os.environ["RUNNER_TEMP"])
+          REPORT = TMP / "a4" / "report.json"
+          BINARY = TMP / "a4-native" / "rootyard"
+          RECEIPT = pathlib.Path(str(BINARY) + ".build.json")
+          HARNESS = ROOT / "tests" / "a4_redis_wake_partition.py"
+          WORKFLOW = ROOT / ".github" / "workflows" / "a4-redis-wake-external-native.yml"
+          INSTALLER = ROOT / "scripts" / "install_ci_native_tools.sh"
+          PHASE = TMP / "a4" / "native-tools-phase.json"
+          PHASE_KEYS = {"mode", "phase", "state", "wrapper_sha256"}
+          PHASE_MODES = {"install", "preflight"}
+          PHASE_NAMES = {"setup", "apt", "git_build", "bubblewrap_build", "profile_export", "preflight", "provenance"}
+          PHASE_STATES = {"entered", "failed", "complete"}
+          PHASE_LIMIT = 512
+          GARAGE = TMP / "a4" / "garage-image.json"
+          OUT = ROOT / "test-results" / "a4"
+          EVIDENCE = OUT / "evidence.json"
+          STAGED = OUT / "report.json"
+
+
+          def digest(path):
+              try:
+                  return hashlib.sha256(path.read_bytes()).hexdigest()
+              except OSError:
+                  return None
+
+
+          def installer_phase():
+              unavailable = {"available": False}
+              def phase_object(pairs):
+                  keys = [key for key, _ in pairs]
+                  if len(keys) != len(set(keys)):
+                      raise ValueError("duplicate phase key")
+                  return dict(pairs)
+              if PHASE.is_symlink() or not PHASE.is_file():
+                  return unavailable
+              try:
+                  with PHASE.open("rb") as stream:
+                      raw = stream.read(PHASE_LIMIT + 1)
+              except OSError:
+                  return unavailable
+              if len(raw) > PHASE_LIMIT:
+                  return unavailable
+              try:
+                  record = json.loads(raw.decode("utf-8"), object_pairs_hook=phase_object)
+              except (UnicodeError, ValueError):
+                  return unavailable
+              if not isinstance(record, dict) or set(record) != PHASE_KEYS:
+                  return unavailable
+              if not all(isinstance(record[key], str) for key in PHASE_KEYS):
+                  return unavailable
+              if record["mode"] not in PHASE_MODES or record["phase"] not in PHASE_NAMES or record["state"] not in PHASE_STATES:
+                  return unavailable
+              wrapper = digest(INSTALLER)
+              if wrapper is None or record["wrapper_sha256"] != wrapper:
+                  return unavailable
+              return {"available": True, "mode": record["mode"], "phase": record["phase"], "state": record["state"], "wrapper_sha256": record["wrapper_sha256"]}
+
+
+          def installer_complete(phase):
+              return (
+                  phase.get("available") is True
+                  and phase.get("mode") == "install"
+                  and phase.get("phase") == "provenance"
+                  and phase.get("state") == "complete"
+              )
+
+
+          def failed_case_stage(case):
+              if not isinstance(case, dict) or case.get("status") != "failed":
+                  return None
+              stage = case.get("stage")
+              return stage if isinstance(stage, str) and stage in CASE_STAGES else "unavailable"
+
+
+          def failed_repo_create_code(case):
+              if not isinstance(case, dict) or case.get("status") != "failed" or case.get("stage") != "repo_create":
+                  return None
+              code = case.get("repo_create")
+              return code if isinstance(code, str) and code in REPO_CREATE_CODES else "unavailable"
+
+
+          def failed_worker_startup_code(case):
+              if not isinstance(case, dict) or case.get("status") != "failed" or case.get("stage") != "worker_startup":
+                  return None
+              code = case.get("worker_startup")
+              return code if isinstance(code, str) and code in WORKER_STARTUP_CODES else "unavailable"
+
+
+          def failed_invalid_hints_code(case):
+              if not isinstance(case, dict) or case.get("status") != "failed" or case.get("stage") != "invalid_hints":
+                  return None
+              code = case.get("invalid_hints")
+              return code if isinstance(code, str) and code in INVALID_HINT_CODES else "unavailable"
+
+
+          def failed_owned_flushall_code(case):
+              if not isinstance(case, dict) or case.get("status") != "failed" or case.get("stage") != "owned_flushall":
+                  return None
+              code = case.get("owned_flushall")
+              return code if isinstance(code, str) and code in OWNED_FLUSHALL_CODES else "unavailable"
+
+
+          def case_evidence(case, observations):
+              case = case if isinstance(case, dict) else {}
+              view = {"name": case.get("name"), "status": case.get("status"), "observations": observations}
+              stage = failed_case_stage(case)
+              if stage is not None:
+                  view["stage"] = stage
+              repo_create = failed_repo_create_code(case)
+              if repo_create is not None:
+                  view["repo_create"] = repo_create
+              worker_startup = failed_worker_startup_code(case)
+              if worker_startup is not None:
+                  view["worker_startup"] = worker_startup
+              invalid_hints = failed_invalid_hints_code(case)
+              if invalid_hints is not None:
+                  view["invalid_hints"] = invalid_hints
+              owned_flushall = failed_owned_flushall_code(case)
+              if owned_flushall is not None:
+                  view["owned_flushall"] = owned_flushall
+              return view
+
+
+          def load(path):
+              try:
+                  raw = path.read_bytes()
+                  return raw, json.loads(raw.decode("utf-8"))
+              except (OSError, UnicodeError, ValueError):
+                  return None, None
+
+
+          def version(argv):
+              try:
+                  result = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+              except (OSError, subprocess.SubprocessError):
+                  return None
+              if result.returncode != 0:
+                  return None
+              return next((x.strip()[:200] for x in (result.stdout + "\n" + result.stderr).splitlines() if x.strip()), None)
+
+
+          def write(payload):
+              OUT.mkdir(parents=True, exist_ok=True)
+              temporary = EVIDENCE.with_suffix(".json.tmp")
+              temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              temporary.replace(EVIDENCE)
+
+
+          def main():
+              harness = os.environ.get("HARNESS_OUTCOME", "missing")
+              garage_start = os.environ.get("GARAGE_START_OUTCOME", "missing")
+              garage_outcome = os.environ.get("GARAGE_OUTCOME", "missing")
+              commit = os.environ.get("GITHUB_SHA", "")
+              tree = os.environ.get("A4_SOURCE_TREE", "")
+              report_raw, report = load(REPORT)
+              receipt_raw, receipt = load(RECEIPT)
+              report = report if isinstance(report, dict) else {}
+              receipt = receipt if isinstance(receipt, dict) else {}
+              cases = report.get("cases")
+              case = cases[0] if isinstance(cases, list) and len(cases) == 1 and isinstance(cases[0], dict) else {}
+              detail = case.get("detail") if isinstance(case.get("detail"), dict) else {}
+              observations = {key: value for key, value in detail.items() if isinstance(value, bool)}
+              phase = installer_phase()
+              phase_complete = installer_complete(phase)
+              binary_sha, receipt_sha, harness_sha = digest(BINARY), digest(RECEIPT), digest(HARNESS)
+              source_inputs = report.get("source_inputs_sha256")
+              kind, passed = report.get("kind"), report.get("passed") is True
+              report_state_ok = (
+                  kind == KIND and passed
+                  and report.get("source_head") == commit and report.get("source_tree") == tree
+                  and isinstance(source_inputs, str) and HEX.fullmatch(source_inputs) is not None
+                  and report.get("postgres_major") == 17
+                  and isinstance(report.get("postgres_server_version_num"), int)
+                  and 170000 <= report.get("postgres_server_version_num") <= 179999
+                  and report.get("case_count") == 1 and report.get("expected_count") == 1
+                  and report.get("skips") == 0 and report.get("pending_cases") == []
+                  and case.get("name") == CASE and case.get("status") == "passed"
+                  and observations and all(observations.values())
+                  and report.get("cleanup_failed") is not True and report.get("cleanup_error") is None
+              )
+              report_binding_ok = (
+                  report.get("binary_sha256") == binary_sha
+                  and report.get("build_receipt_sha256") == receipt_sha
+                  and report.get("harness_sha256") == harness_sha
+              )
+              receipt_ok = (
+                  receipt.get("receipt_schema") == "rootyard/native-build-receipt/v2"
+                  and receipt.get("kind") == "native-binary"
+                  and receipt.get("workspace_commit") == commit and receipt.get("git_head") == commit
+                  and receipt.get("binary_sha256") == report.get("binary_sha256")
+                  and receipt.get("source_inputs_sha256") == source_inputs
+                  and receipt.get("features") == {"enabled": ["state-redis"], "no_default_features": False}
+                  and receipt.get("working_tree") == {"tree": tree, "status": ""}
+              )
+              base_ok = harness == "success" and garage_start == "success" and garage_outcome == "success" and report_state_ok and report_binding_ok and receipt_ok
+              status = "passed" if base_ok and phase_complete else "failed"
+              phase_only = base_ok and not phase_complete
+              if status == "passed":
+                  stage = None
+              elif phase_only:
+                  stage = "installer_phase"
+              elif report.get("cleanup_failed") is True or report.get("cleanup_error") is not None:
+                  stage = "cleanup"
+              elif garage_start == "failure":
+                  stage = "garage_setup"
+              elif garage_start != "success":
+                  stage = "not_run"
+              elif harness == "failure":
+                  stage = "harness"
+              elif harness != "success":
+                  stage = "harness_not_run"
+              elif garage_outcome == "failure":
+                  stage = "garage_cleanup"
+              elif garage_outcome != "success":
+                  stage = "garage_not_run"
+              elif report_raw is None:
+                  stage = "report_missing"
+              elif not report:
+                  stage = "report_invalid"
+              elif kind != KIND:
+                  stage = "report_kind"
+              elif not passed:
+                  stage = case.get("error") if case.get("error") in FAIL else "report_failed"
+              elif receipt_raw is None:
+                  stage = "receipt_missing"
+              elif not receipt:
+                  stage = "receipt_invalid"
+              elif not report_state_ok:
+                  stage = "report"
+              elif not report_binding_ok:
+                  stage = "binding"
+              elif not receipt_ok:
+                  stage = "receipt"
+              else:
+                  stage = "binding"
+              garage = {}
+              try:
+                  garage = json.loads(GARAGE.read_text(encoding="utf-8")) if GARAGE.is_file() else {}
+              except (OSError, ValueError):
+                  garage = {}
+              view = {
+                  key: receipt.get(key)
+                  for key in ("receipt_schema", "kind", "profile", "features", "workspace_commit", "git_head", "binary_sha256", "source_inputs_sha256", "command")
+              } if receipt else None
+              payload = {
+                  "schema": SCHEMA, "status": status, "stage": stage,
+                  "installer_phase": phase,
+                  "installer_complete": phase_complete,
+                  "source": {"head": commit, "tree": tree, "source_inputs_sha256": source_inputs, "harness_sha256": harness_sha, "workflow_sha256": digest(WORKFLOW), "report_sha256": digest(REPORT)},
+                  "run": {key: os.environ.get(key) for key in ("GITHUB_EVENT_NAME", "GITHUB_REF", "GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")},
+                  "binary": {"sha256": binary_sha, "build_receipt_sha256": receipt_sha, "receipt": view},
+                  "runtime": {"postgres_major": report.get("postgres_major"), "postgres_server_version_num": report.get("postgres_server_version_num"), "git_version": version(["git", "--version"]), "redis_version": version(["/usr/bin/redis-server", "--version"]), "psql_version": version(["psql", "--version"]), "rustc_version": version(["rustc", "-V"]), "cargo_version": version(["cargo", "-vV"]), "garage_version": garage.get("version"), "garage_image_digest": garage.get("image_digest")},
+                  "report": {"kind": kind, "passed": passed},
+                  "case": case_evidence(case, observations),
+                  "cleanup": {"harness_outcome": harness, "garage_start_outcome": garage_start, "garage_outcome": garage_outcome, "owned_cleanup_completed": detail.get("owned_cleanup_completed") is True, "cleanup_failed": report.get("cleanup_failed"), "cleanup_error": report.get("cleanup_error"), "postgres_container": "job-owned"},
+              }
+              OUT.mkdir(parents=True, exist_ok=True)
+              if report_raw is not None and kind == KIND:
+                  STAGED.write_bytes(report_raw)
+              write(payload)
+              return 0 if status == "passed" else 1
+
+
+          try:
+              raise SystemExit(main())
+          except SystemExit:
+              raise
+          except Exception:
+              try:
+                  OUT.mkdir(parents=True, exist_ok=True)
+                  temporary = EVIDENCE.with_suffix(".json.tmp")
+                  temporary.write_text(json.dumps({"schema": SCHEMA, "status": "failed", "stage": "evidence", "source": {"head": os.environ.get("GITHUB_SHA"), "tree": os.environ.get("A4_SOURCE_TREE")}, "cleanup": {"harness_outcome": os.environ.get("HARNESS_OUTCOME"), "garage_start_outcome": os.environ.get("GARAGE_START_OUTCOME"), "garage_outcome": os.environ.get("GARAGE_OUTCOME"), "postgres_container": "job-owned"}}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                  temporary.replace(EVIDENCE)
+              except Exception:
+                  pass
+              print("A4 evidence gate failed closed", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Upload closed report and typed evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a4-redis-wake-external-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            test-results/a4/report.json
+            test-results/a4/evidence.json
+          if-no-files-found: error
+          retention-days: 7

@@ -119,35 +119,43 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/git/{owner}/{name}/info/lfs/objects/{oid}",
-            get(handlers::download_object).post(handlers::post_object_or_verify),
+            get(handlers::download_object)
+                .post(handlers::post_object_or_verify)
+                .delete(handlers::delete_object_refused),
         )
         .route(
             "/git/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            get(handlers::download_object_with_size),
+            get(handlers::download_object_with_size).delete(handlers::delete_object_refused),
         )
         .route(
             "/{owner}/{name}/info/lfs/objects/{oid}",
-            get(handlers::download_object).post(handlers::post_object_or_verify),
+            get(handlers::download_object)
+                .post(handlers::post_object_or_verify)
+                .delete(handlers::delete_object_refused),
         )
         .route(
             "/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            get(handlers::download_object_with_size),
+            get(handlers::download_object_with_size).delete(handlers::delete_object_refused),
         )
         .route(
             "/api/repos/{owner}/{name}/lfs/objects/{oid}",
-            get(handlers::download_object).post(handlers::post_object_or_verify),
+            get(handlers::download_object)
+                .post(handlers::post_object_or_verify)
+                .delete(handlers::delete_object_refused),
         )
         .route(
             "/api/repos/{owner}/{name}/lfs/objects/{oid}/{size}",
-            get(handlers::download_object_with_size),
+            get(handlers::download_object_with_size).delete(handlers::delete_object_refused),
         )
         .route(
             "/api/repos/{owner}/{name}/info/lfs/objects/{oid}",
-            get(handlers::download_object).post(handlers::post_object_or_verify),
+            get(handlers::download_object)
+                .post(handlers::post_object_or_verify)
+                .delete(handlers::delete_object_refused),
         )
         .route(
             "/api/repos/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            get(handlers::download_object_with_size),
+            get(handlers::download_object_with_size).delete(handlers::delete_object_refused),
         )
         .merge(upload_routes)
 }

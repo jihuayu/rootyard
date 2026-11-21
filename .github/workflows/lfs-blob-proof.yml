@@ -1,0 +1,145 @@
+name: LFS Blob Proof Publication
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/lfs-blob-proof.yml'
+      - 'src/browse/policy.rs'
+      - 'src/lfs.rs'
+      - 'src/lfs/**'
+      - 'tests/lfs_blob_proof_publication.rs'
+      - 'tests/lfs_blob_proof_support/**'
+      - 'scripts/eval_lfs_blob_proof.py'
+      - 'tests/test_lfs_blob_proof_contracts.py'
+      - 'docs/lfs-blob-proof-publication.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lfs-blob-proof-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lfs-blob-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: rootyard_lfs145
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rootyard_lfs145"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      GIT_LFS_VERSION: '3.6.1'
+      GIT_LFS_TARBALL_SHA256: '2138d2e405a12f1a088272e06790b76699b79cb90d0317b77aafaf35de908d76'
+      ROOTYARD_TEST_DATABASE_URL: postgres://postgres:password@127.0.0.1:5432/rootyard_lfs145
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Git LFS 3.6.1 client with official checksum verification
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/git-lfs" "$RUNNER_TEMP/bin" test-results/lfs-blob-proof
+          scripts/install_git_lfs.sh \
+            --version "$GIT_LFS_VERSION" \
+            --destination "$RUNNER_TEMP/bin" \
+            --work "$RUNNER_TEMP/git-lfs" \
+            --expected-sha256 "$GIT_LFS_TARBALL_SHA256" \
+            --sha-output test-results/lfs-blob-proof/git-lfs-tarball.sha256
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          PATH="$RUNNER_TEMP/bin:$PATH" git lfs version | tee test-results/lfs-blob-proof/git-lfs-version.txt
+          grep -F "git-lfs/${GIT_LFS_VERSION}" test-results/lfs-blob-proof/git-lfs-version.txt
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/lfs-blob-proof/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Format, design-doc and offline contract checks
+        run: |
+          git --version
+          git lfs version
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_lfs_blob_proof_contracts.py
+      - name: Run Clippy and library unit tests
+        run: |
+          cargo clippy --locked --no-default-features --lib --test lfs_blob_proof_publication -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib lfs::blob_proof_publication
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test lfs_blob_proof_publication
+      - name: Run PG17 + LoopbackS3 + official git-lfs 3.6.1 E2E suite
+        run: |
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test lfs_blob_proof_publication -- --ignored --test-threads=1 --nocapture
+      - name: Build receipted test binary and run stock-Git reference evaluator
+        run: |
+          mkdir -p test-results/lfs-blob-proof
+          env -u CARGO_PROFILE_DEV_DEBUG -u CARGO_PROFILE_TEST_DEBUG \
+            python3 scripts/build_native_test.py \
+            --test lfs_blob_proof_publication \
+            --no-default-features \
+            --package-debug 0 \
+            --output "$RUNNER_TEMP/lfs-blob-proof-bin/lfs_blob_proof_publication"
+          cp -- "$RUNNER_TEMP/lfs-blob-proof-bin/lfs_blob_proof_publication.build.json" test-results/lfs-blob-proof/lfs_blob_proof_publication.build.json
+          python3 scripts/eval_lfs_blob_proof.py \
+            --formats sha1,sha256 \
+            --concurrent-uploads 12 \
+            --binary "$RUNNER_TEMP/lfs-blob-proof-bin/lfs_blob_proof_publication" \
+            --build-receipt "$RUNNER_TEMP/lfs-blob-proof-bin/lfs_blob_proof_publication.build.json" \
+            --cargo-fork-record test-results/lfs-blob-proof/cargo-fork.json \
+            --json-out test-results/lfs-blob-proof/eval-summary.json
+      - name: Upload LFS Blob proof CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lfs-blob-proof-evidence
+          path: test-results/lfs-blob-proof/
+          if-no-files-found: warn

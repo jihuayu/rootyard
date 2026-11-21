@@ -105,6 +105,10 @@ pub async fn batch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
+    if let Some(gate) = super::blob_proof_publication::active_blob_gate() {
+        return super::blob_proof_publication::prod_routes::prod_batch(gate, state, owner, repo_raw, headers, body)
+            .await;
+    }
     let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
@@ -160,12 +164,23 @@ pub async fn post_object_or_verify(
     Err(Error::not_found())
 }
 
+pub async fn delete_object_refused() -> Result<Response, Error> {
+    if let Some(gate) = super::blob_proof_publication::active_blob_gate() {
+        return super::blob_proof_publication::prod_routes::prod_delete_refused(gate).await;
+    }
+    Err(Error(StatusCode::METHOD_NOT_ALLOWED, "LFS object deletion is disabled"))
+}
+
 pub async fn verify_object(
     State(state): State<Arc<AppState>>,
     Path((owner, repo_raw)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
+    if let Some(gate) = super::blob_proof_publication::active_blob_gate() {
+        return super::blob_proof_publication::prod_routes::prod_verify(gate, state, owner, repo_raw, headers, body)
+            .await;
+    }
     let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
@@ -275,6 +290,12 @@ async fn download_inner(
     size_param: Option<i64>,
     headers: HeaderMap,
 ) -> Result<Response, Error> {
+    if let Some(gate) = super::blob_proof_publication::active_blob_gate() {
+        return super::blob_proof_publication::prod_routes::prod_download(
+            gate, state, owner, repo_raw, oid, size_param, headers,
+        )
+        .await;
+    }
     let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
