@@ -35,6 +35,12 @@ The fingerprint row, the revision bump and the `external_capture` event commit
 in that one transaction; an unchanged fingerprint writes no revision and no
 event.
 
+On Linux, inotify wakes reconciliation for dirty workspaces between periodic
+scans. It observes the service-owned worktree and overlay directories. A
+directory change rebuilds the registrations before requesting a full scan.
+Queue overflow also requests a full scan. The periodic scan covers directories
+outside the watch budget and keeps capture running when inotify is unavailable.
+
 Eligible workspaces are paged by `id` (`id > cursor ORDER BY id LIMIT 100`), so
 every local workspace is visited each round instead of rescanning one fixed
 prefix. A workspace that is slow, errors, or exceeds the scan budget occupies at
