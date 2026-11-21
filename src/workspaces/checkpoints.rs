@@ -339,13 +339,17 @@ async fn restore_inner(
         (Some(lazy_pub), None, fp)
     } else {
         super::remote::ensure_local(&state, cp, parent.repository_id, owner_id).await?;
+        let require_committed = cp_state == "committed";
         let cp_repo = service::checkpoint_repo(&state, cp);
         let lower_copy = lower.clone();
         let (pub_dir, fp) = super::blocking::run_mutating(&mutation, move |abandoned, fence| {
             if abandoned.is_abandoned() {
                 return Err(Error::timeout());
             }
-            super::compat::validate_repo(&cp_repo)?;
+            let head = super::compat::validate_repo(&cp_repo)?;
+            if require_committed && head == super::compat::HeadKind::Unborn {
+                return Err(Error(StatusCode::CONFLICT, super::compat::CONFLICT_HEAD));
+            }
             let mut pub_dir = copy_snapshot(&cp_repo, &lower_copy)?;
             pub_dir.attach_fence(fence);
             if abandoned.is_abandoned() {

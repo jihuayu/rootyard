@@ -10,8 +10,9 @@
 use crate::{
     AppState, Error,
     workspace_lab::core,
-    workspaces::{blocking, lazy, models::Workspace, mounts, remote, service, snapshot},
+    workspaces::{blocking, compat, lazy, models::Workspace, mounts, remote, service, snapshot},
 };
+use axum::http::StatusCode;
 use std::{fs, sync::Arc};
 use uuid::Uuid;
 
@@ -97,6 +98,9 @@ pub(super) async fn prepare_takeover(
 
 fn materialize_takeover(state: &AppState, id: Uuid, cp: Uuid) -> Result<Option<snapshot::Published>, Error> {
     let source = service::checkpoint_repo(state, cp);
+    if compat::validate_repo(&source)? == compat::HeadKind::Unborn {
+        return Err(Error(StatusCode::CONFLICT, compat::CONFLICT_HEAD));
+    }
     let destination = mounts::lower_path(state, id);
     materialize_takeover_paths(&source, &destination)
 }
