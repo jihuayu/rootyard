@@ -18,6 +18,18 @@ use std::sync::{
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+#[cfg(unix)]
+#[path = "s4_tests/fixture.rs"]
+mod fixture;
+#[cfg(unix)]
+use self::fixture::wait_pids;
+#[cfg(target_os = "linux")]
+#[path = "s4_tests/proc_identity.rs"]
+mod proc_identity;
+#[cfg(target_os = "linux")]
+#[path = "s4_tests/final_wait.rs"]
+mod final_wait;
+
 fn sample_grant(target: &str) -> S4ClosureGrant {
     let packs = "b".repeat(64);
     S4ClosureGrant::new(NewGrant {
@@ -216,52 +228,10 @@ fn digest_and_hex_width_helpers_are_exact() {
 
 #[cfg(unix)]
 const FINAL_SCRIPT: &str = r#"#!/bin/sh
-exec >/dev/null; sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$0.pids"
+exec >/dev/null; sh -c 'trap "" TERM; while :; do sleep 1; done' &
+sh -c 'printf "%s %s\n" "$1" "$2" > "$3"' sh "$$" "$!" "$0.pids"
 trap "" TERM; while :; do sleep 1; done
 "#;
-
-#[cfg(unix)]
-fn wait_pids(path: &std::path::Path) -> (i32, i32) {
-    for _ in 0..200 {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let mut values = text.split_whitespace().filter_map(|value| value.parse::<i32>().ok());
-        if let (Some(leader), Some(grandchild)) = (values.next(), values.next()) {
-            return (leader, grandchild);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    panic!("the Git wrapper did not publish its process group");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes() {
-    use super::s4_authority::{DisposableCiView, run_git_dir_bounded};
-    use std::os::unix::fs::PermissionsExt;
-    let view = DisposableCiView::create().expect("disposable view");
-    let root = view.path().to_path_buf();
-    let wrapper = root.join("git");
-    std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
-    let error = run_git_dir_bounded(
-        &wrapper,
-        None,
-        &[],
-        deadline,
-        || super::Error(StatusCode::CONFLICT, "failed"),
-        Some(view.hold()),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
-    let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
-    assert!(root.exists(), "the disposable view vanished before the final wait was confirmed");
-    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists());
-    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists());
-    drop(view);
-    assert!(!root.exists());
-}
 
 #[cfg(unix)]
 #[tokio::test]

@@ -23,6 +23,8 @@ use super::manifest::{
 
 #[path = "publication.rs"]
 mod publication;
+#[path = "read_lease.rs"]
+mod read_lease;
 
 use crate::{
     blob_store::{
@@ -37,6 +39,7 @@ use crate::{
     },
 };
 pub use publication::{CloneKitPublicationStore, publish_clonekit_versioned};
+pub use read_lease::{CloneKitReadLease, LeasedCloneKitManifest};
 
 /// Deterministic fault injection points proving failed builds never overwrite published kits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

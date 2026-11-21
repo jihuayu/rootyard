@@ -32,6 +32,7 @@ TOUCHED = [
     CI_PINS / "s4_checkout.rs",
     CI_PINS / "s4_transport.rs",
     CI_PINS / "s4_tests.rs",
+    CI_PINS / "s4_tests" / "final_wait.rs",
     SRC / "ci_checkouts" / "authority.rs",
     SRC / "ci_checkouts" / "handlers.rs",
     SRC / "namespace_service" / "handlers.rs",
@@ -288,6 +289,7 @@ class SourceContracts(unittest.TestCase):
         self.assertIn("state.retained", reaper)
         for test_body in (
             text(CI_PINS / "s4_tests.rs"),
+            text(CI_PINS / "s4_tests" / "final_wait.rs"),
             text(SRC / "namespace_service" / "s4_git_proc_tests.rs"),
             reaper_tests,
         ):
