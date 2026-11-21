@@ -174,41 +174,54 @@ def finite_push_ref_verdict(stdout: bytes | bytearray | None, expected_destinati
     itself into a definite failure of the current ref.  Raw bytes are not
     retained and no ref name, remote, path or user text escapes this function.
     """
+    status = _single_push_status(stdout, expected_destination)
+    if status is None or status[0] != b"!":
+        return "unknown"
+    _, summary = status
+    match = _PORCELAIN_REJECTION.fullmatch(summary)
+    if match is None:
+        return "unknown"
+    return "stale_info" if match.group(1) == _PORCELAIN_STALE_REASON else "other_ref_rejection"
+
+
+def _single_push_status(
+    stdout: bytes | bytearray | None, expected_destination: Any,
+) -> tuple[bytes, bytes] | None:
+    """Return the flag and summary from one well-framed status for the given ref."""
     if not isinstance(stdout, (bytes, bytearray)) or not isinstance(expected_destination, str):
-        return "unknown"
+        return None
     if not expected_destination or not expected_destination.startswith("refs/"):
-        return "unknown"
+        return None
     data = bytes(stdout)
     if data.endswith(b"\n"):
         data = data[:-1]
     if not data:
-        return "unknown"
+        return None
     lines = [line[:-1] if line.endswith(b"\r") else line for line in data.split(b"\n")]
     if _is_porcelain_to_line(lines[0]):
         lines = lines[1:]
     if lines and lines[-1] == _PORCELAIN_DONE:
         lines = lines[:-1]
     if len(lines) != 1:
-        return "unknown"
+        return None
     parts = lines[0].split(b"\t")
     if len(parts) != 3:
-        return "unknown"
+        return None
     flag, refs, summary = parts
-    if flag != b"!":
-        return "unknown"
     if b":" not in refs:
-        return "unknown"
+        return None
     _source, raw_destination = refs.rsplit(b":", 1)
     try:
         destination = raw_destination.decode("ascii")
     except UnicodeDecodeError:
-        return "unknown"
+        return None
     if destination != expected_destination:
-        return "unknown"
-    match = _PORCELAIN_REJECTION.fullmatch(summary)
-    if match is None:
-        return "unknown"
-    return "stale_info" if match.group(1) == _PORCELAIN_STALE_REASON else "other_ref_rejection"
+        return None
+    return flag, summary
+
+
+def confirms_new_branch(stdout: bytes | bytearray | None, expected_destination: str | None) -> bool:
+    return _single_push_status(stdout, expected_destination) == (b"*", b"[new branch]")
 
 
 def _fixed_outcome(branch_ordinal: int | None, outcome: str, record: Mapping[str, Any] | None) -> dict[str, Any]:

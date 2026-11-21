@@ -55,7 +55,7 @@ from .live_server import (
 from .multi_repo import run_multi_repo_first_pushes
 from .pack_matrix import CANDIDATE_CONFIGS
 from .report import FETCH_MEASUREMENT_NOTES
-from .s3_meter import S3MeterProxy
+from .s3_meter import SOCKET_IO_TIMEOUT_SECONDS, S3MeterProxy
 from .telemetry import ResourceSampler, percentile_stats, query_pg_refstore_stats, sum_dir_bytes
 
 
@@ -278,13 +278,13 @@ def run_live_serve_blob_eval(
                     (crepo["clone_path"], "refs/heads/main", target["head_oid"], f"{target['archetype']}:{spec.name}", cmp_ro["username"], cmp_ro["token"])
                 )
                 cmp_repos.append(crepo)
-            put_s3 = proxy.snapshot()
+            put_s3 = proxy.snapshot(settle_timeout=SOCKET_IO_TIMEOUT_SECONDS)
 
             proc, base_url, _ = restart_serve_blob(
                 server_owner, lambda: start_owned(f"serve-blob-cmp-{spec.name}.log")
             )
             sampler.set_pids([proc.pid], new_epoch=True)
-            proxy.reset_counters()
+            proxy.reset_counters(settle_timeout=SOCKET_IO_TIMEOUT_SECONDS)
             for t_idx, target in enumerate(eval_targets):
                 crepo = cmp_repos[t_idx]
                 c_remote = base_url + crepo["clone_path"]
@@ -298,7 +298,7 @@ def run_live_serve_blob_eval(
                 c_warm_ms.append(clone_and_fsck(git_bin, c_remote, work_root / f"cmp-warm-{spec.name}-{t_idx}", cmp_ro_env))
                 progress["completed"]["warm_clone_samples_completed"] += 1
                 progress["last_completed_phase"] = "candidate_reads"
-            read_s3 = proxy.snapshot()
+            read_s3 = proxy.snapshot(settle_timeout=SOCKET_IO_TIMEOUT_SECONDS)
             fetch_targets = [
                 {**target, "repo": candidate, "ro": cmp_ro}
                 for candidate, target in zip(cmp_repos, eval_targets, strict=True)
@@ -307,12 +307,12 @@ def run_live_serve_blob_eval(
                 git_bin, fetch_targets, work_root, run_env, askpass, proxy, progress,
                 config=spec.name, owner=server_owner, sampler=sampler, start=start_owned,
             )
+            progress["completed"]["candidate_reads_completed"] += 1
             multi_repo = run_multi_repo_first_pushes(
                 git_bin, base_url, [{**target, "rw": cmp_rw} for target in fetch_targets],
                 spec, proxy, work_root, progress,
                 config=spec.name, run_env=run_env, askpass=askpass,
             )
-            progress["completed"]["candidate_reads_completed"] += 1
             progress["completed"]["candidate_configs_completed"] += 1
             candidate_serving.append(
                 {

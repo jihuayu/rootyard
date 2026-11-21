@@ -17,6 +17,7 @@ import uuid
 
 from .capacity import build_server_env, derive_capacity_envelope
 from .cleanup_diagnostics import StopPostcondition
+from .concurrent_outcomes import confirms_new_branch
 from .corpus import isolated_git_env, run_git, url_quote_repo
 from .failure_diagnostics import (
     LiveEvalFailure,
@@ -331,6 +332,7 @@ def push_with_pack_config(
     *,
     context: dict[str, Any] | None = None,
     fixture_operation: str | None = None,
+    expect_new_ref: bool = False,
 ) -> float:
     args: list[str] = ["-c", "credential.helper="]
     if fixture_operation is not None:
@@ -339,7 +341,10 @@ def push_with_pack_config(
         args.extend(["-c", f"http.extraHeader=X-Rootyard-Operation: {uuid.UUID(str(fixture_operation))}"])
     if spec is not None:
         args.extend(spec.git_config_args())
-    args.extend(["push", "--quiet", "--porcelain", remote_url, ref_target])
+    args.append("push")
+    if not expect_new_ref:
+        args.append("--quiet")
+    args.extend(["--porcelain", remote_url, ref_target])
     try:
         proc, ms = run_git(git_bin, args, work_dir, env)
     except subprocess.TimeoutExpired:
@@ -360,6 +365,11 @@ def push_with_pack_config(
                 expected_destination=push_expected_destination(ref_target),
             )
         ) from None
+    if expect_new_ref and not confirms_new_branch(proc.stdout, push_expected_destination(ref_target)):
+        raise LiveEvalFailure(git_failure_record(
+            context, failure_class="multi_repo_new_ref_unconfirmed",
+            returncode=proc.returncode, elapsed_ms=ms,
+        ))
     return ms
 
 

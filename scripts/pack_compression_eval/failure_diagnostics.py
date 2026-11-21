@@ -38,7 +38,7 @@ PHASES = PUSH_PHASES + ("multi_repo_first_push", "multi_repo_verify", "baseline_
 PROGRESS_PHASES = PHASES + ("none", "baseline_reads", "candidate_reads")
 FAILURE_CLASSES = PUSH_FAILURE_CLASSES + (
     "git_fetch", "fetch_ack_mismatch", "fetch_fsck", "multi_repo_cohort", "multi_repo_fixture",
-    "multi_repo_head_mismatch", "multi_repo_verify", "multi_repo_ref_mismatch", "multi_repo_overlap",
+    "multi_repo_head_mismatch", "multi_repo_verify", "multi_repo_ref_mismatch", "multi_repo_overlap", "multi_repo_new_ref_unconfirmed",
 )
 RECEIPT_SCHEMAS = frozenset(("rootyard/native-build-receipt/v2", "v1", "v2"))
 MODES, SCALES = ("full", "git-only"), ("quick", "full")

@@ -28,8 +28,8 @@ from pack_compression_eval.failure_diagnostics import (  # noqa: E402
     LiveEvalFailure,
     completed_counts,
     git_failure_record,
-    push_expected_destination,
 )
+from pack_compression_eval.live_server import push_with_pack_config  # noqa: E402
 from pack_compression_eval.pack_matrix import CANDIDATE_CONFIGS  # noqa: E402
 from pack_compression_eval.report import _validate_multi_repo_group  # noqa: E402
 from pack_compression_eval.telemetry import percentile_stats  # noqa: E402
@@ -99,21 +99,6 @@ class FakeProxy:
         }
 
 
-def local_push(git_bin, work_dir, remote_url, spec, ref_target, env, *, context=None, fixture_operation=None):
-    proc, elapsed = run_git(
-        git_bin, ["-c", "credential.helper=", "push", "--quiet", "--porcelain", remote_url, ref_target],
-        work_dir, env,
-    )
-    if proc.returncode != 0:
-        raise LiveEvalFailure(
-            git_failure_record(
-                context, returncode=proc.returncode, elapsed_ms=elapsed, stderr=proc.stderr,
-                stdout=proc.stdout, expected_destination=push_expected_destination(ref_target),
-            )
-        )
-    return elapsed
-
-
 class MultiRepoTargetSelectionTest(unittest.TestCase):
     def test_first_two_and_final_are_identical_for_quick_and_full(self) -> None:
         quick = [{"ordinal": index, "archetype": arch, "object_format": fmt} for index, (arch, fmt) in enumerate(COHORT)]
@@ -141,7 +126,7 @@ class MultiRepoTargetSelectionTest(unittest.TestCase):
                 rows = copy.deepcopy(targets)
                 mutate(rows)
                 with self.subTest(target=rows[1]["repo"]["id"]):
-                    with mock.patch.object(multi_repo, "push_with_pack_config", side_effect=local_push):
+                    with mock.patch.object(multi_repo, "push_with_pack_config", wraps=push_with_pack_config):
                         with self.assertRaises(LiveEvalFailure) as caught:
                             multi_repo.run_multi_repo_first_pushes(
                                 GIT, "", rows, CANDIDATE_CONFIGS[0], FakeProxy(), fixture.root, progress,
@@ -165,7 +150,7 @@ class MultiRepoCheckpointTest(unittest.TestCase):
                 return real_clone_and_fsck(*args, **kwargs)
 
             real_clone_and_fsck = multi_repo.clone_and_fsck
-            with mock.patch.object(multi_repo, "push_with_pack_config", side_effect=local_push), \
+            with mock.patch.object(multi_repo, "push_with_pack_config", wraps=push_with_pack_config), \
                     mock.patch.object(multi_repo, "clone_and_fsck", side_effect=verify_after_snapshot):
                 result = multi_repo.run_multi_repo_first_pushes(
                     GIT, "", targets, CANDIDATE_CONFIGS[0], proxy, fixture.root, progress,
@@ -202,13 +187,27 @@ class MultiRepoCheckpointTest(unittest.TestCase):
             self.assertNotIn("rw-secret-sentinel", encoded)
             self.assertNotIn("ro-secret-sentinel", encoded)
 
+    def test_up_to_date_is_not_a_new_ref_ack(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="multi-repo-new-ref-") as tmp:
+            fixture = Fixture(Path(tmp))
+            target = fixture.target(0, *COHORT[0])
+            args = (
+                GIT, target["work_dir"], target["repo"]["clone_path"], None,
+                f"HEAD:{multi_repo.MULTI_REPO_REF}", fixture.env,
+            )
+            self.assertGreater(push_with_pack_config(*args, expect_new_ref=True), 0)
+            with self.assertRaises(LiveEvalFailure) as caught:
+                push_with_pack_config(*args, expect_new_ref=True)
+            self.assertEqual(caught.exception.record["failure_class"], "multi_repo_new_ref_unconfirmed")
+            self.assertEqual(caught.exception.record["git_returncode"], 0)
+
     def test_head_mismatch_fails_before_any_push(self) -> None:
         with tempfile.TemporaryDirectory(prefix="multi-repo-head-") as tmp:
             fixture = Fixture(Path(tmp))
             targets = fixture.targets()
             targets[1]["head_oid"] = "0" * 40
             progress = {"completed": completed_counts(), "last_completed_phase": "candidate_reads"}
-            with mock.patch.object(multi_repo, "push_with_pack_config", side_effect=local_push) as push:
+            with mock.patch.object(multi_repo, "push_with_pack_config", wraps=push_with_pack_config) as push:
                 with self.assertRaises(LiveEvalFailure) as caught:
                     multi_repo.run_multi_repo_first_pushes(
                         GIT, "", targets, CANDIDATE_CONFIGS[0], FakeProxy(), fixture.root, progress,
@@ -233,10 +232,12 @@ class MultiRepoCheckpointTest(unittest.TestCase):
                 )
             )
 
-            def fail_one(git_bin, work_dir, remote_url, spec, ref_target, env, *, context=None, fixture_operation=None):
+            def fail_one(git_bin, work_dir, remote_url, spec, ref_target, env, *, context=None, expect_new_ref=False):
                 if context and context.get("repo_ordinal") == 1:
                     raise original
-                return local_push(git_bin, work_dir, remote_url, spec, ref_target, env, context=context)
+                return push_with_pack_config(
+                    git_bin, work_dir, remote_url, spec, ref_target, env, context=context, expect_new_ref=expect_new_ref,
+                )
 
             with mock.patch.object(multi_repo, "push_with_pack_config", side_effect=fail_one):
                 with self.assertRaises(LiveEvalFailure) as caught:

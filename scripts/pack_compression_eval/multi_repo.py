@@ -242,6 +242,7 @@ def _push_one(
             archetype=target["archetype"], object_format=target["object_format"],
             config=config, repo_ordinal=ordinal, target_ordinal=ordinal,
         ),
+        expect_new_ref=True,
     )
     end = time.monotonic()
     with lock:
