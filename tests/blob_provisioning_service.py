@@ -47,9 +47,13 @@ Startup-refusal checkpoint (selected together by default, or alone):
   fallback starts;
 * the public ``serve-blob`` CLI keeps the owned, migrated PostgreSQL schema but
   loses its explicit Blob endpoint; the production Blob profile has no local or
-  in-memory fallback and must exit before any listener starts.
+  in-memory fallback and must exit before any listener starts;
+* the public ``serve-blob`` CLI receives a PostgreSQL URL for an owned loopback
+  port with no listener. Startup exits when the lifecycle barrier connection
+  fails. Restoring the healthy URL preserves the original ready repository and
+  its Git tip.
 
-Both startup cases compare only a closed fixed reason, keep no raw stderr in the
+All startup cases compare only a closed fixed reason, keep no raw stderr in the
 report, and reuse only the harness-owned process group and temporary root.
 
 No SQL inserts a ready repository, binding, gate, protocol row, ref, object or
@@ -90,6 +94,7 @@ CASES = (
     "unsupported_legacy_repository_format_is_explicitly_refused",
     "missing_database_url_is_explicit_refusal_without_listener",
     "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
+    "unavailable_postgres_refuses_startup_and_preserves_authority",
 )
 
 FIRST_CHECKPOINT = CASES[:4]
@@ -102,6 +107,7 @@ MAX_STARTUP_LOG_BYTES = 64 * 1024
 STARTUP_REFUSAL_REASONS = (
     "DATABASE_URL is required",
     "invalid Blob profile",
+    "could not open the lifecycle barrier session",
 )
 
 LIMITATIONS = [
@@ -116,7 +122,7 @@ LIMITATIONS = [
     "Concurrency is a small bounded request group on one process, not a scalability benchmark.",
     "The harness sets the existing ROOTYARD_MAX_CONCURRENT_GIT knob to 8 so the half-ready read probe can run while one create is blocked; it is not a capacity claim.",
     "SHA-256 Git operations require the Root-supplied trusted Git to support that object format.",
-    "The startup-refusal cases remove only local configuration from a fresh owned child; they do not simulate a PostgreSQL server outage, external Raft authority, network failure or provider unavailability.",
+    "The unavailable PostgreSQL case covers startup and recovery of the same authority on one host. In-service partitions, database crash recovery and external authority have separate acceptance requirements.",
 ]
 
 
@@ -465,15 +471,12 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
                 return True
         return False
 
-    def _startup_refusal(self, label, command, unset, reason):
+    def _startup_refusal(self, label, command, unset, reason, *, database_url=None):
         """Run one fresh owned CLI child and retain only a closed fixed reason.
 
-        The child receives the harness's legitimate Git/PG context except for
-        the explicitly removed keys. ``StartupProjection`` proves it exited
-        during startup; this method then consumes the already-retained bounded
-        child log only to compare one literal from ``STARTUP_REFUSAL_REASONS``.
-        The raw log, exception, argv, environment and path never enter the case
-        result or the report.
+        The child inherits the fixture environment with selected keys removed
+        and an optional replacement PostgreSQL endpoint. The result is derived
+        from the startup projection and a single fixed reason in the bounded log.
         """
         assert reason in STARTUP_REFUSAL_REASONS, "expected reason is outside the closed set"
         if self.proc is not None:
@@ -484,11 +487,13 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         bind = self.env["ROOTYARD_BIND"]
         data = self.root / ("startup-refusal-" + label + "-data")
         scratch = self.root / ("startup-refusal-" + label + "-scratch")
+        overrides = {"ROOTYARD_DATA_DIR": str(data), "ROOTYARD_SCRATCH_DIR": str(scratch)}
+        if database_url is not None:
+            overrides["DATABASE_URL"] = database_url
         projection = serving.StartupProjection()
         try:
             try:
-                self.start(overrides={"ROOTYARD_DATA_DIR": str(data),
-                                      "ROOTYARD_SCRATCH_DIR": str(scratch)},
+                self.start(overrides=overrides,
                            label=label, startup_projection=projection,
                            command=command, unset=unset)
             except Exception:
@@ -1238,6 +1243,48 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         return self._startup_refusal(
             "missing-blob-endpoint", ("serve-blob",), ("ROOTYARD_BLOB_ENDPOINT",),
             "invalid Blob profile")
+
+    def unavailable_postgres_refuses_startup_and_preserves_authority(self):
+        name = "unavailable-postgres"
+        if self.proc is None:
+            self.start(label="before-unavailable-postgres")
+        repo, created_status = self.create(name, self.alice)
+        assert created_status in (201, 202)
+        files = {"known.txt": "known bytes survive an unavailable PostgreSQL start\n"}
+        oid = self.push_and_clone(repo, name, "sha1", files)
+        before = self.authority(repo, name)
+        payload = {"owner": "alice", "name": name, "object_format": "sha1"}
+        # The owned socket reserves an unused IPv4 loopback port and is
+        # deliberately never listening. Holding it across startup makes the
+        # explicit child-only DSN deterministic without an imitation server.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as owned:
+            owned.bind(("127.0.0.1", 0))
+            port = owned.getsockname()[1]
+            dsn = f"postgresql://rootyard_issue143@127.0.0.1:{port}/rootyard_issue143?connect_timeout=2"
+            refusal = self._startup_refusal(
+                "unavailable-postgres", ("serve-blob",), (),
+                "could not open the lifecycle barrier session",
+                database_url=dsn)
+        # The refused child never touched the harness's healthy control PG.
+        before_restart = self.authority(repo, name)
+        assert before_restart == before, "refused startup changed the durable authority"
+        self.start(label="after-unavailable-postgres")
+        status, raw = self.post_create(payload, attempts=1)
+        assert status == 200, "post-refusal idempotent create was not exactly one 200: " + str(status)
+        replay = json.loads(raw)
+        assert replay["id"] == repo["id"] and replay["state"] == "ready", replay
+        after = self.authority(repo, name)
+        assert after == before, "idempotent retry after restart changed the authority snapshot"
+        self.exact_clone(self.base + repo["clone_path"],
+                         self.root / (name + "-read-only-clone"),
+                         oid, "sha1", files, self.reader)
+        return {**refusal, "repository_id": repo["id"],
+                "authority_unchanged": True,
+                "idempotent_status": status,
+                "idempotent_same_repository_id": True,
+                "authority_after_restart_unchanged": True,
+                "read_only_clone_fsck": True,
+                "ack_oid": oid}
 
 
 def report_result(harness, profile, blob_profile, selected, success, hashes):
