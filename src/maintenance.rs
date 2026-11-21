@@ -1,8 +1,13 @@
 //! Offline, explicit acknowledgment of a GitFS audit gap. Never assigns a
 //! successful outcome to an unknown push and never replays that push.
+pub mod paired_raft_backup;
+
+pub use paired_raft_backup::{PairedProductionRuntimeGuard, WorkerProjectionTicket};
+
 use crate::{config::Config, git_http, journal, storage::Storage};
 use anyhow::{Context, Result, ensure};
 use deadpool_postgres::Pool;
+use paired_raft_backup::{PAIRED_FREEZE_JOURNAL_LOCK_KEY, enforce_maintenance_pg_write_guard};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -224,6 +229,9 @@ pub async fn resolve(
     );
     let storage = Storage::open(config)?;
     let mut client = pool.get().await?;
+    // Refuse to write while a durable paired backup freeze, database-wide read-only
+    // fence, or storage-authority remote-delete fence is active (#153).
+    enforce_maintenance_pg_write_guard(&**client, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     // A lost commit acknowledgment can be retried without reclassifying history.
     if let Some(row)=client.query_opt("SELECT to_jsonb(r) FROM recovery_resolutions r WHERE repository_id=$1 AND old_generation=$2 AND inspected_fingerprint=$3",&[&repo,&expected_generation,&expected_fingerprint]).await? {
         let resolution:Value=row.get(0);
@@ -243,6 +251,8 @@ pub async fn resolve(
     );
     ensure!(!observed.operations.is_empty(), "no unresolved unknown operations");
     let tx = client.transaction().await?;
+    tx.query_one("SELECT pg_advisory_xact_lock_shared($1)", &[&PAIRED_FREEZE_JOURNAL_LOCK_KEY]).await?;
+    enforce_maintenance_pg_write_guard(&*tx, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     tx.query_one("SELECT id FROM repositories WHERE id=$1 FOR UPDATE", &[&repo]).await?;
     // Re-read filesystem plus every SQL operation after the common repository
     // fence. Workers use FOR SHARE before their delivery/projection effect.
@@ -284,11 +294,16 @@ pub async fn retire_resolved_journals(pool: &Pool, storage: &Storage, repo: Uuid
     Ok(())
 }
 pub async fn retire_if_resolved(pool: &Pool, storage: &Storage, op: &journal::Operation) -> Result<bool> {
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
     let row=client.query_opt("SELECT r.journal_digest,r.operation_digest,to_jsonb(o),resolution.volume_id FROM operation_resolutions r JOIN git_operations o ON o.id=r.operation_id JOIN recovery_resolutions resolution ON resolution.id=r.resolution_id WHERE r.operation_id=$1 AND r.repository_id=$2",&[&op.id,&op.repository_id]).await?;
     let Some(row) = row else {
         return Ok(false);
     };
+    // Retiring a journal entry is a write: hold the shared journal lock and re-check the
+    // freeze guard inside the transaction so retirement cannot race an exclusive freeze.
+    let tx = client.transaction().await?;
+    tx.query_one("SELECT pg_advisory_xact_lock_shared($1)", &[&PAIRED_FREEZE_JOURNAL_LOCK_KEY]).await?;
+    enforce_maintenance_pg_write_guard(&*tx, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     ensure!(row.get::<_, Uuid>(3) == storage.volume_id, "resolution belongs to another storage volume");
     let expected: Option<String> = row.get(0);
     ensure!(
@@ -298,5 +313,6 @@ pub async fn retire_if_resolved(pool: &Pool, storage: &Storage, op: &journal::Op
     let operation: Value = row.get(2);
     ensure!(digest(&operation)? == row.get::<_, String>(1), "resolved operation history changed");
     journal::retire(op)?;
+    tx.commit().await?;
     Ok(true)
 }

@@ -1,0 +1,480 @@
+//! Remote-Blob-only LFS Batch and final-locator-verified streaming transfer (`Refs #145`).
+
+use std::collections::BTreeMap;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant as StdInstant};
+
+use sha2::{Digest, Sha256};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::time::Instant as TokioInstant;
+use uuid::Uuid;
+
+use crate::blob_store::{
+    BlobReceipt,
+    protected::{ProtectedUploadError, ProtectedUploader, UploadSource},
+};
+use crate::lfs::models::{
+    BatchActionLink, BatchActions, BatchObjectError, BatchObjectResult, BatchRequest, BatchResponse, LFS_HASH_ALGO,
+    LFS_MEDIA_TYPE, MAX_BATCH_OBJECTS, valid_lfs_oid,
+};
+
+use super::authz::{AuthorizedRepoAccess, LfsBlobRuntimeGate, operation_token_to_uuid};
+pub(crate) use super::hydration_view::{EphemeralScratchGuard, open_verified_remote_download_file};
+pub use super::hydration_view::{
+    ComputeViewHydrationReport, MAX_CONCURRENT_S4_TRANSFERS, acquire_transfer_permit, delete_or_retire_lfs_object,
+    download_lfs_object_from_remote, hydrate_clean_compute_view, resolve_and_verify_remote_blob,
+    verify_committed_locator_bytes,
+};
+use super::pg_store::{LfsRepoRealm, PgLfsBlobStore, UploadOpSpec};
+use super::prod_auth_tx::ProdCommitAuthCheck;
+use super::types::{CommittedLfsBlobRecord, LfsBlobError, LfsProofRejectCode, StoredBlobLocatorRef};
+
+#[derive(Clone, Copy)]
+pub struct LfsTransferContext<'a> {
+    pub gate: &'a LfsBlobRuntimeGate,
+    pub pg: &'a PgLfsBlobStore,
+    pub realm: &'a LfsRepoRealm,
+    pub access: &'a AuthorizedRepoAccess,
+    pub scratch_dir: &'a Path,
+    pub timeout: Duration,
+}
+
+pub struct PreStreamedScratch {
+    pub path: PathBuf,
+    pub size_bytes: i64,
+    pub sha256_hex: String,
+    pub pre_attempt_id: Option<Uuid>,
+}
+
+pub async fn process_batch_request(
+    ctx: &LfsTransferContext<'_>,
+    base_url: &str,
+    action_headers: &BTreeMap<String, String>,
+    req: &BatchRequest,
+) -> Result<BatchResponse, LfsBlobError> {
+    process_batch_request_with_auth(ctx, None, base_url, action_headers, req).await
+}
+
+pub async fn process_batch_request_with_auth(
+    ctx: &LfsTransferContext<'_>,
+    commit_auth: Option<&ProdCommitAuthCheck>,
+    base_url: &str,
+    action_headers: &BTreeMap<String, String>,
+    req: &BatchRequest,
+) -> Result<BatchResponse, LfsBlobError> {
+    let store = ctx.gate.require_store()?;
+    if req.objects.is_empty() || req.objects.len() > MAX_BATCH_OBJECTS {
+        return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid batch object count"));
+    }
+    if !req.transfers.is_empty() && !req.transfers.iter().any(|t| t == "basic") {
+        return Err(LfsBlobError::new(LfsProofRejectCode::MalformedLfsPointer, "only basic transfer is supported"));
+    }
+    if let Some(algo) = req.hash_algo.as_deref()
+        && algo != LFS_HASH_ALGO
+    {
+        return Err(LfsBlobError::new(LfsProofRejectCode::MalformedLfsPointer, "unsupported LFS hash_algo"));
+    }
+    let is_upload = match req.operation.as_str() {
+        "upload" => {
+            if !ctx.access.role.allows_write() {
+                return Err(LfsBlobError::new(
+                    LfsProofRejectCode::UnauthorizedCollaborator,
+                    "write permission required for LFS batch upload",
+                ));
+            }
+            true
+        }
+        "download" => false,
+        _ => return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "unsupported LFS batch operation")),
+    };
+    let prefix = format!(
+        "{}/git/{}/{}.git",
+        base_url.trim_end_matches('/'),
+        ctx.realm.owner_username,
+        ctx.realm.repo_name
+    );
+    let mut upload_hdr = action_headers.clone();
+    upload_hdr.insert("Content-Type".to_owned(), "application/octet-stream".to_owned());
+    let mut verify_hdr = action_headers.clone();
+    verify_hdr.insert("Content-Type".to_owned(), LFS_MEDIA_TYPE.to_owned());
+    let mut results = Vec::with_capacity(req.objects.len());
+    for spec in &req.objects {
+        if !valid_lfs_oid(&spec.oid) || spec.size < 0 {
+            results.push(BatchObjectResult {
+                oid: spec.oid.clone(),
+                size: spec.size,
+                authenticated: Some(true),
+                actions: None,
+                error: Some(BatchObjectError { code: 422, message: "invalid LFS oid or size".into() }),
+            });
+            continue;
+        }
+        let dl = StdInstant::now() + ctx.timeout;
+        if is_upload {
+            let mut stale_missing = false;
+            match ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, &spec.oid).await? {
+                Some(existing) if !existing.retired => {
+                    if existing.size_bytes != spec.size {
+                        results.push(BatchObjectResult {
+                            oid: spec.oid.clone(),
+                            size: spec.size,
+                            authenticated: Some(true),
+                            actions: None,
+                            error: Some(BatchObjectError {
+                                code: 422,
+                                message: "size mismatch against committed remote blob".into(),
+                            }),
+                        });
+                        continue;
+                    }
+                    match verify_committed_locator_bytes(
+                        store,
+                        ctx.scratch_dir,
+                        &existing,
+                        &spec.oid,
+                        spec.size,
+                        dl,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            results.push(BatchObjectResult {
+                                oid: spec.oid.clone(),
+                                size: spec.size,
+                                authenticated: Some(true),
+                                actions: None,
+                                error: None,
+                            });
+                            continue;
+                        }
+                        Err(e) if e.code == LfsProofRejectCode::MissingRemoteBlob => stale_missing = true,
+                        Err(other) => return Err(other),
+                    }
+                }
+                Some(_) => stale_missing = true,
+                None => {}
+            }
+            let op_spec = UploadOpSpec {
+                repository_id: ctx.realm.repository_id,
+                tenant_id: ctx.realm.owner_tenant_id,
+                actor_id: ctx.access.actor_id,
+                oid_sha256: &spec.oid,
+                size_bytes: spec.size,
+            };
+            let op_id = if let Some(tok) =
+                action_headers.get("X-Rootyard-Operation-Id").or_else(|| action_headers.get("Idempotency-Key"))
+            {
+                let id = operation_token_to_uuid(tok)?;
+                let _ = ctx.pg.begin_or_load_upload_operation_with_auth(id, op_spec, commit_auth).await?;
+                id
+            } else {
+                ctx.pg.ensure_default_upload_operation_with_auth(op_spec, stale_missing, commit_auth).await?
+            };
+            let mut obj_upload_hdr = upload_hdr.clone();
+            obj_upload_hdr.insert("X-Rootyard-Operation-Id".to_owned(), op_id.to_string());
+            let mut obj_verify_hdr = verify_hdr.clone();
+            obj_verify_hdr.insert("X-Rootyard-Operation-Id".to_owned(), op_id.to_string());
+            results.push(BatchObjectResult {
+                oid: spec.oid.clone(),
+                size: spec.size,
+                authenticated: Some(true),
+                actions: Some(BatchActions {
+                    upload: Some(BatchActionLink {
+                        href: format!("{prefix}/info/lfs/objects/{}/{}", spec.oid, spec.size),
+                        header: obj_upload_hdr,
+                        expires_in: Some(3600),
+                    }),
+                    download: None,
+                    verify: Some(BatchActionLink {
+                        href: format!("{prefix}/info/lfs/verify"),
+                        header: obj_verify_hdr,
+                        expires_in: Some(3600),
+                    }),
+                }),
+                error: None,
+            });
+        } else {
+            match resolve_and_verify_remote_blob(ctx, &spec.oid, spec.size, dl).await {
+                Ok(_) => results.push(BatchObjectResult {
+                    oid: spec.oid.clone(),
+                    size: spec.size,
+                    authenticated: Some(true),
+                    actions: Some(BatchActions {
+                        upload: None,
+                        download: Some(BatchActionLink {
+                            href: format!("{prefix}/info/lfs/objects/{}/{}", spec.oid, spec.size),
+                            header: action_headers.clone(),
+                            expires_in: Some(3600),
+                        }),
+                        verify: None,
+                    }),
+                    error: None,
+                }),
+                Err(e) if e.code == LfsProofRejectCode::RemoteBlobUnreachable => return Err(e),
+                Err(e) => results.push(BatchObjectResult {
+                    oid: spec.oid.clone(),
+                    size: spec.size,
+                    authenticated: Some(true),
+                    actions: None,
+                    error: Some(BatchObjectError { code: e.code.http_status().as_u16(), message: e.message }),
+                }),
+            }
+        }
+    }
+    Ok(BatchResponse { transfer: "basic", objects: results, hash_algo: LFS_HASH_ALGO })
+}
+/// Publishes a pre-streamed `0600` scratch file via `ProtectedUploader`, commits/repairs
+/// `lfs_blob_objects`, and verifies the **final persisted `committed.locator`** before ACK.
+pub async fn upload_streamed_lfs_object_to_remote(
+    ctx: &LfsTransferContext<'_>,
+    operation_id: Option<Uuid>,
+    oid_sha256: &str,
+    expected_size: i64,
+    streamed: &PreStreamedScratch,
+) -> Result<CommittedLfsBlobRecord, LfsBlobError> {
+    upload_streamed_lfs_object_to_remote_with_auth(ctx, None, operation_id, oid_sha256, expected_size, streamed).await
+}
+pub async fn upload_streamed_lfs_object_to_remote_with_auth(
+    ctx: &LfsTransferContext<'_>,
+    commit_auth: Option<&ProdCommitAuthCheck>,
+    operation_id: Option<Uuid>,
+    oid_sha256: &str,
+    expected_size: i64,
+    streamed: &PreStreamedScratch,
+) -> Result<CommittedLfsBlobRecord, LfsBlobError> {
+    let store = ctx.gate.require_store()?;
+    if !ctx.access.role.allows_write() {
+        return Err(LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "write role required"));
+    }
+    if !valid_lfs_oid(oid_sha256) || expected_size < 0 {
+        return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid LFS oid or negative size"));
+    }
+    let attempt_id = match streamed.pre_attempt_id {
+        Some(id) => id,
+        None => {
+            let id = Uuid::new_v4();
+            ctx.pg
+                .record_upload_attempt_start(
+                    id,
+                    ctx.realm.owner_tenant_id,
+                    ctx.realm.repository_id,
+                    ctx.access.actor_id,
+                    oid_sha256,
+                    expected_size,
+                )
+                .await?;
+            id
+        }
+    };
+    if streamed.size_bytes != expected_size {
+        let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "upload byte length mismatch").await;
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::SizeOrDigestMismatch,
+            format!("upload size mismatch: expected {expected_size}, got {}", streamed.size_bytes),
+        ));
+    }
+    if streamed.sha256_hex != oid_sha256 {
+        let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "upload SHA-256 mismatch").await;
+        return Err(LfsBlobError::new(LfsProofRejectCode::SizeOrDigestMismatch, "upload SHA-256 digest mismatch"));
+    }
+    if streamed.pre_attempt_id.is_some()
+        && let Err(e) = super::prod_auth_tx::verify_staged_attempt_lease(ctx.pg, attempt_id, expected_size, false).await
+    {
+        let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
+        return Err(e);
+    }
+    let mut stale_missing_locator: Option<StoredBlobLocatorRef> = None;
+    let std_dl = StdInstant::now() + ctx.timeout;
+    let mut verified_fast_existing: Option<CommittedLfsBlobRecord> = None;
+    if let Some(existing) =
+        ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?
+    {
+        if existing.size_bytes != expected_size {
+            let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "conflicting committed size").await;
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::SizeOrDigestMismatch,
+                "upload size conflicts with existing committed LFS object",
+            ));
+        }
+        if existing.retired {
+            stale_missing_locator = Some(existing.locator.clone());
+        } else {
+            match verify_committed_locator_bytes(store, ctx.scratch_dir, &existing, oid_sha256, expected_size, std_dl)
+                .await
+            {
+                Ok(_) => verified_fast_existing = Some(existing),
+                Err(e) if e.code == LfsProofRejectCode::MissingRemoteBlob => {
+                    stale_missing_locator = Some(existing.locator.clone());
+                }
+                Err(other) => {
+                    let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &other.message).await;
+                    return Err(other);
+                }
+            }
+        }
+    }
+    let op_spec = UploadOpSpec {
+        repository_id: ctx.realm.repository_id,
+        tenant_id: ctx.realm.owner_tenant_id,
+        actor_id: ctx.access.actor_id,
+        oid_sha256,
+        size_bytes: expected_size,
+    };
+    let resolved_op_id = match operation_id {
+        Some(op_id) => {
+            if let Err(e) = ctx.pg.begin_or_load_upload_operation_with_auth(op_id, op_spec, commit_auth).await {
+                return Err(orphan_fail(ctx, attempt_id, op_id, e).await);
+            }
+            op_id
+        }
+        None => match ctx
+            .pg
+            .ensure_default_upload_operation_with_auth(op_spec, stale_missing_locator.is_some(), commit_auth)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
+                return Err(e);
+            }
+        },
+    };
+    if let Some(existing) = verified_fast_existing {
+        let committed = match ctx
+            .pg
+            .record_committed_blob_with_auth(attempt_id, Some(resolved_op_id), &existing, None, commit_auth)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await),
+        };
+        verify_record_locator(ctx, &committed, oid_sha256, expected_size).await?;
+        return Ok(committed);
+    }
+    let pg_dl = TokioInstant::now() + ctx.timeout;
+    let grant = match ctx.pg.acquire_lfs_upload_hold(store, ctx.realm, oid_sha256, expected_size as u64, pg_dl).await {
+        Ok(g) => g,
+        Err(e) => return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await),
+    };
+    let uploader = ProtectedUploader::new(store.clone());
+    let pub_res = uploader
+        .consume_and_upload(ctx.pg.pool(), grant, &[UploadSource::new(&streamed.path)], std_dl)
+        .await
+        .map_err(|err| match err {
+            ProtectedUploadError::ForeignBackend => {
+                LfsBlobError::new(LfsProofRejectCode::ForeignBackendMismatch, err.to_string())
+            }
+            ProtectedUploadError::Blob { error, .. } => LfsBlobError::from_blob_error(error),
+            other => LfsBlobError::new(LfsProofRejectCode::RemoteBlobUnreachable, other.to_string()),
+        });
+    let publication = match pub_res {
+        Ok(p) => p,
+        Err(e) => return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await),
+    };
+    let pr = publication
+        .receipts()
+        .first()
+        .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::RemoteBlobUnreachable, "missing ProtectedReceipt"))?;
+    let candidate = CommittedLfsBlobRecord {
+        tenant_id: ctx.realm.owner_tenant_id,
+        repository_id: ctx.realm.repository_id,
+        oid_sha256: oid_sha256.to_owned(),
+        size_bytes: expected_size,
+        locator: StoredBlobLocatorRef::from_locator(pr.receipt().locator()),
+        hold_id: pr.hold_id(),
+        acquire_request_id: publication.acquire_request_id(),
+        consume_request_id: publication.consume_request_id(),
+        backend_identity_hex: pr.receipt().backend_identity().as_hex().to_owned(),
+        uploader_actor_id: ctx.access.actor_id,
+        retired: false,
+    };
+    if let Err(e) = verify_record_locator(ctx, &candidate, oid_sha256, expected_size).await {
+        return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await);
+    }
+    let committed = match ctx
+        .pg
+        .record_committed_blob_with_auth(
+            attempt_id,
+            Some(resolved_op_id),
+            &candidate,
+            stale_missing_locator.as_ref(),
+            commit_auth,
+        )
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await),
+    };
+    verify_record_locator(ctx, &committed, oid_sha256, expected_size).await?;
+    Ok(committed)
+}
+
+async fn orphan_fail(ctx: &LfsTransferContext<'_>, attempt_id: Uuid, op_id: Uuid, e: LfsBlobError) -> LfsBlobError {
+    super::prod_auth_tx::abort_attempt_and_orphan_op(ctx.pg, ctx.realm.repository_id, attempt_id, op_id, &e.message)
+        .await;
+    e
+}
+
+async fn verify_record_locator(
+    ctx: &LfsTransferContext<'_>,
+    rec: &CommittedLfsBlobRecord,
+    oid_sha256: &str,
+    expected_size: i64,
+) -> Result<(), LfsBlobError> {
+    let store = ctx.gate.require_store()?;
+    verify_committed_locator_bytes(
+        store,
+        ctx.scratch_dir,
+        rec,
+        oid_sha256,
+        expected_size,
+        StdInstant::now() + ctx.timeout,
+    )
+    .await
+    .map(|_| ())
+}
+pub async fn upload_lfs_object_to_remote(
+    ctx: &LfsTransferContext<'_>,
+    operation_id: Option<Uuid>,
+    oid_sha256: &str,
+    expected_size: i64,
+    payload: &[u8],
+) -> Result<CommittedLfsBlobRecord, LfsBlobError> {
+    let _permit = acquire_transfer_permit(ctx.timeout).await?;
+    fs::create_dir_all(ctx.scratch_dir)
+        .await
+        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let scratch_path = ctx.scratch_dir.join(format!(".lfs-mem-upload-{}.tmp", Uuid::new_v4()));
+    let _guard = EphemeralScratchGuard(scratch_path.clone());
+    let std_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&scratch_path)
+        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let mut f = fs::File::from_std(std_file);
+    f.write_all(payload).await.map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    f.sync_all().await.map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let streamed = PreStreamedScratch {
+        path: scratch_path,
+        size_bytes: payload.len() as i64,
+        sha256_hex: hex::encode(Sha256::digest(payload)),
+        pre_attempt_id: None,
+    };
+    upload_streamed_lfs_object_to_remote(ctx, operation_id, oid_sha256, expected_size, &streamed).await
+}
+pub async fn verify_lfs_object_remote(
+    ctx: &LfsTransferContext<'_>,
+    oid_sha256: &str,
+    expected_size: i64,
+) -> Result<BlobReceipt, LfsBlobError> {
+    let _ = ctx.gate.require_store()?;
+    if !ctx.access.role.allows_write() {
+        return Err(LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "write role required"));
+    }
+    let dl = StdInstant::now() + ctx.timeout;
+    let (_, _, rcpt) = resolve_and_verify_remote_blob(ctx, oid_sha256, expected_size, dl).await?;
+    Ok(rcpt)
+}

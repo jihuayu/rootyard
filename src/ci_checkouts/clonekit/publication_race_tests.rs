@@ -11,6 +11,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::publication_child_fixture::OwnedChild;
 use super::{
     CP_AFTER_INSTALL, CP_AFTER_POINTER, CP_BEFORE_INSTALL, CP_BEFORE_LOCK, CP_BEFORE_POINTER, CloneKitPublicationStore,
     publish_clonekit_versioned, test_seam,
@@ -22,6 +23,13 @@ use crate::ci_checkouts::clonekit::{
         CloneKitStatus,
     },
 };
+
+// Libtest names are crate-relative; `module_path!()` includes the crate name.
+fn child_test_name(helper: &str) -> String {
+    let module = module_path!();
+    let module = module.split_once("::").map_or(module, |(_, relative)| relative);
+    format!("{module}::{helper}")
+}
 
 fn git() -> &'static Path {
     Path::new("/usr/bin/git")
@@ -173,16 +181,19 @@ fn cross_process_lock_excludes_and_releases_on_child_termination() {
     let root = td.path().join("catalog");
     let repository_id = Uuid::new_v4();
     let ready = td.path().join("child-ready");
-    let mut child = Command::new(std::env::current_exe().expect("current exe"))
-        .arg("--nocapture")
-        .arg("publication_lock_child_helper")
-        .env("ROOTYARD_CK_LOCK_ROOT", &root)
-        .env("ROOTYARD_CK_LOCK_REPO", repository_id.to_string())
-        .env("ROOTYARD_CK_LOCK_READY", &ready)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("child");
+    let mut child = OwnedChild::new(
+        Command::new(std::env::current_exe().expect("current exe"))
+            .arg("--nocapture")
+            .arg("--exact")
+            .arg(child_test_name("publication_lock_child_helper"))
+            .env("ROOTYARD_CK_LOCK_ROOT", &root)
+            .env("ROOTYARD_CK_LOCK_REPO", repository_id.to_string())
+            .env("ROOTYARD_CK_LOCK_READY", &ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("child"),
+    );
     let mut ready_seen = false;
     for _ in 0..1000 {
         if ready.exists() {
@@ -192,15 +203,12 @@ fn cross_process_lock_excludes_and_releases_on_child_termination() {
         std::thread::sleep(Duration::from_millis(10));
     }
     if !ready_seen {
-        let _ = child.kill();
-        let _ = child.wait();
         panic!("child publisher did not acquire the lock");
     }
     let store = CloneKitPublicationStore::open(&root).expect("store");
     let error = store.acquire_publication_lock(repository_id).unwrap_err();
     assert!(matches!(error, CloneKitError::GitFailed(ref message) if message.contains("busy")));
-    child.kill().expect("kill child");
-    child.wait().expect("reap child");
+    assert!(child.kill_and_reap().is_some(), "child did not exit after kill");
     let _guard = store.acquire_publication_lock(repository_id).expect("lock released on child death");
 }
 
