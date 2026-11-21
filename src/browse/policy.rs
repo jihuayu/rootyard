@@ -77,9 +77,9 @@ pub fn validate_hook(op: &crate::journal::Operation, changes: &[RefChange]) -> a
             .await.map_err(|e| anyhow::anyhow!(e.1))?;
         validate(&client, op.repository_id, changes, Path::new(&git_bin), Path::new(&git_dir), Duration::from_secs(timeout)).await
             .map_err(|e| anyhow::anyhow!(e.1))?;
-        Box::pin(crate::lfs::publication::validate_new_refs_with_client(
-            &client, Path::new(&git_dir), Path::new(&data_root), Path::new(&git_bin),
-            Duration::from_secs(timeout), op.repository_id, tenant_id, changes,
+        Box::pin(crate::lfs::publication::validate_new_refs_for_hook(
+            &client, &url, Path::new(&git_dir), Path::new(&data_root), Path::new(&git_bin),
+            Duration::from_secs(timeout), tenant_id, op, changes,
         )).await.map_err(|e| anyhow::anyhow!(e.1))?;
         Box::pin(crate::lfs::locks::validate_new_refs_with_client(
             &client, Path::new(&git_dir), Path::new(&git_bin),
