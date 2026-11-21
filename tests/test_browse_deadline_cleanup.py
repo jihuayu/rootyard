@@ -6,6 +6,8 @@ drive the same parser and `/proc` scan that `tests/browse.py` uses to prove a
 delayed Git process group is quiescent, matching the service's rule that a
 group is quiescent only when no member is in a state other than Z/X.
 """
+from concurrent.futures import Future
+import json
 import os
 from pathlib import Path
 import sys
@@ -95,6 +97,53 @@ class LiveGroupMembersTest(unittest.TestCase):
                 self.members(40)
         finally:
             (self.proc / "40" / "stat").chmod(0o600)
+
+
+class DeadlineStartWaitTest(unittest.TestCase):
+    """The first-start wait prefers a captured event over request completion."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.log = Path(self.temp.name) / "browse-deadline-git.jsonl"
+        self.event = {
+            "cmd": "rev-parse",
+            "pid": 4242,
+            "pgid": 4242,
+            "timestamp": 1,
+        }
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_captured_start_wins_over_completed_request(self):
+        self.log.write_text(json.dumps(self.event) + "\n")
+        request = Future()
+        request.set_exception(AssertionError("request failed"))
+        self.assertEqual(
+            HARNESS._wait_deadline_git_start(self.log, timeout=0.01, request=request),
+            [self.event],
+        )
+
+    def test_completed_request_failure_is_surfaced_without_an_event(self):
+        request = Future()
+        request.set_exception(AssertionError("expected 504, got 503"))
+        with self.assertRaisesRegex(AssertionError, "expected 504, got 503"):
+            HARNESS._wait_deadline_git_start(self.log, timeout=1, request=request)
+
+    def test_expected_completion_without_an_event_has_its_own_assertion(self):
+        request = Future()
+        request.set_result((504, b"", {}))
+        with self.assertRaisesRegex(
+            AssertionError, "completed before any armed Git start was recorded"
+        ):
+            HARNESS._wait_deadline_git_start(self.log, timeout=1, request=request)
+
+    def test_pending_request_keeps_the_existing_timeout_assertion(self):
+        request = Future()
+        with self.assertRaisesRegex(
+            AssertionError, "armed Git wrapper never recorded a delayed start"
+        ):
+            HARNESS._wait_deadline_git_start(self.log, timeout=0.03, request=request)
 
 
 if __name__ == "__main__":

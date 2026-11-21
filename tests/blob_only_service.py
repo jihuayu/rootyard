@@ -44,6 +44,14 @@ LIMITATIONS = ["serve-blob is an increment, not the default server; full equival
 class ProfileError(RuntimeError): pass
 
 
+def _repo_create_status_code(prefix, code):
+    if 400 <= code < 500:
+        return prefix + "_status_4xx"
+    if 500 <= code < 600:
+        return prefix + "_status_5xx"
+    return prefix + "_status_other"
+
+
 def http_input_hashes():
     try:
         return _http_contract.hash_inputs(Path(__file__).resolve().parents[1])
@@ -272,19 +280,29 @@ esac
 
     def prepare(self):
         if not self.schema_created: self.setup()
-    def start(self, overrides=None, label="server", startup_projection=None):
+    def start(self, overrides=None, label="server", startup_projection=None,
+              command=("serve-blob",), unset=()):
         if self.proc is not None:
             raise AssertionError("serve-blob is already running")
+        if not isinstance(command, tuple) or not command or not all(
+                type(part) is str and part for part in command):
+            raise TypeError("command must be a non-empty tuple of fixed argv tokens")
+        if not isinstance(unset, tuple) or not all(type(key) is str and key for key in unset):
+            raise TypeError("unset must be a tuple of fixed environment names")
+        command_line = " ".join(command)
         observation = startup_projection if type(startup_projection) is StartupProjection else None
         if observation is not None:
             observation.enter("spawn")
         completed = False
         try:
             env = self.env.copy()
+            for key in unset:
+                env.pop(key, None)
             env.update(overrides or {})
             self.server_count += 1
-            self.log = open(self.root / (label + "-" + str(self.server_count) + ".log"), "ab")
-            self.proc = subprocess.Popen([str(self.profile.binary), "serve-blob"], env=env,
+            self.log_path = self.root / (label + "-" + str(self.server_count) + ".log")
+            self.log = open(self.log_path, "ab")
+            self.proc = subprocess.Popen([str(self.profile.binary), *command], env=env,
                                          stdout=self.log, stderr=self.log, start_new_session=True)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -298,7 +316,7 @@ esac
                     self.stop()
                     if observation is not None:
                         observation.leave_stop()
-                    raise RuntimeError("serve-blob exited during startup with status " + str(status))
+                    raise RuntimeError(command_line + " exited during startup with status " + str(status))
                 try:
                     if self.http("/health/ready")[0] == 200:
                         if observation is not None:
@@ -316,7 +334,7 @@ esac
             self.stop(hard=True)
             if observation is not None:
                 observation.leave_stop()
-            raise RuntimeError("serve-blob readiness timeout")
+            raise RuntimeError(command_line + " readiness timeout")
         finally:
             if observation is not None and not completed:
                 observation.failed = True
@@ -345,28 +363,84 @@ esac
                 oid, name = line.split("\t", 1)
                 refs[name] = oid
         return refs
-    def post_repo(self, name, token, object_format="sha1", expect=(201, 202), basic=False):
-        code, raw, _ = self.http("/api/repos", token=token, method="POST", basic=basic,
-                                 body={"name": name, "object_format": object_format})
-        assert code in expect, "POST /api/repos: " + str(code) + ": " + repr(raw[:200])
-        return code, json.loads(raw)
-    def await_ready(self, owner, name, token):
+    def post_repo(self, name, token, object_format="sha1", expect=(201, 202), basic=False, observer=None):
+        try:
+            code, raw, _ = self.http("/api/repos", token=token, method="POST", basic=basic,
+                                     body={"name": name, "object_format": object_format})
+        except (OSError, urllib.error.URLError):
+            if observer: observer("post_send")
+            raise
+        if code not in expect:
+            if observer: observer(_repo_create_status_code("post", code))
+            assert code in expect, "POST /api/repos: " + str(code) + ": " + repr(raw[:200])
+        try:
+            created = json.loads(raw)
+        except ValueError:
+            if observer: observer("post_shape")
+            raise
+        if observer and not (isinstance(created, dict) and all(
+                isinstance(created.get(field), str) and created.get(field) for field in ("id", "owner", "name"))):
+            observer("post_shape")
+        return code, created
+    def await_ready(self, owner, name, token, observer=None):
         path = "/api/repos/" + urllib.parse.quote(owner, safe="") + "/" + urllib.parse.quote(name, safe="")
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            code, raw, _ = self.http(path, token=token)
-            assert code == 200, "GET " + path + ": " + str(code)
-            data = json.loads(raw)
+            try:
+                code, raw, _ = self.http(path, token=token)
+            except (OSError, urllib.error.URLError):
+                if observer: observer("get_send")
+                raise
+            if code != 200:
+                if observer: observer(_repo_create_status_code("get", code))
+                assert code == 200, "GET " + path + ": " + str(code)
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                if observer: observer("get_shape")
+                raise
+            if observer and not (isinstance(data, dict) and isinstance(data.get("state"), str)):
+                observer("get_shape")
             if data.get("state") == "ready":
                 return data
-            assert data.get("state") == "provisioning", data.get("state")
+            if data.get("state") != "provisioning":
+                if observer: observer("get_terminal_state")
+                assert data.get("state") == "provisioning", data.get("state")
             time.sleep(0.1)
+        if observer: observer("get_timeout")
         raise AssertionError("repository did not become ready within 30s")
-    def create(self, name, token, object_format="sha1"):
-        code, created = self.post_repo(name, token, object_format)
-        repo = self.await_ready(created["owner"], created["name"], token)
+    def create(self, name, token, object_format="sha1", observer=None):
+        code, created = self.post_repo(name, token, object_format, observer=observer)
+        if observer and not (isinstance(created, dict) and all(
+                isinstance(created.get(field), str) and created.get(field) for field in ("id", "owner", "name"))):
+            observer("post_shape")
+        repo = self.await_ready(created["owner"], created["name"], token, observer=observer)
+        if observer and not (
+                isinstance(repo, dict)
+                and isinstance(repo.get("id"), str) and repo.get("id")
+                and isinstance(repo.get("owner"), str) and repo.get("owner")
+                and isinstance(repo.get("name"), str) and repo.get("name")
+                and isinstance(repo.get("storage_backend"), str) and repo.get("storage_backend")
+                and isinstance(repo.get("object_format"), str) and repo.get("object_format")
+                and isinstance(repo.get("clone_path"), str) and repo.get("clone_path")):
+            observer("get_shape")
+        if isinstance(repo, dict) and isinstance(created, dict):
+            if repo.get("id") != created.get("id"):
+                if observer: observer("identity_mismatch")
+            if repo.get("storage_backend") != "pg_refstore":
+                if observer: observer("backend_mismatch")
         assert repo["id"] == created["id"] and repo["storage_backend"] == "pg_refstore"
+        if isinstance(repo, dict) and repo.get("object_format") != object_format:
+            if observer: observer("object_format_mismatch")
         assert repo["object_format"] == object_format, repo.get("object_format")
+        if observer:
+            try:
+                expected_clone = "/git/" + repo["owner"] + "/" + repo["name"] + ".git"
+            except (KeyError, TypeError):
+                pass
+            else:
+                if repo.get("clone_path") != expected_clone:
+                    observer("clone_path_mismatch")
         assert repo["clone_path"] == "/git/" + repo["owner"] + "/" + repo["name"] + ".git"
         return repo, code
     def db_repo(self, repo_id):

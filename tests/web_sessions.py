@@ -76,6 +76,12 @@ class BrowserHarness(Harness):
     def cookie_header(cookies):
         return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
+    def session_token_id(self, session_cookie):
+        digest = hashlib.sha256(session_cookie.encode()).hexdigest()
+        return self.sql(
+            f"SELECT id FROM tokens WHERE digest=decode('{digest}','hex') AND kind='browser'"
+        )
+
     def run_flow(self):
         self.setup()
         self.api()
@@ -360,19 +366,183 @@ class BrowserHarness(Harness):
         self.sql(f"UPDATE tokens SET expires_at=NULL WHERE id='{self.alice['token_id']}'")
 
         # Cross-origin logout is rejected; same-origin logout revokes the old
-        # cookie so it cannot be replayed.
+        # cookie and both durable revocation flags in one transaction.
         cookies, _, _ = self.sign_in()
         headers = {"Cookie": self.cookie_header(cookies)}
+        session_id = self.session_token_id(cookies["rootyard_session"])
+        session_version = int(
+            self.sql(f"SELECT scope_version FROM tokens WHERE id='{session_id}'")
+        )
+        other_cookies, _, _ = self.sign_in()
+        other_id = self.session_token_id(other_cookies["rootyard_session"])
+        other_version = int(
+            self.sql(f"SELECT scope_version FROM tokens WHERE id='{other_id}'")
+        )
+        other_headers = {"Cookie": self.cookie_header(other_cookies)}
         assert self.request(
             "/web/logout",
             "POST",
             headers={**headers, "Origin": "https://evil.example"},
         )[0] == 403
         assert self.request("/web/repos", headers=headers)[0] == 200
-        assert self.request(
+        status, _, logout_headers = self.request(
             "/web/logout", "POST", headers={**headers, "Origin": self.base}
-        )[0] == 303
+        )
+        assert status == 303
+        assert self.response_header(logout_headers, "Location") == "/web/login"
+        assert self.response_header(logout_headers, "Cache-Control") == "no-store"
+        cleared, cleared_raw = self.split_cookies(logout_headers)
+        assert cleared["rootyard_session"] == ""
+        assert cleared["rootyard_csrf"] == ""
+        assert "Max-Age=0" in cleared_raw["rootyard_session"]
+        assert "Max-Age=0" in cleared_raw["rootyard_csrf"]
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{session_id}'") == "t"
+        assert self.sql(f"SELECT revoked FROM web_sessions WHERE token_id='{session_id}'") == "t"
+        assert int(self.sql(f"SELECT scope_version FROM tokens WHERE id='{session_id}'")) == session_version + 1
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{other_id}'") == "f"
+        assert self.sql(f"SELECT revoked FROM web_sessions WHERE token_id='{other_id}'") == "f"
+        assert int(self.sql(f"SELECT scope_version FROM tokens WHERE id='{other_id}'")) == other_version
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{self.alice['token_id']}'") == "f"
+        assert self.request("/web/repos", headers=other_headers)[0] == 200
         assert self.request("/web/repos", headers=headers)[0] == 401
+
+        # Replaying the old cookie is an idempotent no-op that still clears.
+        session_xmin = self.sql(f"SELECT xmin FROM web_sessions WHERE token_id='{session_id}'")
+        token_xmin = self.sql(f"SELECT xmin FROM tokens WHERE id='{session_id}'")
+        status, _, replay_headers = self.request(
+            "/web/logout", "POST", headers={**headers, "Origin": self.base}
+        )
+        assert status == 303
+        assert self.split_cookies(replay_headers)[0]["rootyard_session"] == ""
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{session_id}'") == "t"
+        assert self.sql(f"SELECT revoked FROM web_sessions WHERE token_id='{session_id}'") == "t"
+        assert int(self.sql(f"SELECT scope_version FROM tokens WHERE id='{session_id}'")) == session_version + 1
+        assert self.sql(f"SELECT xmin FROM tokens WHERE id='{session_id}'") == token_xmin
+        assert self.sql(f"SELECT xmin FROM web_sessions WHERE token_id='{session_id}'") == session_xmin
+
+        # Expired, missing and unknown browser credentials all keep the legacy
+        # 303 + cookie clearing without requiring a live authenticated write.
+        cookies, _, _ = self.sign_in()
+        headers = {"Cookie": self.cookie_header(cookies)}
+        expired_id = self.session_token_id(cookies["rootyard_session"])
+        self.sql(
+            f"UPDATE tokens SET expires_at=clock_timestamp()-interval '1 second' WHERE id='{expired_id}'"
+        )
+        status, _, expired_logout = self.request(
+            "/web/logout", "POST", headers={**headers, "Origin": self.base}
+        )
+        assert status == 303
+        assert self.split_cookies(expired_logout)[0]["rootyard_session"] == ""
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{expired_id}'") == "t"
+        assert self.sql(f"SELECT revoked FROM web_sessions WHERE token_id='{expired_id}'") == "t"
+
+        forged = "ryt_" + "cd" * 32
+        for logout_cookie in (None, "rootyard_session=" + forged):
+            unknown_headers = {"Origin": self.base}
+            if logout_cookie:
+                unknown_headers["Cookie"] = logout_cookie
+            status, _, missing_logout = self.request(
+                "/web/logout", "POST", headers=unknown_headers
+            )
+            assert status == 303
+            assert self.split_cookies(missing_logout)[0]["rootyard_session"] == ""
+
+        # A missing companion row is tolerated and still revokes the token.
+        cookies, _, _ = self.sign_in()
+        headers = {"Cookie": self.cookie_header(cookies)}
+        orphan_id = self.session_token_id(cookies["rootyard_session"])
+        self.sql(f"DELETE FROM web_sessions WHERE token_id='{orphan_id}'")
+        status, _, orphan_headers = self.request(
+            "/web/logout", "POST", headers={**headers, "Origin": self.base}
+        )
+        assert status == 303
+        assert self.split_cookies(orphan_headers)[0]["rootyard_session"] == ""
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{orphan_id}'") == "t"
+
+        # A prior half-revoked token is repaired without a second version bump.
+        cookies, _, _ = self.sign_in()
+        headers = {"Cookie": self.cookie_header(cookies)}
+        half_token_id = self.session_token_id(cookies["rootyard_session"])
+        half_token_version = int(
+            self.sql(f"SELECT scope_version FROM tokens WHERE id='{half_token_id}'")
+        )
+        self.sql(f"UPDATE tokens SET revoked=true WHERE id='{half_token_id}'")
+        status, _, half_token_headers = self.request(
+            "/web/logout", "POST", headers={**headers, "Origin": self.base}
+        )
+        assert status == 303
+        assert self.split_cookies(half_token_headers)[0]["rootyard_session"] == ""
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{half_token_id}'") == "t"
+        assert self.sql(f"SELECT revoked FROM web_sessions WHERE token_id='{half_token_id}'") == "t"
+        assert int(self.sql(f"SELECT scope_version FROM tokens WHERE id='{half_token_id}'")) == half_token_version
+
+        # The reverse half state is repaired with exactly one token transition.
+        cookies, _, _ = self.sign_in()
+        headers = {"Cookie": self.cookie_header(cookies)}
+        half_session_id = self.session_token_id(cookies["rootyard_session"])
+        half_session_version = int(
+            self.sql(f"SELECT scope_version FROM tokens WHERE id='{half_session_id}'")
+        )
+        self.sql(f"UPDATE web_sessions SET revoked=true WHERE token_id='{half_session_id}'")
+        half_session_xmin = self.sql(
+            f"SELECT xmin FROM web_sessions WHERE token_id='{half_session_id}'"
+        )
+        status, _, half_session_headers = self.request(
+            "/web/logout", "POST", headers={**headers, "Origin": self.base}
+        )
+        assert status == 303
+        assert self.split_cookies(half_session_headers)[0]["rootyard_session"] == ""
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{half_session_id}'") == "t"
+        assert self.sql(f"SELECT revoked FROM web_sessions WHERE token_id='{half_session_id}'") == "t"
+        assert int(self.sql(f"SELECT scope_version FROM tokens WHERE id='{half_session_id}'")) == half_session_version + 1
+        assert self.sql(
+            f"SELECT xmin FROM web_sessions WHERE token_id='{half_session_id}'"
+        ) == half_session_xmin
+
+        # A failure in the companion update rolls the token revocation back
+        # instead of leaving half of the logout durable.
+        cookies, _, _ = self.sign_in()
+        headers = {"Cookie": self.cookie_header(cookies)}
+        rollback_id = self.session_token_id(cookies["rootyard_session"])
+        rollback_version = int(
+            self.sql(f"SELECT scope_version FROM tokens WHERE id='{rollback_id}'")
+        )
+        self.sql(
+            "CREATE FUNCTION rootyard_logout_fault() RETURNS trigger LANGUAGE plpgsql "
+            "AS $$ BEGIN RAISE EXCEPTION 'logout fixture'; END $$"
+        )
+        self.sql(
+            "CREATE TRIGGER rootyard_logout_fault BEFORE UPDATE ON web_sessions "
+            "FOR EACH ROW EXECUTE FUNCTION rootyard_logout_fault()"
+        )
+        try:
+            status, _, failure_headers = self.request(
+                "/web/logout", "POST", headers={**headers, "Origin": self.base}
+            )
+            assert status == 503, status
+            assert self.response_header(failure_headers, "Set-Cookie") is None
+            assert self.sql(f"SELECT revoked FROM tokens WHERE id='{rollback_id}'") == "f"
+            assert self.sql(
+                f"SELECT revoked FROM web_sessions WHERE token_id='{rollback_id}'"
+            ) == "f"
+            assert int(
+                self.sql(f"SELECT scope_version FROM tokens WHERE id='{rollback_id}'")
+            ) == rollback_version
+        finally:
+            self.sql("DROP TRIGGER IF EXISTS rootyard_logout_fault ON web_sessions")
+            self.sql("DROP FUNCTION IF EXISTS rootyard_logout_fault()")
+        status, _, rollback_headers = self.request(
+            "/web/logout", "POST", headers={**headers, "Origin": self.base}
+        )
+        assert status == 303
+        assert self.split_cookies(rollback_headers)[0]["rootyard_session"] == ""
+        assert self.sql(f"SELECT revoked FROM tokens WHERE id='{rollback_id}'") == "t"
+        assert self.sql(
+            f"SELECT revoked FROM web_sessions WHERE token_id='{rollback_id}'"
+        ) == "t"
+        assert int(
+            self.sql(f"SELECT scope_version FROM tokens WHERE id='{rollback_id}'")
+        ) == rollback_version + 1
 
         # Parent API token revocation terminates the derived browser session.
         cookies, _, _ = self.sign_in()

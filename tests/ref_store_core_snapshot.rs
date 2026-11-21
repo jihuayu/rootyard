@@ -14,11 +14,11 @@ use deadpool_postgres::{Manager, Pool};
 use rootyard::db;
 use rootyard::ref_store::{
     CommitMode, CommitRefsRequest, CoreGate, CoreGateInit, CoreGateVersion, CreateMetadataSnapshotOutcome,
-    CreateMetadataSnapshotRequest, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataMutationAction,
-    MetadataPinOutcome, MetadataPinPurpose, MetadataReceipt, MetadataReceiptLookup, MetadataSnapshotPage,
-    MetadataSnapshotScope, PgRefStoreCore, PinReleaseReason, REPO_MAX_SNAPSHOTS, ReadMetadataSnapshotPageRequest,
-    RefName, RefPrecondition, RefPrefix, RefStoreError, RefTarget, RefUpdate, ReleaseMetadataPinRequest,
-    RenewMetadataPinRequest, RequestDigest, VersionCheck,
+    CreateMetadataSnapshotRequest, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MAX_PIN_LEASE_SECONDS,
+    MetadataMutationAction, MetadataPinOutcome, MetadataPinPurpose, MetadataReceipt, MetadataReceiptLookup,
+    MetadataSnapshotPage, MetadataSnapshotScope, PgRefStoreCore, PinReleaseReason, REPO_MAX_SNAPSHOTS,
+    ReadMetadataSnapshotPageRequest, RefName, RefPrecondition, RefPrefix, RefStoreError, RefTarget, RefUpdate,
+    ReleaseMetadataPinRequest, RenewMetadataPinRequest, RequestDigest, VersionCheck,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -1295,39 +1295,18 @@ async fn retained_quota_is_exact_without_refund_and_racing_creates() -> Result<(
         let history = Uuid::new_v4();
         initialize_and_seed(&pool, repo, tenant, history).await?;
         let version = gate_version(&pool, repo, tenant).await?;
-        // Fixture seeding of retained history: REPO_MAX_SNAPSHOTS - 1 snapshots
-        // with matching usage counters. This does not imitate a capture path.
-        let seeded = REPO_MAX_SNAPSHOTS - 1;
-        let ids = (0..seeded).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
-        let client = pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO ref_store_core_snapshots(
-                     snapshot_id,repository_id,tenant_id,owner_id,purpose,object_format,history_incarnation,
-                     authority_epoch,group_epoch,gate_revision,gate_digest,head_ref,head_oid,ref_count,
-                     refs_digest,logical_bytes)
-                 SELECT id,$1,$2,$2,'verification','sha1',$3,1,1,$4,$5,'refs/heads/main',NULL,0,$5,1
-                 FROM unnest($6::uuid[]) AS id",
-                &[&repo, &tenant, &history, &2_i64, &"a".repeat(64), &ids],
-            )
-            .await?;
-        client
-            .execute(
-                "INSERT INTO ref_store_core_repo_usage(repository_id,tenant_id,snapshot_count,logical_bytes)
-                 VALUES($1,$2,$3,$3) ON CONFLICT(repository_id) DO UPDATE
-                 SET snapshot_count=$3,logical_bytes=$3",
-                &[&repo, &tenant, &seeded],
-            )
-            .await?;
-        client
-            .execute(
-                "INSERT INTO ref_store_core_tenant_usage(tenant_id,snapshot_count,logical_bytes)
-                 VALUES($1,$2,$2) ON CONFLICT(tenant_id) DO UPDATE
-                 SET snapshot_count=$2,logical_bytes=$2",
-                &[&tenant, &seeded],
-            )
-            .await?;
-        drop(client);
+        // Fill retained history through the ordinary typed capture path so the
+        // quota accounting is the same one production uses. Keep the first
+        // request/receipt for a page and replay check after the quota refusal.
+        let (_, first_request) = create_request(scope(repo, tenant, history), version.digest(), MAX_PIN_LEASE_SECONDS);
+        let first = create(&pool, &first_request).await?;
+        assert!(!first.replayed);
+        let first_receipt = first.receipt;
+        for index in 2..REPO_MAX_SNAPSHOTS {
+            let (_, request) = create_request(scope(repo, tenant, history), version.digest(), LEASE);
+            let created = create(&pool, &request).await?;
+            assert!(!created.replayed, "fixture capture {index} must be fresh, not a replay");
+        }
 
         // Four concurrent creators race for the single remaining slot.
         let mut tasks = Vec::new();
@@ -1366,6 +1345,9 @@ async fn retained_quota_is_exact_without_refund_and_racing_creates() -> Result<(
             )?,
         )
         .await?;
+        let after_release_counts = counts(&pool, repo).await?;
+        let after_release_usage = usage(&pool, repo, tenant).await?;
+        assert_eq!(after_release_usage.0, REPO_MAX_SNAPSHOTS, "release must not refund retained quota");
         let (_, after) = create_request(scope(repo, tenant, history), version.digest(), LEASE);
         match create(&pool, &after).await {
             Err(RefStoreError::MetadataQuotaExceeded { scope, resource }) => {
@@ -1374,7 +1356,43 @@ async fn retained_quota_is_exact_without_refund_and_racing_creates() -> Result<(
             }
             other => panic!("release must not refund retained quota: {other:?}"),
         }
-        assert_eq!(usage(&pool, repo, tenant).await?.0, REPO_MAX_SNAPSHOTS);
+        assert_eq!(counts(&pool, repo).await?, after_release_counts, "refused create mutated retained rows");
+        assert_eq!(usage(&pool, repo, tenant).await?, after_release_usage, "refused create charged usage");
+
+        // The retained first snapshot still owns valid metadata and its exact
+        // create replay still returns the original receipt without mutations.
+        let first_page = page(
+            &pool,
+            &ReadMetadataSnapshotPageRequest::new(
+                scope(repo, tenant, history),
+                first_receipt.snapshot_id(),
+                first_receipt.pin_id(),
+                first_receipt.pin_generation(),
+                None,
+                None,
+                8,
+            )?,
+        )
+        .await?;
+        assert_eq!(first_page.snapshot_id(), first_receipt.snapshot_id());
+        assert_eq!(first_page.pin_id(), first_receipt.pin_id());
+        assert_eq!(first_page.pin_generation(), first_receipt.pin_generation());
+        assert_eq!(first_page.gate_revision(), first_receipt.gate_revision());
+        assert_eq!(first_page.ref_count(), 3);
+        assert!(first_page.complete());
+        assert_eq!(
+            first_page.refs().iter().map(|entry| (entry.name().as_str(), entry.oid())).collect::<Vec<_>>(),
+            vec![("refs/heads/feature/x", oid(2)), ("refs/heads/main", oid(1)), ("refs/tags/v1", oid(3))]
+        );
+        match lookup(&pool, &scope(repo, tenant, history), first_request.request_id()).await? {
+            MetadataReceiptLookup::Found(MetadataReceipt::Snapshot(found)) => assert_eq!(found, first_receipt),
+            other => panic!("retained create receipt must still resolve: {other:?}"),
+        }
+        let replay = create(&pool, &first_request).await?;
+        assert!(replay.replayed, "retained create must replay exactly after the quota refusal");
+        assert_eq!(replay.receipt, first_receipt, "exact replay must return the original receipt");
+        assert_eq!(counts(&pool, repo).await?, after_release_counts, "exact create replay mutated retained rows");
+        assert_eq!(usage(&pool, repo, tenant).await?, after_release_usage, "exact create replay charged usage");
         Ok::<(), anyhow::Error>(())
     }
     .await;

@@ -21,9 +21,22 @@ use uuid::Uuid;
 
 /// Run one bounded claim with a fresh operation context for external callers.
 pub async fn run_once(state: &Arc<AppState>, policy: &Policy, owner: Uuid) -> Result<Option<JobOutcome>> {
+    run_once_with_refcas_source(state, policy, owner, None).await
+}
+
+pub async fn run_once_with_refcas_source(
+    state: &Arc<AppState>,
+    policy: &Policy,
+    owner: Uuid,
+    refcas_source: Option<&dyn super::safe_gc::RefCasCutpointSource>,
+) -> Result<Option<JobOutcome>> {
     let operation = OperationContext::new(WorkerKind::StorageLifecycle);
-    observability::worker::run(&operation, Phase::Claim, Box::pin(run_once_scoped(state, policy, owner, &operation)))
-        .await
+    observability::worker::run(
+        &operation,
+        Phase::Claim,
+        Box::pin(run_once_scoped_with_refcas(state, policy, owner, &operation, refcas_source)),
+    )
+    .await
 }
 
 pub(crate) async fn run_once_scoped(
@@ -32,6 +45,28 @@ pub(crate) async fn run_once_scoped(
     owner: Uuid,
     operation: &OperationContext,
 ) -> Result<Option<JobOutcome>> {
+    run_once_scoped_with_refcas(state, policy, owner, operation, None).await
+}
+
+async fn run_once_scoped_with_refcas(
+    state: &Arc<AppState>,
+    policy: &Policy,
+    owner: Uuid,
+    operation: &OperationContext,
+    refcas_source: Option<&dyn super::safe_gc::RefCasCutpointSource>,
+) -> Result<Option<JobOutcome>> {
+    // The scheduled worker must read Ref-CAS authority only from independently attested
+    // quorum voters; sealed volumes and in-process state machines never authorize deletion.
+    let production_source = if refcas_source.is_none() {
+        Some(super::safe_gc::ProductionRefCasAuthoritySource::new(state.storage.root.as_path()))
+    } else {
+        None
+    };
+    let fallback = production_source.as_ref().map(|source| source as &dyn super::safe_gc::RefCasCutpointSource);
+    let refcas_source = refcas_source.or(fallback);
+    // A hard `SIGKILL` leaves an expired `running` row and a stale `gc_owner`
+    // behind; reap before claiming so a cold worker resumes without manual SQL.
+    super::safe_gc::pg_maintenance::reap_expired_pg_refstore_jobs(&state.pool).await?;
     // Observe a claim failure inside the Claim scope before `?` drops it, so
     // the event keeps the worker, the fixed phase and any SQLSTATE.
     let Some(job) = observability::worker::run(operation, Phase::Claim, async {
@@ -45,7 +80,13 @@ pub(crate) async fn run_once_scoped(
     })
     .await?
     else {
-        return Ok(None);
+        return super::safe_gc::pg_maintenance::run_claimed_safe_gc_once_with_refcas(
+            state,
+            policy,
+            owner,
+            refcas_source,
+        )
+        .await;
     };
     // The persisted attempt and repository generation are safe numeric
     // correlation. The raw job, repository, tenant and actor IDs stay out.

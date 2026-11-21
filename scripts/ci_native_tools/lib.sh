@@ -55,8 +55,9 @@ ubuntu_archive_keyring() {
 # Add deb-src-only entries for the signed Ubuntu Noble archive. Noble is the
 # first Ubuntu release whose Git source is the required 2.43 family; 22.04's
 # own archive only offers 2.34. Binary packages from Noble are never enabled.
-# The refresh is bounded and fails closed when the signed index cannot be
-# acquired; the pinned source version is selected only from that index.
+# Only the exact owned fragment is refreshed, and the update fails closed when
+# its signed index cannot be acquired; the pinned source version is selected
+# only from that index.
 prepare_ubuntu_archive_source() {
   local keyring list want current
   require_command sudo
@@ -83,8 +84,11 @@ EOF
   fi
   # Refresh even when the list was already current: a hosted runner can
   # carry an owned list from a previous attempt without its indexes, and the
-  # pinned source versions below are selected from the refreshed index.
-  apt_update
+  # pinned source versions below are selected from the refreshed index. Scope
+  # this refresh to the exact owned fragment because the apt phase has already
+  # validated the image's inherited Jammy/PGDG/vendor indexes. List-Cleanup is
+  # disabled so those already-validated indexes are retained.
+  apt_update_sources_list "$list"
 }
 
 # The one official PGDG signing-key endpoint and its fixed fingerprint. The
@@ -232,6 +236,21 @@ apt_run() {
 # so the update reports any hash-sum or other transient index failure.
 apt_update() {
   apt_run update --error-on=any
+}
+
+# Refresh exactly one sources.list file. The hosted image also carries its own
+# Jammy archive, PGDG and vendor indexes; re-fetching all of them is unrelated
+# network work when only the owned Noble deb-src fragment changed. apt's
+# per-invocation Dir::Etc options read just that fragment, while List-Cleanup
+# stays disabled so the other already-validated indexes are retained. No apt
+# configuration file is written or changed, and --error-on=any stays fatal.
+apt_update_sources_list() {
+  local list=$1
+  apt_run \
+    -o "Dir::Etc::sourcelist=$list" \
+    -o Dir::Etc::sourceparts=- \
+    -o APT::Get::List-Cleanup=0 \
+    update --error-on=any
 }
 
 # Indexes and packages change system state, so they run through sudo.

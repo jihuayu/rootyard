@@ -39,7 +39,7 @@ from .corpus import (
     run_git,
     write_askpass_script,
 )
-from .report import compute_overlap_metrics, percentile_stats, redact_text, validate_report
+from .report import OUTCOME_CLASSES, compute_overlap_metrics, percentile_stats, redact_text, validate_report
 from .workloads import (
     METER_BOUNDARY_WAIT_SECONDS,
     ResourceSampler,
@@ -798,6 +798,7 @@ def _phase_same_repo_mixed(
     lock = threading.Lock()
     stop_readers = threading.Event()
     counters = {"committed_success": 0, "contention_retries": 0, "read_browse_ops": 0, "maintenance_pg_select_ops": 0}
+    first_attempt_outcomes = dict.fromkeys(OUTCOME_CLASSES, 0)
 
     def _push_worker(idx: int) -> None:
         wdir, ref_name, new_oid, env = prepared[idx]
@@ -813,6 +814,7 @@ def _phase_same_repo_mixed(
         retries = 0
         with lock:
             intervals.append((s_ns, e_ns))
+            first_attempt_outcomes[outcome] += 1
             _record_op(records, "same_repo_push", entry["ds_class"], outcome, ms, "measured")
         for attempt in range(3):
             if outcome == "committed_success":
@@ -891,6 +893,7 @@ def _phase_same_repo_mixed(
         "scope": "same_repository_distinct_refs",
         "repo": entry["info"]["name"],
         **compute_overlap_metrics(intervals),
+        "first_attempt_outcomes": first_attempt_outcomes,
         **counters,
     }
 

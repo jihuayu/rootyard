@@ -29,8 +29,8 @@ use super::{
     error::GatewayError,
     repo_session::SessionTokens,
 };
-use crate::blob_store::opendal::BlobStore;
-
+use crate::{blob_store::opendal::BlobStore, cache_wake::ServingCache, dispatch};
+mod signals;
 tokio::task_local! {
     pub(super) static REQUEST_DEADLINE: Instant;
 }
@@ -49,6 +49,10 @@ pub struct BlobGitState {
     inflight: Arc<AtomicU64>,
     workspace: Arc<AtomicU64>,
     sessions: Option<SessionTokens>,
+    /// Advisory, non-authoritative payload cache. It is absent by default and
+    /// carries no refs, auth, sessions, holds, roots or durable bytes.
+    cache: Option<Arc<ServingCache>>,
+    dispatch: dispatch::Signals,
     packfile_offload: Option<Arc<crate::browse::packfile_uri::GatewayPackfileOffload>>,
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
@@ -58,6 +62,11 @@ pub struct BlobGitState {
     /// first protected upload. Also absent from every non-test build.
     #[cfg(test)]
     publication_pause: Option<Arc<AdmissionPause>>,
+    /// Acceptance-only rendezvous reached after an exact commit-preview cache
+    /// lookup and before the final encoded-response fence. It is absent in
+    /// every non-test build and cannot be selected by a request or config.
+    #[cfg(test)]
+    read_pause: Option<Arc<ReadPause>>,
 }
 
 impl BlobGitState {
@@ -80,11 +89,15 @@ impl BlobGitState {
             inflight: Arc::new(AtomicU64::new(0)),
             workspace: Arc::new(AtomicU64::new(0)),
             sessions: None,
+            cache: None,
+            dispatch: dispatch::Signals::default(),
             packfile_offload: None,
             #[cfg(test)]
             admission_pause: None,
             #[cfg(test)]
             publication_pause: None,
+            #[cfg(test)]
+            read_pause: None,
         })
     }
 
@@ -96,6 +109,19 @@ impl BlobGitState {
         self
     }
 
+    /// Attach the bounded advisory ServingCache. It is used only for immutable
+    /// payload computation after every live authority and reachable-closure
+    /// check has already run; a miss, corruption or backend error always falls
+    /// back to the existing origin read.
+    pub fn with_cache(mut self, cache: Arc<ServingCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// The configured advisory cache, if any.
+    pub(super) fn cache(&self) -> Option<&Arc<ServingCache>> {
+        self.cache.as_ref()
+    }
     /// Attach optional Smart-HTTP v2 `packfile-uris` offload runtime (#185).
     /// Absent (`None`) by default so gateway behavior stays strictly inline unless enabled.
     pub fn with_packfile_offload(mut self, offload: Arc<crate::browse::packfile_uri::GatewayPackfileOffload>) -> Self {
@@ -148,6 +174,22 @@ impl BlobGitState {
             return Err(GatewayError::Conflict("acceptance publication was abandoned before upload"));
         }
         Ok(())
+    }
+
+    /// Acceptance-only: attach a private read rendezvous to this gateway.
+    #[cfg(test)]
+    pub(crate) fn with_read_pause(mut self, pause: Arc<ReadPause>) -> Self {
+        self.read_pause = Some(pause);
+        self
+    }
+
+    /// Acceptance-only: pause one exact commit-preview request after its
+    /// advisory payload lookup and before response encoding/final fences.
+    #[cfg(test)]
+    pub(crate) async fn pause_before_commit_finalize(&self, oid: &str) {
+        if let Some(pause) = &self.read_pause {
+            pause.pause(oid).await;
+        }
     }
 
     pub fn pool(&self) -> &Pool {
@@ -307,6 +349,67 @@ impl AdmissionPause {
 
     fn was_abandoned(&self) -> bool {
         self.abandoned.load(Ordering::Acquire)
+    }
+}
+
+/// Acceptance-only rendezvous reached after an exact commit-preview payload
+/// lookup and before the final encoded-response authorization fence. It is
+/// keyed by the exact OID admitted by the route and fires at most once; the
+/// wait has a fixed bounded timeout so a missing release fails the test rather
+/// than hanging the process.
+#[cfg(test)]
+pub(crate) struct ReadPause {
+    target: std::sync::Mutex<Option<String>>,
+    paused: AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ReadPause {
+    pub(crate) fn new() -> Self {
+        Self {
+            target: std::sync::Mutex::new(None),
+            paused: AtomicBool::new(false),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Select the one exact OID whose next commit-preview request pauses.
+    pub(crate) fn target(&self, oid: impl Into<String>) {
+        *self.target.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(oid.into());
+    }
+
+    async fn pause(&self, oid: &str) {
+        let matches = self
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .is_some_and(|target| target == oid);
+        if !matches || self.paused.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // `notify_one` stores a permit, so a test that starts waiting after the
+        // request arrived still observes the rendezvous.
+        self.reached.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(30), self.release.notified()).await;
+    }
+
+    /// Wait until the selected exact-OID request reached the pre-finalize pause.
+    /// The caller's one deadline bounds the wait; expiration is a normal error so
+    /// the fixture can still release, reap and finish the database.
+    pub(crate) async fn wait_reached(&self, deadline: Instant) -> anyhow::Result<()> {
+        tokio::time::timeout_at(deadline, self.reached.notified())
+            .await
+            .map(|_| ())
+            .map_err(|_| anyhow::anyhow!("deterministic commit-finalize pause was not reached"))
+    }
+
+    /// Let the paused request continue into response encoding and final fences.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
     }
 }
 

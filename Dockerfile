@@ -20,6 +20,7 @@ RUN /usr/local/bin/install_ci_cargo_fork.sh verify \
       --record /build/ci-cargo-fork.json
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY vendor ./vendor
+COPY crates/refcas-log ./crates/refcas-log
 COPY src ./src
 COPY migrations ./migrations
 COPY schema ./schema
@@ -33,6 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
     && useradd --uid 10001 --gid rootyard --no-create-home rootyard \
     && mkdir -p /var/lib/rootyard && chown rootyard:rootyard /var/lib/rootyard
 COPY --from=build /build/target/release/rootyard /usr/local/bin/rootyard
+COPY --from=build /build/target/release/rootyard-safe-gc-voter /usr/local/bin/rootyard-safe-gc-voter
+RUN test -x /usr/local/bin/rootyard-safe-gc-voter && /usr/local/bin/rootyard-safe-gc-voter --version
 ENV ROOTYARD_DATA_DIR=/var/lib/rootyard ROOTYARD_BIND=0.0.0.0:8080
 USER 10001:10001
 EXPOSE 8080

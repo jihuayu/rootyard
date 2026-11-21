@@ -215,11 +215,20 @@ pub(super) async fn push(
                         plan.packs().get(index).ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
                     publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
                 }
-                decide(state, actor, (*plan).clone(), mode, deadline).await
+                decide(state, actor, (*plan).clone(), mode, serving.cluster_incarnation, deadline).await
             }
             .await;
             match result {
-                Ok(terminal) => Ok(PushOutcome::Terminal(terminal)),
+                Ok((terminal, notify)) => {
+                    // Non-blocking advisory hint only after the core transaction
+                    // (including its audit outbox projection) has committed and
+                    // returned a fresh committed terminal. A lost hint only
+                    // delays the existing PostgreSQL poll by one interval.
+                    if notify {
+                        state.dispatch().committed();
+                    }
+                    Ok(PushOutcome::Terminal(terminal))
+                }
                 Err(error @ GatewayError::Conflict(_)) => {
                     // Only a definite conflict is eligible. Unknown COMMIT,
                     // timeout and provider failures keep their original outcome.
@@ -625,8 +634,9 @@ async fn decide(
     actor: &Identity,
     plan: PackCommitPlan,
     mode: CommitMode,
+    expected_cluster_incarnation: Uuid,
     deadline: Instant,
-) -> Result<PackCommitTerminal, GatewayError> {
+) -> Result<(PackCommitTerminal, bool), GatewayError> {
     let adapter = authorized(state)?;
     let mode = match mode {
         CommitMode::Atomic => AuthorizedCommitMode::Atomic,
@@ -634,12 +644,24 @@ async fn decide(
     };
     let prepared = match adapter.prepare(state.pool(), plan, deadline).await.map_err(map_authorized)? {
         PrepareOutcome::Prepared(prepared) => prepared,
-        PrepareOutcome::Replayed(receipt) => return Ok(receipt.terminal),
+        // A replay is already durable and was (or will be) repaired by polling;
+        // it is not a fresh event and must not emit another hint.
+        PrepareOutcome::Replayed(receipt) => return Ok((receipt.terminal, false)),
     };
     let selection = adapter.select(state.pool(), *prepared, actor, mode, deadline).await.map_err(map_authorized)?;
     let verified = adapter.verify(selection, deadline).await.map_err(map_authorized)?;
-    let receipt = adapter.commit(state.pool(), &verified, deadline).await.map_err(map_authorized)?;
-    Ok(receipt.terminal)
+    let receipt = adapter
+        .commit_with_expected_cluster_incarnation(state.pool(), &verified, expected_cluster_incarnation, deadline)
+        .await
+        .map_err(map_authorized)?;
+    let notify = should_notify(&receipt.terminal, receipt.replayed, receipt.audit_enqueued);
+    Ok((receipt.terminal, notify))
+}
+
+/// The one trigger predicate for a local wake hint. It is true only for a
+/// fresh committed terminal whose exact audit outbox rows committed with it.
+fn should_notify(terminal: &PackCommitTerminal, replayed: bool, audit_enqueued: bool) -> bool {
+    terminal.is_committed() && !replayed && audit_enqueued
 }
 
 /// The authorized A4 facade over this gateway's one opened Blob store and
@@ -897,5 +919,33 @@ mod tests {
             build_plan(&request_for(55), &[pair], CommitMode::Atomic, owner_id, &baseline, identity).unwrap_err(),
             GatewayError::TooLarge
         );
+    }
+}
+
+#[cfg(test)]
+mod wake_trigger_tests {
+    use super::*;
+    use crate::ref_store::core::terminal::TerminalKind;
+    use uuid::Uuid;
+
+    fn terminal(kind: TerminalKind) -> PackCommitTerminal {
+        PackCommitTerminal {
+            kind,
+            repository_id: Uuid::new_v4(),
+            revision: 2,
+            head_ref: Some("refs/heads/main".into()),
+            mode: "pack_verified".into(),
+            refs: Vec::new(),
+            registrations: Vec::new(),
+            rejection: None,
+        }
+    }
+
+    #[test]
+    fn only_a_fresh_committed_audit_enqueued_terminal_signals() {
+        assert!(should_notify(&terminal(TerminalKind::Committed), false, true));
+        assert!(!should_notify(&terminal(TerminalKind::Committed), true, true));
+        assert!(!should_notify(&terminal(TerminalKind::Committed), false, false));
+        assert!(!should_notify(&terminal(TerminalKind::Rejected), false, true));
     }
 }
