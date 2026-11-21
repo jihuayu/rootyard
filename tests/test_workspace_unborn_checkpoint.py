@@ -3,17 +3,27 @@
 The advertised branch is deliberately not ``main``. The fixture proves that a
 genuine unborn HEAD survives create and local materialization, that an empty
 HEAD is never treated as a committed revision, and that staged plus unstaged
-bytes survive a checkpoint/restore. Nonempty sources whose HEAD is unresolved
-are still rejected instead of becoming an empty workspace, and a local-only
-unborn checkpoint cannot be published to remote storage.
+Python entrypoint bytes survive a checkpoint/restore. After the real restore,
+the working version is compiled to a fixture-owned bytecode artifact outside
+the checked-out repository and executed against the restored workspace.
+Nonempty sources whose HEAD is unresolved are still rejected instead of
+becoming an empty workspace, and a local-only unborn checkpoint cannot be
+published to remote storage.
 """
 import argparse
 import base64
 import json
+import py_compile
+import sys
 import unittest
 
 from tests.e2e import Harness
 from tests.runtime_binary import select_runtime_binary
+
+
+STAGED_SOURCE = b'print("unborn-staged-index")\n'
+WORKING_SOURCE = b'print("unborn-working-restored")\n'
+WORKING_MARKER = b"unborn-working-restored\n"
 
 
 def read_git(h, *args, cwd=None, check=True):
@@ -36,11 +46,11 @@ def assert_unborn_identity(case, h, repo, branch):
 def assert_unborn_worktree(case, h, repo, expected):
     case.assertEqual(read_git(h, "status", "--porcelain=v1", "-z", cwd=repo).stdout, expected["status"])
     case.assertEqual(read_git(h, "ls-files", "--stage", "-z", cwd=repo).stdout, expected["index"])
-    case.assertEqual(read_git(h, "show", ":initial.txt", cwd=repo).stdout, expected["staged"])
-    case.assertEqual((repo / "initial.txt").read_bytes(), expected["working"])
+    case.assertEqual(read_git(h, "show", ":initial.py", cwd=repo).stdout, expected["staged"])
+    case.assertEqual((repo / "initial.py").read_bytes(), expected["working"])
     case.assertEqual(read_git(h, "diff", "--cached", "--binary", cwd=repo).stdout, expected["diff_cached"])
     case.assertEqual(read_git(h, "diff", "--binary", cwd=repo).stdout, expected["diff_work"])
-    staged_oid = read_git(h, "rev-parse", ":initial.txt", cwd=repo).stdout.strip()
+    staged_oid = read_git(h, "rev-parse", ":initial.py", cwd=repo).stdout.strip()
     case.assertEqual(read_git(h, "cat-file", "-t", staged_oid.decode(), cwd=repo).stdout.strip(), b"blob")
     case.assertEqual(read_git(h, "fsck", "--full", "--strict", cwd=repo, check=False).returncode, 0)
 
@@ -78,21 +88,21 @@ class WorkspaceUnbornCheckpointTest(unittest.TestCase):
             self.assertEqual(read_git(h, "status", "--porcelain=v1", "-z", cwd=live).stdout, b"")
             self.assertEqual(read_git(h, "ls-files", "--stage", "-z", cwd=live).stdout, b"")
 
-            path = f"/api/workspaces/{wid}/files?path=initial.txt"
+            path = f"/api/workspaces/{wid}/files?path=initial.py"
             first = json.loads(h.expect(path, 200, token=h.alice, method="PUT",
-                body={"content_base64": base64.b64encode(b"staged\n").decode(), "expected_entry_version": 0,
+                body={"content_base64": base64.b64encode(STAGED_SOURCE).decode(), "expected_entry_version": 0,
                       "expected_workspace_revision": created["revision"], "lease_epoch": epoch},
                 extra_headers={"Idempotency-Key": "unborn-put-staged"}))
             self.assertGreaterEqual(first["workspace_revision"], 1)
             staged = json.loads(h.expect(f"/api/workspaces/{wid}/git", 200, token=h.alice, method="POST",
-                body={"action": "add", "paths": ["initial.txt"],
+                body={"action": "add", "paths": ["initial.py"],
                       "expected_git_generation": created["git_generation"],
                       "expected_workspace_revision": first["workspace_revision"], "lease_epoch": epoch},
                 extra_headers={"Idempotency-Key": "unborn-git-add"}))
             self.assertGreater(staged["workspace_revision"], first["workspace_revision"])
             self.assertGreater(staged["git_generation"], created["git_generation"])
             second = json.loads(h.expect(path, 200, token=h.alice, method="PUT",
-                body={"content_base64": base64.b64encode(b"unstaged\n").decode(), "expected_entry_version": 1,
+                body={"content_base64": base64.b64encode(WORKING_SOURCE).decode(), "expected_entry_version": 1,
                       "expected_workspace_revision": staged["workspace_revision"], "lease_epoch": epoch},
                 extra_headers={"Idempotency-Key": "unborn-put-worktree"}))
             self.assertGreater(second["workspace_revision"], staged["workspace_revision"])
@@ -100,14 +110,14 @@ class WorkspaceUnbornCheckpointTest(unittest.TestCase):
             expected = {
                 "status": read_git(h, "status", "--porcelain=v1", "-z", cwd=live).stdout,
                 "index": read_git(h, "ls-files", "--stage", "-z", cwd=live).stdout,
-                "staged": read_git(h, "show", ":initial.txt", cwd=live).stdout,
-                "working": (live / "initial.txt").read_bytes(),
+                "staged": read_git(h, "show", ":initial.py", cwd=live).stdout,
+                "working": (live / "initial.py").read_bytes(),
                 "diff_cached": read_git(h, "diff", "--cached", "--binary", cwd=live).stdout,
                 "diff_work": read_git(h, "diff", "--binary", cwd=live).stdout,
             }
-            self.assertEqual(expected["status"], b"AM initial.txt\0")
-            self.assertEqual(expected["staged"], b"staged\n")
-            self.assertEqual(expected["working"], b"unstaged\n")
+            self.assertEqual(expected["status"], b"AM initial.py\0")
+            self.assertEqual(expected["staged"], STAGED_SOURCE)
+            self.assertEqual(expected["working"], WORKING_SOURCE)
             assert_unborn_identity(self, h, live, branch)
             assert_unborn_worktree(self, h, live, expected)
 
@@ -141,6 +151,20 @@ class WorkspaceUnbornCheckpointTest(unittest.TestCase):
                 extra_headers={"Idempotency-Key": "unborn-restore"}))
             copy = h.root / "data/workspace-service/workspaces" / restored["id"]
             self.assertEqual(h.sql(f"SELECT base_oid IS NULL FROM workspaces WHERE id='{restored['id']}'"), "t")
+            assert_unborn_identity(self, h, copy, branch)
+            assert_unborn_worktree(self, h, copy, expected)
+
+            # Compile the restored working file outside the Git tree.
+            artifact = h.root / "restored-bytecode" / "initial.pyc"
+            artifact.parent.mkdir()
+            py_compile.compile(str(copy / "initial.py"), cfile=str(artifact), doraise=True)
+            self.assertTrue(artifact.is_file(), f"missing compiled artifact at {artifact}")
+            self.assertNotIn(copy.resolve(), artifact.resolve().parents)
+            built = h.run([sys.executable, str(artifact)], cwd=copy)
+            self.assertEqual(built.stdout, WORKING_MARKER)
+
+            # The build/run is side-effect free with respect to the native
+            # unborn repository and the captured Git bytes.
             assert_unborn_identity(self, h, copy, branch)
             assert_unborn_worktree(self, h, copy, expected)
 
