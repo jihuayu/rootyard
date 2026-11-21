@@ -20,6 +20,9 @@ import issue107_native11_inventory as inventory  # noqa: E402
 import issue107_native11_runner as runner  # noqa: E402
 
 HEAD = "1" * 40
+A4_EXTRA = (
+    "decision_subset_support::cases_f::"
+    "a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit")
 
 
 def target_report():
@@ -71,6 +74,11 @@ class StaticInventoryTests(unittest.TestCase):
         self.assertIn(
             "decision_subset_support::cases_a::mixed_batch_bad_cas_and_valid_new_ref_commits_only_the_good_ref_and_replays_exactly",
             inventory.TARGETS["ref_store_decision_subset"]["cases"])
+        self.assertNotIn(
+            A4_EXTRA, inventory.TARGETS["ref_store_decision_subset"]["cases"])
+        self.assertEqual(
+            inventory.HOSTED_KNOWN_EXTRA_CASES,
+            {"ref_store_decision_subset": (A4_EXTRA,)})
 
     def test_target_and_pairs_mutations(self):
         targets = {name: "/x" for name in inventory.TARGET_ORDER}
@@ -141,6 +149,48 @@ class OutputTests(unittest.TestCase):
             with self.assertRaises(runner.RunnerError) as raised:
                 runner._list_target("fake", cfg, 5.0)
             self.assertEqual(raised.exception.code, "static_inventory_mismatch")
+
+    def test_known_a4_extra_is_opt_in_listing_only_and_exact(self):
+        target = "ref_store_decision_subset"
+        cfg = inventory.TARGETS[target]
+        base = [name.encode() + b": test" for name in cfg["cases"]]
+        extra = A4_EXTRA.encode() + b": test"
+        self.assertEqual(len(cfg["cases"]), 23)
+        self.assertEqual(len(runner.listed_cases(target, cfg, True)), 24)
+        self.assertEqual(runner.listed_cases(target, cfg)[-1],
+                         cfg["cases"][-1])
+        self.assertEqual(runner.listed_cases(target, cfg, True)[-1], A4_EXTRA)
+
+        with mock.patch.object(runner, "run_bounded", return_value=b"\n".join(base)):
+            self.assertEqual(
+                len(runner._list_target("fake", cfg, 5.0, target)), 23)
+        with mock.patch.object(
+                runner, "run_bounded", return_value=b"\n".join(base + [extra])):
+            self.assertEqual(
+                runner._list_target(
+                    "fake", cfg, 5.0, target, allow_known_a4_extra=True),
+                list(cfg["cases"]) + [A4_EXTRA])
+
+        def rejects(payload, allow=True, scoped_cfg=cfg, scoped_target=target):
+            with mock.patch.object(
+                    runner, "run_bounded", return_value=b"\n".join(payload)):
+                with self.assertRaises(runner.RunnerError) as raised:
+                    runner._list_target(
+                        "fake", scoped_cfg, 5.0, scoped_target,
+                        allow_known_a4_extra=allow)
+            self.assertEqual(raised.exception.code, "static_inventory_mismatch")
+
+        rejects(base + [extra], allow=False)
+        rejects(base, allow=True)
+        rejects(base[:-1] + [extra], allow=True)
+        rejects(base + [extra, b"unknown: test"], allow=True)
+        rejects(base + [extra, extra], allow=True)
+
+        operations = inventory.TARGETS["ref_store_operations"]
+        operations_listing = [
+            name.encode() + b": test" for name in operations["cases"]]
+        rejects(operations_listing + [b"unknown: test"], allow=True,
+                scoped_cfg=operations, scoped_target="ref_store_operations")
 
 
 class ReceiptTests(unittest.TestCase):
