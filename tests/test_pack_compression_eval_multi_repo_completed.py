@@ -38,11 +38,14 @@ CONFIG = CANDIDATE_CONFIGS[0].name
 def raw_group(
     config: str = CONFIG,
     pushes: tuple[object, ...] = (1.0, 2.5, 4.0),
-    starts: tuple[object, ...] = (10.0, 11.0, 12.0),
-    ends: tuple[object, ...] = (20.0, 21.0, 22.0),
+    starts: tuple[object, ...] = (0.0, 1.0, 2.0),
+    ends: tuple[object, ...] = (10.0, 11.0, 12.0),
 ) -> dict:
     return {
         "config_name": config,
+        "all_verified": True,
+        "verified_samples": 3,
+        "first_attempt_only": True,
         "repository_ids": [f"{SENTINEL}-{ordinal}" for ordinal in range(3)],
         "clone_paths": [f"/{SENTINEL}/clone-{ordinal}" for ordinal in range(3)],
         "push_samples": [
@@ -54,6 +57,8 @@ def raw_group(
                 "push_ms": pushes[ordinal],
                 "client_invocation_start_ms": starts[ordinal],
                 "client_invocation_end_ms": ends[ordinal],
+                "push_verified": True,
+                "first_attempt": True,
                 "environment": SENTINEL,
                 "raw_git": SENTINEL,
                 "payload": SENTINEL,
@@ -75,9 +80,12 @@ def raw_group(
 def projected(config: str = CONFIG) -> dict:
     return {
         "config_name": config,
+        "all_verified": True,
+        "verified_samples": 3,
+        "first_attempt_only": True,
         "push_ms": [1.0, 2.5, 4.0],
-        "client_invocation_start_ms": [10.0, 11.0, 12.0],
-        "client_invocation_end_ms": [20.0, 21.0, 22.0],
+        "client_invocation_start_ms": [0.0, 1.0, 2.0],
+        "client_invocation_end_ms": [10.0, 11.0, 12.0],
         "push_stats": percentile_stats([1.0, 2.5, 4.0]),
         "client_invocation_overlap": {
             "scope": "client_invocations_only",
@@ -104,23 +112,31 @@ class MultiRepoCompletedProjectionTest(unittest.TestCase):
         self.assertNotIn(SENTINEL, encoded)
         for field in ("repository_id", "clone_path", "push_oid", "push_samples", "status_counts", "environment", "raw_git", "payload"):
             self.assertNotIn(field, encoded)
-        # Intervals are already origin-relative and must not be rebased again.
-        self.assertEqual(record["client_invocation_start_ms"], [10.0, 11.0, 12.0])
-        self.assertEqual(record["client_invocation_end_ms"], [20.0, 21.0, 22.0])
+        self.assertEqual(record["client_invocation_start_ms"], [0.0, 1.0, 2.0])
+        self.assertEqual(record["client_invocation_end_ms"], [10.0, 11.0, 12.0])
 
     def test_repeat_sanitation_and_failure_normalization_are_idempotent(self) -> None:
         once = sanitize_multi_repo_completed([raw_group()])
         self.assertEqual(sanitize_multi_repo_completed(once), once)
         self.assertEqual(sanitize_multi_repo_completed([raw_group(), raw_group()]), once)
+        for field, bad in (
+            ("all_verified", False),
+            ("verified_samples", True),
+            ("first_attempt_only", False),
+        ):
+            broken = copy.deepcopy(once)
+            broken[0][field] = bad
+            self.assertEqual(sanitize_multi_repo_completed(broken), [])
+        for field in ("all_verified", "verified_samples", "first_attempt_only"):
+            broken = copy.deepcopy(once)
+            broken[0].pop(field)
+            self.assertEqual(sanitize_multi_repo_completed(broken), [])
         built = build_failure_record(multi_repo_completed=once)
         self.assertEqual(built["multi_repo_completed"], once)
         enriched = enrich_failure_record(built, phase="multi_repo_verify", failure_class="multi_repo_verify")
         self.assertEqual(enriched["multi_repo_completed"], once)
-        with tempfile.TemporaryDirectory(prefix="multi-repo-completed-") as tmp:
-            path = write_failure_json(Path(tmp) / "report.failure.json", built)
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["multi_repo_completed"], once)
 
-    def test_completed_groups_survive_later_structured_generic_and_cleanup_failure(self) -> None:
+    def test_source_held_first_error_survives_and_writes_safely(self) -> None:
         groups = sanitize_multi_repo_completed([raw_group()])
         earlier = LiveEvalFailure(
             build_failure_record(
@@ -142,6 +158,12 @@ class MultiRepoCompletedProjectionTest(unittest.TestCase):
         )
         self.assertEqual(late["multi_repo_completed"], groups)
         self.assertEqual(late["cleanup"]["failures"], ["server_stop_timeout"])
+        with tempfile.TemporaryDirectory(prefix="multi-repo-completed-") as tmp:
+            path = write_failure_json(Path(tmp) / "report.failure.json", earlier.record)
+            written = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(written["multi_repo_completed"], groups)
+            self.assertEqual(written["phase"], "multi_repo_first_push")
+            self.assertNotIn(SENTINEL, path.read_text(encoding="utf-8"))
 
         with self.assertRaises(LiveEvalFailure) as caught:
             finalize_cleanup(
@@ -153,38 +175,64 @@ class MultiRepoCompletedProjectionTest(unittest.TestCase):
         self.assertEqual(caught.exception.record["multi_repo_completed"], groups)
         self.assertEqual(caught.exception.record["cleanup"]["failures"], ["server_stop_timeout"])
 
-    def test_malformed_unrecognized_duplicate_and_sentinel_entries_are_dismissed(self) -> None:
-        valid = raw_group()
-        bad = [
+    def test_malformed_missing_untyped_oversized_and_sentinel_entries_are_dismissed(self) -> None:
+        bad: list[object] = [
             None,
+            "not-a-mapping",
             {"config_name": SENTINEL, "push_ms": [1, 2, 3]},
             raw_group("baseline"),
-            raw_group(CANDIDATE_CONFIGS[1].name, pushes=(1.0, float("inf"), 3.0)),
-            raw_group(CANDIDATE_CONFIGS[2].name, pushes=(1.0, -1.0, 3.0)),
-            raw_group(CANDIDATE_CONFIGS[3].name, pushes=(1.0, True, 3.0)),
-            raw_group(CANDIDATE_CONFIGS[4].name, starts=(0.0, 1.0, 2.0), ends=(0.0, 1.5, 2.5)),
-            raw_group(CANDIDATE_CONFIGS[5].name, starts=(0.0, 1.0, 2.0), ends=(1.0, 1.5, 2.5)),
-            raw_group(CANDIDATE_CONFIGS[6].name, starts=(0.0, 1.0, float("inf")), ends=(1.0, 2.0, 3.0)),
         ]
-        unverified = raw_group(CANDIDATE_CONFIGS[0].name)
+        for field in ("all_verified", "verified_samples"):
+            missing = raw_group()
+            missing.pop(field)
+            bad.append(missing)
+        for field, value in (
+            ("all_verified", 1), ("all_verified", False), ("verified_samples", True),
+            ("verified_samples", 4), ("first_attempt_only", 1), ("first_attempt_only", False),
+        ):
+            variant = raw_group()
+            variant[field] = value
+            bad.append(variant)
+        for field in ("push_verified", "first_attempt"):
+            missing = raw_group()
+            missing["push_samples"][0].pop(field)
+            bad.append(missing)
+            for value in (1, False):
+                variant = raw_group()
+                variant["push_samples"][0][field] = value
+                bad.append(variant)
+        bad.extend(
+            (
+                raw_group(starts=(1.0, 2.0, 3.0)),
+                raw_group(starts=(-1.0, 0.0, 1.0)),
+                raw_group(starts=(0.0, 1.0, 1e308)),
+                raw_group(ends=(0.0, 1.0, 2.0)),
+                raw_group(ends=(1e308, 1.0, 2.0)),
+                raw_group(pushes=(1e308, 2.5, 4.0)),
+                raw_group(pushes=(1.0, float("inf"), 4.0)),
+                raw_group(starts=(0.0, 5.0, 6.0), ends=(1.0, 2.0, 3.0)),
+                raw_group(starts=(0.0, 1.0, 2.0), ends=(1.0, 1.5, 2.5)),
+            )
+        )
+        unverified = raw_group()
         unverified["all_verified"] = False
         bad.append(unverified)
-        rejected = raw_group(CANDIDATE_CONFIGS[1].name)
-        rejected["push_samples"][1]["push_verified"] = False
-        bad.append(rejected)
-        s3_bad = raw_group(CANDIDATE_CONFIGS[7].name)
-        s3_bad["s3_push"] = {"observed": False, "get_requests": 1, "get_bytes": 1, "put_requests": 1, "put_bytes": 1}
-        bad.append(s3_bad)
         for field in ("get_requests", "get_bytes", "put_requests", "put_bytes"):
-            mutated = copy.deepcopy(raw_group(CANDIDATE_CONFIGS[0].name))
-            mutated["s3_push"][field] = -1
-            bad.append(mutated)
-            mutated = copy.deepcopy(raw_group(CANDIDATE_CONFIGS[1].name))
-            mutated["s3_push"][field] = True
-            bad.append(mutated)
-        self.assertEqual(sanitize_multi_repo_completed([unverified]), [])
-        self.assertEqual(sanitize_multi_repo_completed([rejected]), [])
-        records = sanitize_multi_repo_completed([valid, valid, *bad])
+            for value in (-1, True, 1.0, 1 << 63, 1 << 100):
+                variant = raw_group()
+                variant["s3_push"][field] = value
+                bad.append(variant)
+            missing = raw_group()
+            missing["s3_push"].pop(field)
+            bad.append(missing)
+        for observed in (False, None):
+            variant = raw_group()
+            variant["s3_push"]["observed"] = observed
+            bad.append(variant)
+        for item in bad:
+            with self.subTest(item=item):
+                self.assertEqual(sanitize_multi_repo_completed([item]), [])
+        records = sanitize_multi_repo_completed([raw_group(), raw_group(), *bad])
         self.assertEqual(records, [projected()])
         encoded = json.dumps(records, sort_keys=True)
         self.assertNotIn(SENTINEL, encoded)

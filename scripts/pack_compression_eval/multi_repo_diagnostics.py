@@ -17,6 +17,8 @@ from .telemetry import percentile_stats
 MULTI_REPO_COMPLETED_FIELD = "multi_repo_completed"
 MULTI_REPO_COMPLETED_LIMIT = 4
 MULTI_REPO_CONFIG_NAMES = frozenset(spec.name for spec in CANDIDATE_CONFIGS)
+_MAX_FAILURE_MS = (1 << 53) - 1
+_MAX_S3_COUNT = (1 << 63) - 1
 _S3_FIELDS = ("get_requests", "get_bytes", "put_requests", "put_bytes")
 
 
@@ -27,7 +29,9 @@ def _finite(value: Any, *, positive: bool = False) -> float | None:
         number = float(value)
     except OverflowError:
         return None
-    if not math.isfinite(number) or (number <= 0 if positive else number < 0):
+    if not math.isfinite(number) or number > _MAX_FAILURE_MS:
+        return None
+    if number < 0 or (positive and number == 0):
         return None
     return round(number, 3)
 
@@ -39,13 +43,17 @@ def _raw_values(item: Mapping[str, Any]) -> tuple[list[Any], list[Any], list[Any
             return None
         if not all(isinstance(sample, Mapping) for sample in samples):
             return None
-        if "all_verified" in item and item.get("all_verified") is not True:
+        if item.get("all_verified") is not True:
             return None
-        if item.get("verified_samples", 3) != 3:
+        verified_samples = item.get("verified_samples")
+        if type(verified_samples) is not int or verified_samples != 3:
             return None
-        if any(sample.get("push_verified") is False for sample in samples):
+        if "first_attempt_only" in item and item.get("first_attempt_only") is not True:
             return None
-        if any(sample.get("first_attempt") is False for sample in samples):
+        if not all(
+            sample.get("push_verified") is True and sample.get("first_attempt") is True
+            for sample in samples
+        ):
             return None
         return (
             [sample.get("push_ms") for sample in samples],
@@ -56,6 +64,12 @@ def _raw_values(item: Mapping[str, Any]) -> tuple[list[Any], list[Any], list[Any
         item.get("push_ms"), item.get("client_invocation_start_ms"), item.get("client_invocation_end_ms"),
     )
     if not all(isinstance(values, (list, tuple)) and len(values) == 3 for values in (push_ms, starts, ends)):
+        return None
+    if item.get("all_verified") is not True:
+        return None
+    if type(item.get("verified_samples")) is not int or item.get("verified_samples") != 3:
+        return None
+    if item.get("first_attempt_only") is not True:
         return None
     return list(push_ms), list(starts), list(ends)
 
@@ -74,6 +88,8 @@ def _project(item: Any) -> dict[str, Any] | None:
     ends = [_finite(value, positive=True) for value in values[2]]
     if any(value is None for value in (*pushes, *starts, *ends)):
         return None
+    if not any(start == 0 for start in starts):
+        return None
     if not all(start < end for start, end in zip(starts, ends, strict=True)):
         return None
     overlap_ms = round(max(0.0, min(ends) - max(starts)), 3)
@@ -85,11 +101,14 @@ def _project(item: Any) -> dict[str, Any] | None:
     counters: dict[str, int] = {}
     for field in _S3_FIELDS:
         value = s3.get(field)
-        if type(value) is not int or value < 0:
+        if type(value) is not int or not 0 <= value <= _MAX_S3_COUNT:
             return None
         counters[field] = value
     return {
         "config_name": config_name,
+        "all_verified": True,
+        "verified_samples": 3,
+        "first_attempt_only": True,
         "push_ms": pushes,
         "client_invocation_start_ms": starts,
         "client_invocation_end_ms": ends,
