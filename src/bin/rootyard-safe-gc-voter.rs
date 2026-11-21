@@ -20,8 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ready_file = None;
     let mut version = false;
     let mut args = std::env::args().skip(1);
-    loop {
-        let Some(arg) = args.next() else { break };
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" => version = true,
             "--config" => config_path = Some(args.next().ok_or_else(|| invalid("--config requires a value"))?),
