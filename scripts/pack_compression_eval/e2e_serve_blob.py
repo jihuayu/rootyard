@@ -248,7 +248,7 @@ def run_live_serve_blob_eval(
             c_browse_ms: list[float] = []
             serving_sum = 0
             coexist_sum = 0
-            proxy.reset_counters()
+            proxy.reset_counters(settle_timeout=SOCKET_IO_TIMEOUT_SECONDS)
             cmp_repos: list[dict[str, Any]] = []
             for t_idx, target in enumerate(eval_targets):
                 crepo = create_repo(
