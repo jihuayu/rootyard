@@ -140,12 +140,15 @@ jobs:
         run: |
           cargo test --locked --test s4_ci_pins_git_view -- --ignored --test-threads=1
 
-      - name: Publish optional bounded fsck diagnostics
+      - name: Validate optional bounded fsck receipts
+        id: fsck_receipts
         if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.fsck_diagnostics }}
         run: |
           set -euo pipefail
-          mkdir -p test-results/s4-ci-pins-git-view
-          python3 - "$ROOTYARD_S4_FSCK_DIAGNOSTIC" "$ROOTYARD_S4_FSCK_DIAGNOSTIC_DIR" <<'PY'
+          validated_root="$(mktemp -d "$RUNNER_TEMP/rootyard-s4-validated-fsck.XXXXXX")"
+          chmod 700 "$validated_root"
+          validated_file="$validated_root/fsck-receipts.jsonl"
+          python3 - "$ROOTYARD_S4_FSCK_DIAGNOSTIC" "$ROOTYARD_S4_FSCK_DIAGNOSTIC_DIR" "$validated_file" <<'PY'
           from __future__ import annotations
           import json
           import os
@@ -174,15 +177,34 @@ jobs:
               fail("run-owned diagnostic path is absent")
           source = Path(raw_source)
           root = Path(raw_root)
-          runner_temp = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
+          validated = Path(sys.argv[3])
+          raw_runner = os.environ.get("RUNNER_TEMP", "")
+          if not raw_runner:
+              fail("RUNNER_TEMP is absent")
+          runner_temp = Path(raw_runner).resolve()
           if not source.is_absolute() or not root.is_absolute() or not runner_temp.is_dir():
               fail("diagnostic paths are not absolute run-owned paths")
+          if not validated.is_absolute() or validated.parent == source.parent:
+              fail("validated receipt path is not a distinct absolute path")
           try:
               root_resolved = root.resolve(strict=True)
           except OSError:
               fail("run-owned diagnostic directory is unreadable")
           if source.parent.resolve() != root_resolved or runner_temp not in root_resolved.parents:
               fail("diagnostic path escaped the run-owned directory")
+          try:
+              parent_lstat = os.lstat(validated.parent)
+              validated_root = validated.parent.resolve(strict=True)
+              validated_info = os.stat(validated_root)
+          except OSError:
+              fail("validated receipt directory is unreadable")
+          if (stat.S_ISLNK(parent_lstat.st_mode)
+                  or not stat.S_ISDIR(validated_info.st_mode)
+                  or validated_root == root_resolved
+                  or runner_temp not in validated_root.parents
+                  or validated_info.st_uid != os.geteuid()
+                  or validated_info.st_mode & 0o077):
+              fail("validated receipt directory is not a private run-owned directory")
           try:
               lstat = os.lstat(source)
           except OSError:
@@ -232,8 +254,8 @@ jobs:
                   fail("diagnostic exit status is not finite")
               if sig is not None and (type(sig) is not int or not 1 <= sig <= 64):
                   fail("diagnostic signal is not finite")
-              if code is None and sig is None:
-                  fail("diagnostic record has no finite status")
+              if (code is None) == (sig is None):
+                  fail("diagnostic record must contain exactly one finite status")
               if type(record["truncated"]) is not bool:
                   fail("diagnostic truncation marker is not boolean")
               categories = record["categories"]
@@ -247,26 +269,39 @@ jobs:
               (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
               for record in records
           )
-          destination = Path("test-results/s4-ci-pins-git-view/fsck-diagnostics.jsonl")
+          if not output or len(output) > MAX_BYTES:
+              fail("canonical receipt output exceeds the byte bound")
           try:
               out_fd = os.open(
-                  destination,
-                  os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                  validated,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                   0o600,
               )
           except OSError:
-              fail("bounded evidence destination is unsafe")
+              fail("validated receipt destination is unsafe or already exists")
           try:
+              out_info = os.fstat(out_fd)
+              if (not stat.S_ISREG(out_info.st_mode) or out_info.st_uid != os.geteuid()
+                      or out_info.st_nlink != 1 or out_info.st_size != 0
+                      or out_info.st_mode & 0o077):
+                  fail("validated receipt is not a fresh private owned regular file")
               view = memoryview(output)
               while view:
                   written = os.write(out_fd, view)
                   if written <= 0:
-                      fail("bounded evidence write failed")
+                      fail("validated receipt write failed")
                   view = view[written:]
+              if os.fstat(out_fd).st_size != len(output):
+                  fail("validated receipt write was incomplete")
+              os.fsync(out_fd)
           finally:
               os.close(out_fd)
-          print(f"fsck diagnostics validated: {len(records)} record(s), {len(output)} bytes")
+          print(f"fsck receipts validated: {len(records)} record(s), {len(output)} bytes")
           PY
+          test -f "$validated_file"
+          test ! -L "$validated_file"
+          test -O "$validated_file"
+          printf 'path=%s\n' "$validated_file" >> "$GITHUB_OUTPUT"
 
       - name: Upload S4 acceptance evidence
         if: always()
@@ -274,4 +309,12 @@ jobs:
         with:
           name: s4-ci-pins-git-view-evidence
           path: test-results/s4-ci-pins-git-view
+          if-no-files-found: error
+
+      - name: Upload validated fsck receipts
+        if: ${{ always() && steps.fsck_receipts.outcome == 'success' && github.event_name == 'workflow_dispatch' && inputs.fsck_diagnostics }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4-fsck-validated-receipts
+          path: ${{ steps.fsck_receipts.outputs.path }}
           if-no-files-found: error
