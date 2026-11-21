@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 from scripts.pack_compression_eval.corpus import isolated_git_env, run_git
-from scripts.pack_compression_eval.failure_diagnostics import LiveEvalFailure, completed_counts
+from scripts.pack_compression_eval.failure_diagnostics import LiveEvalFailure, completed_counts, git_failure_record
 from scripts.pack_compression_eval.live_reads import measure_fetches
 from scripts.pack_compression_eval.live_server import fetch_and_fsck
 from scripts.pack_compression_eval.report import _validate_fetch_group
@@ -43,13 +43,24 @@ class PackCompressionFetchTest(unittest.TestCase):
                 head = git_ok(["rev-parse", "HEAD"], source).decode("ascii")
                 self.assertEqual(len(head), width)
 
+                decoy = root / "decoy.git"
+                git_ok(["init", "--bare", "--quiet", f"--object-format={object_format}", str(decoy)])
+                decoy_config = (decoy / "config").read_bytes()
+                contaminated_env = {
+                    **env,
+                    "GIT_DIR": str(decoy),
+                    "GIT_OBJECT_DIRECTORY": str(decoy / "objects"),
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(source / ".git/objects"),
+                }
                 context = {"phase": "baseline_fetch", "object_format": object_format}
                 for label in ("cold", "warm"):
                     client = root / f"{label}.git"
-                    duration = fetch_and_fsck(git, source.as_uri(), client, env, head, object_format, context=context)
+                    duration = fetch_and_fsck(git, source.as_uri(), client, contaminated_env, head, object_format, context=context)
                     self.assertTrue(math.isfinite(duration) and duration >= 0)
                     self.assertEqual(git_ok(["for-each-ref", "--format=%(refname)"], client), b"refs/heads/main")
                     self.assertEqual(git_ok(["show", "refs/heads/main:fixture.txt"], client), b"fetch witness")
+                self.assertEqual(git_ok(["for-each-ref"], decoy), b"")
+                self.assertEqual((decoy / "config").read_bytes(), decoy_config)
 
                 with self.assertRaises(LiveEvalFailure) as failure:
                     fetch_and_fsck(git, source.as_uri(), root / "wrong-oid.git", env, "0" * width, object_format, context=context)
@@ -100,6 +111,15 @@ class PackCompressionFetchTest(unittest.TestCase):
         self.assertEqual(result["s3_fetch_warm"]["get_requests"], 1)
         self.assertEqual(progress["completed"]["cold_fetch_samples_completed"], 1)
         self.assertEqual(progress["completed"]["warm_fetch_samples_completed"], 1)
+
+    def test_fetch_records_http_status_without_inferring_a_push_subphase(self):
+        stderr = b"error: RPC failed; HTTP 503 curl 22"
+        for phase in ("baseline_fetch", "candidate_fetch"):
+            with self.subTest(phase=phase):
+                failure = git_failure_record({"phase": phase}, failure_class="git_fetch", stderr=stderr)
+                self.assertEqual((failure["http_status"], failure["http_subphase"]), (503, "unknown"))
+        push = git_failure_record({"phase": "concurrent_push"}, stderr=stderr)
+        self.assertEqual((push["http_status"], push["http_subphase"]), (503, "receive_pack"))
 
     def test_fetch_report_percentiles_must_match_samples(self):
         cohort = [("text_history", "sha256")]

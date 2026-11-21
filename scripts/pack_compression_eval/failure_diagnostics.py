@@ -373,9 +373,9 @@ def git_failure_record(
     stdout: bytes | bytearray | None = None,
     expected_destination: Any = None,
 ) -> dict[str, Any]:
-    """Push-boundary record; raw stdout/stderr are parsed and never kept.
+    """Git command record with finite diagnostics from raw stdout and stderr.
 
-    HTTP fields come only from stderr, independent of the per-ref verdict.
+    HTTP status comes from stderr. The subphase classifier describes pushes.
     """
     values = context if isinstance(context, Mapping) else {}
     code, signal = child_outcome(returncode)
@@ -393,7 +393,7 @@ def git_failure_record(
         git_returncode=code,
         signal=signal,
         http_status=status,
-        http_subphase=finite_http_subphase(stderr, status),
+        http_subphase="unknown" if values.get("phase") in ("baseline_fetch", "candidate_fetch") else finite_http_subphase(stderr, status),
         push_ref_verdict=finite_push_ref_verdict(stdout, expected_destination),
         elapsed_ms=elapsed_ms,
         completed=values.get("completed"),

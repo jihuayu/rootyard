@@ -17,7 +17,7 @@ import uuid
 
 from .capacity import build_server_env, derive_capacity_envelope
 from .cleanup_diagnostics import StopPostcondition
-from .corpus import run_git, url_quote_repo
+from .corpus import isolated_git_env, run_git, url_quote_repo
 from .failure_diagnostics import (
     LiveEvalFailure,
     build_failure_record,
@@ -387,9 +387,13 @@ def fetch_and_fsck(
 ) -> float:
     """Time a stock Git fetch into a fresh bare client, then verify its exact commit."""
     main_ref = "refs/heads/main"
+    env = isolated_git_env({
+        name: value for name, value in env.items()
+        if not name.startswith("GIT_") or name in ("GIT_ASKPASS", "GIT_ASKPASS_REQUIRE")
+    })
     try:
         dest.mkdir()
-        init, _ = run_git(git_bin, ["init", "--bare", "--quiet", f"--object-format={object_format}"], dest, env)
+        init, _ = run_git(git_bin, ["init", "--bare", "--quiet", "--template=", f"--object-format={object_format}"], dest, env)
         if init.returncode:
             raise LiveEvalFailure(git_failure_record(context, failure_class="git_fetch", returncode=init.returncode))
         fetch, elapsed = run_git(
