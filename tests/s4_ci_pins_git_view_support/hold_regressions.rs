@@ -212,12 +212,30 @@ async fn wait_scratch_gone(scratch: &str, pids: &[String]) -> Result<()> {
     for _ in 0..200 {
         if !root.exists() {
             let alive = pids.iter().filter(|pid| PathBuf::from(format!("/proc/{pid}")).exists()).count();
-            ensure!(alive == 0, "a Git view child survived scratch deletion: {pids:?}");
+            ensure!(alive == 0, "a Git view child survived scratch deletion: {}", child_states(pids));
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     Err(anyhow::anyhow!("the Git view scratch directory was never removed: {}", root.display()))
+}
+#[cfg(unix)]
+fn child_state(pid: &str) -> &'static str {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(err) => return if err.kind() == std::io::ErrorKind::NotFound { "missing" } else { "unknown" },
+    };
+    let Some((_, tail)) = stat.rsplit_once(')') else { return "unknown" };
+    match tail.split_whitespace().next() {
+        Some("Z") => "zombie",
+        Some("X" | "x") => "dead",
+        Some("R" | "S" | "D" | "T" | "t" | "W" | "K" | "P" | "I") => "live",
+        _ => "unknown",
+    }
+}
+#[cfg(unix)]
+fn child_states(pids: &[String]) -> String {
+    pids.iter().enumerate().map(|(slot, pid)| format!("slot{slot}={}", child_state(pid))).collect::<Vec<_>>().join(",")
 }
 
 pub async fn bounded_child_lifecycle() -> Result<()> {
