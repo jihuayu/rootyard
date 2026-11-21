@@ -101,6 +101,12 @@ async fn upload_inner(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Error> {
+    if let Some(gate) = super::blob_proof_publication::active_blob_gate() {
+        return super::blob_proof_publication::prod_routes::prod_upload(
+            gate, state, owner, repo_raw, oid, size_param, headers, body,
+        )
+        .await;
+    }
     let deadline = storage::verification_deadline(&state);
     let headers = sanitize_headers(&headers);
     let actor = auth::authenticate(&state.pool, &headers).await?;
