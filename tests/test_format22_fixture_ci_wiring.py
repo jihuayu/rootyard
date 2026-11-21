@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import re
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -54,7 +55,7 @@ PROTOCOL_COUNTS = {
     "ref_store_packs": 8,
     "ref_store_retention_roots": 23,
     "ref_store_materialized_reads": 12,
-    "ref_store_decision_subset": 23,
+    "ref_store_decision_subset": 24,
 }
 
 _TEST_ATTRIBUTE = re.compile(
@@ -616,6 +617,60 @@ class ProtocolSuiteCountTest(unittest.TestCase):
                     if re.match(r"^      - ", lines[index])), len(lines))
         return "\n".join(lines[start:end])
 
+    def _suite_counts_gate(self, step: str) -> list[int]:
+        """Check the one adjacent suite_counts binding/verifier pair in Step11."""
+        marker = "python3 - <<'PY'\n"
+        self.assertEqual(step.count(marker), 1, "expected exactly one Python gate")
+        block = step.split(marker, 1)[1]
+        terminator = "\n          PY"
+        self.assertEqual(block.count(terminator), 1, "expected exactly one gate terminator")
+        code = textwrap.dedent(block.split(terminator, 1)[0])
+        lines = code.splitlines()
+        binding = "suite_counts = sorted(int(passed) for _, passed, _, _ in rows)"
+        assertion = "assert suite_counts == [8, 12, 23, 24], rows"
+        binding_lines = [index for index, line in enumerate(lines) if line == binding]
+        assertion_lines = [index for index, line in enumerate(lines) if line == assertion]
+        self.assertEqual(len(binding_lines), 1, "expected one exact suite_counts binding")
+        self.assertEqual(len(assertion_lines), 1, "expected one exact suite_counts verifier")
+        self.assertEqual(assertion_lines[0], binding_lines[0] + 1,
+                         "binding and verifier must be adjacent top-level statements")
+
+        tree = ast.parse(code)
+        body = {node.lineno: node for node in tree.body}
+        self.assertIsInstance(body.get(binding_lines[0] + 1), ast.Assign)
+        assertion_node = body.get(assertion_lines[0] + 1)
+        self.assertIsInstance(assertion_node, ast.Assert)
+        self.assertIsInstance(assertion_node.test, ast.Compare)
+        self.assertEqual(len(assertion_node.test.comparators), 1)
+        asserted = ast.literal_eval(assertion_node.test.comparators[0])
+        self.assertEqual(asserted, [8, 12, 23, 24])
+
+        receipt_lines = [
+            index + 1 for index, line in enumerate(lines)
+            if line.strip() == "'suite_counts': suite_counts,"
+        ]
+        self.assertEqual(len(receipt_lines), 1, "expected one exact A4 receipt reference")
+        names = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id == "suite_counts"
+        ]
+        self.assertEqual(len(names), 3, "expected exactly three suite_counts references")
+        self.assertEqual(
+            {(node.lineno, type(node.ctx)) for node in names},
+            {
+                (binding_lines[0] + 1, ast.Store),
+                (assertion_lines[0] + 1, ast.Load),
+                (receipt_lines[0], ast.Load),
+            },
+            "suite_counts is only bound, verified, and read by the A4 receipt",
+        )
+
+        self.assertEqual(step.count("issue107-a4-native.json"), 1)
+        self.assertLess(assertion_lines[0] + 1, receipt_lines[0])
+        self.assertLess(step.index("issue107-a4-native.json"),
+                        step.index("'suite_counts': suite_counts,"))
+        return asserted
+
     def test_protocol_suite_counts_match_test_crates(self) -> None:
         # The workflow runs this exact set through `cargo test -- --ignored`;
         # every runtime row must therefore match the static per-crate count.
@@ -627,14 +682,40 @@ class ProtocolSuiteCountTest(unittest.TestCase):
             self.assertIn(f"--test {suite}", step)
         self.assertIn("-- --ignored --test-threads=1", step)
 
-        assertion = re.search(
-            r"assert sorted\(int\(passed\) for _, passed, _, _ in rows\) == (\[[^\]]*\]), rows",
-            step,
-        )
-        self.assertIsNotNone(assertion, "the step has no sorted suite-count assertion")
-        asserted = ast.literal_eval(assertion.group(1))
+        asserted = self._suite_counts_gate(step)
         self.assertEqual(asserted, sorted(counts.values()))
-        self.assertEqual(asserted, [8, 12, 23, 23])
+        self.assertEqual(asserted, [8, 12, 23, 24])
+
+    def test_protocol_suite_counts_gate_rejects_changed_or_missing_statements(self) -> None:
+        step = self._step(PROTOCOL_STEP)
+        binding = "suite_counts = sorted(int(passed) for _, passed, _, _ in rows)"
+        assertion = "assert suite_counts == [8, 12, 23, 24], rows"
+        self.assertEqual(self._suite_counts_gate(step), [8, 12, 23, 24])
+        variants = (
+            step.replace(binding, "suite_counts = sorted(int(failed) for _, passed, _, _ in rows)", 1),
+            step.replace(binding, "", 1),
+            step.replace(assertion, "assert suite_counts == [8, 12, 23, 23], rows", 1),
+            step.replace(assertion, "", 1),
+            step.replace(binding, binding + "\n" + binding, 1),
+            step.replace(
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                "          suite_counts = [0, 0, 0, 0]\n"
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                1),
+            step.replace(
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                "          suite_counts[:] = [0, 0, 0, 0]\n"
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                1),
+            step.replace(
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                "          suite_counts.clear()\n"
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                1),
+        )
+        for variant in variants:
+            with self.assertRaises(AssertionError):
+                self._suite_counts_gate(variant)
 
     def test_strip_rust_comments_handles_comments_and_char_literals(self) -> None:
         sample = (

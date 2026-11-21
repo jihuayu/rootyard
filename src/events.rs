@@ -1,11 +1,15 @@
 //! PostgreSQL outbox and fenced, transactional local consumers.
 //! These projections are rebuildable; GitFS is the authoritative ref store.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, ensure};
 use deadpool_postgres::Pool;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio_postgres::{Row, Transaction};
+use tokio_postgres::Transaction;
 use uuid::Uuid;
+
+mod consumer;
+
+pub use consumer::{acknowledge, claim, fail, worker_once, worker_once_with_lease, worker_once_with_lease_scoped};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AdmissionRecord {
@@ -50,10 +54,10 @@ pub struct Claim {
     pub new_oid: String,
 }
 pub const CONSUMERS: &[&str] = &["audit-log", "ref-index"];
-fn valid_consumer(consumer: &str) -> Result<()> {
-    ensure!(CONSUMERS.contains(&consumer), "unknown consumer");
-    Ok(())
-}
+/// The only delivery consumer the standalone worker is allowed to scan.
+pub const TARGET_AUDIT_CONSUMER: &str = "audit-log";
+/// Fixed durable evidence kind produced by the pg_refstore A4 audit bridge.
+pub const TARGET_AUDIT_KIND: &str = "pg_refstore_core_commit_audit";
 pub fn event_id(operation_id: Uuid, transaction_sequence: i64, ref_name: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(b"rootyard-ref-event-v1\0");
@@ -107,7 +111,7 @@ async fn publish_guarded(
 ) -> Result<()> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    publish_in_tx_guarded(&tx, operation, changes, no_grant, recorded).await?;
+    publish_in_tx_guarded(&tx, operation, changes, no_grant, recorded, true).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -116,7 +120,74 @@ async fn publish_guarded(
 /// transaction. Pando uses this with the authoritative ref/pack CAS so neither
 /// side can commit independently.
 pub async fn publish_in_tx(tx: &Transaction<'_>, operation: &OperationRecord, changes: &[RefEventInput]) -> Result<()> {
-    publish_in_tx_guarded(tx, operation, changes, None, None).await
+    publish_in_tx_guarded(tx, operation, changes, None, None, true).await
+}
+
+/// Project one already-committed core pack operation into the durable delivery
+/// outbox as *audit-log only*. It runs inside the core commit transaction, so
+/// the `git_operations` row, exact applied ref events and their `audit-log`
+/// deliveries become durable atomically with `ref_store_core_events`.
+///
+/// This is a delivery/audit projection, never a ref authority: the core refs,
+/// gate revision and terminal remain the only source of truth, and no
+/// `ref-index` delivery is created (that legacy consumer would otherwise write
+/// `repository_ref_projection`, which the `pg_refstore` serving predicate
+/// treats as a conflicting legacy authority).
+///
+/// The unique delivery identity is the exact
+/// `(repository, storage_generation, sequence)` tuple plus the operation UUID.
+/// An unrelated operation at another tuple is harmless history and is
+/// tolerated. A different UUID owning this tuple, or a different payload under
+/// this UUID, is a typed namespace conflict: the caller must roll back the
+/// whole core commit rather than ACK content whose audit delivery was silently
+/// dropped.
+pub async fn publish_core_commit_audit_in_tx(
+    tx: &Transaction<'_>,
+    operation: &OperationRecord,
+    changes: &[RefEventInput],
+) -> Result<(), crate::ref_store::contract::RefStoreError> {
+    if operation.outcome != "recorded" {
+        return Err(crate::ref_store::contract::RefStoreError::Unsupported(
+            "core audit projection requires a recorded operation",
+        ));
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    // Only the exact tuple/UUID can conflict. Unrelated history in the same
+    // repository (other generations or sequences) is tolerated and is never
+    // rewritten, renumbered or adopted.
+    let existing = tx
+        .query_opt(
+            "SELECT id,repository_id,storage_generation,sequence,actor_id,token_id,service_principal_id,actor_name,outcome,evidence \
+             FROM git_operations \
+             WHERE (repository_id=$1 AND storage_generation=$2 AND sequence=$3) OR id=$4",
+            &[&operation.repository_id, &operation.storage_generation, &operation.sequence, &operation.id],
+        )
+        .await
+        .map_err(crate::ref_store::pg::db_error)?;
+    if let Some(row) = existing {
+        // Only a byte-identical local duplicate of this exact tuple/UUID may be
+        // confirmed. A different UUID owning the tuple, a different payload
+        // under the UUID, or any principal/outcome mismatch fails closed rather
+        // than letting generic `ON CONFLICT` idempotency hide it.
+        let exact = row.get::<_, Uuid>(0) == operation.id
+            && row.get::<_, Uuid>(1) == operation.repository_id
+            && row.get::<_, i64>(2) == operation.storage_generation
+            && row.get::<_, i64>(3) == operation.sequence
+            && row.get::<_, Option<Uuid>>(4) == Some(operation.actor_id)
+            && row.get::<_, Option<Uuid>>(5) == Some(operation.token_id)
+            && row.get::<_, Option<Uuid>>(6) == operation.service_principal_id
+            && row.get::<_, String>(7) == operation.actor_name
+            && row.get::<_, String>(8) == "recorded"
+            && row.get::<_, serde_json::Value>(9) == operation.evidence;
+        if !exact {
+            return Err(crate::ref_store::contract::RefStoreError::IdentityConflict);
+        }
+    }
+    publish_in_tx_guarded(tx, operation, changes, None, None, false)
+        .await
+        .map_err(|_| crate::ref_store::contract::RefStoreError::Database("core audit outbox projection failed".into()))
 }
 
 async fn publish_in_tx_guarded(
@@ -125,6 +196,7 @@ async fn publish_in_tx_guarded(
     changes: &[RefEventInput],
     no_grant: Option<&crate::storage::no_grant_proof::NoGrantAbort>,
     recorded: Option<&crate::storage::recorded_receipt_proof::RecordedReceiptProof>,
+    enqueue_ref_index: bool,
 ) -> Result<()> {
     ensure!(matches!(operation.outcome.as_str(), "unknown" | "recorded" | "no_ref_changes"), "invalid outcome");
     ensure!(operation.sequence > 0 && operation.storage_generation > 0, "invalid operation sequence");
@@ -245,180 +317,21 @@ async fn publish_in_tx_guarded(
                 && old.get::<_, String>(4) == change.new_oid,
             "event replay mismatch"
         );
-        tx.execute("INSERT INTO event_deliveries(event_id,consumer) VALUES($1,'audit-log'),($1,'ref-index') ON CONFLICT DO NOTHING", &[&id]).await?;
+        tx.execute(
+            "INSERT INTO event_deliveries(event_id,consumer) VALUES($1,'audit-log') ON CONFLICT DO NOTHING",
+            &[&id],
+        )
+        .await?;
+        if enqueue_ref_index {
+            tx.execute(
+                "INSERT INTO event_deliveries(event_id,consumer) VALUES($1,'ref-index') ON CONFLICT DO NOTHING",
+                &[&id],
+            )
+            .await?;
+        }
     }
     tx.execute("UPDATE git_operations SET outcome=$2,evidence=$3,settled_at=CASE WHEN $2='unknown' THEN NULL ELSE COALESCE(settled_at,clock_timestamp()) END WHERE id=$1", &[&operation.id,&operation.outcome,&operation.evidence]).await?;
     Ok(())
-}
-
-fn claim_from_row(row: &Row, consumer: &str, owner: Uuid, generation: i64) -> Claim {
-    Claim {
-        event_id: row.get("event_id"),
-        consumer: consumer.into(),
-        lease_owner: owner,
-        generation,
-        repository_id: row.get("repository_id"),
-        operation_id: row.get("operation_id"),
-        storage_generation: row.get("storage_generation"),
-        operation_sequence: row.get("operation_sequence"),
-        transaction_sequence: row.get("transaction_sequence"),
-        ref_name: row.get("ref_name"),
-        old_oid: row.get("old_oid"),
-        new_oid: row.get("new_oid"),
-    }
-}
-
-pub async fn claim(pool: &Pool, consumer: &str, owner: Uuid, limit: i64, lease_seconds: i64) -> Result<Vec<Claim>> {
-    valid_consumer(consumer)?;
-    ensure!((1..=1000).contains(&limit) && (1..=3600).contains(&lease_seconds), "invalid claim bounds");
-    let mut client = pool.get().await?;
-    let tx = client.transaction().await?;
-    let rows=tx.query("SELECT e.* FROM event_deliveries d JOIN outbox_events e USING(event_id) JOIN git_operations o ON o.id=e.operation_id WHERE d.consumer=$1 AND o.outcome <> 'unknown' AND d.state <> 'delivered' AND d.next_attempt_at <= clock_timestamp() AND (d.state='pending' OR d.lease_until <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM outbox_events prior JOIN event_deliveries pd USING(event_id) WHERE pd.consumer=d.consumer AND pd.state <> 'delivered' AND prior.repository_id=e.repository_id AND prior.ref_name=e.ref_name AND (prior.storage_generation,prior.operation_sequence,prior.transaction_sequence)<(e.storage_generation,e.operation_sequence,e.transaction_sequence)) AND NOT EXISTS (SELECT 1 FROM git_operations unknown_op WHERE unknown_op.repository_id=e.repository_id AND unknown_op.outcome='unknown' AND NOT EXISTS(SELECT 1 FROM operation_resolutions resolved WHERE resolved.operation_id=unknown_op.id) AND (unknown_op.storage_generation,unknown_op.sequence)<(e.storage_generation,e.operation_sequence)) ORDER BY e.storage_generation,e.operation_sequence,e.transaction_sequence,e.event_id LIMIT $2 FOR UPDATE OF d SKIP LOCKED", &[&consumer,&limit]).await?;
-    let mut claims = Vec::new();
-    for row in rows {
-        let id: String = row.get("event_id");
-        // Recheck the clock only after obtaining the delivery row lock.
-        if let Some(lease)=tx.query_opt("UPDATE event_deliveries SET state='leased',lease_owner=$3,lease_generation=lease_generation+1,lease_until=clock_timestamp()+($4::bigint * interval '1 second'),attempts=attempts+1 WHERE event_id=$1 AND consumer=$2 AND state <> 'delivered' AND next_attempt_at<=clock_timestamp() AND (state='pending' OR lease_until<=clock_timestamp()) RETURNING lease_generation", &[&id,&consumer,&owner,&lease_seconds]).await? {
-            claims.push(claim_from_row(&row,consumer,owner,lease.get(0)));
-        }
-    }
-    tx.commit().await?;
-    Ok(claims)
-}
-
-async fn lock_valid_lease(tx: &Transaction<'_>, claim: &Claim) -> Result<bool> {
-    valid_consumer(&claim.consumer)?;
-    let exists = tx
-        .query_opt(
-            "SELECT event_id FROM event_deliveries WHERE event_id=$1 AND consumer=$2 FOR UPDATE",
-            &[&claim.event_id, &claim.consumer],
-        )
-        .await?;
-    if exists.is_none() {
-        return Ok(false);
-    }
-    Ok(tx.query_one("SELECT state='leased' AND lease_owner=$3 AND lease_generation=$4 AND lease_until>clock_timestamp() FROM event_deliveries WHERE event_id=$1 AND consumer=$2", &[&claim.event_id,&claim.consumer,&claim.lease_owner,&claim.generation]).await?.get::<_,Option<bool>>(0).unwrap_or(false))
-}
-
-/// Apply the local database effect and delivery acknowledgment in one transaction.
-/// No exactly-once promise is made for external side effects.
-pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
-    let mut client = pool.get().await?;
-    let tx = client.transaction().await?;
-    // Canonical event metadata, never the caller's Claim payload, chooses the
-    // repository. Repository -> delivery -> projection is the global lock order.
-    let Some(event)=tx.query_opt("SELECT repository_id,storage_generation,operation_sequence,transaction_sequence,ref_name,operation_id FROM outbox_events WHERE event_id=$1",&[&claim.event_id]).await? else {return Ok(false);};
-    let repository_id: Uuid = event.get(0);
-    let current: i64 = tx
-        .query_one("SELECT rootyard_worker_repository_generation($1, current_schema())", &[&repository_id])
-        .await?
-        .get(0);
-    if !lock_valid_lease(&tx, claim).await? {
-        return Ok(false);
-    }
-    let generation: i64 = event.get(1);
-    let sequence: i64 = event.get(2);
-    let ordinal: i64 = event.get(3);
-    let ref_name: String = event.get(4);
-    let operation_id: Uuid = event.get(5);
-    let blocked:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM git_operations o WHERE o.repository_id=$1 AND o.outcome='unknown' AND NOT EXISTS(SELECT 1 FROM operation_resolutions r WHERE r.operation_id=o.id) AND (o.storage_generation,o.sequence)<=($2,$3)) OR EXISTS(SELECT 1 FROM outbox_events p JOIN event_deliveries d USING(event_id) WHERE p.repository_id=$1 AND p.ref_name=$4 AND d.consumer=$5 AND d.state<>'delivered' AND (p.storage_generation,p.operation_sequence,p.transaction_sequence)<($2,$3,$6)) OR EXISTS(SELECT 1 FROM git_operations o WHERE o.id=$7 AND o.outcome='unknown')",&[&repository_id,&generation,&sequence,&ref_name,&claim.consumer,&ordinal,&operation_id]).await?.get(0);
-    if blocked {
-        return Ok(false);
-    }
-    ensure!(generation <= current, "event generation exceeds repository generation");
-    let superseded = claim.consumer == "ref-index" && generation < current;
-    // CI maintenance has exact root-observation evidence, not a native push
-    // receipt. Keep its outbox/audit trail, but never label it push_receipt in
-    // the user ref projection. Explicit recovery snapshots remain independent.
-    let ci_maintenance: bool = tx
-        .query_one(
-            "SELECT COALESCE(evidence->>'kind'='observed_immutable_ci_root',false) FROM git_operations WHERE id=$1",
-            &[&operation_id],
-        )
-        .await?
-        .get(0);
-    // A repository with a durable `pg_refstore` serving binding is the single
-    // ref authority: keep its outbox/audit trail, but never mirror it into the
-    // legacy rebuildable projection (migration 145 refuses that second write).
-    let pg_refstore_served: bool = if tx
-        .query_one("SELECT to_regclass(format('%I.ref_store_serving_repositories', current_schema())) IS NOT NULL", &[])
-        .await?
-        .get(0)
-    {
-        tx.query_one(
-            "SELECT EXISTS (SELECT 1 FROM ref_store_serving_repositories WHERE repository_id=$1)",
-            &[&repository_id],
-        )
-        .await?
-        .get(0)
-    } else {
-        false
-    };
-    match claim.consumer.as_str() {
-        "audit-log" => {
-            tx.execute("INSERT INTO audit_events(event_id) VALUES($1) ON CONFLICT DO NOTHING", &[&claim.event_id])
-                .await?;
-        }
-        "ref-index" if !superseded && !ci_maintenance && !pg_refstore_served => {
-            tx.execute("INSERT INTO repository_ref_projection(repository_id,ref_name,oid,deleted,storage_generation,operation_sequence,transaction_sequence,event_id) SELECT repository_id,ref_name,CASE WHEN new_oid ~ '^0+$' THEN NULL ELSE new_oid END,new_oid ~ '^0+$',storage_generation,operation_sequence,transaction_sequence,event_id FROM outbox_events WHERE event_id=$1 ON CONFLICT(repository_id,ref_name) DO UPDATE SET oid=EXCLUDED.oid,deleted=EXCLUDED.deleted,storage_generation=EXCLUDED.storage_generation,operation_sequence=EXCLUDED.operation_sequence,transaction_sequence=EXCLUDED.transaction_sequence,event_id=EXCLUDED.event_id,source_kind='push_receipt',resolution_id=NULL,updated_at=clock_timestamp() WHERE (repository_ref_projection.storage_generation,repository_ref_projection.operation_sequence,repository_ref_projection.transaction_sequence)<(EXCLUDED.storage_generation,EXCLUDED.operation_sequence,EXCLUDED.transaction_sequence)", &[&claim.event_id]).await?;
-        }
-        "ref-index" => {}
-        _ => bail!("unknown consumer"),
-    }
-    // Effects may wait on another lock. Expiry is checked again before commit;
-    // an expired fence rolls back the entire local effect.
-    let effect = if superseded { "superseded_generation" } else { "applied" };
-    let count=tx.execute("UPDATE event_deliveries SET state='delivered',lease_owner=NULL,lease_until=NULL,delivered_at=clock_timestamp(),last_error_code=NULL,effect=$5 WHERE event_id=$1 AND consumer=$2 AND state='leased' AND lease_owner=$3 AND lease_generation=$4 AND lease_until>clock_timestamp()", &[&claim.event_id,&claim.consumer,&claim.lease_owner,&claim.generation,&effect]).await?;
-    if count == 0 {
-        tx.rollback().await?;
-        return Ok(false);
-    }
-    tx.commit().await?;
-    Ok(true)
-}
-
-pub async fn fail(pool: &Pool, claim: &Claim, error_code: &str, delay_seconds: i64) -> Result<bool> {
-    ensure!((0..=86400).contains(&delay_seconds), "invalid retry delay");
-    ensure!(
-        !error_code.is_empty()
-            && error_code.len() <= 64
-            && error_code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-        "invalid error code"
-    );
-    let mut client = pool.get().await?;
-    let tx = client.transaction().await?;
-    if !lock_valid_lease(&tx, claim).await? {
-        return Ok(false);
-    }
-    let count=tx.execute("UPDATE event_deliveries SET state='pending',lease_owner=NULL,lease_until=NULL,next_attempt_at=clock_timestamp()+($5::bigint * interval '1 second'),last_error_code=$6 WHERE event_id=$1 AND consumer=$2 AND state='leased' AND lease_owner=$3 AND lease_generation=$4 AND lease_until>clock_timestamp()", &[&claim.event_id,&claim.consumer,&claim.lease_owner,&claim.generation,&delay_seconds,&error_code]).await?;
-    tx.commit().await?;
-    Ok(count == 1)
-}
-
-pub async fn worker_once(pool: &Pool, consumer: &str, owner: Uuid, limit: i64) -> Result<usize> {
-    worker_once_with_lease(pool, consumer, owner, limit, 60).await
-}
-
-pub async fn worker_once_with_lease(
-    pool: &Pool,
-    consumer: &str,
-    owner: Uuid,
-    limit: i64,
-    lease_seconds: i64,
-) -> Result<usize> {
-    let claims = claim(pool, consumer, owner, limit, lease_seconds).await?;
-    let mut count = 0;
-    for item in claims {
-        match acknowledge(pool, &item).await {
-            Ok(true) => count += 1,
-            Ok(false) => {}
-            Err(error) => {
-                fail(pool, &item, "local_effect_failed", 5).await.context("reschedule local consumer")?;
-                return Err(error);
-            }
-        }
-    }
-    Ok(count)
 }
 
 pub async fn process_ref_cas_projection_jobs(

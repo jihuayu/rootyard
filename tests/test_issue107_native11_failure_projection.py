@@ -665,6 +665,40 @@ class AcceptanceFailureReportTests(unittest.TestCase):
         self.assertEqual(runner.validate_report(report, HEAD),
                          {"targets": 11, "cases": 167})
 
+    def test_known_a4_listing_opt_in_keeps_execution_at_167(self):
+        def opted_in(command):
+            target = Path(command[0]).name
+            if "--list" in command:
+                names = list(inventory.TARGETS[target]["cases"])
+                if target == "ref_store_decision_subset":
+                    names.extend(inventory.HOSTED_KNOWN_EXTRA_CASES[target])
+                payload = "\n".join(name + ": test" for name in names)
+                return FakeProcess(payload.encode(), returncode=0)
+            payload = "\n".join([case_line(command[1], "ok"),
+                                 summary("ok", 1, 0, 0)]).encode()
+            return FakeProcess(payload, returncode=0)
+
+        with mock.patch.object(runner, "input_hashes",
+                               return_value={"a": "f" * 64}), \
+             mock.patch.object(runner, "_required_environment", return_value=None), \
+             mock.patch.object(runner, "_receipt_identity",
+                               side_effect=lambda target, *args: self.identities[target]), \
+             mock.patch.object(runner.subprocess, "Popen",
+                               side_effect=lambda command, **kwargs: opted_in(command)):
+            report = runner.run_acceptance(
+                HEAD, self.source, self.targets, self.receipts,
+                report_path=self.root / "a4-opt-in.json",
+                allow_known_a4_extra=True)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["case_count"], 167)
+        self.assertEqual(report["expected_count"], 167)
+        a4_extra = inventory.HOSTED_KNOWN_EXTRA_CASES[
+            "ref_store_decision_subset"][0]
+        self.assertNotIn(
+            a4_extra,
+            {case["name"] for row in report["targets"]
+             for case in row["cases"]})
+
     def test_success_contract_accepts_optional_clear_empty_diagnostic(self):
         report = success_report()
         report["failed_target"] = None

@@ -62,7 +62,12 @@ pub(crate) struct BrowseSession {
     pub head_oid: Option<String>,
     pub format: GitObjectFormat,
     pub repository_id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+    pub history_incarnation: uuid::Uuid,
     pub storage_generation: i64,
+    /// The gate revision the capture actually locked. `Some` is required before
+    /// any advisory payload cache entry may be formed; `None` bypasses it.
+    pub capture_gate_revision: Option<i64>,
 }
 
 impl BrowseSession {
@@ -89,6 +94,7 @@ impl BrowseSession {
         // fails close whenever it is absent, and a checked empty capture has no
         // proof to read it from later.
         let capture_incarnation = snapshot::capture_incarnation(&refs);
+        let capture_gate_revision = snapshot::capture_gate_revision(&refs);
         let view = snapshot::build_sealed_view(&state, &refs, deadline).await?;
         authorization.revalidate(deadline).await?;
         let tokens = state.sessions().cloned();
@@ -98,7 +104,10 @@ impl BrowseSession {
             head_oid: refs.head_oid.clone(),
             format: refs.format,
             repository_id: serving.gate.repository_id(),
+            tenant_id: serving.gate.tenant_id(),
+            history_incarnation: serving.gate.history_incarnation(),
             storage_generation: serving.repository.storage_generation,
+            capture_gate_revision,
             authorization,
             tokens,
             capture_incarnation,
@@ -126,6 +135,13 @@ impl BrowseSession {
     /// had anything to prove.
     pub(crate) fn materialized_read(&self) -> Option<&MaterializedServingRead> {
         self.view.read()
+    }
+
+    /// The captured cluster authority incarnation used by the final fence and
+    /// by the advisory payload key. It is never a substitute for the live
+    /// lookup performed in [`finalize`].
+    pub(crate) fn capture_incarnation(&self) -> Option<uuid::Uuid> {
+        self.capture_incarnation
     }
 }
 
