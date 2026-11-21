@@ -42,6 +42,7 @@ TOUCHED = [
     SRC / "namespace_service" / "s4_git_view.rs",
     SRC / "namespace_service" / "s4_git_proc.rs",
     SRC / "namespace_service" / "s4_git_proc_tests.rs",
+    SRC / "namespace_service" / "s4_git_proc_reverse_diag_tests.rs",
     SRC / "namespace_service" / "s4_git_proc_reverse.rs",
     SRC / "namespace_service" / "s4_git_reverse_diag.rs",
     SRC / "namespace_service" / "s4_git_view_reverse.rs",
@@ -310,7 +311,7 @@ class SourceContracts(unittest.TestCase):
         diag = text(SRC / "namespace_service" / "s4_git_reverse_diag.rs")
         reverse = text(SRC / "namespace_service" / "s4_git_proc_reverse.rs")
         view_reverse = text(SRC / "namespace_service" / "s4_git_view_reverse.rs")
-        tests = text(SRC / "namespace_service" / "s4_git_proc_tests.rs")
+        diag_tests = text(SRC / "namespace_service" / "s4_git_proc_reverse_diag_tests.rs")
         product = proc.split('#[path = "s4_git_proc_tests.rs"]', 1)[0]
 
         for label in (
@@ -374,11 +375,11 @@ class SourceContracts(unittest.TestCase):
         self.assertIn("Git View reverse mapping conflict", reverse)
         self.assertIn("Git View reverse mapping conflict", view_reverse)
 
-        self.assertIn("reverse_diag::take_for_test", tests)
-        self.assertIn("every_reverse_stage_reaches_closed_runner_diagnostic_and_keeps_public_conflict", tests)
-        self.assertIn("reverse_git_child_outcome_distinguishes_nonzero_signal_and_unknown", tests)
-        self.assertIn("reverse_git_diagnostic_labels_are_closed_and_bounded", tests)
-        self.assertIn("reverse_git_diagnostic_write_failure_is_best_effort", tests)
+        self.assertIn("reverse_diag::take_for_test", diag_tests)
+        self.assertIn("every_reverse_stage_reaches_closed_runner_diagnostic_and_keeps_public_conflict", diag_tests)
+        self.assertIn("reverse_git_child_outcome_distinguishes_nonzero_signal_and_unknown", diag_tests)
+        self.assertIn("reverse_git_diagnostic_labels_are_closed_and_bounded", diag_tests)
+        self.assertIn("reverse_git_diagnostic_write_failure_is_best_effort", diag_tests)
 
     def test_discarded_projection_cleanup_is_not_diagnosed(self) -> None:
         view = text(SRC / "namespace_service" / "s4_git_view.rs")
