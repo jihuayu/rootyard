@@ -278,13 +278,6 @@ impl State {
         self.unmount_all_with_busy_retry(true);
     }
 
-    /// The scheduling-failure fail-stop reuses the same ordered teardown but
-    /// keeps its immediate typed failure behavior: no retry budget is spent on
-    /// a path that is already exiting with a failure code.
-    fn unmount_all_failstop(&self) {
-        self.unmount_all_with_busy_retry(false);
-    }
-
     fn unmount_all_with_busy_retry(&self, retry_busy: bool) {
         {
             let pending = lock(&self.pending);
@@ -296,25 +289,38 @@ impl State {
             let mut mounts = lock(&self.mounts);
             mounts.drain().map(|(_, mount)| mount).collect()
         };
+        // Only the explicit ordinary shutdown, once its absolute deadline is
+        // published, may defer a typed busy failure while other mounts receive
+        // their first attempt. Every other path keeps the prior immediate
+        // fail-stop and cannot substitute a later mount's class.
+        let retry_deadline = if retry_busy { self.shutdown_deadline_instant() } else { None };
         let mut busy = Vec::new();
         for mut mount in mounts {
             match mount.handle.teardown_owned_classified() {
                 Ok(()) => {}
-                Err(MountTeardownClass::MatchedIdBusy) => busy.push(mount),
+                Err(MountTeardownClass::MatchedIdBusy) if retry_deadline.is_some() => busy.push(mount),
                 Err(class) => failstop(self, "owned FUSE teardown failed", teardown_failstop_exit(class)),
             }
         }
-        if retry_busy {
+        if let Some(deadline) = retry_deadline {
             // Every owned mount has had its first exact attempt. Spend the
             // small shared window only on typed busy mounts, one round at a
             // time, so a single mount cannot consume the remaining shutdown
             // budget.
-            let mut retry = BusyRetry::new(Instant::now(), self.shutdown_deadline_instant());
+            let mut retry = BusyRetry::new(Instant::now(), Some(deadline));
             while !busy.is_empty() {
                 let Some(delay) = retry.next_delay(Instant::now()) else { break };
                 thread::sleep(delay);
+                if !retry.within_window(Instant::now()) {
+                    self.failstop_busy();
+                }
                 let mut still_busy = Vec::with_capacity(busy.len());
                 for mut mount in busy {
+                    // Recheck immediately before every exact repeat: sleep or
+                    // an earlier mount may have consumed the same boundary.
+                    if !retry.within_window(Instant::now()) {
+                        self.failstop_busy();
+                    }
                     match mount.handle.teardown_owned_classified() {
                         Ok(()) => {}
                         Err(MountTeardownClass::MatchedIdBusy) => still_busy.push(mount),
@@ -325,7 +331,7 @@ impl State {
             }
         }
         if !busy.is_empty() {
-            failstop(self, "owned FUSE teardown failed", teardown_failstop_exit(MountTeardownClass::MatchedIdBusy));
+            self.failstop_busy();
         }
         // A registration that raced `begin_shutdown` is visible here; one that
         // races after the flag is rejected under the pending lock. Either way
@@ -337,6 +343,10 @@ impl State {
 
     fn failstop(&self, reason: &str, code: i32) -> ! {
         failstop(self, reason, code)
+    }
+
+    fn failstop_busy(&self) -> ! {
+        failstop(self, "owned FUSE teardown failed", teardown_failstop_exit(MountTeardownClass::MatchedIdBusy))
     }
 }
 
@@ -632,7 +642,7 @@ fn teardown(state: &State, reason: &str, code: i32) -> ! {
         // typed handling.
         state.unmount_all();
     } else {
-        state.unmount_all_failstop();
+        state.unmount_all_with_busy_retry(false);
     }
     std::process::exit(code)
 }

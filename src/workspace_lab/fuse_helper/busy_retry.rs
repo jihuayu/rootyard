@@ -61,6 +61,14 @@ impl BusyRetry {
         self.rounds_left -= 1;
         Some(RETRY_DELAY)
     }
+
+    /// True while the same absolute retry boundary still permits another exact
+    /// repeat. Callers recheck this after sleeping and immediately before each
+    /// repeat, because either the sleep or an earlier mount can consume the
+    /// remaining window.
+    pub(super) fn within_window(&self, now: Instant) -> bool {
+        now < self.retry_until
+    }
 }
 
 #[cfg(test)]
@@ -126,5 +134,16 @@ mod tests {
         let mut retry = BusyRetry::new(now, Some(now + Duration::from_secs(5)));
         assert_eq!(retry.next_delay(now + RETRY_BUDGET + Duration::from_millis(1)), None);
         assert_eq!(retry.next_delay(now), None);
+    }
+
+    #[test]
+    fn boundary_recheck_rejects_a_sleep_overshoot_and_a_consumed_window() {
+        let now = Instant::now();
+        let mut retry = BusyRetry::new(now, Some(now + Duration::from_secs(5)));
+        let delay = retry.next_delay(now).expect("the first retry is inside the window");
+
+        assert!(retry.within_window(now + delay));
+        assert!(!retry.within_window(now + RETRY_BUDGET));
+        assert!(!retry.within_window(now + RETRY_BUDGET + Duration::from_millis(1)));
     }
 }
