@@ -7,16 +7,23 @@ use super::s4_models::{
     GrantExpectation, NewGrant, S4ClosureGrant, fixed_oid, is_digest_hex, is_lower_hex, oid_width,
 };
 use super::s4_authority::{StreamSlot, wide_credential};
-use super::s4_transport::{guarded_chunks, refused_want};
+use super::s4_transport::refused_want;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use bytes::Bytes;
-use futures_util::StreamExt;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+#[cfg(unix)]
+#[path = "s4_tests/fixture.rs"]
+mod fixture;
+#[cfg(unix)]
+use self::fixture::wait_pids;
+#[cfg(target_os = "linux")]
+#[path = "s4_tests/proc_identity.rs"]
+mod proc_identity;
 
 fn sample_grant(target: &str) -> S4ClosureGrant {
     let packs = "b".repeat(64);
@@ -182,29 +189,6 @@ fn stream_slot_returns_its_permit_when_dropped() {
     assert!(semaphore.clone().try_acquire_owned().is_ok());
 }
 
-#[tokio::test]
-async fn revoked_stream_aborts_on_next_chunk_and_releases_slot() {
-    let live = Arc::new(AtomicBool::new(true));
-    let semaphore = Arc::new(Semaphore::new(1));
-    let permit = semaphore.clone().try_acquire_owned().expect("one slot");
-    let source = futures_util::stream::iter([
-        Ok::<_, std::io::Error>(Bytes::from_static(b"first-chunk")),
-        Ok(Bytes::from_static(b"second-chunk")),
-    ]);
-    let gate = live.clone();
-    let check = move || {
-        let value = gate.load(Ordering::SeqCst);
-        Box::pin(std::future::ready(value)) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
-    };
-    let mut stream = Box::pin(guarded_chunks(source, check, StreamSlot::from_permit(permit)));
-    assert_eq!(stream.next().await.expect("first").expect("chunk"), Bytes::from_static(b"first-chunk"));
-    live.store(false, Ordering::SeqCst);
-    assert!(stream.next().await.expect("second").is_err(), "revocation must abort the next chunk");
-    // The generator dropped its owned permit at the exact point it returned the
-    // error, so the shared Git capacity is immediately reusable.
-    assert!(semaphore.clone().try_acquire_owned().is_ok());
-}
-
 #[test]
 fn digest_and_hex_width_helpers_are_exact() {
     assert!(is_lower_hex(&"a".repeat(64), 64));
@@ -216,26 +200,15 @@ fn digest_and_hex_width_helpers_are_exact() {
 
 #[cfg(unix)]
 const FINAL_SCRIPT: &str = r#"#!/bin/sh
-exec >/dev/null; sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$0.pids"
+exec >/dev/null; sh -c 'trap "" TERM; while :; do sleep 1; done' &
+sh -c 'printf "%s %s\n" "$1" "$2" > "$3"' sh "$$" "$!" "$0.pids"
 trap "" TERM; while :; do sleep 1; done
 "#;
 
-#[cfg(unix)]
-fn wait_pids(path: &std::path::Path) -> (i32, i32) {
-    for _ in 0..200 {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let mut values = text.split_whitespace().filter_map(|value| value.parse::<i32>().ok());
-        if let (Some(leader), Some(grandchild)) = (values.next(), values.next()) {
-            return (leader, grandchild);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    panic!("the Git wrapper did not publish its process group");
-}
-
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes() {
+    use self::proc_identity::{ProcState, wait_for_original_pair};
     use super::s4_authority::{DisposableCiView, run_git_dir_bounded};
     use std::os::unix::fs::PermissionsExt;
     let view = DisposableCiView::create().expect("disposable view");
@@ -244,21 +217,31 @@ async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes
     std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
-    let error = run_git_dir_bounded(
+    // This awaits the fixture's pid file under the product's own deadline, then proves
+    // both original processes are live and that the stdout write ends are already closed.
+    let pids = wrapper.with_extension("pids");
+    let observed = wait_for_original_pair(&pids, deadline);
+    let call = run_git_dir_bounded(
         &wrapper,
         None,
         &[],
         deadline,
         || super::Error(StatusCode::CONFLICT, "failed"),
         Some(view.hold()),
-    )
-    .await
-    .unwrap_err();
+    );
+    let (result, (leader, descendant)) = tokio::join!(call, observed);
+    let error = result.unwrap_err();
     assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
-    let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
     assert!(root.exists(), "the disposable view vanished before the final wait was confirmed");
-    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists());
-    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists());
+    // The direct leader is our child; a zombie here means cleanup did not reap it.
+    assert_eq!(leader.state(), ProcState::Gone, "the original direct leader was not reaped");
+    // A descendant killed during cleanup may remain visible as Z/X until its new parent
+    // reaps it. The production contract is quiescence, not disappearance.
+    let descendant_state = descendant.state();
+    assert!(
+        matches!(descendant_state, ProcState::Gone | ProcState::Exited),
+        "the original descendant is still live after the timeout: {descendant_state:?}"
+    );
     drop(view);
     assert!(!root.exists());
 }

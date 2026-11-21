@@ -445,6 +445,74 @@ fn git_text(output: &GitOutput) -> String {
     format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))
 }
 
+/// Git's destination lines include the fixture's ephemeral port and random
+/// owner/repo name. Recognize only the stock client's own HTTP transport
+/// failure wording, so destination or sideband digits cannot fail a real
+/// report-status.
+fn has_stock_http_error(text: &str, status: &str) -> bool {
+    let rpc_error = format!("RPC failed; HTTP {status} curl ");
+    let url_error = format!("The requested URL returned error: {status}");
+    let access_prefix = "fatal: unable to access '";
+    let access_suffix = format!("': {url_error}");
+    text.lines().any(|line| {
+        let rpc = line.strip_prefix("error: ").unwrap_or(line).starts_with(rpc_error.as_str());
+        let access = line
+            .strip_prefix(access_prefix)
+            .and_then(|rest| rest.strip_suffix(access_suffix.as_str()))
+            .is_some_and(|url| !url.is_empty() && !url.contains('\'') && !url.contains(url_error.as_str()));
+        rpc || access
+    })
+}
+
+#[test]
+fn stock_http_errors_anchor_url_failure_to_git_fatal_line() {
+    // Both status digits can occur in the loopback port and random owner/repo
+    // name while the client still received the real stale-info report-status.
+    for destination in [
+        "http://127.0.0.1:54090/git/owner/race-admission-a503b0000000.git",
+        "http://127.0.0.1:55030/git/owner/race-409f000000.git",
+    ] {
+        let stale = format!(
+            "To {destination}\n\
+             ! [rejected] HEAD -> main (stale info)\n\
+             remote: X-Rootyard-Trace: 409\n\
+             HTTP/1.1 503 Service Unavailable\n\
+             error: failed to push some refs to '{destination}'"
+        );
+        for status in ["409", "503"] {
+            assert!(stale.contains(status));
+            assert!(
+                !has_stock_http_error(&stale, status),
+                "destination/header digits `{status}` were mistaken for a Git transport failure: {stale}"
+            );
+        }
+    }
+    for status in ["409", "503"] {
+        let destination = "http://127.0.0.1:54090/git/owner/race-admission-a503b0000000.git/";
+        // Stock Git's real curl 22 transport failure still matches, even with
+        // the status digits repeated in the failed destination URL.
+        let rpc = format!(
+            "error: RPC failed; HTTP {status} curl 22 The requested URL returned error: {status}\n\
+             To {destination}"
+        );
+        assert!(has_stock_http_error(&rpc, status));
+
+        // The URL-error form is accepted only as Git's whole fatal access line.
+        let access = format!("fatal: unable to access '{destination}': The requested URL returned error: {status}");
+        assert!(has_stock_http_error(&access, status));
+
+        // A remote sideband line, an arbitrary header prefix, a trailing suffix
+        // and a URL that itself prints the marker are all rejected.
+        assert!(!has_stock_http_error(&format!("remote: {access}"), status));
+        assert!(!has_stock_http_error(&format!("X-Upstream: {access}"), status));
+        assert!(!has_stock_http_error(&format!("{access} remote: trailing"), status));
+        let marker_in_url = format!(
+            "fatal: unable to access '{destination}The requested URL returned error: {status}': The requested URL returned error: {status}"
+        );
+        assert!(!has_stock_http_error(&marker_in_url, status));
+    }
+}
+
 /// A failed client's outcome plus a redacted diagnostic for assertion
 /// messages: no remote URL, URL userinfo, token, credential-bearing profile
 /// value, request header or operation id reaches the message, and each line is
@@ -736,8 +804,15 @@ async fn race_case(case: &Case, git: &'static Git) -> Result<Value> {
     // Raw output feeds the in-memory acceptance checks only.
     let loser_text = git_text(loser_output);
     for forbidden in ["409", "503", "non-fast-forward", "fetch first", "unexpected disconnect", "remote end hung up"] {
+        // Stock Git's destination lines can carry 409/503 in the fixture's
+        // ephemeral port or random owner/repo name, so status digits are only a
+        // transport failure when they appear in Git's own HTTP error wording.
+        let found = match forbidden {
+            "409" | "503" => has_stock_http_error(&loser_text, forbidden),
+            _ => loser_text.contains(forbidden),
+        };
         ensure!(
-            !loser_text.contains(forbidden),
+            !found,
             "loser saw `{forbidden}`, not a report-status: {}",
             redacted_git_output(loser_label, loser_output)
         );

@@ -66,10 +66,11 @@ pub(crate) mod s4_git_reaper;
 pub(crate) mod s4_checkout;
 #[path = "ci_pins/s4_transport.rs"]
 pub(crate) mod s4_transport;
+#[path = "ci_pins/s4_transport_stream.rs"]
+pub(crate) mod s4_transport_stream;
 #[path = "ci_pins/s4_tests.rs"]
 #[cfg(test)]
 mod s4_tests;
-
 #[path = "ci_pins/models.rs"]
 mod models;
 #[path = "ci_pins/store.rs"]
