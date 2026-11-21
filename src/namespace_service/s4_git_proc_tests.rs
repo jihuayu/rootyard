@@ -115,6 +115,17 @@ fn classify_grandchild(expected: ProcStat, observed: Probe, procfs_live: bool) -
 
 #[cfg(unix)]
 fn fixture_identity(leader: i32, grandchild: i32) -> ProcStat {
+    // #318 captured both original identities while procfs was demonstrably live:
+    // the direct child is its own group leader and the TERM-resistant descendant
+    // shares that group. Keep those leader-side checks on the merged #317
+    // parser/probe/classification, which owns the start-time identity below.
+    assert!(live_procfs(), "procfs is not live for the test process");
+    match probe(leader) {
+        Probe::Present(stat) if stat.group == leader && live_state(stat.state) => {}
+        Probe::Present(_) => panic!("fixture leader stat: not-live-or-wrong-group"),
+        Probe::Missing => panic!("fixture leader stat: missing"),
+        Probe::Invalid => panic!("fixture leader stat: invalid"),
+    }
     match probe(grandchild) {
         Probe::Present(stat) if stat.group == leader && live_state(stat.state) => stat,
         Probe::Present(_) => panic!("fixture grandchild stat: not-live-or-wrong-group"),
@@ -170,16 +181,52 @@ async fn timeout_kills_process_group_and_reaps_leader() {
     let root = scratch.root().to_path_buf();
     let pidfile = root.join("timeout.pid");
     let deadline = Instant::now() + Duration::from_millis(700);
-    let error = with_scratch(
+    let mut future = Box::pin(with_scratch(
         vec![scratch.hold()],
         run_git_bounded(command(&pidfile), GitStdin::Null, 1024, deadline, Error::internal("failed")),
-    )
-    .await
-    .unwrap_err();
+    ));
+    // Keep the integrated 700ms deadline intact, but capture the original live
+    // identities while the bounded runner is still waiting. A descendant that
+    // is only visible as Z/X after the timeout, or a reused PID, must not be
+    // mistaken for the process this run actually owned.
+    let (leader, grandchild) = loop {
+        if let Some(pids) = try_pids(&pidfile) {
+            break pids;
+        }
+        tokio::select! {
+            _ = &mut future => panic!("timed-out process unexpectedly finished before publishing its process group"),
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let (_original_leader, original_descendant) = {
+        // Pin both the direct leader and its TERM-resistant descendant as live
+        // members of the published process group before the timeout invalidates
+        // their identities.
+        let leader_stat = match probe(leader) {
+            Probe::Present(stat) if stat.group == leader && live_state(stat.state) => stat,
+            Probe::Present(_) => panic!("original direct leader stat: not-live-or-wrong-group"),
+            Probe::Missing => panic!("original direct leader stat: missing"),
+            Probe::Invalid => panic!("original direct leader stat: invalid"),
+        };
+        (leader_stat, fixture_identity(leader, grandchild))
+    };
+    let error = future.await.unwrap_err();
     assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
-    let (leader, grandchild) = wait_pids(&pidfile).await;
     assert!(root.exists(), "the scratch directory vanished before the reaped check");
     assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
+    // A killed descendant can remain visible as Z/X until its new parent reaps
+    // it. Quiescence, not disappearance, is the contract; the recorded starttime
+    // keeps PID reuse from being mistaken for a live original.
+    #[cfg(target_os = "linux")]
+    {
+        let observed = probe(grandchild);
+        let procfs_live = matches!(observed, Probe::Missing) && live_procfs();
+        if let Err(class) = classify_grandchild(original_descendant, observed, procfs_live) {
+            panic!("timed-out Git descendant cleanup class: {class} (expected exited, pid-reused or quiescent)");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
     drop(scratch);
     assert!(!root.exists());
