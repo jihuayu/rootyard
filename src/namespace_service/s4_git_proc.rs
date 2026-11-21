@@ -264,6 +264,32 @@ fn child_gone(child: &mut Child) -> bool {
     child.id().is_none() || matches!(child.try_wait(), Ok(Some(_)))
 }
 
+#[cfg(debug_assertions)]
+fn reverse_failure_phase<'a>(mut args: impl Iterator<Item = &'a std::ffi::OsStr>) -> &'static str {
+    use std::ffi::OsStr;
+    let global_args = ["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "-C"];
+    if !args.by_ref().take(global_args.len()).eq(global_args.map(OsStr::new)) || args.next().is_none() {
+        return "unknown";
+    }
+    match args.next().and_then(OsStr::to_str) {
+        Some("bundle") if args.next().and_then(OsStr::to_str) == Some("verify") => "bundle_verify",
+        Some("fetch") if args.nth(1).and_then(OsStr::to_str) == Some("--no-write-fetch-head") => "source_fetch",
+        Some("fetch") => "fetch",
+        Some("rev-parse") => "rev_parse",
+        Some("merge-base") => "merge_base",
+        Some("rev-list") => "rev_list",
+        Some("cat-file") => "cat_file",
+        Some("fsck") => "fsck",
+        Some("ls-tree") => "ls_tree",
+        Some("mktree") => "mktree",
+        Some("update-ref") => "update_ref",
+        Some("commit-tree") => "commit_tree",
+        Some("pack-objects") => "pack_objects",
+        Some("index-pack") => "index_pack",
+        _ => "unknown",
+    }
+}
+
 pub(crate) async fn run_git_bounded(
     mut cmd: Command,
     stdin: GitStdin<'_>,
@@ -289,6 +315,9 @@ pub(crate) async fn run_git_bounded(
         }
     };
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(debug_assertions)]
+    let reverse_phase = (fail_error.0 == StatusCode::CONFLICT && fail_error.1 == "Git View reverse mapping conflict")
+        .then(|| reverse_failure_phase(cmd.as_std().get_args()));
     let mut guard = ReapOnDropGuard::spawn(cmd)?;
     let writer = writer_bytes.map(|bytes| {
         let stdin = guard.child.as_mut().and_then(|child| child.stdin.take());
@@ -356,6 +385,13 @@ pub(crate) async fn run_git_bounded(
     }
     let status = guard.finish(deadline).await?;
     if !status.success() {
+        #[cfg(debug_assertions)]
+        if let Some(phase) = reverse_phase {
+            let exit = if status.code().is_some() { "nonzero_exit" } else { "no_exit_code" };
+            use std::io::Write;
+            let _ =
+                writeln!(std::io::stderr().lock(), "rootyard: Git View reverse child failed phase={phase} exit={exit}");
+        }
         return Err(fail_error);
     }
     Ok(output)
