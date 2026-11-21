@@ -33,6 +33,11 @@ assert LATEST_VERSION == CURRENT_SCHEMA_VERSION, (
 FROZEN_FORMAT17_SCHEMA_VERSION = 141
 FROZEN_FORMAT18_SCHEMA_VERSION = 142
 FROZEN_FORMAT19_SCHEMA_VERSION = 143
+# Immutable archive-contract pins for formats 29 (metadata) and 30 (paired
+# PG+Blob). Never derive these from CURRENT_*: a later current-format bump must
+# not stop proving that the old 29/30 mappings remain schema151.
+FROZEN_FORMAT29_SCHEMA_VERSION = 151
+FROZEN_FORMAT30_SCHEMA_VERSION = 151
 
 CATALOG_SQL_PATH = SCHEMA_DIR / f"{LATEST_PREFIX}_catalog.sql"
 CATALOG_JSON_PATH = SCHEMA_DIR / f"{LATEST_PREFIX}_catalog.json"
