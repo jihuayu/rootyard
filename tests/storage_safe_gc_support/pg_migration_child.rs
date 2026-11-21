@@ -10,7 +10,7 @@ use std::{
     ffi::OsString,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
 
@@ -35,6 +35,89 @@ const CHILD_NONCE_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_MIGRATION_NONCE";
 const CHILD_QUORUM_ENV: &str = "ROOTYARD_SAFE_GC_CHILD_MIGRATION_QUORUM";
 const ENTRYPOINT: &str = "pg_child_worker::child_process_entrypoint";
 const BOUNDARY_NAME: &str = "trust_committed_before_journal_persist";
+const BOUNDARY_MARKER_TIMEOUT: Duration = Duration::from_secs(60);
+const PROBE_WAIT_TIMEOUT: Duration = Duration::from_secs(90);
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Owns exactly one spawned fixture child until a wait reaps it.
+///
+/// The boundary child parks until `SIGKILL`, and `std::process::Child` does not kill on drop.
+/// Every early return or cancelled future must therefore take this guard down with the child.
+struct OwnedChild(Option<Child>);
+
+impl OwnedChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn id(&self) -> u32 {
+        self.0.as_ref().expect("owned fixture child is attached").id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let child = self.0.as_mut().ok_or_else(|| std::io::Error::other("owned fixture child is already reaped"))?;
+        let status = child.try_wait()?;
+        if status.is_some() {
+            // `try_wait` reaped the process: never signal this PID again.
+            self.0 = None;
+        }
+        Ok(status)
+    }
+
+    async fn wait_bounded(&mut self, timeout: Duration, label: &str) -> Result<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.try_wait().with_context(|| format!("poll {label}"))? {
+                Some(status) => return Ok(status),
+                None if Instant::now() >= deadline => {
+                    let cleanup = self.kill_and_reap();
+                    let timed_out = format!("{label} did not exit within {}s", timeout.as_secs());
+                    match cleanup {
+                        Ok(_) => bail!("{timed_out}"),
+                        Err(error) => bail!("{timed_out}; cleanup of the owned child also failed: {error:#}"),
+                    }
+                }
+                None => tokio::time::sleep(CHILD_POLL_INTERVAL).await,
+            }
+        }
+    }
+
+    fn kill_and_reap(&mut self) -> Result<ExitStatus> {
+        let mut child = self.0.take().context("owned fixture child is already reaped")?;
+        let killed = child.kill();
+        let reaped = reap_bounded(&mut child, CHILD_REAP_TIMEOUT);
+        match (killed, reaped) {
+            (Ok(()), Some(status)) => Ok(status),
+            (Ok(()), None) => {
+                bail!("owned fixture child did not reap within {}s after SIGKILL", CHILD_REAP_TIMEOUT.as_secs())
+            }
+            (Err(error), Some(_)) => Err(error).context("SIGKILL owned fixture child (child was reaped)"),
+            (Err(error), None) => Err(error).context("SIGKILL owned fixture child (bounded reap observed no exit)"),
+        }
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = reap_bounded(&mut child, CHILD_REAP_TIMEOUT);
+        }
+    }
+}
+
+fn reap_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(CHILD_REAP_POLL_INTERVAL),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
 
 pub(super) struct BoundaryKillOutcome {
     pub pid: u32,
@@ -75,29 +158,29 @@ pub(super) async fn spawn_migration_boundary_sigkill_child(
     let marker_path = storage_root.join(format!("safe-gc-migration-boundary-{}.json", Uuid::new_v4()));
     let nonce = Uuid::new_v4().to_string();
     let voters_json = serde_json::to_string(trusted_voters)?;
-    let mut child = minimal_child_command(MODE_BOUNDARY, storage_root, db_url, schema, repo_id)
-        .env(CHILD_JOURNAL_ENV, journal_path)
-        .env(CHILD_MARKER_ENV, &marker_path)
-        .env(CHILD_VOTERS_ENV, voters_json)
-        .env(CHILD_NONCE_ENV, &nonce)
-        .env(CHILD_QUORUM_ENV, quorum_threshold.to_string())
-        .spawn()
-        .context("spawn safe-gc migration boundary child")?;
+    let mut child = OwnedChild::new(
+        minimal_child_command(MODE_BOUNDARY, storage_root, db_url, schema, repo_id)
+            .env(CHILD_JOURNAL_ENV, journal_path)
+            .env(CHILD_MARKER_ENV, &marker_path)
+            .env(CHILD_VOTERS_ENV, voters_json)
+            .env(CHILD_NONCE_ENV, &nonce)
+            .env(CHILD_QUORUM_ENV, quorum_threshold.to_string())
+            .spawn()
+            .context("spawn safe-gc migration boundary child")?,
+    );
     let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + BOUNDARY_MARKER_TIMEOUT;
     while !marker_path.is_file() {
         if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             bail!("migration boundary child never reported the post-trust/pre-journal marker");
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.try_wait().context("poll migration boundary child")? {
             bail!("migration boundary child exited before the marker: {status}");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(CHILD_POLL_INTERVAL).await;
     }
-    let marker: Value =
-        serde_json::from_slice(&std::fs::read(&marker_path)?).context("parse migration boundary marker")?;
+    let marker: Value = serde_json::from_slice(&std::fs::read(&marker_path).context("read migration boundary marker")?)
+        .context("parse migration boundary marker")?;
     ensure!(marker["boundary"].as_str() == Some(BOUNDARY_NAME), "unexpected migration boundary marker");
     ensure!(marker["nonce"].as_str() == Some(nonce.as_str()), "migration boundary marker nonce mismatch");
     ensure!(
@@ -108,9 +191,11 @@ pub(super) async fn spawn_migration_boundary_sigkill_child(
     let marker_start = marker["start_time"].as_u64().context("migration boundary marker start_time")?;
     let live_start = process_start_time(pid).context("read owned child /proc start_time")?;
     ensure!(marker_start == live_start, "migration boundary child identity changed before SIGKILL");
-    ensure!(child.try_wait()?.is_none(), "migration boundary child exited at the marker before SIGKILL");
-    child.kill().context("SIGKILL migration boundary child")?;
-    let status = child.wait().context("reap SIGKILLed migration boundary child")?;
+    ensure!(
+        child.try_wait().context("poll migration boundary child before SIGKILL")?.is_none(),
+        "migration boundary child exited at the marker before SIGKILL"
+    );
+    let status = child.kill_and_reap().context("SIGKILL migration boundary child")?;
     #[cfg(unix)]
     let signal = {
         use std::os::unix::process::ExitStatusExt;
@@ -140,9 +225,8 @@ pub(super) async fn spawn_migrated_fixture_probe_child(
         .env(CHILD_VOTERS_ENV, voters_json)
         .env(CHILD_QUORUM_ENV, quorum_threshold.to_string())
         .env(CHILD_OUT_JSON_ENV, &out_path);
-    let mut child =
-        tokio::process::Command::from(command).spawn().context("spawn safe-gc migrated fixture probe child")?;
-    let status = child.wait().await.context("wait for safe-gc migrated fixture probe child")?;
+    let mut child = OwnedChild::new(command.spawn().context("spawn safe-gc migrated fixture probe child")?);
+    let status = child.wait_bounded(PROBE_WAIT_TIMEOUT, "safe-gc migrated fixture probe child").await?;
     ensure!(status.success(), "safe-gc migrated fixture probe exited with {status}");
     let value: Value = serde_json::from_slice(&std::fs::read(&out_path)?).context("parse migrated fixture probe")?;
     Ok(MigratedProbeOutcome {
@@ -296,6 +380,46 @@ async fn ensure_same_database(db_url: &str, schema: &str, repo_id: Uuid) -> Resu
     let row = pool.get().await?.query_opt("SELECT 1 FROM repositories WHERE id = $1", &[&repo_id]).await?;
     ensure!(row.is_some(), "fresh child must observe the parent repository row in the same PG schema");
     Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_parked_fixture_child() -> Child {
+    Command::new("sh")
+        .args(["-c", "exec sleep 60"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn parked ownership fixture child")
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 only probes for the process; it delivers no signal.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_child_drop_reaps_parked_child_on_early_error() {
+    let child = spawn_parked_fixture_child();
+    let pid = child.id();
+    drop(OwnedChild::new(child));
+    assert!(!process_exists(pid), "dropping the guard must SIGKILL and reap the owned parked child");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_child_bounded_wait_reaps_parked_probe() {
+    let child = spawn_parked_fixture_child();
+    let pid = child.id();
+    let mut owned = OwnedChild::new(child);
+    let error = owned
+        .wait_bounded(Duration::from_millis(100), "test parked child")
+        .await
+        .expect_err("a parked child must hit the bounded wait");
+    assert!(format!("{error:#}").contains("did not exit within"), "timeout error must stay primary: {error:#}");
+    assert!(!process_exists(pid), "the bounded wait must SIGKILL and reap the timed-out owned child");
 }
 
 #[cfg(target_os = "linux")]
