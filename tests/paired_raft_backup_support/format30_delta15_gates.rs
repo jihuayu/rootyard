@@ -53,6 +53,13 @@ const SEED_OPERATION: &str = "DELETE FROM public.ref_store_operations WHERE repo
 /// Payload builder for the `i`-th pushed commit: `(file name, bytes)`.
 type Payload = fn(usize) -> (String, Vec<u8>);
 
+/// `git-config(1)` documents `http.postBuffer` as the smart-HTTP POST buffer. Git v2.43
+/// `remote-curl.c` takes the large-request probe path when a request exceeds it, and that
+/// probe is unrelated to backup closure. Each over-budget push carries one 6 MiB
+/// incompressible blob, so 8 MiB keeps it on the ordinary buffered POST while staying below
+/// the fixture gateway's 16 MiB request limit. This is applied only to those push commands.
+const OVER_BUDGET_PUSH_CONFIG: &[&str] = &["-c", "http.postBuffer=8388608"];
+
 /// A fully bootstrapped source: PostgreSQL 17, one Blob store and one live 3-voter mTLS Raft group.
 struct SourceEnv {
     s3: LoopbackS3,
@@ -150,7 +157,16 @@ async fn boot_source(git: &Path, dir: &Path, url: &str, gid: i64, repo: &str, bu
 }
 
 /// Clone over Smart-HTTP and land `n` independent pushes, one commit each.
-fn clone_and_push(git: &Path, dir: &Path, env: &SourceEnv, repo: &str, fill: Payload, n: usize) -> Result<()> {
+/// `push_config` is command-scoped `-c` settings prepended only to each `git push`.
+fn clone_and_push(
+    git: &Path,
+    dir: &Path,
+    env: &SourceEnv,
+    repo: &str,
+    fill: Payload,
+    n: usize,
+    push_config: &[&str],
+) -> Result<()> {
     let (u, t) = (&env.owner.username, &env.owner.token);
     let url = format!("http://{u}:{t}@{}/git/{}/{repo}.git", env.addr, u);
     ensure!(run_git_cli(git, dir, &["clone", &url, "clone"]).status.success(), "clone");
@@ -160,7 +176,9 @@ fn clone_and_push(git: &Path, dir: &Path, env: &SourceEnv, repo: &str, fill: Pay
         fs::write(clone.join(&name), body)?;
         ensure!(run_git_cli(git, &clone, &["add", "."]).status.success(), "add {name}");
         ensure!(run_git_cli(git, &clone, &["commit", "-q", "-m", &name]).status.success(), "commit {name}");
-        let pushed = run_git_cli(git, &clone, &["push", "origin", "HEAD:refs/heads/main"]);
+        let mut push = push_config.to_vec();
+        push.extend_from_slice(&["push", "origin", "HEAD:refs/heads/main"]);
+        let pushed = run_git_cli(git, &clone, &push);
         ensure!(pushed.status.success(), "push {name}: {}", String::from_utf8_lossy(&pushed.stderr));
     }
     Ok(())
@@ -304,7 +322,7 @@ async fn gate15_admitted_over_eight_pairs_restores_and_verifies_end_to_end() -> 
         let git = find_git_bin()?;
         let dir = TempDir::new()?;
         let mut env = boot_source(&git, dir.path(), &src_url, 51, "gate15-nine", "paired-fmt30-d15-src").await?;
-        clone_and_push(&git, dir.path(), &env, "gate15-nine", text_payload, 9)?;
+        clone_and_push(&git, dir.path(), &env, "gate15-nine", text_payload, 9, &[])?;
         stop_gateway(&mut env.gw).await;
         let memberships: i64 = env.pool.get().await?.query_one(MEMBERSHIPS, &[&env.repo_id]).await?.get(0);
         ensure!(memberships == 9, "nine Smart-HTTP pushes must own nine active pairs, got {memberships}");
@@ -374,7 +392,7 @@ async fn gate15_over_budget_backup_refused_before_publishing_destination() -> Re
         let git = find_git_bin()?;
         let dir = TempDir::new()?;
         let mut env = boot_source(&git, dir.path(), &url, 53, "gate15-over", "paired-fmt30-d15-over").await?;
-        clone_and_push(&git, dir.path(), &env, "gate15-over", blob_payload, 10)?;
+        clone_and_push(&git, dir.path(), &env, "gate15-over", blob_payload, 10, OVER_BUDGET_PUSH_CONFIG)?;
         stop_gateway(&mut env.gw).await;
         let memberships: i64 = env.pool.get().await?.query_one(MEMBERSHIPS, &[&env.repo_id]).await?.get(0);
         ensure!(memberships == 10, "ten Smart-HTTP pushes must own ten active pairs, got {memberships}");
