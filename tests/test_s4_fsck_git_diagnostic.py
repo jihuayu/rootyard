@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -113,29 +114,21 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual(wrapper.classify(line), "unknown")
 
     def test_oversized_line_is_capped_while_later_lines_drain(self):
-        read_fd, write_fd = os.pipe()
-        try:
-            os.write(write_fd, b"x" * 5000 + b"\nmissing blob " + OID40.encode() + b"\n")
-        finally:
-            os.close(write_fd)
-        try:
-            counts, truncated = wrapper.classify_stream(read_fd)
-        finally:
-            os.close(read_fd)
+        with tempfile.TemporaryFile() as stream:
+            stream.write(b"x" * (53 * 1024) + b"\nmissing blob " + OID40.encode() + b"\n")
+            stream.flush()
+            stream.seek(0)
+            counts, truncated = wrapper.classify_stream(stream.fileno())
         self.assertTrue(truncated)
         self.assertEqual(counts["unknown"], 1)
         self.assertEqual(counts["missing_object"], 1)
 
     def test_line_count_is_bounded(self):
-        read_fd, write_fd = os.pipe()
-        try:
-            os.write(write_fd, b"notice: line\n" * (wrapper.MAX_LINES + 8))
-        finally:
-            os.close(write_fd)
-        try:
-            counts, truncated = wrapper.classify_stream(read_fd)
-        finally:
-            os.close(read_fd)
+        with tempfile.TemporaryFile() as stream:
+            stream.write(b"notice: line\n" * (wrapper.MAX_LINES + 8))
+            stream.flush()
+            stream.seek(0)
+            counts, truncated = wrapper.classify_stream(stream.fileno())
         self.assertTrue(truncated)
         self.assertEqual(counts["notice"], wrapper.MAX_LINES)
 
@@ -227,17 +220,24 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(wrapper.finish(None), 1)
         self.assertEqual(wrapper.finish(300), 1)
 
+    def test_sigkill_reset_failure_still_attempts_resignal(self):
+        with mock.patch.object(wrapper.signal, "signal", side_effect=ValueError("uncatchable")), \
+                mock.patch.object(wrapper.os, "kill") as kill, \
+                mock.patch.object(wrapper.os, "getpid", return_value=4242):
+            self.assertEqual(wrapper.finish(-signal.SIGKILL), 128 + signal.SIGKILL)
+            kill.assert_called_once_with(4242, signal.SIGKILL)
+
 
 SIGNAL_GIT = """#!/usr/bin/env python3
 import os, signal
 with open(os.environ["S4_MARKER"], "a", encoding="ascii") as out:
     out.write("x")
-os.kill(os.getpid(), signal.SIGTERM)
+os.kill(os.getpid(), getattr(signal, os.environ.get("S4_SIGNAL", "SIGTERM")))
 """
 
 
 class StockGitTests(unittest.TestCase):
-    def run_driver(self, fake_git, args, env):
+    def run_driver(self, fake_git, args, env, timeout=20):
         code = (
             "import importlib.util,sys;"
             "s=importlib.util.spec_from_file_location('w',sys.argv[1]);"
@@ -246,10 +246,10 @@ class StockGitTests(unittest.TestCase):
         )
         return subprocess.run(
             [sys.executable, "-c", code, str(WRAPPER), str(fake_git), *args],
-            env=env, capture_output=True, timeout=20,
+            env=env, capture_output=True, timeout=timeout,
         )
 
-    def test_signal_status_and_single_invocation_are_preserved(self):
+    def assert_signal_preserved(self, name):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             fake = base / "signal-git"
@@ -257,13 +257,40 @@ class StockGitTests(unittest.TestCase):
             fake.chmod(0o700)
             marker = base / "marker"
             artifact = base / "artifact.jsonl"
-            env = dict(os.environ, S4_MARKER=str(marker), **{wrapper.ENV: str(artifact)})
+            expected = getattr(signal, name)
+            env = dict(os.environ, S4_MARKER=str(marker), S4_SIGNAL=name,
+                       **{wrapper.ENV: str(artifact)})
             result = self.run_driver(fake, target(repo=str(base)), env)
-            self.assertEqual(result.returncode, -signal.SIGTERM)
+            self.assertEqual(result.returncode, -expected)
             self.assertEqual(marker.read_text(encoding="ascii"), "x")
             record = json.loads(artifact.read_text(encoding="utf-8"))
             self.assertIsNone(record["exit_code"])
-            self.assertEqual(record["signal"], signal.SIGTERM)
+            self.assertEqual(record["signal"], expected)
+
+    def test_signal_status_and_single_invocation_are_preserved(self):
+        self.assert_signal_preserved("SIGTERM")
+
+    def test_sigkill_status_and_single_invocation_are_preserved(self):
+        self.assert_signal_preserved("SIGKILL")
+
+    def test_fifo_evidence_path_does_not_block(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fake = base / "failed-git"
+            fake.write_text("#!/usr/bin/env python3\nimport os,sys\n"
+                            "open(os.environ['S4_MARKER'],'a').write('x')\nsys.exit(7)\n",
+                            encoding="utf-8")
+            fake.chmod(0o700)
+            marker = base / "marker"
+            fifo = base / "diagnostic.fifo"
+            os.mkfifo(fifo, 0o600)
+            self.assertTrue(stat.S_ISFIFO(os.stat(fifo).st_mode))
+            env = dict(os.environ, S4_MARKER=str(marker), **{wrapper.ENV: str(fifo)})
+            result = self.run_driver(fake, target(repo=str(base)), env, timeout=8)
+            self.assertEqual(result.returncode, 7)
+            self.assertEqual(marker.read_text(encoding="ascii"), "x")
 
     def test_diagnostic_write_failure_still_forwards_exit_once(self):
         with tempfile.TemporaryDirectory() as directory:

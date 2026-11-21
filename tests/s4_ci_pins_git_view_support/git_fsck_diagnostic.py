@@ -69,7 +69,7 @@ def classify_stream(fd):
 
 def append_record(path, record):
     data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try: fd = os.open(path, flags, 0o600)
     except OSError: return
     try:
@@ -119,11 +119,10 @@ def finish(status):
     if status is None: return 1
     if status >= 0: return status if status <= 255 else 1
     signum = -status
-    try:
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
-    except (OSError, ValueError):
-        pass
+    try: signal.signal(signum, signal.SIG_DFL)
+    except (OSError, ValueError): pass
+    try: os.kill(os.getpid(), signum)
+    except (OSError, ValueError): pass
     return 128 + signum
 
 def main(argv):
