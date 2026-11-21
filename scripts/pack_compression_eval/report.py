@@ -8,11 +8,13 @@ import re
 from typing import Any
 
 from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
+from .multi_repo import MULTI_REPO_COHORT, MULTI_REPO_GROUP, MULTI_REPO_REF, invocation_overlap
 from .telemetry import percentile_stats
 
 _TOKEN_RE = re.compile(r"ryt_[0-9A-Za-z_-]{16,}")
 _BEARER_RE = re.compile(r"(?i)(Bearer\s+)[0-9A-Za-z._~+/=-]{8,}")
 _PG_URL_RE = re.compile(r"postgres(?:ql)?://[^\s\"'<>]+")
+_OBJECT_OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 FETCH_MEASUREMENT_NOTES = {
@@ -213,6 +215,84 @@ def _validate_fetch_group(
         )
 
 
+def _validate_multi_repo_group(group: Any, label: str) -> None:
+    """Fail closed on the three unique, verified first incremental pushes."""
+    _require(isinstance(group, dict), f"{label} multi-repo group missing")
+    _require(group.get("config_name") == label, f"{label} multi-repo config mismatch")
+    samples = group.get("push_samples")
+    _require(
+        isinstance(samples, list) and group.get("cohort_size") == len(samples) == 3,
+        f"{label} multi-repo cohort size mismatch",
+    )
+    _require(all(isinstance(sample, dict) for sample in samples), f"{label} multi-repo sample invalid")
+    _require(
+        [sample.get("repo_ordinal") for sample in samples] == [0, 1, 2],
+        f"{label} multi-repo sample ordinals invalid",
+    )
+    _require(
+        [(sample.get("archetype"), sample.get("object_format")) for sample in samples] == list(MULTI_REPO_COHORT),
+        f"{label} multi-repo cohort mismatch",
+    )
+    for field in ("repository_ids_distinct", "clone_paths_distinct", "same_writer_cohort", "all_verified", "first_attempt_only"):
+        _require(group.get(field) is True, f"{label} multi-repo {field} not confirmed")
+    _require(group.get("writer_cohort_size") == 1, f"{label} multi-repo writer cohort not unique")
+    _require(group.get("fixed_ref") == MULTI_REPO_REF, f"{label} multi-repo test ref invalid")
+    _require(group.get("verified_samples") == 3, f"{label} multi-repo verification coverage incomplete")
+    verification = group.get("verification")
+    _require(isinstance(verification, dict), f"{label} multi-repo verification invalid")
+    for field in ("fresh_stock_clone", "strict_fsck", "exact_oid", "known_file", "main_unchanged", "outside_push_and_s3_timing"):
+        _require(verification.get(field) is True, f"{label} multi-repo verification {field} missing")
+    repository_ids = [sample.get("repository_id") for sample in samples]
+    clone_digests = [sample.get("clone_path_sha256") for sample in samples]
+    push_oids = [sample.get("push_oid") for sample in samples]
+    _require(
+        all(isinstance(value, str) and value for value in (*repository_ids, *clone_digests))
+        and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in clone_digests),
+        f"{label} multi-repo repository identity invalid",
+    )
+    _require(len(set(repository_ids)) == 3, f"{label} multi-repo repository ids not distinct")
+    _require(len(set(clone_digests)) == 3, f"{label} multi-repo clone paths not distinct")
+    for ordinal, sample in enumerate(samples):
+        width = 40 if sample.get("object_format") == "sha1" else 64
+        _require(
+            isinstance(sample.get("base_oid"), str)
+            and isinstance(sample.get("push_oid"), str)
+            and _OBJECT_OID.fullmatch(sample["base_oid"]) is not None
+            and _OBJECT_OID.fullmatch(sample["push_oid"]) is not None
+            and len(sample["base_oid"]) == width
+            and len(sample["push_oid"]) == width
+            and sample["base_oid"] != sample["push_oid"]
+            and sample.get("verified_ref_oid") == sample.get("push_oid")
+            and sample.get("verified_main_oid") == sample.get("base_oid")
+            and sample.get("first_attempt") is True
+            and sample.get("retry_count") == 0
+            and sample.get("push_verified") is True
+            and sample.get("known_file_verified") is True,
+            f"{label} multi-repo sample {ordinal} unverified",
+        )
+        for field in ("client_invocation_start_ms", "client_invocation_end_ms"):
+            value = sample.get(field)
+            _require(type(value) in (int, float) and math.isfinite(value) and value >= 0, f"{label} multi-repo {field} invalid")
+        _require(sample["client_invocation_start_ms"] < sample["client_invocation_end_ms"], f"{label} multi-repo sample {ordinal} interval invalid")
+    _require(len(set(push_oids)) == 3, f"{label} multi-repo push heads not distinct")
+    durations = [sample.get("push_ms") for sample in samples]
+    _require(
+        all(type(value) in (int, float) and 0 <= value < math.inf for value in durations),
+        f"{label} multi-repo push duration invalid",
+    )
+    _require(group.get("push_stats") == percentile_stats(durations), f"{label} multi-repo push statistics do not match samples")
+    s3 = group.get("s3_push")
+    _require(isinstance(s3, dict) and s3.get("observed") is True, f"{label} multi-repo push S3 evidence missing")
+    _require(
+        all(type(s3.get(field)) is int and s3[field] >= 0 for field in ("put_requests", "put_bytes", "get_requests", "get_bytes")),
+        f"{label} multi-repo push S3 counts invalid",
+    )
+    overlap = invocation_overlap(samples)
+    _require(overlap["all_overlap"], f"{label} multi-repo invocations did not overlap")
+    _require(group.get("client_invocation_overlap") == overlap, f"{label} multi-repo overlap evidence mismatch")
+
+
+
 def validate_report(report: dict[str, Any], secrets: list[str] | tuple[str, ...] = ()) -> None:
     """Fail-closed validation of Issue #178 report structure, truthfulness, and secret hygiene."""
     _require(report.get("schema_version") == "rootyard/pando-pack-compression-eval/v1", "invalid schema_version")
@@ -257,6 +337,7 @@ def validate_report(report: dict[str, Any], secrets: list[str] | tuple[str, ...]
         for row in candidates:
             _require(row.get("physical_savings_claimed") is False, "candidate serving must not claim unverified physical savings")
             _validate_fetch_group(row, row["config_name"], candidate_cohort)
+            _validate_multi_repo_group(row.get(MULTI_REPO_GROUP), row["config_name"])
     else:
         _require(e2e is None, "git-only mode must leave e2e_serve_blob null")
 
@@ -334,6 +415,19 @@ def render_summary_markdown(report: dict[str, Any]) -> str:
                 f"| `{config}` | {cold['count']} | {cold['p50_ms']}/{cold['p95_ms']}/{cold['p99_ms']} | "
                 f"{warm['p50_ms']}/{warm['p95_ms']}/{warm['p99_ms']} | "
                 f"{cold_s3['get_requests']}/{cold_s3['get_bytes']} | {warm_s3['get_requests']}/{warm_s3['get_bytes']} |"
+            )
+        lines.extend([
+            "", "## Three-Repository First Incremental Pushes (Client Invocation Timing Only)", "",
+            "| Config | Repositories | Push P50/P95 (ms) | Client Invocation Overlap | Push S3 PUT (reqs/B) | Verified |",
+            "| --- | ---: | ---: | ---: | --- | ---: |",
+        ])
+        for row in e2e["candidate_serving_comparison"]:
+            group = row[MULTI_REPO_GROUP]
+            stats, overlap, s3 = group["push_stats"], group["client_invocation_overlap"], group["s3_push"]
+            lines.append(
+                f"| `{row['config_name']}` | {group['cohort_size']} | {stats['p50_ms']}/{stats['p95_ms']} | "
+                f"`{overlap['all_overlap']}` ({overlap['overlap_ms']} ms) | "
+                f"{s3['put_requests']}/{s3['put_bytes']} | {group['verified_samples']}/{group['cohort_size']} |"
             )
     lines.extend(["", "## Correctness & Safety Gates", ""])
     for fmt, res in report["correctness"]["formats"].items():

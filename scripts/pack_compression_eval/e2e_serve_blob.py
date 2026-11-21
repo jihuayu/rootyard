@@ -52,6 +52,7 @@ from .live_server import (
     start_serve_blob,
     verify_binary_receipt,
 )
+from .multi_repo import run_multi_repo_first_pushes
 from .pack_matrix import CANDIDATE_CONFIGS
 from .report import FETCH_MEASUREMENT_NOTES
 from .s3_meter import S3MeterProxy
@@ -306,6 +307,11 @@ def run_live_serve_blob_eval(
                 git_bin, fetch_targets, work_root, run_env, askpass, proxy, progress,
                 config=spec.name, owner=server_owner, sampler=sampler, start=start_owned,
             )
+            multi_repo = run_multi_repo_first_pushes(
+                git_bin, base_url, [{**target, "rw": cmp_rw} for target in fetch_targets],
+                spec, proxy, work_root, progress,
+                config=spec.name, run_env=run_env, askpass=askpass,
+            )
             progress["completed"]["candidate_reads_completed"] += 1
             progress["completed"]["candidate_configs_completed"] += 1
             candidate_serving.append(
@@ -316,6 +322,7 @@ def run_live_serve_blob_eval(
                     "warm_clone_stats": percentile_stats(c_warm_ms),
                     "browse_stats": percentile_stats(c_browse_ms),
                     **candidate_fetch,
+                    "multi_repo_first_pushes": multi_repo,
                     "serving_pack_bytes": serving_sum,
                     "coexisting_non_gc_bytes": coexist_sum,
                     "physical_savings_claimed": False,

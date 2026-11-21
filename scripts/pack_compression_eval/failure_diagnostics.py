@@ -32,19 +32,18 @@ from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
 from .pack_matrix import CANDIDATE_CONFIGS
 
 FAILURE_SCHEMA = "rootyard/pando-pack-compression-eval-failure/v1"
-OBJECT_FORMAT_SET = frozenset(OBJECT_FORMATS)
-ARCHETYPE_SET = frozenset(DATASET_ARCHETYPES)
+OBJECT_FORMAT_SET, ARCHETYPE_SET = frozenset(OBJECT_FORMATS), frozenset(DATASET_ARCHETYPES)
 CONFIG_SET = frozenset(("baseline",) + tuple(spec.name for spec in CANDIDATE_CONFIGS))
-PHASES = PUSH_PHASES + ("baseline_fetch", "candidate_fetch")
+PHASES = PUSH_PHASES + ("multi_repo_first_push", "multi_repo_verify", "baseline_fetch", "candidate_fetch")
 PROGRESS_PHASES = PHASES + ("none", "baseline_reads", "candidate_reads")
-FAILURE_CLASSES = PUSH_FAILURE_CLASSES + ("git_fetch", "fetch_ack_mismatch", "fetch_fsck")
+FAILURE_CLASSES = PUSH_FAILURE_CLASSES + (
+    "git_fetch", "fetch_ack_mismatch", "fetch_fsck", "multi_repo_cohort", "multi_repo_fixture",
+    "multi_repo_head_mismatch", "multi_repo_verify", "multi_repo_ref_mismatch", "multi_repo_overlap",
+)
 RECEIPT_SCHEMAS = frozenset(("rootyard/native-build-receipt/v2", "v1", "v2"))
-MODES = ("full", "git-only")
-SCALES = ("quick", "full")
+MODES, SCALES = ("full", "git-only"), ("quick", "full")
 COMPLETED_KEYS = (
-    "baseline_repos_completed",
-    "baseline_seed_pushes_completed",
-    "baseline_wave_pushes_completed",
+    "baseline_repos_completed", "baseline_seed_pushes_completed", "baseline_wave_pushes_completed",
     "cold_clone_samples_completed",
     "warm_clone_samples_completed",
     "cold_fetch_samples_completed", "warm_fetch_samples_completed",
@@ -52,6 +51,7 @@ COMPLETED_KEYS = (
     "candidate_configs_completed",
     "candidate_pushes_completed",
     "candidate_reads_completed",
+    "multi_repo_pushes_completed", "multi_repo_verifications_completed", "multi_repo_configs_completed",
     "concurrent_pushes_completed",
     "acked_refs_verified",
 )
