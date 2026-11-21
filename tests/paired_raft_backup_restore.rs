@@ -26,6 +26,7 @@ pub mod mtls_cluster;
 use std::fs;
 
 use anyhow::{Result, ensure};
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -442,15 +443,16 @@ async fn production_mtls_quorum_durable_freeze_format30_and_new_incarnation_boot
 
 #[tokio::test]
 async fn loopback_s3_single_byte_range_replies_cover_standard_forms() -> Result<()> {
-    let object = b"0123456789";
-    let etag = format!("\"{}\"", &hex::encode(Sha256::digest(object))[..32]);
+    let data = b"0123456789";
+    let object = fixture::StoredObject::new(Bytes::from_static(data));
+    let etag = format!("\"{}\"", &hex::encode(Sha256::digest(data))[..32]);
     for (raw, range, body) in [
-        ("bytes=0-2", "bytes 0-2/10", &object[..3]),
-        ("bytes=4-", "bytes 4-9/10", &object[4..]),
-        ("bytes=-3", "bytes 7-9/10", &object[7..]),
-        ("bytes=8-99", "bytes 8-9/10", &object[8..]),
+        ("bytes=0-2", "bytes 0-2/10", &data[..3]),
+        ("bytes=4-", "bytes 4-9/10", &data[4..]),
+        ("bytes=-3", "bytes 7-9/10", &data[7..]),
+        ("bytes=8-99", "bytes 8-9/10", &data[8..]),
     ] {
-        let response = fixture::range_reply(object, raw);
+        let response = fixture::range_reply(&object, raw);
         assert_eq!(response.status(), axum::http::StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()[axum::http::header::CONTENT_RANGE].to_str()?, range);
         assert_eq!(response.headers()[axum::http::header::CONTENT_LENGTH].to_str()?.parse::<usize>()?, body.len());
@@ -458,7 +460,7 @@ async fn loopback_s3_single_byte_range_replies_cover_standard_forms() -> Result<
         assert_eq!(axum::body::to_bytes(response.into_body(), usize::MAX).await?.as_ref(), body);
     }
     for raw in ["bytes=10-", "bytes=0-1,4-5", "items=0-1"] {
-        let response = fixture::range_reply(object, raw);
+        let response = fixture::range_reply(&object, raw);
         assert_eq!(response.status(), axum::http::StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(response.headers()[axum::http::header::CONTENT_RANGE].to_str()?, "bytes */10");
     }

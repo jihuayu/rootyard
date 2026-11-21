@@ -12,7 +12,6 @@ use axum::http::{HeaderMap, Method, Uri, header};
 use axum::response::Response;
 use bytes::Bytes;
 use deadpool_postgres::{Manager, Pool};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use rootyard::blob_store::capacity_contract::git_ops::{UploadScope, upload_pack_pair};
@@ -36,9 +35,12 @@ use rootyard::ref_store::{
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+mod loopback_object;
+pub(crate) use loopback_object::{StoredObject, range_reply};
+
 #[derive(Default)]
 pub struct S3State {
-    pub objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    pub objects: Mutex<BTreeMap<String, StoredObject>>,
 }
 
 pub struct LoopbackS3 {
@@ -113,43 +115,6 @@ impl LoopbackS3 {
     }
 }
 
-fn parse_byte_range(raw: &str, total: usize) -> Option<(usize, usize)> {
-    let spec = raw.strip_prefix("bytes=")?;
-    let spec = (total > 0 && !spec.contains(',')).then_some(spec)?;
-    let (start, end) = spec.split_once('-')?;
-    if start.is_empty() {
-        let suffix = end.parse::<usize>().ok()?;
-        return (suffix > 0).then_some((total.saturating_sub(suffix), total - 1));
-    }
-    let start = start.parse::<usize>().ok().filter(|start| *start < total)?;
-    let end = if end.is_empty() { total - 1 } else { end.parse::<usize>().ok()?.min(total - 1) };
-    (start <= end).then_some((start, end))
-}
-
-fn etag(b: &[u8]) -> String {
-    format!("\"{}\"", &hex::encode(Sha256::digest(b))[..32])
-}
-
-pub(crate) fn range_reply(object: &[u8], raw: &str) -> Response {
-    let Some((start, end)) = parse_byte_range(raw, object.len()) else {
-        return Response::builder()
-            .status(416u16)
-            .header(header::CONNECTION, "close")
-            .header(header::CONTENT_RANGE, format!("bytes */{}", object.len()))
-            .body(Body::empty())
-            .unwrap();
-    };
-    Response::builder()
-        .status(206u16)
-        .header(header::CONNECTION, "close")
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::ETAG, etag(object))
-        .header(header::CONTENT_LENGTH, end - start + 1)
-        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", object.len()))
-        .body(Body::from(object[start..=end].to_vec()))
-        .unwrap()
-}
-
 async fn handle_s3(
     State(st): State<Arc<S3State>>,
     method: Method,
@@ -164,29 +129,30 @@ async fn handle_s3(
     if !key.contains('/') {
         return empty(200, "<ListBucketResult/>");
     }
-    let ok = |b: &[u8], bd: Body| {
+    let ok = |object: &StoredObject, body: Body| {
         Response::builder()
             .status(200u16)
             .header(header::CONNECTION, "close")
-            .header(header::ETAG, etag(b))
-            .header(header::CONTENT_LENGTH, b.len())
-            .body(bd)
+            .header(header::ETAG, object.etag.clone())
+            .header(header::CONTENT_LENGTH, object.bytes.len())
+            .body(body)
             .unwrap()
     };
     match method {
         Method::PUT => {
-            let r = ok(body.as_ref(), Body::empty());
-            st.objects.lock().unwrap().insert(key, body.to_vec());
-            r
+            let object = StoredObject::new(body);
+            let response = ok(&object, Body::empty());
+            st.objects.lock().unwrap().insert(key, object);
+            response
         }
         Method::HEAD | Method::GET => {
-            let Some(d) = st.objects.lock().unwrap().get(&key).cloned() else { return empty(404, "") };
+            let Some(object) = st.objects.lock().unwrap().get(&key).cloned() else { return empty(404, "") };
             if method == Method::GET
                 && let Some(raw) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
             {
-                return range_reply(&d, raw);
+                return range_reply(&object, raw);
             }
-            ok(&d, if method == Method::HEAD { Body::empty() } else { Body::from(d.clone()) })
+            ok(&object, if method == Method::HEAD { Body::empty() } else { Body::from(object.bytes.clone()) })
         }
         _ => empty(405, ""),
     }
