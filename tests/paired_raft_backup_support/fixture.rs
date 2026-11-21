@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Method, Uri, header};
+use axum::http::{HeaderMap, Method, Uri, header};
 use axum::response::Response;
 use bytes::Bytes;
 use deadpool_postgres::{Manager, Pool};
@@ -113,7 +113,50 @@ impl LoopbackS3 {
     }
 }
 
-async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, body: Bytes) -> Response {
+fn parse_byte_range(raw: &str, total: usize) -> Option<(usize, usize)> {
+    let spec = raw.strip_prefix("bytes=")?;
+    let spec = (total > 0 && !spec.contains(',')).then_some(spec)?;
+    let (start, end) = spec.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<usize>().ok()?;
+        return (suffix > 0).then_some((total.saturating_sub(suffix), total - 1));
+    }
+    let start = start.parse::<usize>().ok().filter(|start| *start < total)?;
+    let end = if end.is_empty() { total - 1 } else { end.parse::<usize>().ok()?.min(total - 1) };
+    (start <= end).then_some((start, end))
+}
+
+fn etag(b: &[u8]) -> String {
+    format!("\"{}\"", &hex::encode(Sha256::digest(b))[..32])
+}
+
+pub(crate) fn range_reply(object: &[u8], raw: &str) -> Response {
+    let Some((start, end)) = parse_byte_range(raw, object.len()) else {
+        return Response::builder()
+            .status(416u16)
+            .header(header::CONNECTION, "close")
+            .header(header::CONTENT_RANGE, format!("bytes */{}", object.len()))
+            .body(Body::empty())
+            .unwrap();
+    };
+    Response::builder()
+        .status(206u16)
+        .header(header::CONNECTION, "close")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::ETAG, etag(object))
+        .header(header::CONTENT_LENGTH, end - start + 1)
+        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", object.len()))
+        .body(Body::from(object[start..=end].to_vec()))
+        .unwrap()
+}
+
+async fn handle_s3(
+    State(st): State<Arc<S3State>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let key = uri.path().trim_start_matches('/').to_owned();
     let empty = |c: u16, t: &'static str| {
         Response::builder().status(c).header(header::CONNECTION, "close").body(Body::from(t)).unwrap()
@@ -125,8 +168,8 @@ async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, bod
         Response::builder()
             .status(200u16)
             .header(header::CONNECTION, "close")
-            .header("etag", format!("\"{}\"", &hex::encode(Sha256::digest(b))[..32]))
-            .header("content-length", b.len())
+            .header(header::ETAG, etag(b))
+            .header(header::CONTENT_LENGTH, b.len())
             .body(bd)
             .unwrap()
     };
@@ -136,10 +179,15 @@ async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, bod
             st.objects.lock().unwrap().insert(key, body.to_vec());
             r
         }
-        Method::HEAD | Method::GET => st.objects.lock().unwrap().get(&key).cloned().map_or_else(
-            || empty(404, ""),
-            |d| ok(&d, if method == Method::HEAD { Body::empty() } else { Body::from(d.clone()) }),
-        ),
+        Method::HEAD | Method::GET => {
+            let Some(d) = st.objects.lock().unwrap().get(&key).cloned() else { return empty(404, "") };
+            if method == Method::GET
+                && let Some(raw) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+            {
+                return range_reply(&d, raw);
+            }
+            ok(&d, if method == Method::HEAD { Body::empty() } else { Body::from(d.clone()) })
+        }
         _ => empty(405, ""),
     }
 }

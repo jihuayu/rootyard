@@ -439,3 +439,28 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
 async fn production_mtls_quorum_durable_freeze_format30_and_new_incarnation_boot() -> Result<()> {
     format30_e2e::run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot().await
 }
+
+#[tokio::test]
+async fn loopback_s3_single_byte_range_replies_cover_standard_forms() -> Result<()> {
+    let object = b"0123456789";
+    let etag = format!("\"{}\"", &hex::encode(Sha256::digest(object))[..32]);
+    for (raw, range, body) in [
+        ("bytes=0-2", "bytes 0-2/10", &object[..3]),
+        ("bytes=4-", "bytes 4-9/10", &object[4..]),
+        ("bytes=-3", "bytes 7-9/10", &object[7..]),
+        ("bytes=8-99", "bytes 8-9/10", &object[8..]),
+    ] {
+        let response = fixture::range_reply(object, raw);
+        assert_eq!(response.status(), axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[axum::http::header::CONTENT_RANGE].to_str()?, range);
+        assert_eq!(response.headers()[axum::http::header::CONTENT_LENGTH].to_str()?.parse::<usize>()?, body.len());
+        assert_eq!(response.headers()[axum::http::header::ETAG].to_str()?, etag);
+        assert_eq!(axum::body::to_bytes(response.into_body(), usize::MAX).await?.as_ref(), body);
+    }
+    for raw in ["bytes=10-", "bytes=0-1,4-5", "items=0-1"] {
+        let response = fixture::range_reply(object, raw);
+        assert_eq!(response.status(), axum::http::StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()[axum::http::header::CONTENT_RANGE].to_str()?, "bytes */10");
+    }
+    Ok(())
+}
