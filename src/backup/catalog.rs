@@ -156,7 +156,7 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         23 | 24 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 148).collect()),
         25 | 26 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 149).collect()),
         27 | 28 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 150).collect()),
-        29 | 30 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        29 | 30 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 151).collect()),
         _ => bail!("unsupported backup format"),
     }
 }
@@ -176,4 +176,19 @@ pub(super) fn relations(format: u32, only_tables: bool) -> Result<Vec<String>> {
     }
     names.sort();
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_29_and_30_keep_the_schema_151_prefix() -> Result<()> {
+        let frozen = crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 151).collect::<Vec<_>>();
+        assert_eq!(frozen.last(), Some(&151));
+        assert_eq!(versions(29)?, frozen);
+        assert_eq!(versions(30)?, frozen);
+        assert_eq!(versions(29)?, versions(30)?);
+        Ok(())
+    }
 }
