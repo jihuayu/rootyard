@@ -2,16 +2,18 @@
 //!
 //! Enforces the frozen compatibility contract across workspace creation, file writes,
 //! Git staging/reset, checkpoint capture, restore/fork, remote recovery, and handoff:
-//! - Supported: committed SHA-1 repositories, detached HEAD, index v2/v3 with `TREE`
-//!   and `REUC`, merge conflicts, `intent-to-add`, safe relative internal symlinks,
-//!   non-filter `.gitattributes`, and inert `filter=lfs` declarations without local
-//!   filter drivers.
+//! - Supported: committed SHA-1 repositories, detached HEAD, a declared unborn
+//!   symbolic HEAD on `refs/heads/*` with that ref genuinely absent and no other
+//!   refs or commits, index v2/v3 with `TREE` and `REUC`, merge conflicts,
+//!   `intent-to-add`, safe relative internal symlinks, non-filter `.gitattributes`,
+//!   and inert `filter=lfs` declarations without local filter drivers.
 //! - Rejected (`409 Conflict`): submodules/gitlinks (`160000`, `.git/modules/*`, nested
 //!   `.git`), linked worktrees (`.git` pointer file, `commondir`, `gitdir`,
 //!   `.git/worktrees/*`), active clean/smudge/diff/merge drivers in `.git/config`,
 //!   custom `filter=` attributes or `.git/info/attributes` filters, split/sparse
 //!   indexes (`link`, `sdir`, `FSMN`, `UNTR`, `skip-worktree`, `sharedindex.*`,
-//!   `info/sparse-checkout`), unborn HEAD, SHA-256 object format, external alternates,
+//!   `info/sparse-checkout`), detached or non-branch unresolved HEADs, unborn HEADs
+//!   with any other ref/commit, SHA-256 object format, external alternates,
 //!   shallow clones, grafts, replacement refs, custom hooks, locks, and symlinks inside `.git`.
 
 #[path = "compat_config.rs"]
@@ -35,7 +37,7 @@ pub(super) const CONFLICT_CONFIG: &str = "unsupported workspace Git configuratio
 const CONFLICT_STORAGE: &str =
     "external Git storage, shallow clones, grafts, replace refs, and custom hooks are unsupported";
 pub(super) const CONFLICT_HEAD: &str =
-    "only committed SHA-1 repositories (branch or detached HEAD) are supported in workspaces";
+    "workspace HEAD must be a SHA-1 branch, detached commit, or declared unborn branch with no other refs";
 const CONFLICT_BUSY: &str = "workspace checkpoint busy: Git lock exists";
 const CONFLICT_SYMLINK: &str = "symlinks inside .git or .gitattributes are unsupported in workspaces";
 
@@ -62,7 +64,11 @@ pub(super) fn validate_tree_listing_no_gitlinks(listing: &[u8]) -> Result<(), Er
 }
 
 /// Validate a live on-disk hosted workspace or materialized checkpoint directory.
-pub(super) fn validate_repo(repo: &Path) -> Result<(), Error> {
+///
+/// The returned [`HeadKind`] lets callers that must stay on the committed-only
+/// path (remote cross-host materialization) reject a declared unborn HEAD while
+/// local checkpoint restore accepts it.
+pub(super) fn validate_repo(repo: &Path) -> Result<HeadKind, Error> {
     core::require_directory(repo).map_err(|_| Error(StatusCode::CONFLICT, CONFLICT_STORAGE))?;
     let dot_git = repo.join(".git");
     let dot_git_meta = fs::symlink_metadata(&dot_git).map_err(|_| Error(StatusCode::CONFLICT, CONFLICT_WORKTREE))?;
@@ -103,7 +109,10 @@ pub(super) fn validate_repo(repo: &Path) -> Result<(), Error> {
     } else {
         None
     };
-    validate_head_bytes(&head, |refname| resolve_disk_ref(&dot_git, packed.as_deref(), refname))?;
+    let head_kind = validate_head_bytes(&head, |refname| resolve_disk_ref(&dot_git, packed.as_deref(), refname))?;
+    if head_kind == HeadKind::Unborn {
+        validate_unborn_refs(&git_paths, packed.as_deref())?;
+    }
 
     if git_paths.contains(Path::new("index")) {
         let index = core::read_regular(&dot_git.join("index"), core::MAX_MANIFEST).map_err(Error::internal)?;
@@ -115,7 +124,8 @@ pub(super) fn validate_repo(repo: &Path) -> Result<(), Error> {
         validate_gitattributes_bytes(&info_attr, false)?;
     }
 
-    walk_worktree_compat(repo, Path::new(""), &mut 0)
+    walk_worktree_compat(repo, Path::new(""), &mut 0)?;
+    Ok(head_kind)
 }
 
 /// Validate a frozen merged workspace snapshot (`Origin::Lower` + `Origin::Upper` - whiteouts).
@@ -166,13 +176,20 @@ pub(super) fn validate_raw(raw: &super::snapshot::Raw) -> Result<(), Error> {
     } else {
         None
     };
-    validate_head_bytes(&head, |refname| {
+    let head_kind = validate_head_bytes(&head, |refname| {
         if git_paths.contains(Path::new(refname)) {
             let raw_ref = raw.raw_file(&Path::new(".git").join(refname))?;
-            return Ok(is_valid_sha1_oid_line(&raw_ref));
+            return Ok(if is_valid_sha1_oid_line(&raw_ref) { HeadRefState::Resolved } else { HeadRefState::Invalid });
         }
-        Ok(packed.as_deref().is_some_and(|p| packed_refs_contains(p, refname)))
+        Ok(if packed.as_deref().is_some_and(|p| packed_refs_contains(p, refname)) {
+            HeadRefState::Resolved
+        } else {
+            HeadRefState::Absent
+        })
     })?;
+    if head_kind == HeadKind::Unborn {
+        validate_unborn_refs(&git_paths, packed.as_deref())?;
+    }
 
     if git_paths.contains(Path::new("index")) {
         let index = raw.raw_file(Path::new(".git/index"))?;
@@ -202,18 +219,28 @@ fn read_required_git_file(dot_git: &Path, rel: &Path) -> Result<Vec<u8>, Error> 
     core::read_regular(&path, core::MAX_MANIFEST).map_err(Error::internal)
 }
 
-fn resolve_disk_ref(dot_git: &Path, packed: Option<&[u8]>, refname: &str) -> Result<bool, Error> {
+fn resolve_disk_ref(dot_git: &Path, packed: Option<&[u8]>, refname: &str) -> Result<HeadRefState, Error> {
     let loose = dot_git.join(refname);
-    if let Ok(meta) = fs::symlink_metadata(&loose) {
-        if meta.file_type().is_symlink() {
-            return Err(Error(StatusCode::CONFLICT, CONFLICT_SYMLINK));
-        }
-        if meta.is_file() {
+    match fs::symlink_metadata(&loose) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(Error(StatusCode::CONFLICT, CONFLICT_SYMLINK));
+            }
+            if !meta.is_file() {
+                return Ok(HeadRefState::Invalid);
+            }
             let bytes = core::read_regular(&loose, core::MAX_MANIFEST).map_err(Error::internal)?;
-            return Ok(is_valid_sha1_oid_line(&bytes));
+            Ok(if is_valid_sha1_oid_line(&bytes) { HeadRefState::Resolved } else { HeadRefState::Invalid })
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(if packed.is_some_and(|p| packed_refs_contains(p, refname)) {
+                HeadRefState::Resolved
+            } else {
+                HeadRefState::Absent
+            })
+        }
+        Err(error) => Err(Error::internal(error)),
     }
-    Ok(packed.is_some_and(|p| packed_refs_contains(p, refname)))
 }
 
 fn has_nested_git_component(rel: &Path) -> bool {
@@ -282,10 +309,28 @@ fn classify_git_admin_path(rel_git: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Resolution of one symbolic HEAD target. `Absent` is only a candidate for a
+/// declared unborn branch; `Invalid` means the ref exists but cannot be read as
+/// one SHA-1 commit pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HeadRefState {
+    Resolved,
+    Absent,
+    Invalid,
+}
+
+/// The validated HEAD shape. Local checkpoint materialization supports both;
+/// remote cross-host materialization stays committed-only and rejects `Unborn`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HeadKind {
+    Resolved,
+    Unborn,
+}
+
 pub(super) fn validate_head_bytes(
     head_bytes: &[u8],
-    mut resolve_ref: impl FnMut(&str) -> Result<bool, Error>,
-) -> Result<(), Error> {
+    mut resolve_ref: impl FnMut(&str) -> Result<HeadRefState, Error>,
+) -> Result<HeadKind, Error> {
     if head_bytes.contains(&0) {
         return Err(Error(StatusCode::CONFLICT, CONFLICT_HEAD));
     }
@@ -300,18 +345,20 @@ pub(super) fn validate_head_bytes(
         if !is_safe_head_ref(target) {
             return Err(Error(StatusCode::CONFLICT, CONFLICT_HEAD));
         }
-        if !resolve_ref(target)? {
-            return Err(Error(StatusCode::CONFLICT, CONFLICT_HEAD));
-        }
-        return Ok(());
+        return match resolve_ref(target)? {
+            HeadRefState::Resolved => Ok(HeadKind::Resolved),
+            HeadRefState::Invalid => Err(Error(StatusCode::CONFLICT, CONFLICT_HEAD)),
+            HeadRefState::Absent if is_safe_unborn_head_ref(target) => Ok(HeadKind::Unborn),
+            HeadRefState::Absent => Err(Error(StatusCode::CONFLICT, CONFLICT_HEAD)),
+        };
     }
     if is_valid_sha1_oid(trimmed) {
-        return Ok(());
+        return Ok(HeadKind::Resolved);
     }
     Err(Error(StatusCode::CONFLICT, CONFLICT_HEAD))
 }
 
-fn is_safe_head_ref(target: &str) -> bool {
+pub(super) fn is_safe_head_ref(target: &str) -> bool {
     target.starts_with("refs/")
         && !target.contains("..")
         && !target.contains("//")
@@ -320,11 +367,50 @@ fn is_safe_head_ref(target: &str) -> bool {
         && !target.bytes().any(|b| b <= 32 || b == 127)
 }
 
+/// The only admitted unresolved HEAD is a canonical local branch name. Tags,
+/// remotes, replace refs and arbitrary `refs/*` targets are not unborn branches.
+pub(super) fn is_safe_unborn_head_ref(target: &str) -> bool {
+    let Some(branch) = target.strip_prefix("refs/heads/") else { return false };
+    !branch.is_empty()
+        && branch.len() <= 1024
+        && !branch.ends_with('.')
+        && !target.contains("..")
+        && !target.contains("//")
+        && !target.contains("@{")
+        && !target.ends_with(".lock")
+        && !target.bytes().any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
+        && branch.split('/').all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+fn validate_unborn_refs(git_paths: &BTreeSet<std::path::PathBuf>, packed: Option<&[u8]>) -> Result<(), Error> {
+    // `git_paths` contains only regular files under `.git`, never directories.
+    // Any loose ref (including a malformed one) means this is not a clean,
+    // declared unborn repository; packed-refs must likewise be empty.
+    if git_paths.iter().any(|path| path.starts_with("refs")) {
+        return Err(Error(StatusCode::CONFLICT, CONFLICT_HEAD));
+    }
+    if packed.is_some_and(packed_refs_has_any_ref) {
+        return Err(Error(StatusCode::CONFLICT, CONFLICT_HEAD));
+    }
+    Ok(())
+}
+
+pub(super) fn packed_refs_has_any_ref(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else { return true };
+    // The unborn validator rejects the whole file unless it is empty. A peeled
+    // `^` line is only valid after a ref; treating it as a ref (and therefore
+    // rejecting it here) also rejects a standalone malformed `^` line.
+    text.lines().any(|raw| {
+        let line = raw.trim_end_matches('\r');
+        !line.is_empty() && !line.starts_with('#')
+    })
+}
+
 fn is_valid_sha1_oid_line(bytes: &[u8]) -> bool {
     std::str::from_utf8(bytes).ok().is_some_and(|s| is_valid_sha1_oid(s.trim_end_matches(['\r', '\n'])))
 }
 
-fn is_valid_sha1_oid(oid: &str) -> bool {
+pub(super) fn is_valid_sha1_oid(oid: &str) -> bool {
     oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) && !oid.bytes().all(|b| b == b'0')
 }
 
