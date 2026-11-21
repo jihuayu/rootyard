@@ -29,6 +29,7 @@ from .concurrent_outcomes import (
     sanitize_concurrent_outcomes,
 )
 from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
+from .multi_repo_diagnostics import MULTI_REPO_COMPLETED_FIELD, sanitize_multi_repo_completed
 from .pack_matrix import CANDIDATE_CONFIGS
 
 FAILURE_SCHEMA = "rootyard/pando-pack-compression-eval-failure/v1"
@@ -95,7 +96,7 @@ _RECORD_FIELDS = (
     "s3",
     "bindings", "fixture_capacity",
     "concurrent_worker_outcomes",
-    "cleanup",
+    "cleanup", "multi_repo_completed",
 )
 _HTTP_PATTERNS = (
     re.compile(rb"\bHTTP\s+(\d{3})\b"),
@@ -103,7 +104,6 @@ _HTTP_PATTERNS = (
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40,64}$")
-
 
 def _choice(value: Any, allowed: tuple[str, ...] | frozenset[str], default: str = "unknown") -> str:
     return value if isinstance(value, str) and value in allowed else default
@@ -113,7 +113,6 @@ def _optional_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
-
 
 def _optional_count(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
@@ -126,12 +125,10 @@ def _count(value: Any) -> int:
         return 0
     return value if 0 <= value <= 2**63 - 1 else 0
 
-
 def _ordinal(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if 0 <= value <= 1_000_000 else None
-
 
 def _signal(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
@@ -289,7 +286,7 @@ def build_failure_record(
     s3: Any = None,
     bindings: Any = None, fixture_capacity: Any = None,
     concurrent_worker_outcomes: Any = None,
-    cleanup: Any = None,
+    cleanup: Any = None, multi_repo_completed: Any = None,
 ) -> dict[str, Any]:
     """Build one fixed-schema failure record from source-known fields only."""
     return {
@@ -320,7 +317,7 @@ def build_failure_record(
         "s3": sanitize_s3_snapshot(s3),
         "bindings": sanitize_bindings(bindings), "fixture_capacity": sanitize_capacity(fixture_capacity),
         "concurrent_worker_outcomes": sanitize_concurrent_outcomes(concurrent_worker_outcomes),
-        "cleanup": sanitize_cleanup(cleanup),
+        "cleanup": sanitize_cleanup(cleanup), "multi_repo_completed": sanitize_multi_repo_completed(multi_repo_completed),
     }
 
 
@@ -335,7 +332,10 @@ def push_context(progress: Any, phase: Any, **values: Any) -> dict[str, Any]:
     """Build caller-owned finite push context from the live progress map."""
     source = progress if isinstance(progress, Mapping) else {}
     completed = source.get("completed") if isinstance(source.get("completed"), Mapping) else {}
-    return {"phase": phase, **values, "completed": dict(completed), "last_completed_phase": source.get("last_completed_phase")}
+    return {
+        "phase": phase, **values, "completed": dict(completed), "last_completed_phase": source.get("last_completed_phase"),
+        MULTI_REPO_COMPLETED_FIELD: source.get(MULTI_REPO_COMPLETED_FIELD),
+    }
 
 
 def failure_record_from_exception(
@@ -397,7 +397,7 @@ def git_failure_record(
         push_ref_verdict=finite_push_ref_verdict(stdout, expected_destination),
         elapsed_ms=elapsed_ms,
         completed=values.get("completed"),
-        last_completed_phase=values.get("last_completed_phase"),
+        last_completed_phase=values.get("last_completed_phase"), multi_repo_completed=values.get(MULTI_REPO_COMPLETED_FIELD),
     )
 
 
@@ -435,7 +435,7 @@ def finalize_cleanup(
     s3: Any,
     completed: Any,
     last_completed_phase: Any,
-    bindings: Any, fixture_capacity: Any = None,
+    bindings: Any, fixture_capacity: Any = None, multi_repo_completed: Any = None,
 ) -> None:
     """Preserve a live failure, or fail a successful run whose cleanup failed."""
     if isinstance(active, FailureArtifactError):
@@ -445,7 +445,7 @@ def finalize_cleanup(
             build_failure_record(
                 phase="cleanup", failure_class="cleanup_failure", s3=s3, completed=completed,
                 last_completed_phase=last_completed_phase,
-                bindings=bindings, fixture_capacity=fixture_capacity, cleanup=cleanup,
+                bindings=bindings, fixture_capacity=fixture_capacity, cleanup=cleanup, multi_repo_completed=multi_repo_completed,
             )
         ) from None
 
@@ -493,7 +493,7 @@ __all__ = [
     "push_context",
     "push_expected_destination",
     "safe_summary",
-    "sanitize_bindings",
+    "sanitize_bindings", "sanitize_multi_repo_completed",
     "sanitize_s3_snapshot",
     "write_failure_json",
 ]

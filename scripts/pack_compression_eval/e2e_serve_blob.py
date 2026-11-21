@@ -53,6 +53,7 @@ from .live_server import (
     verify_binary_receipt,
 )
 from .multi_repo import run_multi_repo_first_pushes
+from .multi_repo_diagnostics import MULTI_REPO_COMPLETED_FIELD, sanitize_multi_repo_completed
 from .pack_matrix import CANDIDATE_CONFIGS
 from .report import FETCH_MEASUREMENT_NOTES
 from .s3_meter import SOCKET_IO_TIMEOUT_SECONDS, S3MeterProxy
@@ -313,6 +314,9 @@ def run_live_serve_blob_eval(
                 spec, proxy, work_root, progress,
                 config=spec.name, run_env=run_env, askpass=askpass,
             )
+            progress[MULTI_REPO_COMPLETED_FIELD] = sanitize_multi_repo_completed(
+                [*progress.get(MULTI_REPO_COMPLETED_FIELD, []), multi_repo]
+            )
             progress["completed"]["candidate_configs_completed"] += 1
             candidate_serving.append(
                 {
@@ -443,6 +447,7 @@ def run_live_serve_blob_eval(
                 last_completed_phase=progress["last_completed_phase"],
                 bindings=bindings_from_receipt(receipt_info), fixture_capacity=fixture_capacity,
                 concurrent_worker_outcomes=progress.get("concurrent_worker_outcomes"),
+                multi_repo_completed=progress.get(MULTI_REPO_COMPLETED_FIELD),
             )
         ) from None
     except Exception:
@@ -455,6 +460,7 @@ def run_live_serve_blob_eval(
                 s3=s3_snapshot(),
                 bindings=bindings_from_receipt(receipt_info), fixture_capacity=fixture_capacity,
                 concurrent_worker_outcomes=progress.get("concurrent_worker_outcomes"),
+                multi_repo_completed=progress.get(MULTI_REPO_COMPLETED_FIELD),
             )
         ) from None
     finally:
@@ -479,4 +485,5 @@ def run_live_serve_blob_eval(
             completed=progress["completed"],
             last_completed_phase=progress["last_completed_phase"],
             bindings=bindings_from_receipt(receipt_info), fixture_capacity=fixture_capacity,
+            multi_repo_completed=progress.get(MULTI_REPO_COMPLETED_FIELD),
         )

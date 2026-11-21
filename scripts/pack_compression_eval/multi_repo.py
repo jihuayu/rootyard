@@ -17,6 +17,7 @@ from typing import Any
 from .corpus import BASE_UNIX_TIME, build_git_http_env, run_git
 from .failure_diagnostics import LiveEvalFailure, build_failure_record, push_context
 from .live_server import clone_and_fsck, push_with_pack_config
+from .multi_repo_diagnostics import MULTI_REPO_COMPLETED_FIELD
 from .pack_matrix import PackConfigSpec
 from .s3_meter import SOCKET_IO_TIMEOUT_SECONDS, S3MeterProxy
 from .telemetry import percentile_stats
@@ -51,6 +52,7 @@ def _fail(progress: dict[str, Any], failure_class: str, **values: Any) -> LiveEv
             failure_class=failure_class,
             completed=completed,
             last_completed_phase=progress.get("last_completed_phase"),
+            multi_repo_completed=progress.get(MULTI_REPO_COMPLETED_FIELD),
             **values,
         )
     )
