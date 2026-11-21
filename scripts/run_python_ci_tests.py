@@ -12,8 +12,12 @@ result semantics:
   still writes an all-thread Python stack;
 * leave an already-installed process-global handler untouched, and remove only
   the handler this run installed on exit;
+* optionally require exact test ids to record a success during that same
+  unfiltered discovery, without treating a skip or expected failure as one;
 * run verbosely, keeping normal test-count, skip and failure/error handling;
 * print every test id as it starts, to stderr;
+* report only the count of required ids that did not record a success, never
+  the raw ids, while preserving the suite's ordinary exit precedence;
 * write one bounded START and one DONE marker per test to stderr, carrying
   only a fixed state, the numeric unittest ordinal and a SHA-256 of the test
   id;
@@ -43,7 +47,7 @@ only projected unittest outcomes and a verified checkout identity.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 import faulthandler
 import hashlib
 from itertools import chain, islice
@@ -86,6 +90,8 @@ REPORT_MAX_CASES = 32
 REPORT_MAX_COUNT = 99_999_999
 REPORT_MAX_ELAPSED_MS = 24 * 60 * 60 * 1000
 REPORT_MAX_BYTES = 8192
+
+REQUIRED_TESTS_MISSING = "Required Python test success missing"
 
 MARKER_PREFIX = b"DSH-RUNNER-DIAG v=1 state="
 MARKER_STATE_START = b"START"
@@ -163,9 +169,17 @@ class _MarkerEmitter:
 def _diagnostic_result_class(
     emitter: _MarkerEmitter,
     observe_result: Callable[[unittest.TextTestResult], None] | None = None,
+    *,
+    required_tests: frozenset[str],
+    required_successes: set[str],
 ) -> type[unittest.TextTestResult]:
-    """Return the TextTestResult that emits one START/DONE pair per test."""
+    """Return the TextTestResult that emits one START/DONE pair per test.
 
+    ``addSuccess`` also records an exact test id only when it is one of the
+    opt-in required tests. The inventory is deliberately based on unittest's
+    own success callback, so skips (including class setup), expected failures,
+    errors and absent cases cannot satisfy a requirement.
+    """
     class _DiagnosticTextTestResult(unittest.TextTestResult):
         def startTestRun(self) -> None:
             super().startTestRun()
@@ -175,6 +189,17 @@ def _diagnostic_result_class(
         def startTest(self, test: unittest.TestCase) -> None:
             super().startTest(test)
             emitter.emit(MARKER_STATE_START, self.testsRun, test)
+
+        def addSuccess(self, test: unittest.TestCase) -> None:
+            super().addSuccess(test)
+            if not required_tests:
+                return
+            try:
+                test_id = test.id()
+            except Exception:
+                return
+            if isinstance(test_id, str) and test_id in required_tests:
+                required_successes.add(test_id)
 
         def stopTest(self, test: unittest.TestCase) -> None:
             try:
@@ -606,8 +631,15 @@ def run(
     marker_write: Callable[[bytes], int] = _write_marker_to_stderr,
     report_out: Path | None = None,
     expected_commit: str | None = None,
+    required_tests: Iterable[str] = (),
 ) -> int:
     """Run discovery and return unittest's success/failure exit status.
+
+    ``required_tests`` contains exact unittest ids that must reach
+    ``addSuccess`` during the unfiltered discovery run. A genuine suite
+    failure, an empty selection and a marker failure keep their existing
+    nonzero exit codes; an otherwise successful run fails when any required
+    test did not record a success.
 
     The periodic-diagnostics factory, fatal-handler and marker-writer seams
     are injectable so focused tests can avoid touching process-global
@@ -618,6 +650,8 @@ def run(
     # the diagnostics thread must not participate in a buffered-I/O lock that
     # a forked child could inherit in a locked state.
     diagnostics = watchdog_stream
+    required = frozenset(required_tests)
+    required_successes: set[str] = set()
     emitter = _MarkerEmitter(marker_write)
     result = None
 
@@ -626,7 +660,12 @@ def run(
         nonlocal result
         result = active_result
 
-    result_class = _diagnostic_result_class(emitter, capture_result if report_out is not None else None)
+    result_class = _diagnostic_result_class(
+        emitter,
+        capture_result if report_out is not None else None,
+        required_tests=required,
+        required_successes=required_successes,
+    )
     report_start = time.monotonic_ns() if report_out is not None else 0
     binding = _checkout_binding(expected_commit) if report_out is not None else None
     code = None
@@ -668,6 +707,12 @@ def run(
         elif emitter.failed:
             stage = "markers"
             code = 1
+        elif missing_required := required - required_successes:
+            print(
+                f"{REQUIRED_TESTS_MISSING}: {len(missing_required)}",
+                file=output,
+            )
+            code = 1
         else:
             code = 0
     finally:
@@ -697,11 +742,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--report-out", type=Path)
     parser.add_argument("--expected-commit")
+    parser.add_argument(
+        "--require-test",
+        action="append",
+        default=[],
+        dest="required_tests",
+        metavar="EXACT_UNITTEST_ID",
+        help=(
+            "require this exact unittest id to record a success during the "
+            "unfiltered discovery run; repeatable"
+        ),
+    )
     args = parser.parse_args(argv)
     if (args.report_out is None) != (args.expected_commit is None):
         parser.error("--report-out and --expected-commit must be supplied together")
     _restore_repo_root_import_context()
-    return run(report_out=args.report_out, expected_commit=args.expected_commit)
+    return run(
+        report_out=args.report_out,
+        expected_commit=args.expected_commit,
+        required_tests=args.required_tests,
+    )
 
 
 if __name__ == "__main__":

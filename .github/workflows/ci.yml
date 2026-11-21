@@ -353,7 +353,7 @@ jobs:
         run: python3 tests/repository_lifecycle_acceptance.py --binary "$ROOTYARD_BIN" --build-receipt "$ROOTYARD_BUILD_RECEIPT" --expected-source-commit "$GITHUB_SHA" --report test-results/repository-lifecycle-issue85-literal.json
       - name: Run all Python unit and Tier-5 adversarial contract suites
         # Full discovery stays unfiltered; the runner adds per-test progress and
-        # periodic stderr thread stacks without changing exit semantics.
+        # periodic stderr thread stacks and requires the live PITR result.
         env:
           ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 283 && 'test-results/python-ci-result.json' || '' }}
           ROOTYARD_PYTHON_CI_REPORT_258: ${{ github.event.pull_request.number == 258 && 'test-results/python-ci-result.json' || '' }}
@@ -363,7 +363,8 @@ jobs:
           if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then
             report_args=(--report-out "$ROOTYARD_PYTHON_SUITE_REPORT" --expected-commit="${GITHUB_SHA:-}")
           fi
-          python3 scripts/run_python_ci_tests.py "${report_args[@]}"
+          python3 scripts/run_python_ci_tests.py "${report_args[@]}" \
+            --require-test test_pando_pitr_service.PandoPitrServiceTest.test_pando_pitr_pg_dump_clone_and_retention_roots
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary "$ROOTYARD_BIN" --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror
