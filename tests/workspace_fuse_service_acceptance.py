@@ -29,7 +29,11 @@ for path in (TESTS, ROOT):
         sys.path.insert(0, str(path))
 
 from tests.workspace_capture_acceptance import TimedTextTestResult
-from tests.workspace_normal_shutdown_support import BUSY_TARGETS, WRITER_CLOSE_STATES
+from tests.workspace_normal_shutdown_support import (
+    BUSY_TARGETS,
+    TERMINAL_WRITE_STATES,
+    WRITER_CLOSE_STATES,
+)
 
 REPORT_SCHEMA = "rootyard/issues91-95/workspace-fuse-service-acceptance/v1"
 REQUIRED_CASES = (
@@ -56,6 +60,9 @@ FAILURE_PHASES = frozenset((
     "setup", "API", "workspace", "capturefreeze", "Gitpark", "signal", "joins", "cleanup",
 ))
 MAX_DIAGNOSTIC_LINE = 100_000
+# A Unix process return is either 0..255 or a negated terminating signal.
+PROCESS_EXIT_MIN = -255
+PROCESS_EXIT_MAX = 255
 
 SHUTDOWN_OUTCOME_UNKNOWN = "unknown"
 SHUTDOWN_OUTCOME_MULTIPLE = "multiple"
@@ -301,7 +308,19 @@ def _errno(error):
 
 def _child_exit(error):
     if isinstance(error, subprocess.CalledProcessError):
-        return _bounded_int(getattr(error, "returncode", None), -255, 255)
+        return _bounded_int(
+            getattr(error, "returncode", None), PROCESS_EXIT_MIN, PROCESS_EXIT_MAX)
+    return None
+
+
+def _api_exit(test):
+    """Return only the named case's own captured numeric process exit."""
+    try:
+        value = getattr(test, "_rootyard_diagnostic_api_exit", None)
+        if type(value) is int and PROCESS_EXIT_MIN <= value <= PROCESS_EXIT_MAX:
+            return value
+    except BaseException:
+        pass
     return None
 
 
@@ -378,6 +397,17 @@ def _writer_close(test):
     return "unknown"
 
 
+def _terminal_write(test):
+    """Return only one closed temporal label, never a timestamp/fd/pid."""
+    try:
+        value = getattr(test, "_rootyard_diagnostic_terminal_write", None)
+        if isinstance(value, str) and value in TERMINAL_WRITE_STATES:
+            return value
+    except BaseException:
+        pass
+    return "unknown"
+
+
 def _unknown_diagnostic():
     return {
         "phase": None,
@@ -386,9 +416,11 @@ def _unknown_diagnostic():
         "http_status": None,
         "errno": None,
         "child_exit": None,
+        "api_exit": None,
         "shutdown_outcome": SHUTDOWN_OUTCOME_UNKNOWN,
         "busy_target": "unknown",
         "writer_close": "unknown",
+        "terminal_write": "unknown",
     }
 
 
@@ -400,9 +432,11 @@ def _diagnostic_record(test, error, tb):
         "http_status": _http_status(error),
         "errno": _errno(error),
         "child_exit": _child_exit(error),
+        "api_exit": _api_exit(test),
         "shutdown_outcome": _shutdown_outcome(test),
         "busy_target": _busy_target(test),
         "writer_close": _writer_close(test),
+        "terminal_write": _terminal_write(test),
     }
 
 

@@ -59,6 +59,75 @@ class WorkspaceServiceTest(unittest.TestCase):
             h.run([str(copy/"build")],cwd=copy)
         finally:h.cleanup()
 
+    def assert_native_split_restore_witness(self, h, source_id, restored_id):
+        """Prove the restored on-disk split with stock Git and a real build."""
+        root = h.root / "data/workspace-service/workspaces"
+        source = root / source_id
+        restored = root / restored_id
+        self.assertNotEqual(source, restored)
+        expected_status = (
+            b"1 MM N... 100644 100644 100644 "
+            b"e019be006cf33489e2d0177a3837a2384eddebc5 "
+            b"626799f0f85326a8c1fc522db584e86cdfccd51f hello.txt\n")
+        expected_cached = (
+            b"diff --git a/hello.txt b/hello.txt\n"
+            b"index e019be006cf33489e2d0177a3837a2384eddebc5.."
+            b"626799f0f85326a8c1fc522db584e86cdfccd51f 100644\n"
+            b"--- a/hello.txt\n"
+            b"+++ b/hello.txt\n"
+            b"@@ -1 +1 @@\n"
+            b"-second\n"
+            b"+v1\n")
+        expected_unstaged = (
+            b"diff --git a/hello.txt b/hello.txt\n"
+            b"index 626799f0f85326a8c1fc522db584e86cdfccd51f.."
+            b"61803007dd3b2836aa129f1ae750ff3a3bed3cd7 100644\n"
+            b"--- a/hello.txt\n"
+            b"+++ b/hello.txt\n"
+            b"@@ -1 +1 @@\n"
+            b"-v1\n"
+            b"+v2 unstaged\n")
+        expected = (expected_status, expected_cached, expected_unstaged)
+
+        def witness(repo):
+            return (
+                h.git("--no-pager", "--no-optional-locks", "status", "--porcelain=v2",
+                      cwd=repo).stdout,
+                h.git("--no-pager", "diff", "--cached", "--full-index", "--no-color",
+                      "--no-ext-diff", "--no-textconv", "--", "hello.txt", cwd=repo).stdout,
+                h.git("--no-pager", "diff", "--full-index", "--no-color",
+                      "--no-ext-diff", "--no-textconv", "--", "hello.txt", cwd=repo).stdout)
+
+        before = witness(source)
+        after = witness(restored)
+        self.assertEqual(before, expected)
+        self.assertEqual(after, before)
+        self.assertEqual((source / "hello.txt").read_bytes(), b"v2 unstaged\n")
+        self.assertEqual((restored / "hello.txt").read_bytes(), b"v2 unstaged\n")
+
+        # Compile a deterministic program that reads the restored worktree, not
+        # the expected staged bytes or the API view.
+        build_src = h.root / "native-split-build.c"
+        build_bin = h.root / "native-split-build"
+        build_src.write_text(
+            "#include <stdio.h>\n"
+            "#include <string.h>\n"
+            "int main(void) {\n"
+            "    static const char expected[] = \"v2 unstaged\\n\";\n"
+            "    char actual[sizeof(expected)] = {0};\n"
+            "    FILE *file = fopen(\"hello.txt\", \"rb\");\n"
+            "    if (file == NULL) return 2;\n"
+            "    size_t count = fread(actual, 1, sizeof(expected) - 1, file);\n"
+            "    if (ferror(file) || fgetc(file) != EOF) return 3;\n"
+            "    fclose(file);\n"
+            "    fwrite(actual, 1, count, stdout);\n"
+            "    return count == sizeof(expected) - 1 && "
+            "memcmp(actual, expected, count) == 0 ? 0 : 1;\n"
+            "}\n", encoding="utf-8")
+        h.run(["gcc", str(build_src), "-o", str(build_bin)])
+        built = h.run([str(build_bin)], cwd=restored)
+        self.assertEqual(built.stdout, b"v2 unstaged\n")
+
     def test_create_edit_checkpoint_fork_restore_restart(self):
         binary, _ = select_runtime_binary()
         h = Harness(argparse.Namespace(binary=str(binary), keep=False))
@@ -120,6 +189,7 @@ class WorkspaceServiceTest(unittest.TestCase):
                 body={"agent_id":"restored"},extra_headers={"Idempotency-Key":"restore-one"}))["id"],restored["id"])
             self.assertNotEqual(restored["id"],wid)
             self.assertEqual(base64.b64decode(json.loads(h.expect(f"/api/workspaces/{restored['id']}/files?path=hello.txt",200,token=h.alice))["content_base64"]),b"v2 unstaged\n")
+            self.assert_native_split_restore_witness(h,wid,restored["id"])
             events = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=0",200,token=h.alice))
             self.assertEqual([e["revision"] for e in events["events"]],[1,2,3,4])
             live_repo = h.root / "data/workspace-service/workspaces" / wid
