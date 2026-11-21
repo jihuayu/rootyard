@@ -42,6 +42,18 @@ pub async fn run_from_env() -> Result<()> {
     let (bind, gateway, sessions) = config::gateway_config(pool.clone(), store)?;
     let mut state = crate::blob_git_gateway::BlobGitState::new(gateway)
         .map_err(|_| anyhow!("invalid Blob Git gateway configuration"))?;
+    // The standalone target uses the existing bounded in-process Memory profile
+    // only. No Redis client/runtime is constructed and no environment-selected
+    // backend is added here.
+    let cache =
+        crate::cache_wake::ServingCache::standalone_memory().map_err(|_| anyhow!("invalid cache configuration"))?;
+    state = state.with_cache(Arc::new(cache));
+    // One advisory local signal set for this process. It is shared by the
+    // gateway's fresh-commit trigger and the embedded PG worker; it carries no
+    // event payload and never affects the committed response.
+    let dispatch = crate::dispatch::Signals::default();
+    state = state.with_dispatch(dispatch.clone());
+    let wake = dispatch.local.clone();
     if let Some(sessions) = sessions {
         state = state.with_sessions(sessions);
     }
@@ -54,7 +66,7 @@ pub async fn run_from_env() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
-    serve(router, pool, bind, check).await
+    serve(router, pool, bind, check, wake).await
 }
 
 /// Only the typed lifecycle-barrier refusal keeps its fixed cause; a busy
@@ -72,6 +84,7 @@ async fn serve(
     pool: Pool,
     bind: SocketAddr,
     check: impl std::future::Future<Output = anyhow::Error>,
+    wake: Arc<Notify>,
 ) -> Result<()> {
     let hard_stop = CancellationToken::new();
     let request_stop = hard_stop.clone();
@@ -95,7 +108,7 @@ async fn serve(
     let mut worker = tokio::spawn(crate::dispatch::worker(
         pool.clone(),
         crate::dispatch::Settings::standalone(),
-        Arc::new(Notify::new()),
+        wake,
         worker_stop.clone(),
     ));
     // The one shared browser-session GC loop. It needs only PostgreSQL and is

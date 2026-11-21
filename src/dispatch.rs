@@ -25,7 +25,7 @@ pub trait WakeTransport: Send + Sync {
     fn publish(&self) -> Task<'_, Result<()>>;
     fn subscribe(&self, signal: Arc<Notify>, stop: CancellationToken) -> Task<'_, ()>;
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Signals {
     pub local: Arc<Notify>,
     pub remote: Arc<Notify>,
@@ -44,6 +44,12 @@ pub struct Settings {
     pub lease_seconds: i64,
     pub consumers: Vec<String>,
     pub transport: Option<Arc<dyn WakeTransport>>,
+    /// Restrict every consumer scan to the dedicated pg_refstore audit
+    /// evidence kind. The shared legacy/default path keeps `false`.
+    pub target_audit_only: bool,
+    /// Enqueue/execute Ref-CAS projection jobs. The standalone target keeps
+    /// this `false`; the shared legacy/default path keeps `true`.
+    pub projection_jobs: bool,
 }
 impl Settings {
     /// Minimal serving never inspects or constructs external wake transports.
@@ -53,8 +59,10 @@ impl Settings {
             poll: Duration::from_secs(1),
             batch: 64,
             lease_seconds: 60,
-            consumers: crate::events::CONSUMERS.iter().map(|name| (*name).to_owned()).collect(),
+            consumers: vec![crate::events::TARGET_AUDIT_CONSUMER.to_owned()],
             transport: None,
+            target_audit_only: true,
+            projection_jobs: false,
         }
     }
 
@@ -112,6 +120,8 @@ impl Settings {
             lease_seconds: number("ROOTYARD_WORKER_LEASE_SECONDS", 60, 1, 3600)? as i64,
             consumers,
             transport,
+            target_audit_only: false,
+            projection_jobs: true,
         })
     }
 }
@@ -140,14 +150,16 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
             _=signal.notified()=>{},
         }
         let operation = OperationContext::new(WorkerKind::DurableDispatch);
+        let target_kind = settings.target_audit_only.then_some(crate::events::TARGET_AUDIT_KIND);
         let scan = async {
             // A poisoned consumer cannot suppress another consumer's scan.
             let results = futures_util::future::join_all(settings.consumers.iter().map(|consumer| {
                 tokio::time::timeout(
                     Duration::from_secs(15),
-                    crate::events::worker_once_with_lease(
+                    crate::events::worker_once_with_lease_scoped(
                         &pool,
                         consumer,
+                        target_kind,
                         owner,
                         settings.batch,
                         settings.lease_seconds,
@@ -170,20 +182,27 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
                     }
                 }
             }
-            match tokio::time::timeout(
-                Duration::from_secs(15),
-                crate::events::process_ref_cas_projection_jobs(&pool, owner, settings.batch, settings.lease_seconds),
-            )
-            .await
-            {
-                Ok(Ok(done)) => count += done,
-                Ok(Err(error)) => {
-                    observability::observe_internal(&error);
-                    failed = true;
-                }
-                Err(_) => {
-                    observability::observe_timeout();
-                    failed = true;
+            if settings.projection_jobs {
+                match tokio::time::timeout(
+                    Duration::from_secs(15),
+                    crate::events::process_ref_cas_projection_jobs(
+                        &pool,
+                        owner,
+                        settings.batch,
+                        settings.lease_seconds,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(done)) => count += done,
+                    Ok(Err(error)) => {
+                        observability::observe_internal(&error);
+                        failed = true;
+                    }
+                    Err(_) => {
+                        observability::observe_timeout();
+                        failed = true;
+                    }
                 }
             }
             (count, failed)
@@ -461,6 +480,14 @@ mod tests {
         fn subscribe(&self, _: Arc<Notify>, stop: CancellationToken) -> Task<'_, ()> {
             Box::pin(async move { stop.cancelled().await })
         }
+    }
+    #[test]
+    fn standalone_scan_is_target_audit_only_and_skips_projection_jobs() {
+        let settings = Settings::standalone();
+        assert_eq!(settings.consumers, vec![crate::events::TARGET_AUDIT_CONSUMER.to_owned()]);
+        assert!(settings.target_audit_only);
+        assert!(!settings.projection_jobs);
+        assert!(settings.transport.is_none());
     }
     #[tokio::test]
     async fn failed_adapter_is_cancellable() {

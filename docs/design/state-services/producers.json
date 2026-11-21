@@ -637,11 +637,16 @@
           "symbols": [
             "publish",
             "publish_in_tx",
+            "pending_count"
+          ]
+        },
+        {
+          "file": "src/events/consumer.rs",
+          "symbols": [
             "claim",
             "acknowledge",
             "fail",
-            "worker_once_with_lease",
-            "pending_count"
+            "worker_once_with_lease"
           ]
         }
       ],
