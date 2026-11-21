@@ -403,7 +403,7 @@ class PolicyHarness(Harness):
 
         self.stop()
         gate_target = (Path(self.root) / "data/workspace-service/uppers"
-                       / wid / "gate-target.txt")
+                       / wid / "capture-gate-target.txt")
         gate_names = ("LD_PRELOAD", "ROOTYARD_TEST_CAPTURE_GATE",
                       "ROOTYARD_TEST_CAPTURE_TARGET")
         prior_env = {name: self.env.get(name) for name in gate_names}
@@ -503,6 +503,11 @@ class PolicyHarness(Harness):
             assert writer_identity["starttime"] > 0
             writer_pidfd = support.open_pidfd(writer.pid)
 
+            # Keep the capture gate out of the writer's setup. The writer
+            # creates its own gate-target.txt through the live mount first.
+            staged_target = Path(self.root) / "capture-gate-staging" / gate_target.name
+            staged_target.parent.mkdir()
+            staged_target.write_bytes(b"capture-gate-target\n")
             capture_deadline = time.monotonic() + 30.0
             readiness_deadline = min(
                 capture_deadline,
@@ -527,14 +532,17 @@ class PolicyHarness(Harness):
                     raise AssertionError(
                         "pending writer could not reach capture-gate readiness: "
                         f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
-                if phase == "writing" and gate_target.exists():
+                if phase == "writing":
                     break
                 if time.monotonic() >= readiness_deadline:
                     raise AssertionError(
-                        "pending writer did not reach writing+target readiness: "
+                        "pending writer did not reach writing phase: "
                         f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
                 time.sleep(0.05)
 
+            # Publish the distinct target atomically only after the live
+            # writer can attempt the separately parked file.
+            os.replace(staged_target, gate_target)
             remaining = capture_deadline - time.monotonic()
             if remaining <= 0:
                 raise AssertionError(
