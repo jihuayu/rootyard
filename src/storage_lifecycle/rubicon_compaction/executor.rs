@@ -25,7 +25,8 @@ use super::{
     },
     lease::{
         BoxFuture, CompactionAuthorityStore, CompactionEquivalenceProof, CompactionFaultHook, CompactionLeaseKey,
-        CompactionPhase, CompactionPublishReceipt, CompactionPublishRequest, PendingOperationRecord,
+        CompactionLeaseToken, CompactionPhase, CompactionPublishReceipt, CompactionPublishRequest,
+        PendingOperationRecord,
     },
     segment::{SegmentTriggerPolicy, TieredMergePlan},
     sharding::{CompactionPackEntry, shard_for_pack_hash},
@@ -162,11 +163,55 @@ async fn execute_shard_compaction_inner(
     };
     let lease_token =
         authority.acquire_or_renew_lease(&lease_key, request.owner_id, request.now_ms, request.lease_ttl_ms).await?;
+    let attempt = LeasedAttempt { token: &lease_token, deadline };
+    match execute_leased_attempt(authority, uploader, store, view_root, budget, request, attempt).await {
+        Err(LeasedAttemptError::CrashInjected(err)) => {
+            // A reached crash injection leaves the lease to expire as designed.
+            Err(err)
+        }
+        Ok(outcome) => {
+            // Preserve the existing success contract: cleanup failure is surfaced.
+            authority.release_lease(&lease_token).await?;
+            Ok(outcome)
+        }
+        Err(LeasedAttemptError::Failed(err)) => {
+            // Best-effort cleanup, but never mask the original compaction failure.
+            let _ = authority.release_lease(&lease_token).await;
+            Err(err)
+        }
+    }
+}
+
+enum LeasedAttemptError {
+    Failed(CompactionError),
+    CrashInjected(CompactionError),
+}
+
+impl From<CompactionError> for LeasedAttemptError {
+    fn from(error: CompactionError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+struct LeasedAttempt<'a> {
+    token: &'a CompactionLeaseToken,
+    deadline: Instant,
+}
+
+async fn execute_leased_attempt(
+    authority: &dyn CompactionAuthorityStore,
+    uploader: &dyn CompactionBlobUploader,
+    store: &BlobStore,
+    view_root: &DisposableViewRoot,
+    budget: &CompactionResourceBudget,
+    request: &CompactionRunRequest<'_>,
+    attempt: LeasedAttempt<'_>,
+) -> Result<CompactionRunOutcome, LeasedAttemptError> {
+    let LeasedAttempt { token: lease_token, deadline } = attempt;
     let started_at = Instant::now();
     let snap = authority.load_snapshot(request.tenant_id, request.repo_id, request.history_id).await?;
     let fmt = parse_object_format(&snap.object_format)?;
     let Some(plan) = snap.segments.plan_tiered_merge(request.shard_id, &request.policy)? else {
-        authority.release_lease(&lease_token).await?;
         return Ok(CompactionRunOutcome::NoWorkDue);
     };
 
@@ -188,12 +233,13 @@ async fn execute_shard_compaction_inner(
                 .collect();
             reg.pin_pack_entries(&entries)
         })
-        .transpose()?;
+        .transpose()
+        .map_err(CompactionError::from)?;
     let op_id = request.op_id_override.unwrap_or_else(Uuid::new_v4);
     authority
         .record_checkpoint(PendingOperationRecord {
             op_id,
-            key: lease_key.clone(),
+            key: lease_token.key.clone(),
             fence_epoch: lease_token.fence_epoch,
             expected_membership_generation: snap.membership_generation,
             phase: CompactionPhase::Claimed,
@@ -201,9 +247,10 @@ async fn execute_shard_compaction_inner(
         .await?;
 
     let view_bytes = total_serving_bytes.saturating_mul(4).max(4 << 20);
-    let scratch_lease =
-        view_root.create_view("rubicon-compact", request.tenant_id, request.repo_id, view_bytes, None)?;
-    let work = scratch_lease.dir_path()?.to_path_buf();
+    let scratch_lease = view_root
+        .create_view("rubicon-compact", request.tenant_id, request.repo_id, view_bytes, None)
+        .map_err(CompactionError::from)?;
+    let work = scratch_lease.dir_path().map_err(CompactionError::from)?.to_path_buf();
     let (before_dir, shard_dir, cand_dir, after_dir, out_dir, rb_dir) = (
         work.join("before.git"),
         work.join("shard.git"),
@@ -216,7 +263,7 @@ async fn execute_shard_compaction_inner(
         std::fs::create_dir_all(d).map_err(|e| CompactionError::Io(e.to_string()))?;
     }
 
-    authority.verify_lease_active(&lease_token, current_now_ms(request.now_ms, started_at)).await?;
+    authority.verify_lease_active(lease_token, current_now_ms(request.now_ms, started_at)).await?;
     let _git_permit = budget.acquire_git_slot(deadline).await?;
     populate_bare_with_entries(store, &before_dir, fmt, &snap.serving_packs, false, deadline).await?;
     let (before_oids, before_closure) =
@@ -256,7 +303,8 @@ async fn execute_shard_compaction_inner(
     if after_oids != before_oids || after_closure != before_closure {
         return Err(CompactionError::EquivalenceFailed(
             "candidate pack broke repository OID set or retention closure".into(),
-        ));
+        )
+        .into());
     }
     let clone_ok = if !snap.refs.is_empty() {
         let clone_dir = work.join("clone-check.git");
@@ -285,9 +333,9 @@ async fn execute_shard_compaction_inner(
         clone_verified: clone_ok,
     };
 
-    authority.verify_lease_active(&lease_token, current_now_ms(request.now_ms, started_at)).await?;
+    authority.verify_lease_active(lease_token, current_now_ms(request.now_ms, started_at)).await?;
     if matches!(request.fault_hook, CompactionFaultHook::CrashBeforeUpload) {
-        return Err(CompactionError::Io("injected crash before Blob upload".into()));
+        return Err(LeasedAttemptError::CrashInjected(CompactionError::Io("injected crash before Blob upload".into())));
     }
     drop(_git_permit);
     let uploaded = uploader
@@ -323,12 +371,12 @@ async fn execute_shard_compaction_inner(
         snap.shard_count,
     )?;
     if replacement_pack.shard_id != shard_for_pack_hash(&cand_pack_sha, snap.shard_count)? {
-        return Err(CompactionError::EquivalenceFailed("replacement pack shard mismatch".into()));
+        return Err(CompactionError::EquivalenceFailed("replacement pack shard mismatch".into()).into());
     }
     authority
         .record_checkpoint(PendingOperationRecord {
             op_id,
-            key: lease_key.clone(),
+            key: lease_token.key.clone(),
             fence_epoch: lease_token.fence_epoch,
             expected_membership_generation: snap.membership_generation,
             phase: CompactionPhase::CandidateUploaded {
@@ -340,13 +388,15 @@ async fn execute_shard_compaction_inner(
         .await?;
 
     if matches!(request.fault_hook, CompactionFaultHook::CrashAfterUploadBeforePublish) {
-        return Err(CompactionError::Io("injected crash after verified upload before CAS publish".into()));
+        return Err(LeasedAttemptError::CrashInjected(CompactionError::Io(
+            "injected crash after verified upload before CAS publish".into(),
+        )));
     }
     if let CompactionFaultHook::StallBeforePublish { delay_ms } = request.fault_hook {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
     let publish_now = current_now_ms(request.now_ms, started_at);
-    authority.inject_fault(&request.fault_hook, &lease_key, publish_now, &request.policy).await?;
+    authority.inject_fault(&request.fault_hook, &lease_token.key, publish_now, &request.policy).await?;
 
     let publish_req = CompactionPublishRequest {
         op_id,
@@ -368,14 +418,13 @@ async fn execute_shard_compaction_inner(
         equivalence_proof: proof.clone(),
         delete_disabled: true,
     };
-    let receipt = authority
-        .cas_publish_compaction(
-            &publish_req,
-            current_now_ms(request.now_ms, started_at),
-            matches!(request.fault_hook, CompactionFaultHook::DropPublishAck),
-        )
-        .await?;
-    authority.release_lease(&lease_token).await?;
+    let receipt =
+        authority.cas_publish_compaction(&publish_req, current_now_ms(request.now_ms, started_at), false).await?;
+    if matches!(request.fault_hook, CompactionFaultHook::DropPublishAck) {
+        return Err(LeasedAttemptError::CrashInjected(CompactionError::Io(
+            "simulated dropped ACK after durable RefStore CAS publish".into(),
+        )));
+    }
     Ok(CompactionRunOutcome::Published(Box::new(PublishedCompaction {
         op_id,
         plan,

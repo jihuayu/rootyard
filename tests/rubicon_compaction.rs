@@ -394,17 +394,24 @@ async fn crash_recovery_lease_fence_concurrent_push_dropped_ack_and_corrupt_read
     let mut repo = seed_repo(tmp.path(), ReadAccelObjectFormat::Sha1, 2, 1)?;
     let store = DurableCompactionStore::open_with_journal(tmp.path().join("journal.json"))?;
     h.seed(&store, &repo, "sha1", 1)?;
+    let lease_key =
+        CompactionLeaseKey { tenant_id: repo.tenant, repo_id: repo.repo, history_id: repo.history, shard_id: 0 };
 
     let rq_none = h.mk_req(&repo, CompactionFaultHook::None);
     assert!(matches!(
         h.go(&store, &TestS3Uploader { corrupt: true }, &rq_none, false).await,
         Err(CompactionError::Blob(_) | CompactionError::EquivalenceFailed(_))
     ));
+    // Another owner can acquire the lease immediately after the readback failure.
+    let next_owner = store.acquire_or_renew_lease(&lease_key, "c2", rq_none.now_ms, rq_none.lease_ttl_ms).await?;
+    store.release_lease(&next_owner).await?;
     let up = TestS3Uploader::default();
     for hook in [CompactionFaultHook::CrashBeforeUpload, CompactionFaultHook::CrashAfterUploadBeforePublish] {
         let mut rq = h.mk_req(&repo, hook);
         rq.op_id_override = Some(Uuid::new_v4());
         assert!(h.go(&store, &up, &rq, false).await.is_err());
+        let contended = store.acquire_or_renew_lease(&lease_key, "c2", rq.now_ms, rq.lease_ttl_ms).await;
+        assert!(matches!(contended, Err(CompactionError::LeaseContended { .. })));
     }
     let store = store.reload_after_crash()?;
     let mut rq_stall = h.mk_req(&repo, CompactionFaultHook::StallBeforePublish { delay_ms: 100 });
@@ -414,6 +421,8 @@ async fn crash_recovery_lease_fence_concurrent_push_dropped_ack_and_corrupt_read
 
     let lose = CompactionFaultHook::LoseLeaseBeforePublish { usurper_owner: "usurper".into() };
     assert!(matches!(h.go(&store, &up, &h.mk_req(&repo, lose), false).await, Err(CompactionError::LeaseLost(_))));
+    let replaced = store.acquire_or_renew_lease(&lease_key, "c2", rq_none.now_ms, rq_none.lease_ttl_ms).await;
+    assert!(matches!(replaced, Err(CompactionError::LeaseContended { .. })));
 
     let concurrent_pack = push_extra_pack(&mut repo, "concurrent-push", 1, 2)?;
     let mut rq = h.mk_req(
