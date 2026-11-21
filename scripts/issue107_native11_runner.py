@@ -1680,7 +1680,21 @@ def parse_case_result(output, name):
     _require(passed == 1 and failed == 0 and ignored == 0, "test_partial_or_skipped")
 
 
-def _list_target(binary, cfg, remaining, target=None):
+def listed_cases(target, cfg, allow_known_a4_extra=False):
+    """Return the exact listing scope, defaulting to the frozen inventory.
+
+    The reviewed hosted extension is listing-only: ``run_acceptance`` still
+    executes exactly ``cfg["cases"]``.  The closed mapping in the inventory is
+    the only source of permitted extras; no caller-supplied names are read.
+    """
+    expected = list(cfg["cases"])
+    if allow_known_a4_extra:
+        expected.extend(inventory.HOSTED_KNOWN_EXTRA_CASES.get(target, ()))
+    _require(len(expected) == len(set(expected)), "static_inventory_duplicate")
+    return expected
+
+
+def _list_target(binary, cfg, remaining, target=None, allow_known_a4_extra=False):
     failure_context = None
     if target is not None:
         failure_context = {
@@ -1693,7 +1707,7 @@ def _list_target(binary, cfg, remaining, target=None):
         timeout=min(60.0, remaining), env=os.environ.copy(),
         failure_context=failure_context)
     actual = parse_listing(output)
-    expected = list(cfg["cases"])
+    expected = listed_cases(target, cfg, allow_known_a4_extra)
     _require(len(actual) == len(expected) and len(set(actual)) == len(actual)
              and set(actual) == set(expected), "static_inventory_mismatch")
     return actual
@@ -1925,7 +1939,8 @@ def _attach_failed_target(report, diagnostic, identities, observed_cases=None):
 
 def run_acceptance(source_head, source_root, targets, receipts_by_name,
                    report_path=None, overall_seconds=DEFAULT_OVERALL_SECONDS,
-                   case_seconds=DEFAULT_CASE_SECONDS):
+                   case_seconds=DEFAULT_CASE_SECONDS,
+                   allow_known_a4_extra=False):
     validate_target_set(targets, receipts_by_name)
     _require(re.fullmatch(r"[0-9a-f]{40,64}", str(source_head)) is not None,
              "invalid_source_head")
@@ -1969,7 +1984,7 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
             binary = targets[target]
             cfg = inventory.TARGETS[target]
             completed_cases = []
-            _list_target(binary, cfg, remaining, target)
+            _list_target(binary, cfg, remaining, target, allow_known_a4_extra)
             for name in cfg["cases"]:
                 remaining = deadline - time.monotonic()
                 _require(remaining > 0, "overall_timeout")
@@ -2066,6 +2081,10 @@ def main(argv=None):
     parser.add_argument("--report")
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_OVERALL_SECONDS)
     parser.add_argument("--case-timeout-seconds", type=float, default=DEFAULT_CASE_SECONDS)
+    parser.add_argument(
+        "--allow-known-a4-extra", action="store_true",
+        help=("Accept only the reviewed hosted A4 row during inventory listing; "
+              "execution and the default 167-case contract are unchanged."))
     args = parser.parse_args(argv)
     try:
         targets = _pairs(args.target, "target")
@@ -2073,7 +2092,8 @@ def main(argv=None):
         report = run_acceptance(
             args.source_head, args.source_root, targets, receipt_paths,
             report_path=args.report, overall_seconds=args.timeout_seconds,
-            case_seconds=args.case_timeout_seconds)
+            case_seconds=args.case_timeout_seconds,
+            allow_known_a4_extra=args.allow_known_a4_extra)
     except RunnerError as error:
         print(json.dumps({"passed": False, "error": error.code}), file=sys.stderr)
         return 1

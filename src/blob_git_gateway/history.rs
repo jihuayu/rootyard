@@ -57,7 +57,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use super::{browse, error::GatewayError, native, state::BlobGitState};
+use super::{browse, error::GatewayError, native, read_cache, state::BlobGitState};
 use crate::browse::models::{self, CommitDetail, CommitSummary, CompareQuery, HeadInfo, RefItem};
 
 /// Ancestor-walk ceiling for `commits` and `compare`; larger histories are
@@ -207,14 +207,26 @@ async fn commit_authorized(
     }
     browse::require_reachable(&session, &oid).await?;
     browse::require_kind(&session, &oid, "commit").await?;
-    let single = [oid.clone()];
-    let summary = commit_summaries(&session, &single)
-        .await?
-        .pop()
-        .ok_or(GatewayError::Internal("captured commit metadata could not be decoded"))?;
-    let changed_paths = commit_paths(&session, &oid).await?;
+    // The exact OID is now proved part of the captured reachable closure and
+    // typed as a commit. Only this immutable payload computation is advisory:
+    // every authority, admission, capture, pin-release, final authorization and
+    // session fence below remains on the real path.
+    let cache = session.state.cache().cloned();
+    let scope = read_cache::CommitPreviewScope::from_session(&session);
+    let detail = read_cache::cached_commit_detail(cache, scope, &oid, || async {
+        let single = [oid.clone()];
+        let summary = commit_summaries(&session, &single)
+            .await?
+            .pop()
+            .ok_or(GatewayError::Internal("captured commit metadata could not be decoded"))?;
+        let changed_paths = commit_paths(&session, &oid).await?;
+        Ok(CommitDetail { summary, changed_paths })
+    })
+    .await?;
+    #[cfg(test)]
+    session.state.pause_before_commit_finalize(&oid).await;
     let response = CommitDetailWire {
-        detail: CommitDetail { summary, changed_paths },
+        detail,
         format: session.format_name(),
         hash_algorithm: hash_algorithm(session.format),
         oid_hex_len: session.format.oid_hex_len(),
