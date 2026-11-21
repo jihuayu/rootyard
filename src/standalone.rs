@@ -192,14 +192,14 @@ async fn serve(
             }
         }
     }
-    if let Some(worker) = worker.as_mut() {
-        if !worker.is_finished() {
-            match tokio::time::timeout(Duration::from_secs(5), &mut *worker).await {
-                Ok(_) => {}
-                Err(_) => {
-                    worker.abort();
-                    let _ = worker.await;
-                }
+    if let Some(worker) = worker.as_mut()
+        && !worker.is_finished()
+    {
+        match tokio::time::timeout(Duration::from_secs(5), &mut *worker).await {
+            Ok(_) => {}
+            Err(_) => {
+                worker.abort();
+                let _ = worker.await;
             }
         }
     }

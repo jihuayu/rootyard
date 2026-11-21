@@ -79,10 +79,7 @@ fn a4_wake_channel_for(explicit: Option<&str>, generic: &str) -> Result<String> 
         None => a4_wake_channel(),
     };
     crate::cache_wake::validate_wake_channel(&channel)?;
-    ensure!(
-        channel.as_str() != generic,
-        "A4 wake channel must differ from the generic wake channel"
-    );
+    ensure!(channel.as_str() != generic, "A4 wake channel must differ from the generic wake channel");
     Ok(channel)
 }
 
@@ -735,8 +732,7 @@ mod tests {
             "ROOTYARD_TEST_STRICT",
             Err(std::env::VarError::NotUnicode(std::ffi::OsString::from("private-value"))),
         )
-        .err()
-        .expect("non-Unicode must be refused");
+        .expect_err("non-Unicode must be refused");
         let text = format!("{error}");
         assert!(text.contains("ROOTYARD_TEST_STRICT"));
         assert!(!text.contains("private-value"));

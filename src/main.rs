@@ -91,15 +91,11 @@ async fn run() -> Result<RunOutcome> {
         // enrolls the legacy ref-index consumer or Ref-CAS projection work.
         let settings = match rootyard::dispatch::worker_scope_from_env()? {
             rootyard::dispatch::WorkerScope::Generic => rootyard::dispatch::Settings::from_env()?,
-            rootyard::dispatch::WorkerScope::A4TargetAudit => {
-                rootyard::dispatch::Settings::a4_target_audit_from_env()?
-            }
+            rootyard::dispatch::WorkerScope::A4TargetAudit => rootyard::dispatch::Settings::a4_target_audit_from_env()?,
         };
         if args[0] == "worker-once" {
             let owner = uuid::Uuid::new_v4();
-            let target_kind = settings
-                .target_audit_only
-                .then_some(rootyard::events::TARGET_AUDIT_KIND);
+            let target_kind = settings.target_audit_only.then_some(rootyard::events::TARGET_AUDIT_KIND);
             let mut count = 0;
             for consumer in &settings.consumers {
                 count += rootyard::events::worker_once_with_lease_scoped(

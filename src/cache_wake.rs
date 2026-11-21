@@ -70,8 +70,7 @@ mod wake_channel_tests {
             GENERIC_WAKE_CHANNEL_DEFAULT
         );
         assert_eq!(
-            generic_wake_channel_from_result(Err(std::env::VarError::NotUnicode(OsString::from("private"))))
-                .unwrap(),
+            generic_wake_channel_from_result(Err(std::env::VarError::NotUnicode(OsString::from("private")))).unwrap(),
             GENERIC_WAKE_CHANNEL_DEFAULT
         );
         assert_eq!(
