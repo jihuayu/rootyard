@@ -115,6 +115,17 @@ fn classify_grandchild(expected: ProcStat, observed: Probe, procfs_live: bool) -
 
 #[cfg(unix)]
 fn fixture_identity(leader: i32, grandchild: i32) -> ProcStat {
+    // #318 captured both original identities while procfs was demonstrably live:
+    // the direct child is its own group leader and the TERM-resistant descendant
+    // shares that group. Keep those leader-side checks on the merged #317
+    // parser/probe/classification, which owns the start-time identity below.
+    assert!(live_procfs(), "procfs is not live for the test process");
+    match probe(leader) {
+        Probe::Present(stat) if stat.group == leader && live_state(stat.state) => {}
+        Probe::Present(_) => panic!("fixture leader stat: not-live-or-wrong-group"),
+        Probe::Missing => panic!("fixture leader stat: missing"),
+        Probe::Invalid => panic!("fixture leader stat: invalid"),
+    }
     match probe(grandchild) {
         Probe::Present(stat) if stat.group == leader && live_state(stat.state) => stat,
         Probe::Present(_) => panic!("fixture grandchild stat: not-live-or-wrong-group"),

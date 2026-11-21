@@ -415,6 +415,8 @@ impl RootRefCasRefusalKind {
             RefStoreError::MetadataCursorScopeMismatch => Some(Self::MetadataCursorScopeMismatch),
             RefStoreError::MetadataQuotaExceeded { .. } => Some(Self::MetadataQuotaExceeded),
             RefStoreError::MetadataGateVersionMismatch => Some(Self::MetadataGateVersionMismatch),
+            // PostgreSQL A4 restore-fence only; no deterministic Raft business outcome.
+            RefStoreError::RestoreIncarnationMismatch => None,
             RefStoreError::Timeout
             | RefStoreError::CommitUnknown { .. }
             | RefStoreError::MetadataCommitUnknown { .. }
@@ -477,5 +479,18 @@ impl RootRefCasRefusalKind {
             Self::MetadataQuotaExceeded => "metadata admission quota exhausted",
             Self::MetadataGateVersionMismatch => "metadata gate version moved before capture",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RootRefCasRefusalKind;
+    use crate::ref_store::contract::RefStoreError;
+    use crate::ref_store::core::state_machine::StateMachineError;
+
+    #[test]
+    fn restore_incarnation_mismatch_has_no_raft_business_outcome() {
+        let error = StateMachineError::Store(RefStoreError::RestoreIncarnationMismatch);
+        assert_eq!(RootRefCasRefusalKind::from_state_machine(&error), None);
     }
 }
