@@ -10,7 +10,7 @@ from typing import Any
 from .corpus import build_git_http_env
 from .failure_diagnostics import push_context
 from .live_server import ServeBlobOwner, clone_and_fsck, exercise_browse, fetch_and_fsck, restart_serve_blob
-from .s3_meter import S3MeterProxy
+from .s3_meter import S3MeterProxy, SOCKET_IO_TIMEOUT_SECONDS
 from .telemetry import ResourceSampler, percentile_stats
 
 
@@ -74,7 +74,7 @@ def measure_fetches(
     ]
     result: dict[str, Any] = {"fetch_samples": samples}
     for temperature in ("cold", "warm"):
-        proxy.reset_counters()
+        proxy.reset_counters(settle_timeout=SOCKET_IO_TIMEOUT_SECONDS)
         timings = []
         for index, (sample, target) in enumerate(zip(samples, targets, strict=True)):
             reader = target["ro"]
@@ -96,5 +96,5 @@ def measure_fetches(
             progress["completed"][f"{temperature}_fetch_samples_completed"] += 1
             progress["last_completed_phase"] = phase
         result[f"{temperature}_fetch_stats"] = percentile_stats(timings)
-        result[f"s3_fetch_{temperature}"] = proxy.snapshot()
+        result[f"s3_fetch_{temperature}"] = proxy.snapshot(settle_timeout=SOCKET_IO_TIMEOUT_SECONDS)
     return base_url, result

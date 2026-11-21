@@ -79,7 +79,7 @@ class PackCompressionFetchTest(unittest.TestCase):
         counter = 0
         fetches = []
 
-        def reset():
+        def reset(*, settle_timeout):
             nonlocal counter
             counter = 0
 
@@ -90,7 +90,7 @@ class PackCompressionFetchTest(unittest.TestCase):
             return 4.0
 
         proxy.reset_counters.side_effect = reset
-        proxy.snapshot.side_effect = lambda: {"get_requests": counter}
+        proxy.snapshot.side_effect = lambda *, settle_timeout: {"get_requests": counter}
         owner, sampler, start = mock.Mock(), mock.Mock(), mock.Mock()
         start.return_value = SimpleNamespace(pid=5), "http://127.0.0.1:1234", None
         owner.stop.return_value.stopped = True

@@ -11,6 +11,7 @@ from .cleanup_diagnostics import StopPostcondition
 
 READ_CHUNK = 65536
 PROXY_STOP_TIMEOUT_SECONDS = 2.0
+SOCKET_IO_TIMEOUT_SECONDS = 30.0
 
 
 class BufferedConn:
@@ -146,6 +147,8 @@ class S3MeterProxy:
             raise
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._settled = threading.Condition(self._lock)
+        self._pending_requests = 0
         self._req_counts: dict[str, int] = {}
         self._req_bytes: dict[str, int] = {}
         self._resp_bytes: dict[str, int] = {}
@@ -196,16 +199,24 @@ class S3MeterProxy:
         reason = "closed" if stopped else "thread_alive" if alive else "listener_alive"
         return StopPostcondition("proxy", stopped, reason)
 
-    def reset_counters(self) -> None:
-        with self._lock:
+    def _wait_for_accounting(self, settle_timeout: float | None) -> None:
+        if settle_timeout is not None and not self._settled.wait_for(
+            lambda: self._pending_requests == 0, timeout=settle_timeout,
+        ):
+            raise TimeoutError("S3 request accounting did not settle")
+
+    def reset_counters(self, *, settle_timeout: float | None = None) -> None:
+        with self._settled:
+            self._wait_for_accounting(settle_timeout)
             self._req_counts.clear()
             self._req_bytes.clear()
             self._resp_bytes.clear()
             self._status_counts.clear()
             self._error_responses = 0
 
-    def snapshot(self) -> dict[str, Any]:
-        with self._lock:
+    def snapshot(self, *, settle_timeout: float | None = None) -> dict[str, Any]:
+        with self._settled:
+            self._wait_for_accounting(settle_timeout)
             return {
                 "observed": True,
                 "get_requests": self._req_counts.get("GET", 0),
@@ -245,16 +256,23 @@ class S3MeterProxy:
             if status >= 400:
                 self._error_responses += 1
 
+    def _finish_request(self) -> None:
+        with self._settled:
+            self._pending_requests -= 1
+            if self._pending_requests == 0:
+                self._settled.notify_all()
+
     def _handle_conn(self, client_sock: socket.socket) -> None:
         upstream_sock: socket.socket | None = None
+        accounting = False
         with self._lock:
             self._sockets.add(client_sock)
         try:
-            client_sock.settimeout(30.0)
+            client_sock.settimeout(SOCKET_IO_TIMEOUT_SECONDS)
             upstream_sock = socket.create_connection((self.upstream_host, self.upstream_port), timeout=15.0)
             with self._lock:
                 self._sockets.add(upstream_sock)
-            upstream_sock.settimeout(30.0)
+            upstream_sock.settimeout(SOCKET_IO_TIMEOUT_SECONDS)
             c_stream = BufferedConn(client_sock)
             u_stream = BufferedConn(upstream_sock)
 
@@ -264,6 +282,9 @@ class S3MeterProxy:
                     break
                 method, _, req_version, req_headers = _parse_http_head(raw_req_head)
                 method = method.upper()
+                with self._lock:
+                    self._pending_requests += 1
+                accounting = True
                 upstream_sock.sendall(raw_req_head)
 
                 expect_100 = "100-continue" in req_headers.get("expect", "").lower()
@@ -319,12 +340,16 @@ class S3MeterProxy:
                         resp_body_bytes = u_stream.forward_until_eof(client_sock)
                         close_conn = True
                     self._record(method, req_body_bytes, resp_body_bytes, status)
+                    self._finish_request()
+                    accounting = False
                     if close_conn:
                         return
                     break
         except (OSError, EOFError, ValueError):
             pass
         finally:
+            if accounting:
+                self._finish_request()
             with self._lock:
                 self._sockets.discard(client_sock)
                 if upstream_sock is not None:
