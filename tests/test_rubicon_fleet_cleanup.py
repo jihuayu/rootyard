@@ -243,7 +243,7 @@ class RubiconFleetCleanupTests(unittest.TestCase):
                 else:
                     patch("_phase_seed", side_effect=phase_error)
                 patch("_phase_concurrent_overlap", return_value={})
-                patch("_phase_same_repo_mixed", return_value={})
+                patch("_phase_same_repo_mixed", return_value=({}, []))
                 patch("_phase_cas_race", return_value={})
                 patch("_phase_atomic_subset", return_value={})
                 patch("_phase_cold_warm_and_ci", return_value=(fake_fleet, {}, {}))
