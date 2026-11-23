@@ -3,9 +3,10 @@
 //! the retained root, the token and live RBAC before a byte is materialized from
 //! a disposable bare repository rebuilt from the verified `.pack`/`.idx` bytes.
 use super::s4_models::{GrantExpectation, S4ClosureGrant, fixed_oid};
-use super::s4_authority::{StreamSlot, still_authorized, wide_credential};
+use super::s4_authority::{still_authorized, wide_credential};
 pub(crate) use super::s4_models::refused_want;
 use super::s4_pin::refstore_repository;
+use super::s4_transport_stream::{Check, upload_pack_body};
 use super::*;
 use crate::members::{models::Role, rbac};
 use crate::ref_store::core::retention_root::{PgRetentionRoots, RootRef};
@@ -15,16 +16,8 @@ use axum::{
     http::{StatusCode, header},
     response::Response,
 };
-use std::{io::ErrorKind, path::Path as FsPath, sync::Arc};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::Instant,
-};
-
-/// Fixed chunk size of the streamed pack response.
-const CHUNK: usize = 16 * 1024;
-/// How often the stream re-proves authorization, independent of chunk size.
-const RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
+use std::{path::Path as FsPath, sync::Arc};
+use tokio::time::Instant;
 
 /// A verified, still-live job grant.
 #[derive(Clone)]
@@ -33,16 +26,24 @@ struct Authorized {
     digest: Vec<u8>,
 }
 
-/// Aborts the stdin writer as soon as the response stream is dropped.
-struct AbortTask(tokio::task::JoinHandle<()>);
+pub(crate) use super::s4_authority::DisposableCiView;
 
-impl Drop for AbortTask {
-    fn drop(&mut self) {
-        self.0.abort();
+/// Build one independent live-grant probe. Producer and Body each get their own
+/// closure so both may run concurrently without sharing mutable state.
+fn live_grant_check(
+    state: Arc<AppState>,
+    grant: S4ClosureGrant,
+    digest: Vec<u8>,
+) -> impl FnMut() -> Check + Send + 'static {
+    move || -> Check {
+        let (state, grant, digest) = (state.clone(), grant.clone(), digest.clone());
+        Box::pin(async move {
+            still_authorized(&state, grant.job_id, &digest, grant.repository_id, grant.storage_generation)
+                .await
+                .unwrap_or(false)
+        })
     }
 }
-
-pub(crate) use super::s4_authority::DisposableCiView;
 
 async fn git_dir(
     state: &AppState,
@@ -260,39 +261,6 @@ async fn authorize(
     Ok(Authorized { grant, digest })
 }
 
-/// Re-check authorization before every chunk, even on a fast loopback read.
-pub(crate) fn guarded_chunks<S, F>(
-    source: S,
-    mut authorized: F,
-    slot: StreamSlot,
-) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>>
-where
-    S: futures_util::Stream<Item = std::io::Result<bytes::Bytes>>,
-    F: FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
-{
-    async_stream::stream! {
-        let mut slot = Some(slot);
-        futures_util::pin_mut!(source);
-        while let Some(next) = futures_util::StreamExt::next(&mut source).await {
-            let chunk = match next {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    drop(slot.take());
-                    yield Err(error);
-                    return;
-                }
-            };
-            if !authorized().await {
-                drop(slot.take());
-                yield Err(std::io::Error::other("checkout authorization revoked during transfer"));
-                return;
-            }
-            yield Ok(chunk);
-        }
-        drop(slot.take());
-    }
-}
-
 fn advertisement(service: &str, refs: &[u8]) -> Vec<u8> {
     let line = format!("# service=git-{service}\n");
     let mut body = format!("{:04x}", line.len() + 4).into_bytes();
@@ -374,76 +342,14 @@ pub(crate) async fn upload_pack(
         deadline,
     )
     .await?;
-    let slot = StreamSlot::acquire(&state)?;
-    let hold = holder.hold();
-    let mut child = super::s4_authority::UploadPackGroup::spawn(&state.config.git, holder.path(), Some(hold))?;
-    drop(holder);
-    let (mut stdin, mut stdout) = child.take_pipes()?;
-    let stdin_guard = AbortTask(tokio::spawn(async move {
-        let _ = tokio::time::timeout_at(deadline, async {
-            let _ = stdin.write_all(&body).await;
-            let _ = stdin.shutdown().await;
-        })
-        .await;
-    }));
-    let stream_state = state.clone();
-    let stream_grant = authorized.grant.clone();
-    let stream_digest = authorized.digest.clone();
-    let check = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
-        let (state, grant, digest) = (stream_state.clone(), stream_grant.clone(), stream_digest.clone());
-        Box::pin(async move {
-            still_authorized(&state, grant.job_id, &digest, grant.repository_id, grant.storage_generation)
-                .await
-                .unwrap_or(false)
-        })
-    };
-    let tick_check = check.clone();
-    let source = async_stream::stream! {
-        let _stdin = stdin_guard;
-        let mut ticker = tokio::time::interval(RECHECK);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut buffer = vec![0u8; CHUNK];
-        loop {
-            tokio::select! {
-                read = tokio::time::timeout_at(deadline, stdout.read(&mut buffer)) => match read {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => yield Ok(bytes::Bytes::copy_from_slice(&buffer[..n])),
-                    Ok(Err(err)) => {
-                        child.kill_and_reap().await;
-                        yield Err(err);
-                        return;
-                    }
-                    Err(_) => {
-                        child.kill_and_reap().await;
-                        yield Err(std::io::Error::new(ErrorKind::TimedOut, "upload-pack exceeded deadline"));
-                        return;
-                    }
-                },
-                _ = ticker.tick() => {
-                    if !tick_check().await {
-                        child.kill_and_reap().await;
-                        yield Err(std::io::Error::other("checkout authorization revoked during transfer"));
-                        return;
-                    }
-                }
-            }
-        }
-        match child.finish(deadline).await {
-            Ok(status) if status.success() => {}
-            Err(err) if err.0 == StatusCode::GATEWAY_TIMEOUT => {
-                yield Err(std::io::Error::new(ErrorKind::TimedOut, "upload-pack exceeded deadline"));
-            }
-            _ => {
-                yield Err(std::io::Error::other("upload-pack failed"));
-            }
-        }
-    };
-    let stream = guarded_chunks(source, check, slot);
+    let producer_check = live_grant_check(state.clone(), authorized.grant.clone(), authorized.digest.clone());
+    let delivery_check = live_grant_check(state.clone(), authorized.grant.clone(), authorized.digest.clone());
+    let body = upload_pack_body(&state, holder, body, deadline, producer_check, delivery_check)?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
         .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from_stream(stream))
+        .body(body)
         .map_err(Error::internal)
 }
 

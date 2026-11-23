@@ -13,7 +13,7 @@ use crate::ref_store::core::retention_root::{PgRetentionRoots, RootRef};
 use crate::token_scopes::RepoAction;
 
 /// Hard wall-clock bound on one active-transfer revocation recheck.
-const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Lock and read `public.cluster_authority.incarnation` (`FOR SHARE NOWAIT`),
 /// matching `src/ref_store/serving/authority.rs` deadlock-free lock order.
