@@ -3,7 +3,10 @@ use super::{remote_publish_guard, service};
 use crate::{
     AppState, Error, auth,
     members::models::Role,
-    storage::remote_objects::{ObjectKey, RemoteObjectStore},
+    storage::{
+        remote_errors::RemoteStoreError,
+        remote_objects::{ObjectKey, RemoteObjectStore},
+    },
     workspace_lab::core,
 };
 use axum::{
@@ -82,6 +85,14 @@ fn bounded_manifest(raw: &[u8]) -> Result<RemoteManifest, Error> {
     serde_json::from_slice(raw).map_err(|_| Error::bad_request())
 }
 
+/// A typed object-store `NotFound` means the committed manifest or a member
+/// blob named by it is missing. Local I/O, permission, transient and transport
+/// failures stay on the existing internal/503 path.
+pub(super) fn remote_read_error(error: anyhow::Error) -> Error {
+    let missing = error.downcast_ref::<RemoteStoreError>().is_some_and(RemoteStoreError::is_not_found);
+    if missing { Error(StatusCode::CONFLICT, "remote checkpoint incomplete") } else { Error::internal(error) }
+}
+
 fn manifest_binding_matches(
     manifest: &RemoteManifest,
     checkpoint_id: Uuid,
@@ -148,7 +159,7 @@ pub(super) async fn load_manifest(
     let temp_guard = super::cleanup::FileCleanupGuard::new(path.clone());
     if let Err(error) = store.get_to_file(&key(tenant, &digest)?, &path, size as u64, deadline()).await {
         temp_guard.cleanup().await;
-        return Err(Error::internal(error));
+        return Err(remote_read_error(error));
     }
     let manifest = match super::blocking::run(move || {
         let raw = fs::read(&path).map_err(Error::internal);
@@ -420,7 +431,7 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     let download_outcome: Result<(), Error> = async {
         for (rel, obj_key, size) in &downloads {
             let to = root.join(rel);
-            store.get_to_file(obj_key, &to, *size, deadline()).await.map_err(Error::internal)?;
+            store.get_to_file(obj_key, &to, *size, deadline()).await.map_err(remote_read_error)?;
         }
         Ok(())
     }
@@ -501,6 +512,37 @@ mod tests {
             captured_revision,
             entries: Vec::new(),
         }
+    }
+
+    #[test]
+    fn typed_remote_not_found_maps_to_the_incomplete_checkpoint_conflict() {
+        let missing = anyhow::Error::new(RemoteStoreError::http_typed(
+            crate::storage::remote_errors::RemoteOp::Get,
+            404,
+            crate::storage::remote_errors::RemoteSdkKind::NotFound,
+            false,
+        ));
+        let mapped = remote_read_error(missing);
+        assert_eq!(mapped.0, StatusCode::CONFLICT);
+        assert_eq!(mapped.1, "remote checkpoint incomplete");
+    }
+
+    #[test]
+    fn unrelated_or_local_failure_keeps_the_internal_status() {
+        let unavailable = anyhow::Error::new(RemoteStoreError::http_typed(
+            crate::storage::remote_errors::RemoteOp::Get,
+            503,
+            crate::storage::remote_errors::RemoteSdkKind::Other,
+            true,
+        ));
+        let mapped = remote_read_error(unavailable);
+        assert_eq!(mapped.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.1, "service temporarily unavailable");
+
+        let local_missing = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let mapped = remote_read_error(local_missing);
+        assert_eq!(mapped.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.1, "service temporarily unavailable");
     }
 
     #[test]
