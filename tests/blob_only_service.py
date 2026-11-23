@@ -7,8 +7,9 @@ SECRET_ACCESS_KEY[,SESSION_TOKEN]} profile. The harness owns the random schema,
 ROOTYARD_SCRATCH_DIR, temp dir and serve-blob process groups. It never seeds a
 ready repository with SQL. Every positive repository is created by POST
 /api/repos and every Git result is an actual HTTP Smart-Git clone/push/fsck;
-SSH is never exercised. Reports carry no DSN, token, S3 endpoint/credential,
-environment dump or raw server stderr.
+SSH is never exercised. The only SQL policy seed is a real branch-rule row on
+an API-created repository; no SQL creates a ref, ACK or terminal. Reports carry
+no DSN, token, S3 endpoint/credential, environment dump or raw server stderr.
 """
 import argparse
 import concurrent.futures
@@ -37,10 +38,11 @@ CASES = ("fresh_create_replay_pg_refstore_binding_no_persistent_bare", "sha1_emp
          "wrong_read_only_scoped_foreign_writes_never_mutate", "concurrent_same_ref_one_winner_parseable_no_false_ok",
          "multi_ref_atomic_vs_accepted_subset_actual_git_push", "blob_unavailable_missing_bytes_never_acked_or_served",
          "registered_read_cycles_do_not_exhaust_retained_snapshot_quota", "exact_receive_post_replays_before_native_without_second_effect",
-         "create_retry_preserves_the_first_pushed_default_branch")
+         "create_retry_preserves_the_first_pushed_default_branch",
+         "server_side_mixed_ref_policy_atomic_then_subset_sha1_sha256")
 BLOB_REQUIRED = ("ROOTYARD_BLOB_SERVICE", "ROOTYARD_BLOB_ENDPOINT", "ROOTYARD_BLOB_REGION", "ROOTYARD_BLOB_BUCKET", "ROOTYARD_BLOB_ACCESS_KEY_ID", "ROOTYARD_BLOB_SECRET_ACCESS_KEY")
 SENSITIVE_ENV = ("ROOTYARD_BLOB_SECRET_ACCESS_KEY", "ROOTYARD_BLOB_SESSION_TOKEN", "ROOTYARD_BLOB_ACCESS_KEY_ID", "ROOTYARD_BLOB_ENDPOINT", "ROOTYARD_TEST_DATABASE_URL")
-LIMITATIONS = ["serve-blob is an increment, not the default server; full equivalence is not claimed.", "LFS, web UI and pull/merge endpoints are outside this harness and remain unqualified.", "SHA-256 requires the Root-supplied trusted Git; missing support fails the case.", "The crash case is SIGKILL of this harness's process group after an ACK, not kernel/power-loss behavior.", "Blob corruption is not injected into the shared S3 fixture; unavailability uses a harmless wrong loopback endpoint and missing bytes use an isolated root prefix without stopping or mutating the shared provider.", "Blob deletion is disabled; failed-upload orphan objects under the fixture root are not reclaimed by this harness.", "Loopback HTTP and stock Git only; no SSH, HA, multi-host or provider failover is claimed.", "No SQL row creates a ready repository or an ACK; SQL only verifies the actual repository binding."]
+LIMITATIONS = ["serve-blob is an increment, not the default server; full equivalence is not claimed.", "LFS, web UI and pull/merge endpoints are outside this harness and remain unqualified.", "SHA-256 requires the Root-supplied trusted Git; missing support fails the case.", "The crash case is SIGKILL of this harness's process group after an ACK, not kernel/power-loss behavior.", "Blob corruption is not injected into the shared S3 fixture; unavailability uses a harmless wrong loopback endpoint and missing bytes use an isolated root prefix without stopping or mutating the shared provider.", "Blob deletion is disabled; failed-upload orphan objects under the fixture root are not reclaimed by this harness.", "Loopback HTTP and stock Git only; no SSH, HA, multi-host or provider failover is claimed.", "No SQL row creates a ready repository, ref, ACK or terminal; SQL inserts only the real branch-rule rows on API-created repositories and verifies the actual repository binding."]
 class ProfileError(RuntimeError): pass
 
 
@@ -946,6 +948,73 @@ def create_retry_preserves_the_first_pushed_default_branch(self):
     assert after == before, "creation retry changed HEAD"
     self.exact_clone(remote, self.root / "head-retry-clone", oid, "sha1", {"topic.txt": "topic bytes\n"}, self.reader)
     return {"repository_id": rid, "ack_oid": oid, "head_ref": after}
+def server_side_mixed_ref_policy_atomic_then_subset_sha1_sha256(self):
+    """Both fast-forward commands reach the server and the same policy rejects one."""
+    protected = "refs/heads/main"
+    allowed = "refs/heads/mixed-side"
+    denied = {"name": protected, "outcome": "not_applied", "reason": "policy_denied"}
+    formats = {}
+    for fmt in ("sha1", "sha256"):
+        name = "server-mixed-" + fmt
+        repo, remote, work, base = self.seed(name, object_format=fmt)
+        assert self.object_format(work) == fmt
+        self.git("push", "origin", base + ":" + allowed, cwd=work, token=self.alice)
+        before = self.remote_refs(remote, self.alice)
+        assert before[protected] == before[allowed] == base
+        repo_id = str(uuid.UUID(repo["id"]))
+        repo_filter = " WHERE repository_id='" + repo_id + "'"
+        rule = self.sql(
+            "WITH inserted AS (INSERT INTO forge_branch_rules(tenant_id,repository_id,branch_ref,required_approvals) "
+            "SELECT owner_id,id,'refs/heads/main',1 FROM repositories WHERE id='" + repo_id + "' "
+            "RETURNING branch_ref) SELECT branch_ref FROM inserted")
+        assert rule == protected, "approval rule was not installed on the fixture repository"
+        revision = int(self.sql("SELECT revision FROM ref_store_core_gates" + repo_filter))
+        reject_oid = self.commit_tree(work, base, "blocked candidate")
+        accept_oid = self.commit_tree(work, base, "allowed candidate")
+        repo_path = "/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/" + name
+
+        def push(atomic, expected_refs, expected_revision):
+            operation = str(uuid.uuid4())
+            options = ["--atomic"] if atomic else []
+            result = self.git("-c", "http.extraHeader=X-Rootyard-Operation: " + operation,
+                              "push", "--porcelain", *options, "origin",
+                              reject_oid + ":" + protected, accept_oid + ":" + allowed,
+                              cwd=work, token=self.alice, check=False)
+            entries = parse_push(result.stdout.decode())
+            assert result.returncode != 0 and push_rejected(entries, protected), entries
+            allowed_verdict = push_rejected if atomic else push_success
+            assert allowed_verdict(entries, allowed), entries
+
+            status, raw, _ = self.http(repo_path + "/operations/" + operation, token=self.alice)
+            assert status == 200, "GET operation status=" + str(status)
+            view = json.loads(raw)
+            kind = "rejected" if atomic else "committed"
+            assert view["operation_id"] == operation and view["state"] == kind
+            terminal = view["terminal"]
+            assert terminal["kind"] == kind and terminal["repository_id"] == repo_id
+            assert terminal["revision"] == expected_revision
+            outcomes = {ref["name"]: ref for ref in terminal["refs"]}
+            assert len(terminal["refs"]) == 2 and outcomes == {protected: denied, allowed: expected_refs}, outcomes
+
+            reason = self.sql(
+                "SELECT r.reject_code FROM ref_store_publication_decisions d "
+                "JOIN ref_store_decision_refs r ON r.decision_id=d.decision_id "
+                "WHERE d.repository_id='" + repo_id + "' AND d.operation_id='" + operation + "' "
+                "AND r.ref_name='refs/heads/main' AND r.verdict='reject'")
+            assert reason == "missing_approvals", reason
+            assert int(self.sql("SELECT revision FROM ref_store_core_gates" + repo_filter)) == expected_revision
+
+        push(True, {"name": allowed, "outcome": "not_applied", "reason": "policy_denied"}, revision)
+        assert self.remote_refs(remote, self.alice) == before, "atomic push changed the advertised refs"
+        push(False, {"name": allowed, "outcome": "applied", "old_oid": base, "new_oid": accept_oid}, revision + 1)
+        assert self.remote_refs(remote, self.alice) == {**before, allowed: accept_oid}, "subset changed other refs"
+        clone = self.root / (name + "-fresh")
+        self.exact_clone(remote, clone, base, fmt, {"base.txt": "seed " + name + "\n"}, self.reader)
+        side = self.git("rev-parse", "refs/remotes/origin/mixed-side", cwd=clone).stdout.decode().strip()
+        assert side == accept_oid
+        formats[fmt] = {"atomic_rolled_back": True, "subset_committed": True,
+                        "protected_reason": "missing_approvals", "fresh_clone_fsck": True}
+    return {"formats": formats}
 for _case_name in CASES:
     setattr(BlobOnlyHarness, _case_name, globals()[_case_name])
 def select_cases(names):
