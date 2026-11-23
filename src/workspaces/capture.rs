@@ -11,7 +11,7 @@
 //! outside any PostgreSQL transaction, then persist the pre-computed
 //! fingerprint atomically with the workspace revision in their short commit
 //! transaction while fencing concurrent background scans via [`super::blocking`].
-use super::{scan, service};
+use super::{capture_watch, scan, service};
 use crate::{
     AppState, Error,
     observability::{
@@ -257,6 +257,52 @@ async fn process_page(state: &AppState, ids: Vec<Uuid>, operation: &OperationCon
         .await;
 }
 
+/// The authoritative periodic sweep. A watcher overflow hint deliberately
+/// reuses this path, so it can only enqueue the same full scan that the timer
+/// would have run.
+async fn sweep(state: &AppState, stop: &CancellationToken) {
+    let operation = OperationContext::new(WorkerKind::WorkspaceCapture);
+    let _ = observability::worker::run(&operation, Phase::Scan, super::mounts::refresh_leases(state)).await;
+    let mut cursor = None;
+    let mut pages = futures_util::stream::FuturesUnordered::new();
+    loop {
+        if stop.is_cancelled() {
+            break;
+        }
+        let rows = match observability::worker::run(&operation, Phase::Scan, eligible_page(state, cursor)).await {
+            Ok(rows) => rows,
+            Err(_) => break,
+        };
+        if stop.is_cancelled() || rows.is_empty() {
+            break;
+        }
+        let complete = (rows.len() as i64) < PAGE;
+        let last = rows.last().map(|row| row.0);
+        let ids: Vec<Uuid> = rows
+            .into_iter()
+            .map(|(id, epoch, deadline)| {
+                super::mounts::update_lease(id, epoch, deadline);
+                id
+            })
+            .collect();
+        // Pages are processed independently instead of waiting for the
+        // previous 100 IDs. A slow or permanently bad early workspace then
+        // cannot delay the fair scan of later UUIDs.
+        pages.push(process_page(state, ids, &operation, stop));
+        if pages.len() >= 2 {
+            let _ = pages.next().await;
+        }
+        cursor = last;
+        if complete {
+            break;
+        }
+    }
+    // Cancellation stops new pages and IDs, but the pages already admitted stay
+    // owned until their scans return. The caller applies the shutdown deadline;
+    // a timed-out scan remains visible through `scan::wait_idle`.
+    while pages.next().await.is_some() {}
+}
+
 pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
     let remote_operation = OperationContext::new(WorkerKind::WorkspaceRemoteGc);
     observability::worker::spawn(
@@ -265,52 +311,24 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
         super::remote_gc::run(state.clone(), stop.child_token()),
     );
     let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let watch = capture_watch::Watch::start(service::workspace_root(&state), stop.clone());
     loop {
-        tokio::select! { _=stop.cancelled()=>break, _=interval.tick()=>{} }
-        let operation = OperationContext::new(WorkerKind::WorkspaceCapture);
-        let _ = observability::worker::run(&operation, Phase::Scan, super::mounts::refresh_leases(&state)).await;
-        let mut cursor = None;
-        let mut pages = futures_util::stream::FuturesUnordered::new();
-        loop {
-            if stop.is_cancelled() {
-                break;
+        let hint = tokio::select! {
+            biased;
+            _ = stop.cancelled() => break,
+            _ = interval.tick() => capture_watch::Hint::Sweep,
+            hint = watch.recv() => hint,
+        };
+        match hint {
+            capture_watch::Hint::Sweep => sweep(&state, &stop).await,
+            capture_watch::Hint::Dirty(ids) => {
+                let operation = OperationContext::new(WorkerKind::WorkspaceCapture);
+                process_page(&state, ids, &operation, &stop).await;
             }
-            let rows = match observability::worker::run(&operation, Phase::Scan, eligible_page(&state, cursor)).await {
-                Ok(rows) => rows,
-                Err(_) => break,
-            };
-            if stop.is_cancelled() || rows.is_empty() {
-                break;
-            }
-            let complete = (rows.len() as i64) < PAGE;
-            let last = rows.last().map(|row| row.0);
-            let ids: Vec<Uuid> = rows
-                .into_iter()
-                .map(|(id, epoch, deadline)| {
-                    super::mounts::update_lease(id, epoch, deadline);
-                    id
-                })
-                .collect();
-            // Pages are processed independently instead of waiting for the
-            // previous 100 IDs. A slow or permanently bad early workspace then
-            // cannot delay the fair scan of later UUIDs.
-            pages.push(process_page(&state, ids, &operation, &stop));
-            if pages.len() >= 2 {
-                let _ = pages.next().await;
-            }
-            cursor = last;
-            if complete {
-                break;
-            }
-        }
-        // Cancellation stops new pages and IDs, but the pages already admitted
-        // stay owned until their scans return. The caller applies the shutdown
-        // deadline; a timed-out scan remains visible through `scan::wait_idle`.
-        while pages.next().await.is_some() {}
-        if stop.is_cancelled() {
-            break;
         }
     }
+    watch.shutdown().await;
 }
 
 #[cfg(test)]
