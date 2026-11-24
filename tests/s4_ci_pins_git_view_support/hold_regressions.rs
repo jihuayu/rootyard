@@ -11,6 +11,12 @@ use std::{
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
+#[cfg(unix)]
+#[path = "git_view_cleanup.rs"]
+mod git_view_cleanup;
+#[cfg(unix)]
+use git_view_cleanup::wait_scratch_gone;
+
 const STALL_SCRIPT: &str = r#"#!/bin/sh
 scratch=""
 for arg in "$@"; do
@@ -205,39 +211,6 @@ async fn wait_pids(path: &FsPath, tries: usize) -> Result<(String, String, Strin
     Err(anyhow::anyhow!("the stalled Git child never wrote {}", path.display()))
 }
 
-#[cfg(unix)]
-async fn wait_scratch_gone(scratch: &str, pids: &[String]) -> Result<()> {
-    ensure!(!scratch.is_empty(), "the stalled Git child did not publish its scratch directory");
-    let root = PathBuf::from(scratch);
-    for _ in 0..200 {
-        if !root.exists() {
-            let alive = pids.iter().filter(|pid| PathBuf::from(format!("/proc/{pid}")).exists()).count();
-            ensure!(alive == 0, "a Git view child survived scratch deletion: {}", child_states(pids));
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    Err(anyhow::anyhow!("the Git view scratch directory was never removed: {}", root.display()))
-}
-#[cfg(unix)]
-fn child_state(pid: &str) -> &'static str {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(err) => return if err.kind() == std::io::ErrorKind::NotFound { "missing" } else { "unknown" },
-    };
-    let Some((_, tail)) = stat.rsplit_once(')') else { return "unknown" };
-    match tail.split_whitespace().next() {
-        Some("Z") => "zombie",
-        Some("X" | "x") => "dead",
-        Some("R" | "S" | "D" | "T" | "t" | "W" | "K" | "P" | "I") => "live",
-        _ => "unknown",
-    }
-}
-#[cfg(unix)]
-fn child_states(pids: &[String]) -> String {
-    pids.iter().enumerate().map(|(slot, pid)| format!("slot{slot}={}", child_state(pid))).collect::<Vec<_>>().join(",")
-}
-
 pub async fn bounded_child_lifecycle() -> Result<()> {
     let cluster = Cluster::setup().await?;
     let outcome = async {
@@ -288,7 +261,7 @@ pub async fn bounded_child_lifecycle() -> Result<()> {
         #[cfg(unix)]
         let (leader, grandchild, scratch_dir) = wait_pids(&pidfile, 60).await?;
         #[cfg(unix)]
-        wait_scratch_gone(&scratch_dir, &[leader, grandchild]).await?;
+        wait_scratch_gone(&scratch_dir, &leader, &grandchild).await?;
         let _ = std::fs::remove_file(&pidfile);
         let url = format!("{timeout_url}/api/views/{view}/bundle");
         let status = reqwest::Client::new().get(url).bearer_auth(&cluster.owner.token).send().await?.status();
@@ -296,7 +269,7 @@ pub async fn bounded_child_lifecycle() -> Result<()> {
         #[cfg(unix)]
         let (leader, grandchild, scratch_dir) = wait_pids(&pidfile, 60).await?;
         #[cfg(unix)]
-        wait_scratch_gone(&scratch_dir, &[leader, grandchild]).await?;
+        wait_scratch_gone(&scratch_dir, &leader, &grandchild).await?;
         timeout_server.abort();
 
         let notify = Arc::new(Notify::new());
@@ -318,7 +291,7 @@ pub async fn bounded_child_lifecycle() -> Result<()> {
         let status = response.await??;
         ensure!(status == StatusCode::REQUEST_TIMEOUT, "cancelled Git view returned {status}");
         #[cfg(unix)]
-        wait_scratch_gone(&scratch_dir, &[leader, grandchild]).await?;
+        wait_scratch_gone(&scratch_dir, &leader, &grandchild).await?;
         ensure!(slots.available_permits() == 2, "a cancelled Git view leaked a Git slot");
         cancel_server.abort();
         Ok(())
