@@ -2,10 +2,9 @@
 
 No Rust, Cargo, PostgreSQL, Blob, native Git, service or network is used. These
 checks pin the intended normal receive orchestration: migration-152 early
-probe/finish for an existing private wrapper, the reviewed terminal mirror
-before any ACK, exactly one slot-one late retirement from the same
-VerifiedReceive, the public/private receipt boundary, and the still-legacy
-fresh entry.
+probe/finish for an existing private wrapper, the terminal mirror before any
+ACK, bounded rotation from the same VerifiedReceive, and the private fresh
+entry and receipt boundary.
 """
 from pathlib import Path
 import unittest
@@ -111,7 +110,7 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         mirror = slice_between(
             self.publish,
             "async fn mirror_public_terminal_with_request(",
-            "/// The one terminal produced",
+            "/// The terminal produced",
         )
         self.assertIn("lock_public_attempt(&tx, public_request, record.identity().operation_id()", mirror)
         self.assertIn("lookup_public_attempt_finish(&tx, public_request, deadline)", mirror)
@@ -150,12 +149,11 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("operation::probe_public(", private)
         self.assertIn("begin_slot_zero(", private)
         self.assertIn("Start::Fresh { plan, _token: token }", private)
-        self.assertIn("publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline)", private)
-        self.assertRegex(
-            private,
-            r"decide\(\s*state,\s*verified\.actor\(\),\s*\(\*plan\)\.clone\(\),\s*"
-            r"verified\.mode\(\),\s*Some\(&public_request\),\s*deadline,?\s*\)",
-        )
+        self.assertIn("publish_admitted_attempt(state, verified, &public_request, &plan, &token, deadline)", private)
+        final = slice_between(self.publish, "async fn publish_admitted_attempt(", "/// Load one immutable private terminal record")
+        self.assertIn("publish_pair(state, plan, planned.pack_id(), pair, Some(public_request), deadline)", final)
+        self.assertIn("decide(state, verified.actor(), plan.clone(), verified.mode(), Some(public_request), deadline)", final)
+        self.assertIn(".reject_superseded_private(state.pool(), token, plan, verified.actor(), public_request, deadline)", final)
         self.assertIn("mirror_public_terminal_with_request(", private)
         self.assertIn("verified.actor(),", private)
         self.assertIn("PrivatePushOutcome::Terminal", private)
@@ -216,27 +214,24 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertNotIn("rotate_slot_one(", source)
         self.assertNotIn("SlotOneReceive", source)
 
-    def test_slot_one_retirement_captures_a_fresh_baseline_and_never_retries(self):
-        retire = slice_between(self.publish, "pub(super) async fn retire_slot_one(", "/// Load one immutable private terminal record")
+    def test_retirement_captures_a_fresh_baseline_and_rotates_only_exact_rejections(self):
+        retire = slice_between(self.publish, "pub(super) async fn retire_slot_one(", "async fn publish_admitted_attempt(")
         self.assertIn("capture_baseline(state, serving.gate.repository_id(), serving.gate.tenant_id(), deadline)", retire)
         self.assertIn("admission_realm_matches_serving(&baseline, serving)", retire)
-        self.assertIn("SlotOneReceive::from_verified_slot_zero(", retire)
-        self.assertIn("handoff.public().clone()", retire)
+        self.assertIn("SlotOneReceive::from_verified_rejection(", retire)
+        self.assertIn("let public_request = handoff.public();", retire)
         self.assertIn("slot_one::rotate_slot_one(state, serving, &handoff, &baseline, deadline)", retire)
-        self.assertIn("publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline)", retire)
-        self.assertRegex(
-            retire,
-            r"decide\(\s*state,\s*verified\.actor\(\),\s*\(\*plan\)\.clone\(\),\s*"
-            r"verified\.mode\(\),\s*Some\(&public_request\),\s*deadline,?\s*\)",
-        )
+        self.assertIn("publish_admitted_attempt(state, verified, public_request, &plan, &token, deadline)", retire)
         self.assertIn("mirror_public_terminal_with_request(", retire)
         self.assertIn("verified.actor(),", retire)
-        self.assertIn("slot_one::SlotOneAdmission::Replayed(_) => Err(GatewayError::OutcomeUnknown)", retire)
-        self.assertNotIn("loop {", retire)
+        self.assertIn("Admission::Fresh { plan, token, receipt }", retire)
+        self.assertIn("return Err(GatewayError::OutcomeUnknown);", retire)
+        self.assertIn("while evidence.current.slot < 2", retire)
+        self.assertIn("found != private_id || refreshed.current.slot != receipt.slot", retire)
         self.assertNotIn("rebases", retire)
         self.assertNotIn("begin_fresh(", retire)
 
-        mirror = slice_between(self.publish, "async fn mirror_public_terminal_with_request(", "/// The one terminal produced")
+        mirror = slice_between(self.publish, "async fn mirror_public_terminal_with_request(", "/// The terminal produced")
         self.assertIn("mirror_public_attempt_terminal_in_tx(", mirror)
         self.assertIn("PublicAttemptTerminalOutcome::Mirrored(receipt)", mirror)
         self.assertIn("commit_deadpool_bounded(tx, deadline).await?", mirror)
@@ -296,7 +291,7 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("Timeout", probe)
         self.assertIn("tx.rollback()", probe)
         self.assertNotIn("private_id.to_string()", probe)
-        mirror = slice_between(self.publish, "async fn mirror_public_terminal_with_request(", "/// The one terminal produced")
+        mirror = slice_between(self.publish, "async fn mirror_public_terminal_with_request(", "/// The terminal produced")
         self.assertIn("commit_deadpool_bounded(tx, deadline).await?", mirror)
         self.assertNotIn("private_id", mirror)
         commit = slice_between(self.publish, "async fn commit_deadpool_bounded(", "fn start_from_claim(")

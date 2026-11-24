@@ -1,4 +1,4 @@
-//! Crate-private gateway handoff for one exact slot-zero stale retirement.
+//! Crate-private gateway handoff for one exact stale retirement.
 //!
 //! This is deliberately not a serving cutover and is not selected by the
 //! current receive route. It is the narrow caller the reviewed
@@ -10,7 +10,7 @@
 //!
 //! # Trusted input
 //!
-//! [`SlotOneReceive::from_verified_slot_zero`] accepts the exact
+//! [`SlotOneReceive::from_verified_rejection`] accepts the exact
 //! [`PublicAttemptRetirement`] selected by the terminal mirror plus the verified
 //! current-slot-zero evidence that names the same event. It binds that
 //! retirement to the already-authenticated actor, parsed wire request and
@@ -72,7 +72,7 @@ use crate::{
         pg::{
             public_attempt::{PublicAttemptEvidence, PublicAttemptRequest},
             public_terminal::PublicAttemptRetirement,
-            slot_one::{SlotOnePreview, SlotOneRotationReceipt, SlotOneRotationRequest},
+            slot_one::{SlotOnePreview, SlotOneRotationReceipt, SlotOneRotationRequest, recompute_slot_one_proof},
             slot_zero,
         },
     },
@@ -97,21 +97,21 @@ pub(in crate::blob_git_gateway) struct SlotOneReceive<'verified, 'actor> {
     verified: &'verified VerifiedReceive<'actor>,
     public: PublicAttemptRequest,
     retirement: PublicAttemptRetirement,
+    next_slot: i16,
 }
 
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
 impl<'verified, 'actor> SlotOneReceive<'verified, 'actor> {
     /// Build the exact handoff input from the completed receive value.
     ///
-    /// The evidence must be the current slot-zero attempt in `Rejected` state
+    /// The evidence must be the current attempt in `Rejected` state, in slot zero or one,
     /// and the retirement must name that attempt's exact migration-139 event.
     /// The public request is rebuilt from the same authorized serving realm and
     /// captured baseline as the original push; its public UUID, producer wire
     /// digest and commit mode come only from `verified`. The retired private
-    /// UUID is only used to recompute the slot-zero proof and is never copied
-    /// into the new request. No PG access, hashing or plan construction happens
-    /// here.
-    pub(in crate::blob_git_gateway) fn from_verified_slot_zero(
+    /// UUID participates only in the rejected attempt's proof. A new plan
+    /// and its private identity are produced by the locked rotation.
+    pub(in crate::blob_git_gateway) fn from_verified_rejection(
         serving: &ServingRepository,
         verified: &'verified VerifiedReceive<'actor>,
         baseline: &PackCommitBaseline,
@@ -124,27 +124,24 @@ impl<'verified, 'actor> SlotOneReceive<'verified, 'actor> {
         let mode = verified.mode();
         let current = &evidence.current;
         if evidence.public_id != public_id
-            || evidence.retired.is_some()
-            || current.slot != 0
+            || !matches!(current.slot, 0 | 1)
             || current.state != OperationState::Rejected
             || current.private_id.is_nil()
             || current.private_id == public_id
             || current.base_revision <= 0
             || current.sequence <= 0
         {
-            return Err(GatewayError::Internal("slot one handoff requires the exact current slot-zero rejection"));
+            return Err(GatewayError::Internal("rotation requires the exact current private rejection"));
         }
         let (Some(event_id), Some(event_revision)) = (current.event_id, current.event_revision) else {
-            return Err(GatewayError::Internal("slot one handoff requires the retired slot-zero event"));
+            return Err(GatewayError::Internal("rotation requires a durable private rejection event"));
         };
         if event_id.is_nil()
             || event_id != retirement.event_id
             || event_revision != retirement.event_revision
             || event_revision <= current.base_revision
         {
-            return Err(GatewayError::Internal(
-                "slot one handoff retirement differs from the current slot-zero evidence",
-            ));
+            return Err(GatewayError::Internal("rotation evidence differs from the current private rejection"));
         }
 
         let public = public_attempt_request(
@@ -159,12 +156,21 @@ impl<'verified, 'actor> SlotOneReceive<'verified, 'actor> {
         if verified.repository_id() != public.repository_id || verified.object_format() != public.object_format {
             return Err(GatewayError::Internal("slot one handoff receive provenance differs from its public realm"));
         }
-        let proof = slot_zero::recompute_slot_zero_proof(&public, current)
-            .map_err(|_| GatewayError::Internal("slot one handoff slot-zero proof is not recomputable"))?;
-        if proof != current.proof_digest {
-            return Err(GatewayError::Internal("slot one handoff slot-zero proof differs from the durable evidence"));
+        let proof = match (current.slot, evidence.retired.as_slice()) {
+            (0, []) => slot_zero::recompute_slot_zero_proof(&public, current),
+            (1, [zero]) => {
+                if slot_zero::recompute_slot_zero_proof(&public, zero).ok() != Some(zero.proof_digest) {
+                    return Err(GatewayError::Internal("oldest retired attempt proof differs from its evidence"));
+                }
+                recompute_slot_one_proof(&public, zero, current)
+            }
+            _ => return Err(GatewayError::Internal("rotation requires a complete retired attempt history")),
         }
-        Ok(Self { verified, public, retirement: retirement.clone() })
+        .map_err(|_| GatewayError::Internal("rotating private attempt proof is not recomputable"))?;
+        if proof != current.proof_digest {
+            return Err(GatewayError::Internal("rotating private attempt proof differs from the durable evidence"));
+        }
+        Ok(Self { verified, public, retirement: retirement.clone(), next_slot: current.slot + 1 })
     }
 
     /// The unchanged public request this context will rotate.
@@ -304,6 +310,9 @@ pub(in crate::blob_git_gateway) async fn rotate_slot_one(
                 savepoint,
                 &rotation,
                 |preview| {
+                    if preview.slot() != receive.next_slot {
+                        return Err(PackCommitError::from(crate::ref_store::RefStoreError::IdentityConflict));
+                    }
                     let plan = build_slot_one_plan(request, pairs, &public, baseline, preview)?;
                     built = Some(plan.clone());
                     Ok(plan)
@@ -343,6 +352,7 @@ pub(in crate::blob_git_gateway) async fn rotate_slot_one(
         }
         if receipt.public_id != public.public_id
             || receipt.wire_digest != public.wire_digest
+            || receipt.slot != receive.next_slot
             || receipt.state != OperationState::Pending
         {
             let _ = rollback_bounded(savepoint, deadline).await;
@@ -390,25 +400,21 @@ pub(in crate::blob_git_gateway) async fn rotate_slot_one(
         let _ = rollback_deadpool_bounded(tx, deadline).await;
         return Err(GatewayError::Internal("slot one rotation did not build its plan"));
     };
-    if let Err(error) = validate_fresh_receipt(&public, &plan, &receipt) {
+    if let Err(error) = validate_fresh_receipt(&public, receive.next_slot, &plan, &receipt) {
         let _ = rollback_bounded(savepoint, deadline).await;
         let _ = rollback_deadpool_bounded(tx, deadline).await;
         return Err(error);
     }
 
-    let token = match PackPendingToken::established(
-        repository_id,
-        plan.tenant_id(),
-        receipt.private_id,
-        receipt.plan_digest,
-    ) {
-        Ok(token) => token,
-        Err(error) => {
-            let _ = rollback_bounded(savepoint, deadline).await;
-            let _ = rollback_deadpool_bounded(tx, deadline).await;
-            return Err(GatewayError::from(error));
-        }
-    };
+    let token =
+        match PackPendingToken::established(repository_id, plan.tenant_id(), receipt.private_id, receipt.plan_digest) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = rollback_bounded(savepoint, deadline).await;
+                let _ = rollback_deadpool_bounded(tx, deadline).await;
+                return Err(GatewayError::from(error));
+            }
+        };
 
     // Releasing the gateway savepoint only moves the already-written rows into
     // the deadpool-owned outer transaction; it is not a durability point.
@@ -504,12 +510,14 @@ fn slot_one_pack_id(private_id: Uuid, pack_sha: &str) -> Uuid {
 /// this adapter just admitted. No private UUID is formatted into an error.
 fn validate_fresh_receipt(
     public: &PublicAttemptRequest,
+    next_slot: i16,
     plan: &PackCommitPlan,
     receipt: &SlotOneRotationReceipt,
 ) -> Result<(), GatewayError> {
     let identity = plan.identity();
     if receipt.replayed
         || receipt.state != OperationState::Pending
+        || receipt.slot != next_slot
         || receipt.public_id != public.public_id
         || receipt.private_id != identity.operation_id()
         || receipt.sequence != identity.sequence()
@@ -736,7 +744,7 @@ mod tests {
         assert!(!signature.contains("request: &PushRequest"));
         assert!(!signature.contains("pairs: &[Pair]"));
         let handoff = source
-            .split("pub(in crate::blob_git_gateway) fn from_verified_slot_zero(")
+            .split("pub(in crate::blob_git_gateway) fn from_verified_rejection(")
             .nth(1)
             .expect("handoff constructor")
             .split(") -> Result<Self, GatewayError>")

@@ -145,7 +145,7 @@ pub(crate) async fn rotate_direct(
         receive::verified_receive_from_test_wire(actor, public_id, serving, body, vec![pair], deadline).await?;
     let backend_identity = state.store().backend_identity().as_hex().to_owned();
     let handoff =
-        SlotOneReceive::from_verified_slot_zero(serving, &verified, baseline, backend_identity, evidence, retirement)?;
+        SlotOneReceive::from_verified_rejection(serving, &verified, baseline, backend_identity, evidence, retirement)?;
     let admission = rotate_slot_one(state, serving, &handoff, baseline, deadline).await?;
     Ok(match admission {
         SlotOneAdmission::Fresh { plan, receipt, .. } => {

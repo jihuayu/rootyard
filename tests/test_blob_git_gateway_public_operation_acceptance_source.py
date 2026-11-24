@@ -43,7 +43,8 @@ class PublicOperationAcceptanceSourceTest(unittest.TestCase):
         for fabricated in ('INSERT INTO ref_store_public_operations', 'INSERT INTO ref_store_private_attempts',
                            'INSERT INTO ref_store_operations'):
             self.assertNotIn(fabricated, self.test)
-        self.assertIn('SELECT current_slot,state,event_id,retired_event_id', self.test)
+        self.assertIn('SELECT w.current_slot,w.state,w.event_id,', self.test)
+        self.assertIn('EXISTS(SELECT FROM ref_store_attempt_retirements r', self.test)
 
     def test_route_is_real_http_and_checks_absent_pending_and_private(self):
         self.assertIn('reqwest::Client::new()', self.test)

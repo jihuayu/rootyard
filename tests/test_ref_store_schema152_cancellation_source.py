@@ -19,7 +19,8 @@ class LateCancellationSourceTest(unittest.TestCase):
         self.assertIn('attempt.exact_tombstone IS NOT TRUE OR attempt.core_state = \'pending\'', verifier)
         self.assertIn('attempt.terminal_result IS DISTINCT FROM \'{"state":"cancelled","reason":"cancel_requested"}\'::jsonb', verifier)
         retired = verifier.split('OR (attempt.slot < wrapper.current_slot', 1)[1].split('OR (attempt.slot = wrapper.current_slot', 1)[0]
-        self.assertIn('attempt.event_id IS DISTINCT FROM wrapper.retired_event_id', retired)
+        self.assertIn('attempt.event_id IS DISTINCT FROM attempt.retired_event_id', retired)
+        self.assertIn('attempt.next_base IS DISTINCT FROM attempt.revision', retired)
         self.assertNotIn('attempt.has_tombstone', retired)
         self.assertIn('attempt.event_id IS DISTINCT FROM wrapper.event_id', verifier)
         self.assertIn('attempt.payload IS DISTINCT FROM attempt.terminal_result', verifier)

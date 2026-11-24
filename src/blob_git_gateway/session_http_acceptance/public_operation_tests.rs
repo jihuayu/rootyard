@@ -145,15 +145,17 @@ async fn admit_pending_public(
 
     let row = client
         .query_one(
-            "SELECT current_slot,state,event_id,retired_event_id
-               FROM ref_store_public_operations WHERE repository_id=$1 AND public_id=$2",
+            "SELECT w.current_slot,w.state,w.event_id,
+                    EXISTS(SELECT FROM ref_store_attempt_retirements r
+                            WHERE (r.repository_id,r.public_id)=(w.repository_id,w.public_id))
+               FROM ref_store_public_operations w WHERE w.repository_id=$1 AND w.public_id=$2",
             &[&request.repository_id, &public_id],
         )
         .await?;
     ensure!(row.get::<_, i16>(0) == 0, "fresh public wrapper was not current slot zero");
     ensure!(row.get::<_, String>(1) == "pending", "fresh public wrapper was not pending");
     ensure!(row.get::<_, Option<Uuid>>(2).is_none(), "fresh pending wrapper carried an event");
-    ensure!(row.get::<_, Option<Uuid>>(3).is_none(), "fresh pending wrapper carried a retired event");
+    ensure!(!row.get::<_, bool>(3), "fresh pending wrapper carried a retired event");
     Ok(())
 }
 

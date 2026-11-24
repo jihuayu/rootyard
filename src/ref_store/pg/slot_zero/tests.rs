@@ -1429,7 +1429,7 @@ async fn slot_zero_public_attempt_lookup_is_exact_and_read_only() -> anyhow::Res
         match PgRefStore.lookup_public_attempt(&tx, &lookup_request, deadline()).await? {
             PublicAttemptLookup::Pending(evidence) => {
                 assert_eq!(evidence.public_id, public);
-                assert!(evidence.retired.is_none());
+                assert!(evidence.retired.is_empty());
                 assert_eq!(evidence.current.slot, 0);
                 assert_eq!(evidence.current.private_id, private);
                 assert_eq!(evidence.current.plan_digest, receipt.plan_digest);
@@ -1633,16 +1633,19 @@ async fn slot_zero_public_terminal_mirror_commits_then_exactly_replays() -> anyh
 
         let wrapper = client
             .query_one(
-                "SELECT state,event_id,current_slot,retired_event_id,cancelled_private_id
-                   FROM ref_store_public_operations
-                  WHERE repository_id=$1 AND public_id=$2",
+                "SELECT w.state,w.event_id,w.current_slot,
+                        EXISTS(SELECT FROM ref_store_attempt_retirements r
+                                WHERE (r.repository_id,r.public_id)=(w.repository_id,w.public_id)),
+                        w.cancelled_private_id
+                   FROM ref_store_public_operations w
+                  WHERE w.repository_id=$1 AND w.public_id=$2",
                 &[&fixture.repo, &public],
             )
             .await?;
         assert_eq!(wrapper.get::<_, String>(0), "rejected");
         assert_eq!(wrapper.get::<_, Option<Uuid>>(1), Some(event_id));
         assert_eq!(wrapper.get::<_, i16>(2), 0);
-        assert_eq!(wrapper.get::<_, Option<Uuid>>(3), None);
+        assert!(!wrapper.get::<_, bool>(3));
         assert_eq!(wrapper.get::<_, Option<Uuid>>(4), None);
 
         let event = client

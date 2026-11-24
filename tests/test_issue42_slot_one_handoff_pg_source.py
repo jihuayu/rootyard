@@ -54,9 +54,9 @@ class SlotOneHandoffPostgresSourceTest(unittest.TestCase):
         self.assertIn("mod gateway;", self.native)
 
     def test_subject_is_the_private_gateway_handoff_and_real_staged_bytes(self):
-        self.assertIn("SlotOneReceive::from_verified_slot_zero", self.slot_one)
+        self.assertIn("SlotOneReceive::from_verified_rejection", self.slot_one)
         self.assertIn("pub(in crate::blob_git_gateway) async fn rotate_slot_one(", self.slot_one)
-        self.assertIn("SlotOneReceive::from_verified_slot_zero", self.support)
+        self.assertIn("SlotOneReceive::from_verified_rejection", self.support)
         self.assertIn("rotate_slot_one(state, serving, &handoff, baseline, deadline)", self.support)
         self.assertIn("let pair = Pair::stage(pack.to_path_buf(), idx.to_path_buf(), public_id).await?;", self.support)
         self.assertIn("public wire digest is derived by the", self.retirement)

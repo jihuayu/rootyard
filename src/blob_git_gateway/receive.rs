@@ -27,8 +27,7 @@ use uuid::Uuid;
 
 use super::{
     error::GatewayError,
-    native,
-    operation,
+    native, operation,
     protocol::{self, PushRequest},
     publish::{self, Pair, PrivatePushOutcome},
     repo_session::CommittedWriteSessionProof,
@@ -486,17 +485,9 @@ async fn receive_pack_authorized(
         // stale-retirement condition), but tenant/format/history/authority/
         // group/restore/backend may not move. The rotation primitive performs
         // its own final realm/restore proof under the slot-one locks.
-        let refreshed = lookup(
-            state.pool(),
-            &identity,
-            &owner,
-            name,
-            true,
-            state.store().backend_identity(),
-            deadline,
-        )
-        .await
-        .map_err(GatewayError::from)?;
+        let refreshed = lookup(state.pool(), &identity, &owner, name, true, state.store().backend_identity(), deadline)
+            .await
+            .map_err(GatewayError::from)?;
         if refreshed.gate.repository_id() != repository_id
             || refreshed.gate.tenant_id() != serving.gate.tenant_id()
             || refreshed.gate.object_format() != serving.gate.object_format()
@@ -983,7 +974,7 @@ mod tests {
             event_revision: Some(event_revision),
         };
         current.proof_digest = slot_zero::recompute_slot_zero_proof(public, &current).unwrap();
-        PublicAttemptEvidence { public_id: public.public_id, current, retired: None }
+        PublicAttemptEvidence { public_id: public.public_id, current, retired: Vec::new() }
     }
 
     fn retirement(event_id: Uuid, event_revision: i64) -> PublicAttemptRetirement {
@@ -1065,7 +1056,7 @@ mod tests {
         let evidence = rejected_evidence(&public, private_id, event_id, 6, 7);
         let retirement = retirement(event_id, 7);
 
-        let handoff = SlotOneReceive::from_verified_slot_zero(
+        let handoff = SlotOneReceive::from_verified_rejection(
             &serving,
             &verified,
             &baseline,
@@ -1126,7 +1117,7 @@ mod tests {
             },
             {
                 let mut evidence = valid.clone();
-                evidence.retired = Some(valid.current.clone());
+                evidence.retired.push(valid.current.clone());
                 ("already retired", evidence, valid_retirement.clone())
             },
             {
@@ -1148,7 +1139,7 @@ mod tests {
         ];
 
         for (label, evidence, retirement) in cases {
-            let error = SlotOneReceive::from_verified_slot_zero(
+            let error = SlotOneReceive::from_verified_rejection(
                 &serving,
                 &verified,
                 &baseline,
@@ -1187,7 +1178,7 @@ mod tests {
         let evidence = rejected_evidence(&public, Uuid::new_v4(), event_id, 6, 7);
         let retirement = retirement(event_id, 7);
 
-        let error = SlotOneReceive::from_verified_slot_zero(
+        let error = SlotOneReceive::from_verified_rejection(
             &other,
             &verified,
             &other_baseline,

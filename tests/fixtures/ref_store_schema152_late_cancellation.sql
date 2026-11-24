@@ -88,12 +88,14 @@ BEGIN
             VALUES (audit_event, repo, scope_revision, private_op, winner, receipt);
             IF scenario = 'retired' THEN
                 PERFORM rootyard_ref_store_lock_public_operation(repo, public_op, next_op);
+                INSERT INTO ref_store_attempt_retirements(repository_id, public_id, slot, event_id)
+                VALUES (repo, public_op, 0, audit_event);
                 INSERT INTO ref_store_private_attempts VALUES (repo, public_op, 1, next_op, repeat('e', 64), proof_digest, scope_revision);
                 INSERT INTO ref_store_operations(repository_id, issuer_id, lane, sequence, operation_id, request_digest, state)
                 VALUES (repo, issuer, scenario, 2, next_op, repeat('e', 64), 'pending');
                 INSERT INTO ref_store_serving_operations(repository_id, operation_id, issuer_id, producer_request_digest, plan_parent_digest)
                 VALUES (repo, next_op, issuer, wire_digest, repeat('e', 64));
-                UPDATE ref_store_public_operations SET current_slot = 1, retired_event_id = audit_event
+                UPDATE ref_store_public_operations SET current_slot = 1
                     WHERE (repository_id, public_id) = (repo, public_op);
             ELSE
                 UPDATE ref_store_public_operations SET state = winner, event_id = audit_event

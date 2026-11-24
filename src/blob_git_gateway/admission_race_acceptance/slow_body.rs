@@ -511,9 +511,9 @@ async fn verify_private_committed_ack_in_tx(
         !evidence.current.private_id.is_nil() && evidence.current.private_id != public_request.public_id,
         "private wrapper selected an invalid private operation"
     );
-    let phase_slot_ok = match (evidence.current.slot, evidence.retired.as_ref()) {
-        (0, None) => true,
-        (1, Some(retired)) => retired.slot == 0 && retired.state == OperationState::Rejected,
+    let phase_slot_ok = match (evidence.current.slot, evidence.retired.as_slice()) {
+        (0, []) => true,
+        (1, [retired]) => retired.slot == 0 && retired.state == OperationState::Rejected,
         _ => false,
     };
     ensure!(phase_slot_ok, "private wrapper phase/slot does not match the selected committed attempt");

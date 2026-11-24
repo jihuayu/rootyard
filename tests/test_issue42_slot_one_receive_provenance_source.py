@@ -65,7 +65,7 @@ class SlotOneReceiveProvenanceSourceTest(unittest.TestCase):
     def test_handoff_accepts_only_completed_receive_and_exact_retirement(self):
         handoff = slice_between(
             self.slot_one,
-            "fn from_verified_slot_zero(",
+            "fn from_verified_rejection(",
             ") -> Result<Self, GatewayError>",
         )
         self.assertIn("verified: &'verified VerifiedReceive<'actor>", handoff)
