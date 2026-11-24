@@ -697,6 +697,7 @@ pub(super) async fn renew_pin(
 
 /// Explicit terminal release of exactly this generation. Release does not
 /// advance the generation and never refunds retained usage.
+/// Preserve the stored timestamp floors if the database clock moves backward.
 pub(super) async fn release_pin(
     tx: &Transaction<'_>,
     pin_id: Uuid,
@@ -708,8 +709,8 @@ pub(super) async fn release_pin(
     let row = tx
         .query_opt(
             "UPDATE ref_store_core_pins
-             SET state='released',released_at=clock_timestamp(),release_request_id=$4,
-                 release_reason=$5,updated_at=clock_timestamp()
+             SET state='released',released_at=GREATEST(clock_timestamp(),created_at),release_request_id=$4,
+                 release_reason=$5,updated_at=GREATEST(clock_timestamp(),updated_at)
              WHERE pin_id=$1 AND repository_id=$2 AND generation=$3 AND state='active'
              RETURNING generation,(extract(epoch FROM released_at)*1000000)::bigint,
                        (extract(epoch FROM expires_at)*1000000)::bigint",
