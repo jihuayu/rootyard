@@ -27,7 +27,7 @@ use std::{
         ffi::OsStringExt,
         fs::{OpenOptionsExt, PermissionsExt, symlink},
     },
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -54,6 +54,18 @@ pub(crate) struct RemoteManifest {
     pub tenant_id: Uuid,
     pub captured_revision: i64,
     pub entries: Vec<RemoteEntry>,
+}
+
+pub(super) struct ManifestBinding {
+    pub(super) digest: String,
+    pub(super) size: i64,
+    pub(super) captured_revision: i64,
+}
+
+pub(super) struct MaterializedCheckpoint {
+    pub(super) repo: PathBuf,
+    pub(super) stage: super::blocking::DirCleanupGuard,
+    pub(super) binding: ManifestBinding,
 }
 
 pub(super) fn remote_store(state: &AppState) -> Result<RemoteObjectStore, Error> {
@@ -128,6 +140,16 @@ pub(super) async fn load_manifest(
     repo: Uuid,
     tenant: Uuid,
 ) -> Result<RemoteManifest, Error> {
+    let (manifest, _) = load_manifest_with_binding(state, cp, repo, tenant).await?;
+    Ok(manifest)
+}
+
+async fn load_manifest_with_binding(
+    state: &AppState,
+    cp: Uuid,
+    repo: Uuid,
+    tenant: Uuid,
+) -> Result<(RemoteManifest, ManifestBinding), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt(
@@ -180,7 +202,7 @@ pub(super) async fn load_manifest(
     if !manifest_binding_matches(&manifest, cp, repo, tenant, captured_revision) {
         return Err(Error::bad_request());
     }
-    Ok(manifest)
+    Ok((manifest, ManifestBinding { digest, size, captured_revision }))
 }
 
 pub async fn publish(
@@ -404,7 +426,41 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     if super::blocking::run(move || Ok(check_path.is_dir())).await? {
         return Ok(());
     }
-    let manifest = load_manifest(state, cp, repo, tenant).await?;
+    let MaterializedCheckpoint { repo, stage, .. } = materialize_committed(state, cp, repo, tenant).await?;
+    let (stage, publication) = super::blocking::run(move || {
+        let publication = publish_checkpoint_cache(&repo, &final_path).and_then(|()| {
+            if final_path.is_dir() { Ok(()) } else { Err(Error::internal("checkpoint restore publication failed")) }
+        });
+        Ok((stage, publication))
+    })
+    .await?;
+    stage.cleanup().await;
+    publication
+}
+
+pub(super) fn publish_checkpoint_cache(repo: &FsPath, cache: &FsPath) -> Result<(), Error> {
+    let parent = cache.parent().ok_or_else(Error::bad_request)?;
+    fs::create_dir_all(parent).map_err(Error::internal)?;
+    if fs::symlink_metadata(cache).is_ok() {
+        return Ok(());
+    }
+    match super::snapshot::publish(repo, cache) {
+        Ok(published) => {
+            published.keep();
+            Ok(())
+        }
+        Err(_) if fs::symlink_metadata(cache).is_ok() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) async fn materialize_committed(
+    state: &AppState,
+    cp: Uuid,
+    repo: Uuid,
+    tenant: Uuid,
+) -> Result<MaterializedCheckpoint, Error> {
+    let (manifest, binding) = load_manifest_with_binding(state, cp, repo, tenant).await?;
     let store = remote_store(state)?;
     let mut paths = BTreeSet::new();
     let mut symlinks = BTreeSet::new();
@@ -439,7 +495,7 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     let root_init = root.clone();
     let stage_init = stage.clone();
     let rels: Vec<PathBuf> = downloads.iter().map(|(rel, _, _)| rel.clone()).collect();
-    let stage_guard = initialize_restore_stage(stage.clone(), move || {
+    let stage_guard = initialize_restore_stage(stage, move || {
         fs::create_dir_all(&stage_init).map_err(Error::internal)?;
         fs::create_dir(&root_init).map_err(Error::internal)?;
         for rel in rels {
@@ -464,7 +520,7 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     }
 
     let entries = manifest.entries;
-    let finalize = super::blocking::run(move || {
+    let (root, stage_guard, validated) = super::blocking::run(move || {
         let outcome = (|| -> Result<(), Error> {
             let mut expected = Vec::with_capacity(entries.len());
             for entry in entries {
@@ -502,28 +558,16 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
                 return Err(Error(StatusCode::CONFLICT, super::compat::CONFLICT_HEAD));
             }
             core::sync_tree(&root).map_err(Error::internal)?;
-            if let Some(parent) = final_path.parent() {
-                fs::create_dir_all(parent).map_err(Error::internal)?;
-            }
-            if fs::rename(&root, &final_path).is_err() && !final_path.is_dir() {
-                return Err(Error::internal("checkpoint restore publication failed"));
-            }
             Ok(())
         })();
-        let _ = fs::remove_dir_all(&stage);
-        outcome
+        Ok((root, stage_guard, outcome))
     })
-    .await;
-    match finalize {
-        Ok(()) => {
-            stage_guard.keep();
-            Ok(())
-        }
-        Err(err) => {
-            stage_guard.cleanup().await;
-            Err(err)
-        }
+    .await?;
+    if let Err(error) = validated {
+        stage_guard.cleanup().await;
+        return Err(error);
     }
+    Ok(MaterializedCheckpoint { repo: root, stage: stage_guard, binding })
 }
 
 #[cfg(test)]

@@ -141,12 +141,16 @@ class BulkheadHarness(Harness):
         super().__init__(args)
         self._loopback_s3: LoopbackS3Fixture | None = None
         if require_s3 and not self.env.get("ROOTYARD_OBJECT_STORE_ENDPOINT"):
-            self._loopback_s3 = LoopbackS3Fixture()
-            self.env["ROOTYARD_OBJECT_STORE_ENDPOINT"] = self._loopback_s3.endpoint
-            self.env["ROOTYARD_OBJECT_STORE_BUCKET"] = "rootyard-ws-bulkhead"
-            self.env["ROOTYARD_OBJECT_STORE_REGION"] = "us-east-1"
-            self.env["ROOTYARD_OBJECT_STORE_ACCESS_KEY"] = "loopback-access"
-            self.env["ROOTYARD_OBJECT_STORE_SECRET_KEY"] = "loopback-secret"
+            self.use_loopback_s3()
+
+    def use_loopback_s3(self) -> None:
+        assert self._loopback_s3 is None, "the harness already owns a loopback store"
+        self._loopback_s3 = LoopbackS3Fixture()
+        self.env["ROOTYARD_OBJECT_STORE_ENDPOINT"] = self._loopback_s3.endpoint
+        self.env["ROOTYARD_OBJECT_STORE_BUCKET"] = "rootyard-ws-bulkhead"
+        self.env["ROOTYARD_OBJECT_STORE_REGION"] = "us-east-1"
+        self.env["ROOTYARD_OBJECT_STORE_ACCESS_KEY"] = "loopback-access"
+        self.env["ROOTYARD_OBJECT_STORE_SECRET_KEY"] = "loopback-secret"
 
     def cleanup(self) -> None:
         try:
