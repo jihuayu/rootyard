@@ -31,12 +31,13 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
-async fn slot_zero_private_pack_registration_and_prepare_use_the_exact_public_attempt() -> Result<()> {
+async fn slot_zero_private_stage_and_selection_use_the_exact_public_attempt() -> Result<()> {
     use super::{common, setup};
     use rootyard::ref_store::{
         RefStoreError, RequestDigest,
         core::pack_commit::{
-            AuthorizedCommitError, PackCommitRejectCode, PackRegistrationRequest, PgPackCommit, PrepareOutcome,
+            AuthorizedCommitError, AuthorizedCommitMode, PackCommitRejectCode, PackRegistrationRequest, PgPackCommit,
+            PrepareOutcome,
         },
     };
 
@@ -143,11 +144,62 @@ async fn slot_zero_private_pack_registration_and_prepare_use_the_exact_public_at
         ensure!(capture.operation_id() == admitted.private_id);
         ensure!(capture.gate_revision() == gate.revision());
         ensure!(capture.new_packs().len() == 1 && capture.new_packs()[0].pack_id() == pack_id);
+        let mut invalid_token = actor.clone();
+        invalid_token.token_digest[0] ^= 1;
+        ensure!(
+            matches!(
+                adapter.select(&db.pool, *capture, &invalid_token, AuthorizedCommitMode::Atomic, deadline()).await,
+                Err(AuthorizedCommitError::Denied("token_invalid"))
+            ),
+            "selection accepted a token that failed the live authority lookup"
+        );
+        let existing = db
+            .pool
+            .get()
+            .await?
+            .query_opt(
+                "SELECT decision_id FROM ref_store_publication_decisions WHERE repository_id=$1 AND operation_id=$2",
+                &[&repo.id, &admitted.private_id],
+            )
+            .await?;
+        ensure!(existing.is_none(), "denied selection wrote a decision");
+
+        let prepare = || adapter.prepare_private(&db.pool, plan.clone(), &public, deadline());
+        let PrepareOutcome::Prepared(capture) = prepare().await? else {
+            bail!("pending private attempt replayed a terminal");
+        };
+        let selection = adapter.select(&db.pool, *capture, &actor, AuthorizedCommitMode::Atomic, deadline()).await?;
+        ensure!(selection.operation_id() == admitted.private_id);
+        ensure!(selection.planned_refs() == 1 && selection.selected().accepted() == plan.refs());
+        let PrepareOutcome::Prepared(capture) = prepare().await? else {
+            bail!("open decision unexpectedly terminalized the private operation");
+        };
+        let replay = adapter.select(&db.pool, *capture, &actor, AuthorizedCommitMode::Atomic, deadline()).await?;
+        ensure!(
+            replay.decision_id() == selection.decision_id()
+                && replay.selection_digest() == selection.selection_digest()
+        );
+
+        let decision = db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT decision_id,state,base_revision,selection_digest
+                 FROM ref_store_publication_decisions WHERE repository_id=$1 AND operation_id=$2",
+                &[&repo.id, &admitted.private_id],
+            )
+            .await?;
+        ensure!(decision.get::<_, Uuid>(0) == selection.decision_id());
+        ensure!(decision.get::<_, String>(1) == "OPEN");
+        ensure!(decision.get::<_, i64>(2) == gate.revision());
+        ensure!(decision.get::<_, String>(3) == selection.selection_digest().as_hex());
+
         ensure!(wrapper_json(&db, repo.id, public.public_id).await? == wrapper_before);
         ensure!(operation_record(&db, repo.id, admitted.private_id).await?.state() == OperationState::Pending);
         let stored = publication_for(&db, repo.id, admitted.private_id).await?;
         ensure!(stored.parent_digest == plan.parent_digest().as_hex());
-        ensure!(stored_ref(&db, repo.id, REF_RETRY).await?.is_none(), "registration published a ref");
+        ensure!(stored_ref(&db, repo.id, REF_RETRY).await?.is_none(), "selection published a ref");
         ensure!(db::gate_version(&db.pool, repo.id, actor.id).await?.revision() == gate.revision());
         Ok(())
     }

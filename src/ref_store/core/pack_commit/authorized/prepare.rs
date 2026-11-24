@@ -1,8 +1,8 @@
 //! Stage 1 of the authorized publication pipeline: the sealed pre-write capture.
 //!
 //! Everything read here is real durable state of the original plan's operation:
-//! the migration-138 registry row (with its exact terminal replay), the
-//! repository authority row, the core gate, the migration-144 protocol realm,
+//! the migration-138 registry row, its migration-152 claim for a private
+//! attempt, the repository authority, the core gate, the migration-144 protocol realm,
 //! the complete ref set, the complete active membership set and the durable
 //! same-parent pack registrations. Nothing is written and nothing is inferred
 //! from a caller boolean.
@@ -32,12 +32,11 @@ pub enum PrepareOutcome {
 /// Opaque sealed capture of one pending authorized publication.
 ///
 /// Private fields, no `Clone`, no serde and no public constructor: it can only be
-/// produced by [`super::PgAuthorizedCommit::prepare`], so a caller cannot invent a
-/// capture, a baseline, a closure context or a gate revision. It carries the
-/// **original** plan (moved in, never re-derived) so every later stage works on
-/// the stable operation id/digest.
+/// produced by the authorized prepare stage. It carries the original plan and,
+/// for a private capture, the exact public attempt verified with that plan.
 pub struct PreparedPublication {
     plan: PackCommitPlan,
+    public_attempt: Option<PublicAttemptRequest>,
     baseline: PackCommitBaseline,
     new_packs: Vec<RegisteredPack>,
     head_ref: String,
@@ -49,6 +48,10 @@ pub struct PreparedPublication {
 impl PreparedPublication {
     pub(crate) fn plan(&self) -> &PackCommitPlan {
         &self.plan
+    }
+
+    pub(super) fn public_attempt(&self) -> Option<&PublicAttemptRequest> {
+        self.public_attempt.as_ref()
     }
 
     pub(crate) fn baseline(&self) -> &PackCommitBaseline {
@@ -166,6 +169,7 @@ pub(super) async fn prepare_in_tx(
     let new_packs = sql::registered_for_parent(tx, &plan).await?;
     Ok(PrepareOutcome::Prepared(Box::new(PreparedPublication {
         plan,
+        public_attempt: public.cloned(),
         baseline,
         new_packs,
         head_ref: gate.head_ref().as_str().to_owned(),
