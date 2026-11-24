@@ -91,6 +91,18 @@ pub async fn terminal_job_race() -> Result<()> {
         ensure!(active_pins(&cluster, &repo).await? == 0, "pre-cancelled pin left an active pin");
         let pre = checkout_status(&cluster, &repo, cancelled_job, &base).await?;
         ensure!(pre == StatusCode::CONFLICT, "pre-cancelled plan reissued: {pre}");
+
+        // Model capture before a backward database clock step without changing the host clock.
+        cluster
+            .pool
+            .get()
+            .await?
+            .batch_execute(
+                "ALTER TABLE ref_store_core_pins
+             ALTER COLUMN created_at SET DEFAULT clock_timestamp() + interval '30 seconds',
+             ALTER COLUMN updated_at SET DEFAULT clock_timestamp() + interval '40 seconds'",
+            )
+            .await?;
         let raced_pin = Uuid::new_v4();
         cluster.set_s3_get_delay_ms(400);
         let pin_request = pin_status(&cluster, &repo, raced_pin, &base);
@@ -111,6 +123,16 @@ pub async fn terminal_job_race() -> Result<()> {
         ensure!(pin_rows_for_job(&cluster, &repo, raced_pin).await? == 0, "captured pin race left a ci_pins row");
         ensure!(orphan_active_roots(&cluster, &repo).await? == 0, "captured pin race leaked an orphan root");
         ensure!(active_pins(&cluster, &repo).await? == 0, "captured pin race leaked an active pin");
+        cluster
+            .pool
+            .get()
+            .await?
+            .batch_execute(
+                "ALTER TABLE ref_store_core_pins
+             ALTER COLUMN created_at SET DEFAULT clock_timestamp(),
+             ALTER COLUMN updated_at SET DEFAULT clock_timestamp()",
+            )
+            .await?;
         let jobs = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         cluster.set_s3_get_delay_ms(120);
         let canceller = async {
