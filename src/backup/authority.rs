@@ -4,6 +4,10 @@ use serde::Serialize;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
+mod restore_lineage;
+pub(super) use restore_lineage::RestoreLineage;
+use restore_lineage::rotate_cluster_incarnation;
+
 const RESET_DELIVERIES: &str = "UPDATE public.event_deliveries SET state='pending', lease_owner=NULL, lease_until=NULL, next_attempt_at=clock_timestamp() WHERE state='leased'";
 const FENCED_WORKSPACES: &str = "UPDATE public.workspaces SET lease_epoch=lease_epoch+1, lease_until=clock_timestamp()-interval '1 second' WHERE state='ready'";
 const CANCELLED_DECISIONS: &str = "UPDATE public.ref_store_publication_decisions SET state='CANCELLED', cancelled_at=clock_timestamp(), closed_code='restored_incarnation', cancel_change_id=gen_random_uuid() WHERE state='OPEN'";
@@ -31,59 +35,9 @@ pub struct W8aFenceReceipt {
     pub reset_deliveries: i64,
 }
 
-pub(super) enum RestoreLineage {
-    None,
-    VerifiedArchive,
-    VerifiedW8aSource(Uuid),
-}
-
 pub(super) async fn fence(client: &mut Client, lineage: RestoreLineage) -> Result<()> {
     let tx = client.transaction().await?;
-    let record_lineage = match lineage {
-        RestoreLineage::None => false,
-        RestoreLineage::VerifiedArchive => true,
-        RestoreLineage::VerifiedW8aSource(source) => {
-            // The signed path first performs the guarded inner restore.
-            // Pin its intermediate incarnation and require an exact first edge.
-            let has_first_edge: bool = tx
-                .query_one(
-                    "SELECT EXISTS (
-                     SELECT FROM public.ref_store_restore_lineage l
-                      WHERE l.target_incarnation=(SELECT incarnation FROM public.cluster_authority
-                                                  WHERE singleton FOR UPDATE)
-                        AND l.source_incarnation=$1
-                 )",
-                    &[&source],
-                )
-                .await?
-                .get(0);
-            ensure!(has_first_edge, "paired restore lineage does not connect to the verified source");
-            true
-        }
-    };
-    if record_lineage {
-        let added = tx
-            .execute(
-                "WITH prior AS (
-                 SELECT incarnation FROM public.cluster_authority WHERE singleton FOR UPDATE
-             ), rotated AS (
-                 UPDATE public.cluster_authority c
-                    SET incarnation=gen_random_uuid(), rotated_at=clock_timestamp()
-                   FROM prior WHERE c.singleton
-                RETURNING c.incarnation AS target, prior.incarnation AS source
-             )
-             INSERT INTO public.ref_store_restore_lineage(target_incarnation, source_incarnation)
-             SELECT target, source FROM rotated",
-                &[],
-            )
-            .await?;
-        ensure!(added == 1, "restored cluster authority must have one lineage edge");
-    } else {
-        tx.execute(
-            "UPDATE public.cluster_authority SET incarnation=gen_random_uuid(),rotated_at=clock_timestamp() WHERE singleton=true",
-            &[],
-        ).await?;
-    }
+    rotate_cluster_incarnation(&tx, lineage).await?;
     tx.batch_execute(
         "DELETE FROM public.cluster_transport_nonces;
          UPDATE public.ci_runs SET state='cancelled',lease_generation=lease_generation+1,

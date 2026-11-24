@@ -309,3 +309,24 @@ pub async fn run_lifecycle_guard_drills(
     let _ = seed::drop_database(admin, &database).await;
     Ok(())
 }
+
+pub async fn verify_restore_lineage(
+    client: &deadpool_postgres::Client,
+    source_incarnation: Uuid,
+    restored_incarnation: Uuid,
+) -> Result<()> {
+    let lineage: bool = client
+        .query_one(
+            "SELECT (SELECT count(*) FROM public.ref_store_restore_lineage)=2 AND EXISTS (
+             SELECT FROM public.ref_store_restore_lineage final_edge
+             JOIN public.ref_store_restore_lineage first_edge ON first_edge.target_incarnation=final_edge.source_incarnation
+             JOIN public.cluster_authority c ON c.singleton AND c.incarnation=final_edge.target_incarnation
+             WHERE final_edge.target_incarnation=$1 AND first_edge.source_incarnation=$2
+         )",
+            &[&restored_incarnation, &source_incarnation],
+        )
+        .await?
+        .get(0);
+    ensure!(lineage, "the sealed W8-A restore must connect its final live cluster to the verified archived source");
+    Ok(())
+}
