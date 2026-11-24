@@ -16,7 +16,7 @@
 //! current ready `pg_refstore` realm and cluster restore incarnation, and that
 //! the current/retired attempt evidence is internally consistent.
 //!
-//! One statement reads the wrapper, both attempt candidates, the migration-138
+//! One statement reads the wrapper, its ordered attempts and retirement events, the migration-138
 //! operation, the migration-139 event, the migration-147 producer binding, the
 //! cancellation tombstone and the current realm from one snapshot. The
 //! request-aware SELECT projects the same finite predicates migration 152's
@@ -39,11 +39,10 @@
 //! `Debug` output are fixed/redacted rather than carrying PostgreSQL text, IDs,
 //! digests or payload bodies.
 //!
-//! A current attempt must agree with its wrapper state. In particular, a slot
-//! zero private rejection whose wrapper is still pending is refused closed
-//! rather than returned as a final rejection; a committed/retired slot one is
-//! returned only from the current slot after the slot-zero revision-mismatch
-//! retirement has been proved.
+//! A current attempt must agree with its wrapper state. In particular, a
+//! private rejection whose wrapper is still pending is refused closed
+//! rather than returned as a final rejection. Later slots require the full
+//! ordered prefix of exact revision-mismatch retirements.
 //!
 //! [`PgRefStore::lookup_public_operation_status`] is the separate GET-side
 //! contract. A GET knows only the repository and public UUID, so the status
@@ -83,7 +82,8 @@ const SCHEMA_PROBE: &str = "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE 
         to_regclass('ref_store_public_operations') IS NOT NULL, \
         to_regclass('ref_store_private_attempts') IS NOT NULL, \
         to_regprocedure('rootyard_ref_store_attempt_has_binding(\
-            ref_store_public_operations,ref_store_private_attempts)') IS NOT NULL";
+            ref_store_public_operations,ref_store_private_attempts)') IS NOT NULL, \
+        to_regclass('ref_store_attempt_retirements') IS NOT NULL";
 
 /// The exact schema refusal that a GET adapter may consider for a *proven*
 /// pre-migration-152 catalog. Any other `Unsupported` value stays a typed
@@ -107,7 +107,7 @@ SELECT jsonb_build_object(
             SELECT repository_id, public_id, admission_owner_id, issuer_id, wire_digest,
                    request_mode, backend_identity, object_format, history_incarnation,
                    authority_epoch, group_epoch, restore_incarnation, current_slot,
-                   state, event_id, retired_event_id, cancelled_private_id
+                   state, event_id, cancelled_private_id
               FROM ref_store_public_operations
              WHERE repository_id=$1 AND public_id=$2
         ) w
@@ -126,6 +126,7 @@ SELECT jsonb_build_object(
                        '{"state":"cancelled","reason":"cancel_requested"}'::jsonb, false)
                        AS terminal_cancelled_exact,
                    e.event_id,
+                   r.event_id AS retired_event_id,
                    e.revision AS event_revision,
                    COALESCE(e.event_id IS NOT NULL AND e.outcome = o.state, false)
                        AS event_outcome_matches,
@@ -153,6 +154,8 @@ SELECT jsonb_build_object(
               FROM ref_store_private_attempts a
               JOIN ref_store_public_operations w
                 ON w.repository_id=a.repository_id AND w.public_id=a.public_id
+              LEFT JOIN ref_store_attempt_retirements r
+                ON (r.repository_id,r.public_id,r.slot)=(a.repository_id,a.public_id,a.slot)
               LEFT JOIN ref_store_operations o
                 ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
               LEFT JOIN ref_store_core_events e
@@ -457,14 +460,13 @@ impl fmt::Debug for PublicOperationStatusLookup {
     }
 }
 
-/// The durable current attempt plus, when current slot one is in use, the
-/// already retired slot-zero evidence.
+/// The durable current attempt and its retired predecessors in ascending slot order.
 #[allow(dead_code)] // Crate-private foundation: the ignored tests and the future serving boundary consume it.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct PublicAttemptEvidence {
     pub public_id: Uuid,
     pub current: PublicAttempt,
-    pub retired: Option<PublicAttempt>,
+    pub retired: Vec<PublicAttempt>,
 }
 
 impl fmt::Debug for PublicAttemptEvidence {
@@ -791,9 +793,13 @@ async fn read_public_snapshot_sql(
 /// function is referenced.
 async fn ensure_schema(tx: &Transaction<'_>) -> Result<(), PackCommitError> {
     let schema = tx.query_one(SCHEMA_PROBE, &[]).await.map_err(lookup_db_error).map_err(PackCommitError::from)?;
-    if !schema.get::<_, bool>(0) || !schema.get::<_, bool>(1) || !schema.get::<_, bool>(2) || !schema.get::<_, bool>(3)
-    {
+    if !schema.get::<_, bool>(0) {
         return Err(PackCommitError::from(RefStoreError::Unsupported(PUBLIC_ATTEMPT_SCHEMA_REQUIRED)));
+    }
+    if (1usize..=4).any(|index| !schema.get::<_, bool>(index)) {
+        return Err(PackCommitError::from(RefStoreError::Unsupported(
+            "public attempt lookup requires the complete three-attempt migration 152",
+        )));
     }
     Ok(())
 }
@@ -971,60 +977,35 @@ fn validate_current_attempts(
     state: OperationState,
     allow_finish: bool,
 ) -> Result<PublicAttemptEvidence, PackCommitError> {
-    if wrapper.current_slot != 0 && wrapper.current_slot != 1 {
-        return Err(ledger("public operation current slot is not zero or one"));
+    if snapshot.attempts.len() != (wrapper.current_slot + 1) as usize {
+        return Err(ledger("public operation does not have a complete attempt prefix"));
     }
-    if (wrapper.current_slot == 1) != wrapper.retired_event_id.is_some() {
-        return Err(ledger("public operation retired event evidence differs from its current slot"));
-    }
-    if wrapper.event_id.is_some() && wrapper.event_id == wrapper.retired_event_id {
-        return Err(ledger("public operation current and retired events are the same"));
-    }
-
-    let mut slot_zero = None;
-    let mut slot_one = None;
-    for attempt in &snapshot.attempts {
-        let slot = match attempt.slot {
-            0 => &mut slot_zero,
-            1 => &mut slot_one,
-            _ => return Err(ledger("public operation has an attempt outside slot zero or one")),
-        };
-        if slot.replace(attempt).is_some() {
-            return Err(ledger("public operation has multiple attempts in one slot"));
+    let mut attempts = Vec::with_capacity(snapshot.attempts.len());
+    for (slot, raw) in (0..).zip(&snapshot.attempts) {
+        if raw.slot != slot {
+            return Err(ledger("public operation attempts are not an ordered slot prefix"));
         }
+        let facts = validate_attempt(raw, wrapper)?;
+        if attempts.iter().any(|previous: &AttemptFacts| {
+            previous.private_id == facts.private_id || facts.event_id.is_some() && previous.event_id == facts.event_id
+        }) {
+            return Err(ledger("public operation attempts share a private identifier or event"));
+        }
+        if let Some(previous) = attempts.last() {
+            validate_retired(previous, &facts)?;
+        }
+        attempts.push(facts);
     }
-
-    let (current_raw, retired_raw) = if wrapper.current_slot == 0 {
-        if slot_one.is_some() {
-            return Err(ledger("public operation slot one exists while slot zero is current"));
-        }
-        (slot_zero.ok_or_else(|| ledger("public operation current attempt is missing"))?, None)
-    } else {
-        (
-            slot_one.ok_or_else(|| ledger("public operation current slot one attempt is missing"))?,
-            Some(slot_zero.ok_or_else(|| ledger("public operation retired slot zero attempt is missing"))?),
-        )
-    };
-
-    let current_facts = validate_attempt(current_raw, wrapper)?;
-    validate_current(wrapper, state, &current_facts, allow_finish)?;
-
-    let retired_facts = match retired_raw {
-        Some(retired_raw) => {
-            let facts = validate_attempt(retired_raw, wrapper)?;
-            validate_retired(wrapper, &facts)?;
-            if facts.private_id == current_facts.private_id {
-                return Err(ledger("public operation attempts share one private identifier"));
-            }
-            Some(facts)
-        }
-        None => None,
-    };
+    let current = attempts.pop().ok_or_else(|| ledger("public operation current attempt is missing"))?;
+    if current.retired_event_id.is_some() {
+        return Err(ledger("current private attempt already carries retirement evidence"));
+    }
+    validate_current(wrapper, state, &current, allow_finish)?;
 
     Ok(PublicAttemptEvidence {
         public_id: wrapper.public_id,
-        current: public_attempt(current_facts),
-        retired: retired_facts.map(public_attempt),
+        current: public_attempt(current),
+        retired: attempts.into_iter().map(public_attempt).collect(),
     })
 }
 
@@ -1094,13 +1075,10 @@ fn validate_wrapper_shape(
     {
         return Err(ledger("public operation identity contains an invalid nil or epoch value"));
     }
-    if wrapper.current_slot != 0 && wrapper.current_slot != 1 {
-        return Err(ledger("public operation current slot is not zero or one"));
+    if !(0..=2).contains(&wrapper.current_slot) {
+        return Err(ledger("public operation current slot is outside zero through two"));
     }
-    if wrapper.event_id.is_some_and(|id| id.is_nil())
-        || wrapper.retired_event_id.is_some_and(|id| id.is_nil())
-        || wrapper.cancelled_private_id.is_some_and(|id| id.is_nil())
-    {
+    if wrapper.event_id.is_some_and(|id| id.is_nil()) || wrapper.cancelled_private_id.is_some_and(|id| id.is_nil()) {
         return Err(ledger("public operation has a nil event or cancellation identity"));
     }
 
@@ -1111,9 +1089,6 @@ fn validate_wrapper_shape(
     }
     if (state == OperationState::Cancelled) != wrapper.cancelled_private_id.is_some() {
         return Err(ledger("public operation cancellation state and private identity disagree"));
-    }
-    if wrapper.event_id == wrapper.retired_event_id && wrapper.event_id.is_some() {
-        return Err(ledger("public operation current and retired events are the same"));
     }
 
     Ok(state)
@@ -1131,12 +1106,10 @@ struct AttemptFacts {
     event_id: Option<Uuid>,
     event_revision: Option<i64>,
     revision_mismatch_rejection: bool,
+    retired_event_id: Option<Uuid>,
 }
 
 fn validate_attempt(attempt: &RawAttempt, wrapper: &RawWrapper) -> Result<AttemptFacts, PackCommitError> {
-    if attempt.slot != 0 && attempt.slot != 1 {
-        return Err(ledger("private attempt slot is not zero or one"));
-    }
     if attempt.private_id.is_nil() || attempt.private_id == wrapper.public_id {
         return Err(ledger("private attempt identity aliases the public identifier"));
     }
@@ -1210,6 +1183,7 @@ fn validate_attempt(attempt: &RawAttempt, wrapper: &RawWrapper) -> Result<Attemp
         event_id: attempt.event_id,
         event_revision: attempt.event_revision,
         revision_mismatch_rejection: attempt.revision_mismatch_rejection,
+        retired_event_id: attempt.retired_event_id,
     })
 }
 
@@ -1244,8 +1218,10 @@ fn validate_event(attempt: &RawAttempt, state: OperationState) -> Result<(), Pac
         return Err(ledger("private attempt event identity is nil"));
     }
     let revision = attempt.event_revision.ok_or_else(|| ledger("private attempt event revision is missing"))?;
-    if revision < 0 {
-        return Err(ledger("private attempt event revision is negative"));
+    if (state == OperationState::Committed && attempt.base_revision.checked_add(1) != Some(revision))
+        || (state == OperationState::Rejected && revision < attempt.base_revision)
+    {
+        return Err(ledger("private attempt event revision does not follow its base"));
     }
     if !matches!(state, OperationState::Committed | OperationState::Rejected) {
         return Err(ledger("private attempt event state is not committed or rejected"));
@@ -1312,19 +1288,19 @@ fn validate_current(
     Ok(())
 }
 
-fn validate_retired(wrapper: &RawWrapper, retired: &AttemptFacts) -> Result<(), PackCommitError> {
-    if retired.slot != 0 || retired.state != OperationState::Rejected {
-        return Err(ledger("retired public attempt is not a slot-zero rejection"));
+fn validate_retired(retired: &AttemptFacts, next: &AttemptFacts) -> Result<(), PackCommitError> {
+    if retired.state != OperationState::Rejected || !retired.revision_mismatch_rejection {
+        return Err(ledger("retired public attempt is not the exact revision-mismatch rejection"));
     }
-    if wrapper.retired_event_id.is_none() || retired.event_id != wrapper.retired_event_id {
-        return Err(ledger("retired public attempt event differs from its public operation"));
+    if retired.retired_event_id.is_none() || retired.event_id != retired.retired_event_id {
+        return Err(ledger("retired public attempt event differs from its recorded retirement"));
     }
     let revision = retired.event_revision.ok_or_else(|| ledger("retired public attempt event revision is missing"))?;
-    if revision <= retired.base_revision {
-        return Err(ledger("retired public attempt did not observe an advanced gate"));
+    if revision <= retired.base_revision || revision != next.base_revision {
+        return Err(ledger("retired public attempt event does not advance to the next base"));
     }
-    if !retired.revision_mismatch_rejection {
-        return Err(ledger("retired public attempt is not the exact revision-mismatch rejection"));
+    if retired.lane != next.lane || retired.sequence >= next.sequence {
+        return Err(ledger("retired public attempt does not advance the sequence in its issuer lane"));
     }
     Ok(())
 }
@@ -1421,10 +1397,6 @@ impl RawWrapper {
         self.event_id
     }
 
-    pub(super) fn retired_event_id(&self) -> Option<Uuid> {
-        self.retired_event_id
-    }
-
     pub(super) fn cancelled_private_id(&self) -> Option<Uuid> {
         self.cancelled_private_id
     }
@@ -1447,7 +1419,6 @@ pub(super) struct RawWrapper {
     current_slot: i16,
     state: String,
     event_id: Option<Uuid>,
-    retired_event_id: Option<Uuid>,
     cancelled_private_id: Option<Uuid>,
 }
 
@@ -1475,6 +1446,7 @@ struct RawAttempt {
     tombstone_matches_lane: bool,
     tombstone_exact_operation: bool,
     revision_mismatch_rejection: bool,
+    retired_event_id: Option<Uuid>,
 }
 
 #[cfg(test)]

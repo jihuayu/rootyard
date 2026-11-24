@@ -47,7 +47,7 @@ SELECT jsonb_build_object(
             SELECT repository_id, public_id, admission_owner_id, issuer_id, wire_digest,
                    request_mode, backend_identity, object_format, history_incarnation,
                    authority_epoch, group_epoch, restore_incarnation, current_slot,
-                   state, event_id, retired_event_id, cancelled_private_id
+                   state, event_id, cancelled_private_id
               FROM ref_store_public_operations
              WHERE repository_id=$1 AND public_id=$2
         ) w
@@ -66,6 +66,7 @@ SELECT jsonb_build_object(
                        '{"state":"cancelled","reason":"cancel_requested"}'::jsonb, false)
                        AS terminal_cancelled_exact,
                    e.event_id,
+                   r.event_id AS retired_event_id,
                    e.revision AS event_revision,
                    COALESCE(e.event_id IS NOT NULL AND e.outcome = o.state, false)
                        AS event_outcome_matches,
@@ -93,6 +94,8 @@ SELECT jsonb_build_object(
               FROM ref_store_private_attempts a
               JOIN ref_store_public_operations w
                 ON w.repository_id=a.repository_id AND w.public_id=a.public_id
+              LEFT JOIN ref_store_attempt_retirements r
+                ON (r.repository_id,r.public_id,r.slot)=(a.repository_id,a.public_id,a.slot)
               LEFT JOIN ref_store_operations o
                 ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
               LEFT JOIN ref_store_core_events e

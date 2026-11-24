@@ -1,7 +1,7 @@
 use super::{
-    PublicAttemptLookup, PublicAttemptRequest, PublicOperationReadAuthorization, PublicOperationStatusLookup,
-    PublicOperationStatusRequest, RawAttempt, RawSnapshot, RawWrapper, SELECT_SNAPSHOT, evaluate, evaluate_status,
-    status_terminal::project_terminal,
+    PublicAttemptFinishLookup, PublicAttemptLookup, PublicAttemptRequest, PublicOperationReadAuthorization,
+    PublicOperationStatusLookup, PublicOperationStatusRequest, RawAttempt, RawSnapshot, RawWrapper, SELECT_SNAPSHOT,
+    evaluate, evaluate_finish, evaluate_status, status_terminal::project_terminal,
 };
 use crate::ref_store::{
     CommitMode, CommitRejectCode, GitObjectFormat, OperationState, RefCommitResult, RefStoreError, RequestDigest,
@@ -135,7 +135,6 @@ fn wrapper(current_slot: i16, state: &str) -> RawWrapper {
         current_slot,
         state: state.into(),
         event_id: if matches!(state, "committed" | "rejected") { Some(event1()) } else { None },
-        retired_event_id: if current_slot == 1 { Some(event0()) } else { None },
         cancelled_private_id: if state == "cancelled" {
             Some(if current_slot == 1 { private1() } else { private0() })
         } else {
@@ -168,6 +167,7 @@ fn base_attempt(slot: i16, private_id: Uuid, plan: RequestDigest, proof: Request
         tombstone_matches_lane: false,
         tombstone_exact_operation: false,
         revision_mismatch_rejection: false,
+        retired_event_id: None,
     }
 }
 
@@ -189,6 +189,7 @@ fn retired_attempt() -> RawAttempt {
     attempt.operation_state = Some("rejected".into());
     attempt.terminal_present = true;
     attempt.event_id = Some(event0());
+    attempt.retired_event_id = attempt.event_id;
     attempt.event_revision = Some(2);
     attempt.event_outcome_matches = true;
     attempt.event_body_matches = true;
@@ -348,7 +349,7 @@ fn pending_slot_zero_is_resolved_from_the_current_attempt() {
             assert_eq!(evidence.current.plan_digest, plan0());
             assert_eq!(evidence.current.proof_digest, proof0());
             assert!(evidence.current.event_id.is_none());
-            assert!(evidence.retired.is_none());
+            assert!(evidence.retired.is_empty());
         }
         other => panic!("expected pending slot zero, got {other:?}"),
     }
@@ -368,7 +369,7 @@ fn pending_slot_one_returns_pending_and_never_the_retired_rejection() {
         PublicAttemptLookup::Pending(evidence) => {
             assert_eq!(evidence.current.slot, 1);
             assert_eq!(evidence.current.private_id, private1());
-            let retired = evidence.retired.expect("slot-zero retirement evidence");
+            let retired = evidence.retired.first().expect("slot-zero retirement evidence");
             assert_eq!(retired.slot, 0);
             assert_eq!(retired.private_id, private0());
             assert_eq!(retired.state, OperationState::Rejected);
@@ -465,7 +466,7 @@ fn cancelled_slot_one_binds_only_the_current_attempt() {
         PublicAttemptLookup::Cancelled(evidence) => {
             assert_eq!(evidence.current.slot, 1);
             assert_eq!(evidence.current.private_id, private1());
-            assert_eq!(evidence.retired.expect("retired evidence").private_id, private0());
+            assert_eq!(evidence.retired.first().expect("retired evidence").private_id, private0());
         }
         other => panic!("expected cancelled slot one, got {other:?}"),
     }
@@ -1220,4 +1221,109 @@ fn snapshot_sql_is_one_read_only_statement_with_finite_evidence() {
     for forbidden in [" insert ", " update ", " delete ", " for update", " for share", "pg_advisory", ";"] {
         assert!(!sql.contains(forbidden), "snapshot SQL contains forbidden {forbidden:?}");
     }
+}
+
+fn three_attempt_prefix() -> Vec<RawAttempt> {
+    let oldest = retired_attempt();
+    let mut middle = oldest.clone();
+    middle.slot = 1;
+    middle.private_id = private1();
+    middle.plan_digest = plan1().as_hex();
+    middle.proof_digest = proof1().as_hex();
+    middle.base_revision = 2;
+    middle.operation_sequence = Some(2);
+    middle.operation_request_digest = Some(plan1().as_hex());
+    middle.event_id = Some(event1());
+    middle.retired_event_id = middle.event_id;
+    middle.event_revision = Some(3);
+    let current = pending_attempt(2, id(21), digest(0x41), digest(0x42), 4, 3);
+    vec![oldest, middle, current]
+}
+
+#[test]
+fn pending_slot_two_returns_only_the_current_attempt() {
+    let raw = snapshot(wrapper(2, "pending"), three_attempt_prefix());
+    match evaluate(raw.clone(), &request()).expect("valid three-attempt prefix") {
+        PublicAttemptLookup::Pending(evidence) => {
+            assert_eq!(evidence.current.slot, 2);
+            assert_eq!(evidence.current.private_id, id(21));
+            assert_eq!(
+                evidence.retired.iter().map(|attempt| (attempt.slot, attempt.event_id)).collect::<Vec<_>>(),
+                vec![(0, Some(event0())), (1, Some(event1()))]
+            );
+        }
+        other => panic!("expected pending slot two, got {other:?}"),
+    }
+    match evaluate_status(raw, &status_request()).expect("valid pending status") {
+        PublicOperationStatusLookup::Found(status) => {
+            assert_eq!(status.state(), OperationState::Pending);
+            assert!(status.terminal().is_none());
+        }
+        other => panic!("expected pending public status, got {other:?}"),
+    }
+}
+
+#[test]
+fn slot_two_rejects_malformed_retirement_prefix_in_lookup_and_status() {
+    let invalid: [fn(&mut Vec<RawAttempt>); 10] = [
+        |attempts| {
+            attempts.remove(1);
+        },
+        |attempts| attempts.swap(0, 1),
+        |attempts| attempts[2].slot = 1,
+        |attempts| attempts[2].private_id = attempts[0].private_id,
+        |attempts| {
+            attempts[1].event_id = attempts[0].event_id;
+            attempts[1].retired_event_id = attempts[0].event_id;
+        },
+        |attempts| attempts[1].retired_event_id = None,
+        |attempts| attempts[0].retired_event_id = Some(id(30)),
+        |attempts| attempts[1].operation_lane = Some("other-lane".into()),
+        |attempts| attempts[1].operation_sequence = attempts[0].operation_sequence,
+        |attempts| attempts[2].base_revision += 1,
+    ];
+    for tamper in invalid {
+        let mut attempts = three_attempt_prefix();
+        tamper(&mut attempts);
+        let raw = snapshot(wrapper(2, "pending"), attempts);
+        assert_ledger(evaluate(raw.clone(), &request()));
+        assert_status_ledger(evaluate_status(raw, &status_request()));
+    }
+}
+
+#[test]
+fn slot_two_finish_and_status_project_only_the_exact_current_terminal() {
+    let mut attempts = three_attempt_prefix();
+    let event_two = id(31);
+    let current = &mut attempts[2];
+    current.operation_state = Some("committed".into());
+    current.terminal_present = true;
+    current.event_id = Some(event_two);
+    current.event_revision = Some(4);
+    current.event_outcome_matches = true;
+    current.event_body_matches = true;
+
+    let unfinished = snapshot(wrapper(2, "pending"), attempts.clone());
+    assert_ledger(evaluate(unfinished.clone(), &request()));
+    assert_status_ledger(evaluate_status(unfinished.clone(), &status_request()));
+    assert!(matches!(
+        evaluate_finish(unfinished, &request()).expect("exact terminal is finishable"),
+        PublicAttemptFinishLookup::Evidence(_)
+    ));
+
+    let mut wrapper = wrapper(2, "committed");
+    wrapper.event_id = Some(event_two);
+    let mut terminal = pack_committed_terminal();
+    terminal.revision = 4;
+    let sealed = with_terminal(snapshot(wrapper.clone(), attempts.clone()), terminal_value(&terminal));
+    match evaluate_status(sealed, &status_request()).expect("valid committed status") {
+        PublicOperationStatusLookup::Found(status) => {
+            assert_eq!(status.state(), OperationState::Committed);
+            assert_eq!(status.terminal(), Some(&terminal_value(&terminal)));
+        }
+        other => panic!("expected committed public status, got {other:?}"),
+    }
+
+    attempts[2].retired_event_id = Some(event_two);
+    assert_ledger(evaluate(snapshot(wrapper, attempts), &request()));
 }

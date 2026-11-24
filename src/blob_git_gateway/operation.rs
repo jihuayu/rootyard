@@ -506,19 +506,16 @@ pub(super) async fn lookup_public_private_in_tx(
     if private_id.is_nil() || private_id == public_id {
         return Err(GatewayError::Internal("verified public attempt has an invalid private identity"));
     }
-    let expected_proof = match evidence.current.slot {
-        0 => slot_zero::recompute_slot_zero_proof(public_request, &evidence.current)
-            .map_err(|_| GatewayError::Internal("verified public attempt proof is not recomputable"))?,
-        1 => {
-            let retired = evidence
-                .retired
-                .as_ref()
-                .ok_or_else(|| GatewayError::Internal("verified slot-one attempt has no retired evidence"))?;
-            slot_one::recompute_slot_one_proof(public_request, retired, &evidence.current)
-                .map_err(|_| GatewayError::Internal("verified slot-one proof is not recomputable"))?
+    let current = &evidence.current;
+    let expected_proof = match (current.slot, evidence.retired.as_slice()) {
+        (0, []) => slot_zero::recompute_slot_zero_proof(public_request, current),
+        (1, [zero]) => slot_one::recompute_slot_one_proof(public_request, zero, current),
+        (2, [zero, one]) => slot_one::recompute_slot_two_proof(public_request, zero, one, current),
+        _ => {
+            return Err(GatewayError::Internal("verified public attempt does not have the expected retirement prefix"));
         }
-        _ => return Err(GatewayError::Internal("verified public attempt has an unsupported slot")),
-    };
+    }
+    .map_err(|_| GatewayError::Internal("verified public attempt proof is not recomputable"))?;
     if expected_proof != evidence.current.proof_digest {
         return Err(GatewayError::Internal("verified public attempt proof differs from its durable attempt"));
     }
@@ -540,7 +537,6 @@ pub(super) async fn lookup_public_private_in_tx(
         OperationLookup::Known(record) => record,
     };
     let identity = record.identity();
-    let current = &evidence.current;
     if identity.repository_id() != repository_id
         || identity.operation_id() != private_id
         || identity.lane() != &current.lane
