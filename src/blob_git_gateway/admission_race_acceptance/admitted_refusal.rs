@@ -29,7 +29,7 @@ async fn run_owned(phase: &mut &'static str) -> Result<()> {
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     prepare()?;
     require_per_run_blob_prefix()?;
-    let db = Db::setup().await?;
+    let db = Db::setup_public_owned().await?;
     let mut resources = WitnessResources::default();
     let mut unproven = false;
     let outcome =
