@@ -1,6 +1,6 @@
 use super::compat::{
-    CONFLICT_SUBMODULE, is_gitattributes_path, map_walk_error, validate_config_bytes, validate_gitattributes_bytes,
-    validate_head_bytes, validate_raw, validate_repo, validate_tree_listing_no_gitlinks,
+    CONFLICT_SUBMODULE, HeadKind, HeadRefState, is_gitattributes_path, map_walk_error, validate_config_bytes,
+    validate_gitattributes_bytes, validate_head_bytes, validate_raw, validate_repo, validate_tree_listing_no_gitlinks,
 };
 use super::snapshot::{Origin, Raw};
 use crate::workspace_lab::core;
@@ -109,14 +109,54 @@ fn valid_cloned_branch_and_detached_head_repos_pass() {
 }
 
 #[test]
-fn unborn_head_and_sha256_are_rejected_as_conflict() {
+fn declared_unborn_head_is_supported_while_dangling_graphs_and_sha256_are_rejected() {
     let repo = make_valid_repo();
     fs::remove_file(repo.path().join(".git/refs/heads/main")).unwrap();
-    let err = validate_repo(repo.path()).expect_err("unborn HEAD rejected");
-    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert_eq!(validate_repo(repo.path()).expect("declared unborn HEAD supported"), HeadKind::Unborn);
+
+    // Any other loose ref means this is an existing graph whose HEAD happens to
+    // be unresolved, not a genuinely empty repository.
+    let other_ref = make_valid_repo();
+    fs::remove_file(other_ref.path().join(".git/refs/heads/main")).unwrap();
+    write(other_ref.path(), ".git/refs/heads/other", format!("{OID_A}\n").as_bytes());
+    assert_eq!(validate_repo(other_ref.path()).unwrap_err().0, StatusCode::CONFLICT);
+
+    // A present-but-malformed target is invalid, never "absent".
+    let broken_target = make_valid_repo();
+    write(broken_target.path(), ".git/refs/heads/main", b"not-an-oid\n");
+    assert_eq!(validate_repo(broken_target.path()).unwrap_err().0, StatusCode::CONFLICT);
+
+    // A packed-refs file with only comments is still genuinely empty.
+    let comments_only = make_valid_repo();
+    fs::remove_file(comments_only.path().join(".git/refs/heads/main")).unwrap();
+    write(comments_only.path(), ".git/packed-refs", b"# pack-refs with: peeled fully-peeled sorted\n");
+    assert_eq!(validate_repo(comments_only.path()).expect("comment-only packed-refs"), HeadKind::Unborn);
+
+    // A standalone peeled line is malformed, not proof of an empty ref store.
+    let standalone_peel = make_valid_repo();
+    fs::remove_file(standalone_peel.path().join(".git/refs/heads/main")).unwrap();
+    write(standalone_peel.path(), ".git/packed-refs", b"^1111111111111111111111111111111111111111\n");
+    assert_eq!(validate_repo(standalone_peel.path()).unwrap_err().0, StatusCode::CONFLICT);
+
+    // Unresolved HEADs are only admitted for local branches, not tags/remotes.
+    let tag_target = make_valid_repo();
+    fs::remove_file(tag_target.path().join(".git/refs/heads/main")).unwrap();
+    write(tag_target.path(), ".git/HEAD", b"ref: refs/tags/main\n");
+    assert_eq!(validate_repo(tag_target.path()).unwrap_err().0, StatusCode::CONFLICT);
+
+    let absent = |_: &str| Ok(HeadRefState::Absent);
+    assert_eq!(validate_head_bytes(b"ref: refs/heads/main\n", absent).expect("unborn branch"), HeadKind::Unborn);
+    assert_eq!(validate_head_bytes(b"ref: refs/tags/main\n", absent).unwrap_err().0, StatusCode::CONFLICT);
+    assert_eq!(
+        validate_head_bytes(b"ref: refs/heads/main\n", |_| Ok(HeadRefState::Invalid)).unwrap_err().0,
+        StatusCode::CONFLICT
+    );
 
     let sha256_oid = "a".repeat(64);
-    assert_eq!(validate_head_bytes(sha256_oid.as_bytes(), |_| Ok(false)).unwrap_err().0, StatusCode::CONFLICT);
+    assert_eq!(
+        validate_head_bytes(sha256_oid.as_bytes(), |_| Ok(HeadRefState::Absent)).unwrap_err().0,
+        StatusCode::CONFLICT
+    );
 
     let sha256_cfg = "[core]\n\trepositoryformatversion = 1\n\tbare = false\n[extensions]\n\tobjectformat = sha256\n";
     assert_eq!(validate_config_bytes(sha256_cfg.as_bytes()).unwrap_err().0, StatusCode::CONFLICT);

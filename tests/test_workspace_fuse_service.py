@@ -257,16 +257,12 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertEqual(
                     h.sql(f"SELECT state FROM workspace_checkpoints WHERE id='{checkpoint_id}'"),
                     "local_complete")
-                base_events = int(h.sql(
-                    "SELECT count(*) FROM workspace_events "
-                    f"WHERE workspace_id='{wid}' AND kind='external_capture'"))
-                base_revision = int(h.sql(
-                    f"SELECT revision FROM workspaces WHERE id='{wid}'"))
-
-                # The gate is armed only after the durable workspace/checkpoint
-                # state exists; the target raw upper file does not exist yet.
+                # Arm the read gate after the durable checkpoint exists.
+                # The target is distinct from the writer's setup file.
                 h.stop()
-                gate_target = h.root / "data/workspace-service/uppers" / wid / "gate-target.txt"
+                gate_target = (
+                    h.root / "data/workspace-service/uppers" / wid
+                    / "capture-gate-target.txt")
                 gate_names = ("LD_PRELOAD", "ROOTYARD_TEST_CAPTURE_GATE",
                               "ROOTYARD_TEST_CAPTURE_TARGET")
                 prior_env = {name: h.env.get(name) for name in gate_names}
@@ -324,6 +320,16 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertGreater(writer_identity["starttime"], 0)
                 writer_pidfd = support.open_pidfd(writer.pid)
 
+                # Publish the capture target after writer setup, so a fast
+                # scan cannot freeze the writer before it enters its loop.
+                staging = (
+                    h.root / "capture-gate-staging" / "capture-gate-target.txt")
+                staging.parent.mkdir(parents=True, exist_ok=True)
+                staging.write_bytes(b"capture-gate-target\n")
+                normal_shutdown.wait_for_writer_writing(
+                    writer, writer_status, timeout=10)
+                os.replace(staging, gate_target)
+
                 hit = gate.with_suffix(".hit")
                 wait_capture_gate(hit, timeout=30)
                 self.assertFalse(gate.with_suffix(".timeout").exists(),
@@ -334,6 +340,17 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                  "capture read gate expired before SIGKILL")
                 self.assertGreaterEqual(evidence["attempts"], 1)
                 self.assertEqual(evidence["attempts"], evidence["writes"] + 1)
+
+                # Compare against the durable state during the proven freeze.
+                # Watch hints can commit earlier, independent captures.
+                observation_sql = (
+                    "SELECT (SELECT count(*) FROM workspace_events "
+                    f"WHERE workspace_id='{wid}' AND kind='external_capture'), "
+                    f"revision FROM workspaces WHERE id='{wid}'")
+                base_events, base_revision = (
+                    int(value) for value in h.sql(observation_sql).split("|"))
+                self.assertFalse(gate.with_suffix(".timeout").exists(),
+                                 "capture read gate expired before SIGKILL")
 
                 kill_ns = time.time_ns()
                 os.killpg(api_pid, signal.SIGKILL)
@@ -375,13 +392,12 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 ]
                 self.assertEqual(old_remaining, [],
                                  "crashed workspace mount was replaced after SIGKILL")
-                self.assertEqual(int(h.sql(
-                    "SELECT count(*) FROM workspace_events "
-                    f"WHERE workspace_id='{wid}' AND kind='external_capture'")),
-                    base_events, "a blocked capture was reported committed after API SIGKILL")
-                self.assertEqual(int(h.sql(
-                    f"SELECT revision FROM workspaces WHERE id='{wid}'")),
-                    base_revision, "workspace revision advanced after API SIGKILL")
+                after_events, after_revision = (
+                    int(value) for value in h.sql(observation_sql).split("|"))
+                self.assertEqual(after_events, base_events,
+                                 "a blocked capture was reported committed after API SIGKILL")
+                self.assertEqual(after_revision, base_revision,
+                                 "workspace revision advanced after API SIGKILL")
                 self.assertEqual(
                     h.sql(f"SELECT state FROM workspace_checkpoints WHERE id='{checkpoint_id}'"),
                     "local_complete", "an in-flight checkpoint was falsely confirmed")

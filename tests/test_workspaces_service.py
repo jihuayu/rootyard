@@ -385,7 +385,11 @@ class WorkspaceServiceTest(unittest.TestCase):
         h = Harness(argparse.Namespace(binary=str(binary), keep=False))
         try:
             h.setup(); h.api(); h.roundtrip()
-            h.create_repository({"name": "empty-ws"}, token=h.alice)
+            empty = h.create_repository({"name": "empty-ws"}, token=h.alice)
+            # A bare source whose HEAD is unresolved but which already holds an
+            # object graph is dangling, not a declared unborn workspace.
+            h.git("push", h.base + empty["clone_path"], f"{h.second}:refs/heads/other",
+                  cwd=h.work, token=h.alice)
             status, body, _ = h.http("/api/workspaces", token=h.alice, method="POST",
                 body={"owner": "alice", "repository": "empty-ws", "agent_id": "compat-empty"},
                 extra_headers={"Idempotency-Key": "compat-empty"})

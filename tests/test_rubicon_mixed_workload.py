@@ -21,13 +21,19 @@ if str(SCRIPTS) not in sys.path:
 
 from rubicon_workload.corpus import DATASET_CLASSES, generate_repo_corpus, parse_push_porcelain  # noqa: E402
 from rubicon_workload.report import (  # noqa: E402
+    REFUSAL_RECEIPT_CLASSES,
     compute_overlap_metrics,
     find_secret_leaks,
     percentile_stats,
     render_summary_markdown,
     validate_report,
 )
-from rubicon_workload.runner import PreflightError, WorkloadConfig, _preflight  # noqa: E402
+from rubicon_workload.runner import (  # noqa: E402
+    PreflightError,
+    WorkloadConfig,
+    _preflight,
+    _query_first_refusal_receipts,
+)
 from rubicon_workload.workloads import S3MeterProxy  # noqa: E402
 
 
@@ -286,6 +292,89 @@ class RubiconReportValidationTests(unittest.TestCase):
                 same_repo["committed_success"] = final
                 with self.assertRaisesRegex(ValueError, error):
                     validate_report(report)
+
+    def test_first_refusal_receipt_validation_and_summary(self) -> None:
+        report = _valid_sample_report()
+        same_repo = report["tiers"][0]["same_repo_mixed_concurrency"]
+        same_repo["first_attempt_outcomes"] = {"committed_success": 1, "typed_refusal": 2, "unknown_outcome": 0}
+        receipts = {
+            "admitted_base_superseded": 1,
+            "per_ref_cas_rejected": 1,
+            "other_durable_rejection": 0,
+            "unresolved": 0,
+        }
+        same_repo["first_refusal_receipts"] = receipts
+        validate_report(report)
+        md = render_summary_markdown(report)
+        for name, count in receipts.items():
+            self.assertIn(f"{name}={count}", md)
+
+        for mutate, error in (
+            (lambda r: r.update(extra=0), "exactly the four receipt classes"),
+            (lambda r: r.pop("unresolved"), "exactly the four receipt classes"),
+            (lambda r: r.update(unresolved=True), "non-negative int"),
+            (lambda r: r.update(other_durable_rejection=-1), "non-negative int"),
+            (lambda r: r.update(other_durable_rejection=1), "must partition"),
+        ):
+            with self.subTest(error=error):
+                broken = copy.deepcopy(report)
+                mutate(broken["tiers"][0]["same_repo_mixed_concurrency"]["first_refusal_receipts"])
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_report(broken)
+        no_first = copy.deepcopy(report)
+        del no_first["tiers"][0]["same_repo_mixed_concurrency"]["first_attempt_outcomes"]
+        with self.assertRaisesRegex(ValueError, "requires first_attempt_outcomes"):
+            validate_report(no_first)
+
+    def test_first_refusal_receipt_query_is_bounded_and_finite(self) -> None:
+        import uuid
+
+        repo = "11111111-1111-4111-8111-111111111111"
+        observations = [(i, str(uuid.uuid4())) for i in range(3)]
+        calls: list[tuple[list[str], dict]] = []
+
+        def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            calls.append((cmd, kwargs))  # type: ignore[arg-type]
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                b'["admitted_base_superseded", "per_ref_cas_rejected", "unresolved"]',
+                b"",
+            )
+
+        with patch("rubicon_workload.runner.subprocess.run", side_effect=fake_run):
+            counts = _query_first_refusal_receipts("postgresql://u@127.0.0.1/db", {}, repo, observations)
+        self.assertEqual(
+            counts,
+            {
+                "admitted_base_superseded": 1,
+                "per_ref_cas_rejected": 1,
+                "other_durable_rejection": 0,
+                "unresolved": 1,
+            },
+        )
+        self.assertEqual(set(counts), set(REFUSAL_RECEIPT_CLASSES))
+        cmd, kwargs = calls[0]
+        sql = cmd[-1]
+        self.assertEqual(kwargs["timeout"], 10)
+        self.assertIn("SELECT json_agg(verdict ORDER BY ordinal)", sql)
+        self.assertIn("refs/heads/same_branch_2", sql)
+        for _, operation_id in observations:
+            self.assertIn(operation_id, sql)
+
+        with patch("rubicon_workload.runner.subprocess.run", side_effect=subprocess.TimeoutExpired("psql", 10)):
+            failed = _query_first_refusal_receipts("postgresql://u@127.0.0.1/db", {}, repo, observations)
+        self.assertEqual(failed["unresolved"], 3)
+
+        unexpected = subprocess.CompletedProcess([], 0, b'["admitted_base_superseded", "bad", "unresolved"]')
+        with patch("rubicon_workload.runner.subprocess.run", return_value=unexpected):
+            malformed = _query_first_refusal_receipts("postgresql://u@127.0.0.1/db", {}, repo, observations)
+        self.assertEqual(malformed["admitted_base_superseded"], 0)
+        self.assertEqual(malformed["unresolved"], 3)
+        bad = [(3, str(uuid.uuid4()))]
+        with patch("rubicon_workload.runner.subprocess.run") as run:
+            invalid = _query_first_refusal_receipts("postgresql://u@127.0.0.1/db", {}, repo, bad)
+        run.assert_not_called()
+        self.assertEqual(invalid["unresolved"], 1)
 
     def test_rejects_false_success_during_fault_window_and_unverified_audit(self) -> None:
         bad_fault = _valid_sample_report()

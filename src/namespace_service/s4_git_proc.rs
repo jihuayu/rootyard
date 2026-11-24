@@ -387,10 +387,13 @@ pub(crate) async fn run_git_bounded(
     if !status.success() {
         #[cfg(debug_assertions)]
         if let Some(phase) = reverse_phase {
-            let exit = if status.code().is_some() { "nonzero_exit" } else { "no_exit_code" };
+            let code = status.code();
+            let exit = if code.is_some() { "nonzero_exit" } else { "no_exit_code" };
             use std::io::Write;
-            let _ =
-                writeln!(std::io::stderr().lock(), "rootyard: Git View reverse child failed phase={phase} exit={exit}");
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "rootyard: Git View reverse child failed phase={phase} exit={exit} code={code:?}"
+            );
         }
         return Err(fail_error);
     }

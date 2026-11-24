@@ -35,6 +35,12 @@ The fingerprint row, the revision bump and the `external_capture` event commit
 in that one transaction; an unchanged fingerprint writes no revision and no
 event.
 
+On Linux, inotify wakes reconciliation for dirty workspaces between periodic
+scans. It observes the service-owned worktree and overlay directories. A
+directory change rebuilds the registrations before requesting a full scan.
+Queue overflow also requests a full scan. The periodic scan covers directories
+outside the watch budget and keeps capture running when inotify is unavailable.
+
 Eligible workspaces are paged by `id` (`id > cursor ORDER BY id LIMIT 100`), so
 every local workspace is visited each round instead of rescanning one fixed
 prefix. A workspace that is slow, errors, or exceeds the scan budget occupies at
@@ -224,7 +230,7 @@ contracts (`src/workspace_lab/core.rs`, `src/workspaces/compat.rs`, and
 | --- | --- | --- | --- |
 | Committed SHA-1 worktrees (tracked, untracked, `.gitignore`, partial staging, `TREE`/`REUC`, `intent-to-add`, merge conflicts) | **Supported** | **Supported** | **Supported** (read-only pinned checkout) |
 | Detached HEAD (`HEAD` pointing to a commit OID) | **Supported** | **Supported** (preserved across checkpoint, restore, and fork) | **Supported** (pinned commit checkout) |
-| Unborn HEAD (0-commit repo or `--orphan` before first commit) | **Explicitly rejected** (`HEAD^{commit}` required) | **Explicitly rejected** (`409` at creation, checkpoint, restore, and `POST /git`) | **Explicitly rejected** |
+| Unborn HEAD (0-commit repo or `--orphan` before first commit) | **Explicitly rejected** (`HEAD^{commit}` required) | **Supported locally** only as a declared empty SHA-1 symbolic `refs/heads/*` HEAD whose ref is absent and whose creation source has no other refs, commits or objects (creation, local checkpoint, restore/fork, and `POST /git` before the first commit; staged blobs in an existing local workspace are allowed). Remote publish, cold remote restore, and cross-host takeover are committed-only (`409`) | **Explicitly rejected** |
 | Non-filter `.gitattributes` (`text`, `eol`, comments `# ...`, patterns containing `filter`) | **Supported** (`core::check_gitattributes`) | **Supported** (`core::check_gitattributes`) | **Supported** |
 | `.gitattributes` `filter=lfs` markers (no local driver) | **Explicitly rejected** (`filter` refused in preflight & capture) | **Supported as inert raw pointer** (stored/preserved byte-for-byte; no local filter execution; not auto-hydrated) | **Supported** (hydrates `ready` LFS objects under per-repo auth) |
 | Active clean/smudge/diff/merge drivers (`.git/config` `filter.*`/`diff.*`/`merge.*`, `.git/info/attributes` filters, custom `filter=<name>`) | **Explicitly rejected** | **Explicitly rejected** (`409` before disk/DB mutation; `Planned extension`: opt-in LFS hydration) | **Planned extension** (LFS pointer hydration only; custom arbitrary filter drivers stay disabled) |

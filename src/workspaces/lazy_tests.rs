@@ -3,8 +3,10 @@
 use super::{
     Reader,
     hydrator::{BlobFetcher, FetchFuture, Flight, Hydrator, RemoteFetcher, eio, reader_entries},
+    validate_committed_materialization,
 };
 use crate::storage::remote_objects::{ObjectKey, RemoteObjectStore};
+use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -419,4 +421,67 @@ fn failed_verification_never_publishes_final_path() {
     assert!(!cache.join(&key.sha256).exists());
     assert!(names(&root.path().join("cache")).is_empty());
     assert_eq!(hydrator.in_flight(), 0);
+}
+
+const MATERIALIZED_OID: &str = "1111111111111111111111111111111111111111";
+
+fn materialization_write(root: &Path, rel: &str, bytes: &[u8]) {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+fn committed_materialization() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    materialization_write(dir.path(), ".git/config", b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n");
+    materialization_write(dir.path(), ".git/HEAD", b"ref: refs/heads/main\n");
+    materialization_write(dir.path(), ".git/refs/heads/main", format!("{MATERIALIZED_OID}\n").as_bytes());
+    materialization_write(dir.path(), "hello.txt", b"hello\n");
+    dir
+}
+
+#[test]
+fn committed_fuse_materialization_admits_symbolic_packed_and_detached_heads() {
+    let symbolic = committed_materialization();
+    validate_committed_materialization(symbolic.path()).expect("committed symbolic HEAD admitted");
+
+    let packed = committed_materialization();
+    fs::remove_file(packed.path().join(".git/refs/heads/main")).unwrap();
+    materialization_write(
+        packed.path(),
+        ".git/packed-refs",
+        format!("# pack-refs with: peeled fully-peeled sorted\n{MATERIALIZED_OID} refs/heads/main\n").as_bytes(),
+    );
+    validate_committed_materialization(packed.path()).expect("committed packed-ref HEAD admitted");
+
+    let detached = committed_materialization();
+    materialization_write(detached.path(), ".git/HEAD", format!("{MATERIALIZED_OID}\n").as_bytes());
+    validate_committed_materialization(detached.path()).expect("detached committed HEAD admitted");
+
+    // Staged and unstaged worktree state is unrelated to the frozen HEAD kind.
+    let dirty = committed_materialization();
+    materialization_write(dirty.path(), "staged.txt", b"staged bytes\n");
+    materialization_write(dirty.path(), "unstaged.txt", b"unstaged bytes\n");
+    validate_committed_materialization(dirty.path()).expect("unrelated worktree state admitted");
+}
+
+#[test]
+fn fuse_materialization_refuses_unborn_and_damaged_git_metadata() {
+    let unborn = committed_materialization();
+    fs::remove_file(unborn.path().join(".git/refs/heads/main")).unwrap();
+    let err = validate_committed_materialization(unborn.path()).unwrap_err();
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert_eq!(err.1, super::super::compat::CONFLICT_HEAD);
+
+    let dangling_ref = committed_materialization();
+    materialization_write(dangling_ref.path(), ".git/refs/heads/main", b"not-an-oid\n");
+    let err = validate_committed_materialization(dangling_ref.path()).unwrap_err();
+    assert_eq!(err.0, StatusCode::CONFLICT);
+
+    let missing_head = committed_materialization();
+    fs::remove_file(missing_head.path().join(".git/HEAD")).unwrap();
+    let err = validate_committed_materialization(missing_head.path()).unwrap_err();
+    assert_eq!(err.0, StatusCode::CONFLICT);
 }
