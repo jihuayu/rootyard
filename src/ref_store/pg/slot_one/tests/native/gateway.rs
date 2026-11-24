@@ -69,6 +69,11 @@ SELECT jsonb_build_object(
           FROM ref_store_private_attempts a
          WHERE a.repository_id=$1 AND a.public_id=$2
     ), '[]'::jsonb),
+    'retirements', COALESCE((
+        SELECT jsonb_agg(to_jsonb(r) ORDER BY r.public_id, r.slot)
+          FROM ref_store_attempt_retirements r
+         WHERE r.repository_id=$1
+    ), '[]'::jsonb),
     'operations', COALESCE((
         SELECT jsonb_agg(to_jsonb(o) ORDER BY o.operation_id)
           FROM ref_store_operations o
@@ -102,6 +107,7 @@ SELECT jsonb_build_object(
     'counts', jsonb_build_object(
         'public_operations', (SELECT count(*) FROM ref_store_public_operations WHERE repository_id=$1),
         'private_attempts', (SELECT count(*) FROM ref_store_private_attempts WHERE repository_id=$1),
+        'retirements', (SELECT count(*) FROM ref_store_attempt_retirements WHERE repository_id=$1),
         'operations', (SELECT count(*) FROM ref_store_operations WHERE repository_id=$1),
         'bindings', (SELECT count(*) FROM ref_store_serving_operations WHERE repository_id=$1),
         'events', (SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1),
@@ -758,7 +764,7 @@ async fn ledger_snapshot(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> R
 }
 
 fn assert_snapshot_invariants(snapshot: &Value) -> Result<()> {
-    for key in ["operations", "bindings", "events", "refs", "publications"] {
+    for key in ["retirements", "operations", "bindings", "events", "refs", "publications"] {
         let entries =
             snapshot[key].as_array().ok_or_else(|| anyhow!("ledger snapshot {key} is not a full-repository array"))?;
         let count =
