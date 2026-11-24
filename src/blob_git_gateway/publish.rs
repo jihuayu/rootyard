@@ -401,12 +401,12 @@ pub(super) async fn push_private(
                     Ok(terminal) => terminal,
                     Err(error @ GatewayError::Conflict(_)) => {
                         match authorized(state)?
-                            .reject_superseded_serving(
+                            .reject_superseded_private(
                                 state.pool(),
                                 &token,
                                 &plan,
                                 verified.actor(),
-                                verified.digest(),
+                                &public_request,
                                 deadline,
                             )
                             .await

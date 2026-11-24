@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
-async fn slot_zero_private_stage_selection_and_commit_use_the_exact_public_attempt() -> Result<()> {
+async fn slot_zero_private_commit_and_superseded_refusal_use_the_exact_public_attempt() -> Result<()> {
     use super::{common, setup};
     use rootyard::ref_store::{
         RefStoreError, RequestDigest,
@@ -201,6 +201,30 @@ async fn slot_zero_private_stage_selection_and_commit_use_the_exact_public_attem
         ensure!(stored.parent_digest == plan.parent_digest().as_hex());
         ensure!(stored_ref(&db, repo.id, REF_RETRY).await?.is_none(), "selection published a ref");
         ensure!(db::gate_version(&db.pool, repo.id, actor.id).await?.revision() == gate.revision());
+        let mut stale_public = public.clone();
+        stale_public.public_id = Uuid::new_v4();
+        stale_public.wire_digest = wire_digest(gate.object_format(), REF_SIDE, None, &oid, CommitMode::Atomic);
+        let (stale_admitted, stale_plan) = admit_slot_zero(
+            &db,
+            &stale_public,
+            Uuid::new_v4(),
+            &IssuerLane::new(SLOT_ZERO_LANE)?,
+            &baseline,
+            vec![ref_update(gate.object_format(), REF_SIDE, None, &oid)?],
+            std::slice::from_ref(&files),
+        )
+        .await?;
+        let stale_token =
+            PackPendingToken::established(repo.id, actor.id, stale_admitted.private_id, *stale_plan.parent_digest())?;
+
+        ensure!(
+            adapter
+                .reject_superseded_private(&db.pool, &stale_token, &stale_plan, &actor, &stale_public, deadline())
+                .await?
+                .is_none(),
+            "an unmoved base was terminalized as superseded"
+        );
+
         let verified = adapter.verify(replay, deadline()).await?;
         let result = adapter.commit(&db.pool, &verified, deadline()).await?;
         let revision = gate.revision() + 1;
@@ -230,6 +254,51 @@ async fn slot_zero_private_stage_selection_and_commit_use_the_exact_public_attem
         ensure!(effects.get::<_, Uuid>(1) == admitted.private_id);
         ensure!(effects.get::<_, String>(2) == "committed");
         ensure!(effects.get::<_, i64>(3) == revision && effects.get::<_, i64>(4) == revision);
+
+        let mut bad_public = stale_public.clone();
+        bad_public.wire_digest = wrong_wire.wire_digest;
+        ensure!(
+            matches!(
+                adapter
+                    .reject_superseded_private(&db.pool, &stale_token, &stale_plan, &actor, &bad_public, deadline())
+                    .await,
+                Err(AuthorizedCommitError::Pack(PackCommitError::RefStore(RefStoreError::DigestConflict)))
+            ),
+            "another producer digest closed the private attempt"
+        );
+        ensure!(
+            matches!(
+                adapter
+                    .reject_superseded_private(
+                        &db.pool,
+                        &stale_token,
+                        &stale_plan,
+                        &invalid_token,
+                        &stale_public,
+                        deadline(),
+                    )
+                    .await,
+                Err(AuthorizedCommitError::Denied("token_invalid"))
+            ),
+            "invalid live credential closed the private attempt"
+        );
+        ensure!(operation_record(&db, repo.id, stale_admitted.private_id).await?.state() == OperationState::Pending);
+        let before_retirement = wrapper_json(&db, repo.id, stale_public.public_id).await?;
+        let stale = adapter
+            .reject_superseded_private(&db.pool, &stale_token, &stale_plan, &actor, &stale_public, deadline())
+            .await?
+            .ok_or_else(|| anyhow!("superseded attempt did not record a refusal"))?;
+        ensure!(stale.kind == TerminalKind::Rejected && stale.revision == revision && stale.registrations.is_empty());
+        ensure!(stale.rejection.as_ref().is_some_and(|refusal| refusal.code == "revision_mismatch"));
+        let stale_record = operation_record(&db, repo.id, stale_admitted.private_id).await?;
+        let stale_receipt = stale_record.terminal_result().ok_or_else(|| anyhow!("private refusal missing"))?;
+        ensure!(PackCommitTerminal::from_terminal_result(stale_receipt)? == stale);
+        let retirement = retirement_required(&db, &stale_public, stale_admitted.private_id).await?;
+        ensure!(retirement.event_revision == revision);
+        ensure!(wrapper_json(&db, repo.id, stale_public.public_id).await? == before_retirement);
+        ensure!(db::gate_version(&db.pool, repo.id, actor.id).await?.revision() == revision);
+        ensure!(stored_ref(&db, repo.id, REF_SIDE).await?.is_none());
+
         Ok(())
     }
     .await;
