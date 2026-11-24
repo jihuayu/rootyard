@@ -48,8 +48,9 @@ mod verify;
 
 use super::contract::VERIFIER_DEADLINE_SECONDS;
 use super::error::{PackCommitError, PackCommitRejectCode, PackCommitRejection};
+use super::pg;
 use super::plan::PackCommitPlan;
-use crate::ref_store::contract::RefStoreError;
+use crate::ref_store::{contract::RefStoreError, pg::public_attempt::PublicAttemptRequest};
 use deadpool_postgres::Pool;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -205,11 +206,36 @@ impl PgAuthorizedCommit {
         plan: PackCommitPlan,
         deadline: Instant,
     ) -> Result<PrepareOutcome, AuthorizedCommitError> {
+        self.prepare_for_attempt(pool, plan, None, deadline).await
+    }
+
+    /// Capture the pending attempt resolved by the authenticated serving gateway.
+    /// Public terminal replay remains owned by the wrapper read path.
+    pub(crate) async fn prepare_private(
+        &self,
+        pool: &Pool,
+        plan: PackCommitPlan,
+        public: &PublicAttemptRequest,
+        deadline: Instant,
+    ) -> Result<PrepareOutcome, AuthorizedCommitError> {
+        if self.store.backend_identity().as_hex() != public.backend_identity {
+            return Err(pg::reject(PackCommitRejectCode::PublicationMismatch, "private attempt backend differs").into());
+        }
+        self.prepare_for_attempt(pool, plan, Some(public), deadline).await
+    }
+
+    async fn prepare_for_attempt(
+        &self,
+        pool: &Pool,
+        plan: PackCommitPlan,
+        public: Option<&PublicAttemptRequest>,
+        deadline: Instant,
+    ) -> Result<PrepareOutcome, AuthorizedCommitError> {
         let deadline = effective_deadline(deadline)?;
         let mut client = pooled_client(pool, deadline).await?;
         let outcome = {
             let tx = crate::ref_store::tx::begin_bounded(&mut client, deadline).await?;
-            let captured = match timeout_at(deadline, prepare::prepare_in_tx(&tx, plan, deadline)).await {
+            let captured = match timeout_at(deadline, prepare::prepare_in_tx(&tx, plan, public, deadline)).await {
                 Ok(value) => value.map_err(AuthorizedCommitError::from),
                 Err(_) => Err(AuthorizedCommitError::from(PackCommitError::from(RefStoreError::Timeout))),
             };

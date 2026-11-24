@@ -151,7 +151,11 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("begin_slot_zero(", private)
         self.assertIn("Start::Fresh { plan, _token: token }", private)
         self.assertIn("publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline)", private)
-        self.assertIn("decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline)", private)
+        self.assertRegex(
+            private,
+            r"decide\(\s*state,\s*verified\.actor\(\),\s*\(\*plan\)\.clone\(\),\s*"
+            r"verified\.mode\(\),\s*Some\(&public_request\),\s*deadline,?\s*\)",
+        )
         self.assertIn("mirror_public_terminal_with_request(", private)
         self.assertIn("verified.actor(),", private)
         self.assertIn("PrivatePushOutcome::Terminal", private)
@@ -220,7 +224,11 @@ class PrivateReceiveFinishSourceTest(unittest.TestCase):
         self.assertIn("handoff.public().clone()", retire)
         self.assertIn("slot_one::rotate_slot_one(state, serving, &handoff, &baseline, deadline)", retire)
         self.assertIn("publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline)", retire)
-        self.assertIn("decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline)", retire)
+        self.assertRegex(
+            retire,
+            r"decide\(\s*state,\s*verified\.actor\(\),\s*\(\*plan\)\.clone\(\),\s*"
+            r"verified\.mode\(\),\s*Some\(&public_request\),\s*deadline,?\s*\)",
+        )
         self.assertIn("mirror_public_terminal_with_request(", retire)
         self.assertIn("verified.actor(),", retire)
         self.assertIn("slot_one::SlotOneAdmission::Replayed(_) => Err(GatewayError::OutcomeUnknown)", retire)

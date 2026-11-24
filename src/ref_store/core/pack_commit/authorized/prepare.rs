@@ -15,7 +15,7 @@ use super::super::receipt::PackCommitReceipt;
 use super::super::{pg, registration, sql};
 use crate::ref_store::contract::{OperationState, RefStoreError, RequestDigest};
 use crate::ref_store::core::decision_commit::{self, RealmExpectation};
-use crate::ref_store::pg::PgRefStore;
+use crate::ref_store::pg::{PgRefStore, public_attempt::PublicAttemptRequest};
 use tokio::time::Instant;
 use tokio_postgres::Transaction;
 use uuid::Uuid;
@@ -103,39 +103,46 @@ impl PreparedPublication {
 pub(super) async fn prepare_in_tx(
     tx: &Transaction<'_>,
     plan: PackCommitPlan,
+    public: Option<&PublicAttemptRequest>,
     deadline: Instant,
 ) -> Result<PrepareOutcome, PackCommitError> {
     crate::ref_store::pg::bound(tx, deadline).await?;
-    // Exact migration-138 prefix: operation advisory key, repository existence
-    // and issuer lane. An existing terminal replays here, first, unchanged.
-    let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
-    match begun.record.state() {
-        OperationState::Committed | OperationState::Rejected => {
-            if begun.created {
-                return Err(pg::reject(
-                    PackCommitRejectCode::AlreadyVerified,
-                    "authorized prepare never creates a terminal operation",
-                ));
+    if let Some(public) = public {
+        PgRefStore.lock_private_pending_attempt(tx, public, &plan, deadline).await?;
+    } else {
+        // Exact migration-138 prefix with historical terminal replay first.
+        let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
+        match begun.record.state() {
+            OperationState::Committed | OperationState::Rejected => {
+                if begun.created {
+                    return Err(pg::reject(
+                        PackCommitRejectCode::AlreadyVerified,
+                        "authorized prepare never creates a terminal operation",
+                    ));
+                }
+                return Ok(PrepareOutcome::Replayed(Box::new(pg::replay_terminal(begun)?)));
             }
-            return Ok(PrepareOutcome::Replayed(Box::new(pg::replay_terminal(begun)?)));
+            OperationState::Cancelled => {
+                return Err(pg::reject(PackCommitRejectCode::Cancelled, "cancellation tombstone won"));
+            }
+            OperationState::Pending => {}
         }
-        OperationState::Cancelled => {
-            return Err(pg::reject(PackCommitRejectCode::Cancelled, "cancellation tombstone won"));
+        if begun.created {
+            return Err(pg::reject(
+                PackCommitRejectCode::PendingMissing,
+                "authorized prepare requires a pending operation established by the A4 flow",
+            ));
         }
-        OperationState::Pending => {}
+        if begun.record.identity() != plan.identity() {
+            return Err(PackCommitError::from(RefStoreError::DigestConflict));
+        }
     }
-    if begun.created {
-        return Err(pg::reject(
-            PackCommitRejectCode::PendingMissing,
-            "authorized prepare requires a pending operation established by the A4 flow",
-        ));
+    let repository_scope = pg::ensure_repository(tx, &plan, true).await?;
+    if let Some(public) = public {
+        repository_scope
+            .require_serving(public.admission_owner_id, &public.backend_identity)
+            .map_err(|refusal| RefStoreError::Unsupported(refusal.reason()))?;
     }
-    if begun.record.identity() != plan.identity() {
-        return Err(PackCommitError::from(RefStoreError::DigestConflict));
-    }
-    // Unchanged isolated unserved repository authority. No global readiness
-    // relaxation is added for the authorized path.
-    pg::ensure_repository(tx, &plan, true).await?;
     // Frozen lock order: repository -> (usage) -> gate -> protocol row.
     let (gate, mode) = sql::gate_locked(tx, plan.repository_id())
         .await?

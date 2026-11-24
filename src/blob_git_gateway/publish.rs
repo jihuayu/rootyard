@@ -259,7 +259,7 @@ pub(super) async fn push(
                         plan.packs().get(index).ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
                     publish_pair(state, &plan, planned.pack_id(), pair, None, deadline).await?;
                 }
-                decide(state, actor, (*plan).clone(), mode, deadline).await
+                decide(state, actor, (*plan).clone(), mode, None, deadline).await
             }
             .await;
             match result {
@@ -386,7 +386,15 @@ pub(super) async fn push_private(
                             .ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
                         publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline).await?;
                     }
-                    decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline).await
+                    decide(
+                        state,
+                        verified.actor(),
+                        (*plan).clone(),
+                        verified.mode(),
+                        Some(&public_request),
+                        deadline,
+                    )
+                    .await
                 }
                 .await;
                 let terminal = match result {
@@ -885,7 +893,15 @@ pub(super) async fn retire_slot_one(
                     plan.packs().get(index).ok_or(GatewayError::Internal("slot one planned pack set is incomplete"))?;
                 publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline).await?;
             }
-            let terminal = decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline).await?;
+            let terminal = decide(
+                state,
+                verified.actor(),
+                (*plan).clone(),
+                verified.mode(),
+                Some(&public_request),
+                deadline,
+            )
+            .await?;
             let private_id = plan.identity().operation_id();
             let record =
                 load_terminal_record(state, serving.gate.repository_id(), private_id, deadline).await?;
@@ -1837,6 +1853,7 @@ async fn decide(
     actor: &Identity,
     plan: PackCommitPlan,
     mode: CommitMode,
+    public: Option<&PublicAttemptRequest>,
     deadline: Instant,
 ) -> Result<PackCommitTerminal, GatewayError> {
     let adapter = authorized(state)?;
@@ -1844,7 +1861,11 @@ async fn decide(
         CommitMode::Atomic => AuthorizedCommitMode::Atomic,
         CommitMode::AcceptedSubset => AuthorizedCommitMode::AcceptedSubset,
     };
-    let prepared = match adapter.prepare(state.pool(), plan, deadline).await.map_err(map_authorized)? {
+    let outcome = match public {
+        Some(public) => adapter.prepare_private(state.pool(), plan, public, deadline).await,
+        None => adapter.prepare(state.pool(), plan, deadline).await,
+    };
+    let prepared = match outcome.map_err(map_authorized)? {
         PrepareOutcome::Prepared(prepared) => prepared,
         PrepareOutcome::Replayed(receipt) => return Ok(receipt.terminal),
     };

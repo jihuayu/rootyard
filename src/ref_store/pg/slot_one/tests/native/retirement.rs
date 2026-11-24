@@ -31,11 +31,13 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
-async fn slot_zero_private_pack_registration_uses_the_exact_public_attempt() -> Result<()> {
+async fn slot_zero_private_pack_registration_and_prepare_use_the_exact_public_attempt() -> Result<()> {
     use super::{common, setup};
     use rootyard::ref_store::{
         RefStoreError, RequestDigest,
-        core::pack_commit::{PackRegistrationRequest, PgPackCommit},
+        core::pack_commit::{
+            AuthorizedCommitError, PackCommitRejectCode, PackRegistrationRequest, PgPackCommit, PrepareOutcome,
+        },
     };
 
     setup::require_owned_disposable_fixture()?;
@@ -48,7 +50,7 @@ async fn slot_zero_private_pack_registration_uses_the_exact_public_attempt() -> 
         let repo = db::provision_serving(&db.pool, &actor, &store, "slot-zero-register").await?;
         let baseline = capture_baseline(&db, repo.id, actor.id).await?;
         let gate = baseline.gate();
-        let fixture = git::GitRepo::new(git, gate.object_format()).await?;
+        let fixture = git::GitRepo::new(git.clone(), gate.object_format()).await?;
         let oid = fixture.build_commit("new-ref", b"new\n", "slot zero").await?;
         fixture.update_ref(REF_RETRY, &oid).await?;
         let files = fixture.pack_all("slot-zero-register").await?;
@@ -108,6 +110,41 @@ async fn slot_zero_private_pack_registration_uses_the_exact_public_attempt() -> 
             "a different wire digest replayed the committed private registration"
         );
         drop(client);
+        let adapter = PgAuthorizedCommit::new(store.clone(), git)?;
+        let wrapper_before = wrapper_json(&db, repo.id, public.public_id).await?;
+        ensure!(
+            matches!(
+                adapter.prepare(&db.pool, plan.clone(), deadline()).await,
+                Err(AuthorizedCommitError::Pack(PackCommitError::RefStore(RefStoreError::IdentityConflict)))
+            ),
+            "legacy prepare accepted a claimed private UUID"
+        );
+        ensure!(
+            matches!(
+                adapter.prepare_private(&db.pool, plan.clone(), &wrong_wire, deadline()).await,
+                Err(AuthorizedCommitError::Pack(PackCommitError::RefStore(RefStoreError::DigestConflict)))
+            ),
+            "a different wire digest captured the private attempt"
+        );
+        let mut wrong_backend = public.clone();
+        wrong_backend.backend_identity = "00".repeat(32);
+        ensure!(
+            matches!(
+                adapter.prepare_private(&db.pool, plan.clone(), &wrong_backend, deadline()).await,
+                Err(AuthorizedCommitError::Pack(PackCommitError::Rejected(rejection)))
+                    if rejection.code == PackCommitRejectCode::PublicationMismatch
+            ),
+            "a different backend captured the private attempt"
+        );
+        let capture = adapter.prepare_private(&db.pool, plan.clone(), &public, deadline()).await?;
+        let PrepareOutcome::Prepared(capture) = capture else {
+            bail!("pending private attempt replayed a terminal");
+        };
+        ensure!(capture.operation_id() == admitted.private_id);
+        ensure!(capture.gate_revision() == gate.revision());
+        ensure!(capture.new_packs().len() == 1 && capture.new_packs()[0].pack_id() == pack_id);
+        ensure!(wrapper_json(&db, repo.id, public.public_id).await? == wrapper_before);
+        ensure!(operation_record(&db, repo.id, admitted.private_id).await?.state() == OperationState::Pending);
         let stored = publication_for(&db, repo.id, admitted.private_id).await?;
         ensure!(stored.parent_digest == plan.parent_digest().as_hex());
         ensure!(stored_ref(&db, repo.id, REF_RETRY).await?.is_none(), "registration published a ref");
