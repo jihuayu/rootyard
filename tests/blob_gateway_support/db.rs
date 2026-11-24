@@ -226,6 +226,10 @@ impl Db {
     /// schema-isolated fixture above cannot host its wrapper functions. The
     /// caller must have CREATEDB; [`Db::finish`] drops this owned database.
     pub async fn setup_public_owned() -> Result<Self> {
+        ensure!(
+            std::env::var("ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES").as_deref() == Ok("1"),
+            "a disposable PostgreSQL fixture is required for the public-schema gateway test"
+        );
         // Pin the per-process Blob prefix through the existing fixture. The
         // random schema selector it also writes is discarded by `options`
         // below; only the independently owned database is used here.

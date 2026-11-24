@@ -1535,6 +1535,7 @@ jobs:
           # per-run prefix. This job-owned Garage is disposed as a whole after
           # the run; no per-key deletion is attempted.
           export ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1
+          export ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1
           export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
           export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
           lib="$evidence/session174-lib-tests"
@@ -1717,6 +1718,9 @@ jobs:
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
               'blob_git_gateway::admission_race_acceptance::pre_admission_revision_mismatch_rebases_to_old_oid_mismatch',
+              'blob_git_gateway::admission_race_acceptance::post_admission_independent_refs_both_commit',
+              'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
+              'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
           ]
           # Exact argv recorded by the builder invocations above, as emitted by the
           # current scripts/build_native_test.py --lib and scripts/build_native.py.
@@ -2290,6 +2294,9 @@ jobs:
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_carries_a5b_binding_and_keeps_the_native_view',
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
               'blob_git_gateway::admission_race_acceptance::pre_admission_revision_mismatch_rebases_to_old_oid_mismatch',
+              'blob_git_gateway::admission_race_acceptance::post_admission_independent_refs_both_commit',
+              'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
+              'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
           ]
           summary = re.compile(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; '
                                r'(\d+) measured; (\d+) filtered out; finished in ([0-9.]+)s$', re.M)
