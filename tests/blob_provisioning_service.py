@@ -56,6 +56,13 @@ Startup-refusal checkpoint (selected together by default, or alone):
 All startup cases compare only a closed fixed reason, keep no raw stderr in the
 report, and reuse only the harness-owned process group and temporary root.
 
+Runtime-outage checkpoint (selected together by default, or alone):
+
+* cut the real running service's PostgreSQL TCP path while its PostgreSQL
+  authority remains available to the fixture. Ingress and stock Git fail
+  closed. Restart the service using the healthy connection to the same
+  authority, then read the exact acknowledged Git state and retry creation.
+
 No SQL inserts a ready repository, binding, gate, protocol row, ref, object or
 ACK. SQL writes only the temporary barrier table/trigger/function in the random
 schema this run owns, plus one unserved legacy ``gitfs`` repository row in the
@@ -76,11 +83,13 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import blob_only_service as serving
+from cluster_partition_native import TcpPartition
 import ops_provenance
 
 
@@ -95,12 +104,14 @@ CASES = (
     "missing_database_url_is_explicit_refusal_without_listener",
     "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
     "unavailable_postgres_refuses_startup_and_preserves_authority",
+    "running_postgres_disconnect_fails_closed_and_restart_preserves_authority",
 )
 
 FIRST_CHECKPOINT = CASES[:4]
 SECOND_CHECKPOINT = CASES[4:5]
 REFUSAL_CHECKPOINT = CASES[5:7]
-STARTUP_CHECKPOINT = CASES[7:]
+STARTUP_CHECKPOINT = CASES[7:10]
+RUNTIME_OUTAGE_CHECKPOINT = CASES[10:]
 MAX_STARTUP_LOG_BYTES = 64 * 1024
 # Only these fixed, credential-free literals may be projected from child
 # startup output. Anything else is a test failure, never report evidence.
@@ -109,6 +120,7 @@ STARTUP_REFUSAL_REASONS = (
     "invalid Blob profile",
     "could not open the lifecycle barrier session",
 )
+RUNTIME_OUTAGE_REASON = "Blob service lost its lifecycle barrier"
 
 LIMITATIONS = [
     "Loopback HTTP, one PostgreSQL 17 server and one fixture-owned S3 provider; no Raft, multi-host, HA or physical durability claim.",
@@ -122,15 +134,16 @@ LIMITATIONS = [
     "Concurrency is a small bounded request group on one process, not a scalability benchmark.",
     "The harness sets the existing ROOTYARD_MAX_CONCURRENT_GIT knob to 8 so the half-ready read probe can run while one create is blocked; it is not a capacity claim.",
     "SHA-256 Git operations require the Root-supplied trusted Git to support that object format.",
-    "The unavailable PostgreSQL case covers startup and recovery of the same authority on one host. In-service partitions, database crash recovery and external authority have separate acceptance requirements.",
+    "The startup and runtime PostgreSQL refusal cases cover recovery of the same authority on one host. The runtime case cuts only this service's loopback relay; PostgreSQL crash recovery and external authority have separate acceptance requirements.",
 ]
 
 
 def input_hashes():
     """Source closure this harness imports or otherwise depends on."""
     root = Path(__file__).resolve().parent
-    names = (Path(__file__).name, "blob_only_service.py", "e2e.py", "native_evidence.py",
-             "ops_provenance.py", "owned_fuse_cleanup.py")
+    names = (Path(__file__).name, "blob_only_service.py", "cluster_partition_native.py",
+             "cluster_workload_native.py", "e2e.py", "native_evidence.py", "ops_provenance.py",
+             "owned_fuse_cleanup.py")
     return {name: serving.sha256_file(root / name) for name in names}
 
 
@@ -1286,6 +1299,106 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
                 "read_only_clone_fsck": True,
                 "ack_oid": oid}
 
+    def _outage_http_refusal(self, path, **kwargs):
+        try:
+            status, _, _ = self.http(path, **kwargs)
+        except urllib.error.URLError as error:
+            if not isinstance(error.reason, (ConnectionError, TimeoutError)):
+                raise
+            return "transport_unavailable"
+        except (ConnectionError, TimeoutError):
+            return "transport_unavailable"
+        assert status in (500, 502, 503, 504), "unexpected HTTP status during PostgreSQL loss: " + str(status)
+        return status
+
+    def running_postgres_disconnect_fails_closed_and_restart_preserves_authority(self):
+        name, outage_name = "running-pg-outage", "attempted-during-pg-outage"
+        files = {"known.txt": "acknowledged before PostgreSQL disconnect\n"}
+        payload = {"owner": "alice", "name": name, "object_format": "sha1"}
+        direct = urllib.parse.urlsplit(self.db)
+        assert direct.hostname in ("127.0.0.1", "localhost", "::1"), "runtime case needs owned loopback PostgreSQL"
+        assert not {"host", "hostaddr", "port", "service"}.intersection(
+            dict(urllib.parse.parse_qsl(direct.query, keep_blank_values=True))
+        ), "PostgreSQL options must not bypass the owned relay"
+        if self.proc is not None:
+            self.stop()
+        authority_query = (
+            "SELECT pg_postmaster_start_time()::text || '|' || incarnation::text"
+            " FROM public.cluster_authority WHERE singleton=true"
+        )
+        postgres_before = self.one(authority_query, "PostgreSQL authority before disconnect")
+        relay = TcpPartition(direct.hostname, direct.port or 5432)
+        try:
+            userinfo = direct.netloc.rsplit("@", 1)[0] + "@" if "@" in direct.netloc else ""
+            relay_url = urllib.parse.urlunsplit(direct._replace(netloc=f"{userinfo}127.0.0.1:{relay.port}"))
+            self.secrets.append(relay_url)
+            self.start(overrides={"DATABASE_URL": relay_url}, label="before-running-postgres-disconnect")
+            repo, _ = self.create(name, self.alice)
+            ack = self.push_and_clone(repo, name, "sha1", files)
+            remote = self.base + repo["clone_path"]
+            refs = self.remote_refs(remote, self.reader)
+            before = self.authority(repo, name)
+            assert self.authority_count_for_name(outage_name) == "0|0|0|0"
+            data = Path(self.env["ROOTYARD_DATA_DIR"])
+            assert not data.exists(), "Blob service created a legacy GitFS volume"
+            work = self.root / (name + "-work")
+            denied_oid = self.commit_files(work, "push during PostgreSQL disconnect", {"denied.txt": "unpublished\n"})
+            process = self.proc
+            assert process.poll() is None
+            relay.cut()
+            assert self._listener_absent(f"127.0.0.1:{relay.port}"), "owned PostgreSQL relay still listening"
+            assert self.one(authority_query, "PostgreSQL authority during disconnect") == postgres_before
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as callers:
+                read = callers.submit(self._outage_http_refusal, f"/api/repos/alice/{name}", token=self.reader)
+                ready = callers.submit(self._outage_http_refusal, "/health/ready")
+                replay = callers.submit(self._outage_http_refusal, "/api/repos", method="POST",
+                                        token=self.alice, body=payload)
+                create = callers.submit(self._outage_http_refusal, "/api/repos", method="POST",
+                                        token=self.alice, body={**payload, "name": outage_name})
+                git_read = callers.submit(self.git, "ls-remote", remote, token=self.reader, check=False)
+                git_push = callers.submit(self.git, "push", "--porcelain", "origin",
+                                          "HEAD:refs/heads/denied-during-outage", cwd=work, token=self.alice, check=False)
+                refusals = {"authorized_read": read.result(), "readiness": ready.result(),
+                            "idempotent_create": replay.result(), "new_create": create.result(),
+                            "git_ls_remote_exit": git_read.result().returncode,
+                            "git_push_exit": git_push.result().returncode}
+            assert refusals["git_ls_remote_exit"] != 0 and refusals["git_push_exit"] != 0
+            assert process.wait(timeout=20) == 1, "service did not exit on loss of its lifecycle barrier"
+            assert self._listener_absent(self.env["ROOTYARD_BIND"]), "old service still listening"
+            with self.log_path.open("rb") as stream:
+                raw = stream.read(MAX_STARTUP_LOG_BYTES + 1)
+            expected = ("Error: " + RUNTIME_OUTAGE_REASON).encode("ascii")
+            assert len(raw) <= MAX_STARTUP_LOG_BYTES and raw.splitlines().count(expected) == 1, (
+                "service exit did not report the fixed lifecycle-barrier reason"
+            )
+            assert self.authority(repo, name) == before
+            assert self.authority_count_for_name(outage_name) == "0|0|0|0", "outage create minted authority"
+        finally:
+            if not relay.closed.is_set():
+                relay.cut()
+
+        self.stop()
+        self.start(label="after-running-postgres-disconnect")
+        status, raw = self.post_create(payload, attempts=1)
+        assert status == 200, "post-disconnect create retry did not resolve the existing authority"
+        replay = json.loads(raw)
+        assert replay["id"] == repo["id"] and replay["state"] == "ready"
+        assert self.authority(repo, name) == before
+        assert self.one(authority_query, "PostgreSQL authority after reconnect") == postgres_before
+        assert self.remote_refs(remote, self.reader) == refs
+        clone = self.root / (name + "-recovered")
+        self.exact_clone(remote, clone, ack, "sha1", files, self.reader)
+        assert self.git("cat-file", "-e", denied_oid, cwd=clone, check=False).returncode != 0
+        created, created_status = self.create(outage_name, self.alice)
+        assert created_status == 201 and created["id"] != repo["id"]
+        new_counts = self.authority(created, outage_name)["counts"]
+        assert not data.exists(), "Blob service created a legacy GitFS volume"
+        return {"disconnect": refusals, "exit_reason": RUNTIME_OUTAGE_REASON, "exit_status": process.returncode,
+                "listener_absent": True, "postgres_authority_unchanged": True, "legacy_volume_absent": True,
+                "repository_id": repo["id"], "authority_unchanged": True, "idempotent_status": status,
+                "outage_create_authority_counts": "0|0|0|0", "post_recovery_create_authority_counts": new_counts,
+                "read_only_clone_fsck": True, "denied_object_absent": True, "ack_oid": ack}
+
 
 def report_result(harness, profile, blob_profile, selected, success, hashes):
     errors = []
@@ -1318,6 +1431,7 @@ def report_result(harness, profile, blob_profile, selected, success, hashes):
         "blob_profile": blob_profile,
         "checkpoints": {"first": list(FIRST_CHECKPOINT), "second": list(SECOND_CHECKPOINT),
                         "refusal": list(REFUSAL_CHECKPOINT), "startup": list(STARTUP_CHECKPOINT),
+                        "runtime_outage": list(RUNTIME_OUTAGE_CHECKPOINT),
                         "selected": list(selected)},
         "expected_cases": list(selected),
         "case_count": len(harness.results),
