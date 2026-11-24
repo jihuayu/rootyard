@@ -29,9 +29,10 @@ BEGIN
     END IF;
 END $$;
 
-\ir ref_store_public_attempts_migration_152.sql
 \if :issue42_candidate
-    \ir ref_store_three_attempt_candidate.sql
+    \ir ref_store_three_attempt_migration_152.sql
+\else
+    \ir ref_store_public_attempts_migration_152.sql
 \endif
 
 -- Scratch helpers create M138/M147 evidence for the exact operation and wire.
