@@ -24,7 +24,7 @@
 
 6. **Strict Replay Zero-Write Contract (`src/blob_git_gateway/receive.rs`, `reclaim_sweeper.rs`)**:
    - The gateway sweeps only on the fresh receive path. Pending, cancelled and replayed operations bypass the sweep. The sweeper requires a configured reclaim operator and an existing private ledger directory.
-   - Replaying a durable terminal leaves the reclaim ledger, PostgreSQL operation and artifact ledgers, and S3 objects unchanged.
+   - A request that finds an exact durable terminal at its first probe leaves the reclaim ledger, PostgreSQL operation and artifact ledgers, and S3 objects unchanged.
 
 ## Concurrent Smart HTTP Receive
 
@@ -33,5 +33,7 @@ On `rootyard serve-blob`, migration 152 gives one public push ID up to three pri
 The gateway rechecks the requested old OIDs at each attempt. A conflicting old OID retains the native stale-ref result. An ambiguous commit remains subject to durable resolution for the same operation. The final Git report preserves the request's atomic or accepted-subset semantics.
 
 Operation reads and owner/admin cancellation use the stable public ID. Cancellation settles the current attempt and public result in a single PostgreSQL transaction, preserving an already committed or rejected terminal. Public responses omit private attempt IDs.
+
+The reclaim ledger retains that same public ID. Before deleting staging bytes for a rejected or cancelled push, PostgreSQL must verify every attempt in the wrapper history, the exact tenant and backend, and the absence of live references.
 
 The GitHub RefStore protocol native acceptance job runs slow-body overlap, same-ref CAS, and two- and three-writer first-request cases with stock Git, PostgreSQL 17, and Garage. The three-writer case uses an owned PostgreSQL fixture that can create an isolated database. It checks all three first responses, exact retirement rows, fresh clone refs, and strict Git fsck.

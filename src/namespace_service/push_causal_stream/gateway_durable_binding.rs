@@ -19,7 +19,8 @@ pub(super) async fn reclaim_binding(
 ) -> Result<Option<ReclaimBinding>, PushCausalError> {
     let schema = client
         .query_one(
-            "SELECT (to_regclass('ref_store_public_operations') IS NOT NULL)::integer
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152),
+                    (to_regclass('ref_store_public_operations') IS NOT NULL)::integer
                     + (to_regclass('ref_store_private_attempts') IS NOT NULL)::integer
                     + (to_regclass('ref_store_attempt_retirements') IS NOT NULL)::integer
                     + (to_regprocedure('rootyard_ref_store_verify_public_operation(uuid,uuid)')
@@ -27,11 +28,10 @@ pub(super) async fn reclaim_binding(
             &[],
         )
         .await
-        .map_err(reclaim_read_error)?
-        .get::<_, i32>(0);
-    match schema {
-        0 => return Ok(Some(ReclaimBinding::Legacy)),
-        4 => {}
+        .map_err(reclaim_read_error)?;
+    match (schema.get::<_, bool>(0), schema.get::<_, i32>(1)) {
+        (false, 0) => return Ok(Some(ReclaimBinding::Legacy)),
+        (true, 4) => {}
         _ => return Err(PushCausalError::StateMachine("incomplete public attempt reclaim schema".into())),
     }
     let wrapper = client
