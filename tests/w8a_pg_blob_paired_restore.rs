@@ -316,6 +316,19 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
         "old browser credential survived"
     );
     let client = destination_pool.get().await?;
+    let lineage: bool = client
+        .query_one(
+            "SELECT (SELECT count(*) FROM public.ref_store_restore_lineage)=2 AND EXISTS (
+             SELECT FROM public.ref_store_restore_lineage last
+             JOIN public.ref_store_restore_lineage first ON first.target_incarnation=last.source_incarnation
+             JOIN public.cluster_authority c ON c.singleton AND c.incarnation=last.target_incarnation
+             WHERE last.target_incarnation=$1 AND first.source_incarnation=$2
+         )",
+            &[&restored.new_cluster_incarnation, &seeded.cluster_incarnation],
+        )
+        .await?
+        .get(0);
+    ensure!(lineage, "signed W8-A restore must connect its final live cluster to the verified archived source");
     let ci: Vec<String> = client.query("SELECT state FROM ci_runs", &[]).await?.iter().map(|row| row.get(0)).collect();
     ensure!(ci.iter().all(|state| state == "cancelled"), "CI runs were not cancelled: {ci:?}");
     let checkout: Vec<(bool, bool, bool)> = client
