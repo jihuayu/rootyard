@@ -75,7 +75,7 @@ impl ReceiveContext<'_> {
                     }
                 }
             }
-            operation::Probe::FinishCancelled { .. } => {
+            operation::Probe::FinishCancelled => {
                 return Err(GatewayError::Conflict("operation cancellation requires reconciliation"));
             }
         };

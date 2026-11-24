@@ -98,7 +98,7 @@ pub(super) enum Probe {
     Replay { terminal: PackCommitTerminal, private_id: Option<Uuid> },
     Cancelled { reason: &'static str },
     Finish { terminal: PackCommitTerminal, private_id: Uuid, evidence: PublicAttemptEvidence, record: OperationRecord },
-    FinishCancelled { reason: &'static str },
+    FinishCancelled,
 }
 
 /// Compute the operation-level request digest over the **decoded** wire body.
@@ -383,7 +383,7 @@ pub(super) async fn probe_public(
                     (OperationState::Pending, Claim::Replay(terminal)) => {
                         Ok(Probe::Finish { terminal, private_id, evidence, record })
                     }
-                    (OperationState::Pending, Claim::Cancelled(reason)) => Ok(Probe::FinishCancelled { reason }),
+                    (OperationState::Pending, Claim::Cancelled(_)) => Ok(Probe::FinishCancelled),
                     (_, Claim::Replay(terminal)) => Ok(Probe::Replay { terminal, private_id: Some(private_id) }),
                     (_, Claim::Cancelled(reason)) => Ok(Probe::Cancelled { reason }),
                     (_, Claim::Pending) => Ok(Probe::Pending),
