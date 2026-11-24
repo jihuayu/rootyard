@@ -22,6 +22,8 @@ pub mod format30_luna_gates;
 pub mod format30_luna_startup_gates;
 #[path = "paired_raft_backup_support/mtls_cluster.rs"]
 pub mod mtls_cluster;
+#[path = "paired_raft_backup_support/format30_resync_gate.rs"]
+mod resync_gate;
 
 use std::fs;
 

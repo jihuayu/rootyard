@@ -13,7 +13,8 @@ use super::{AuthorizedCommitError, PgAuthorizedCommit, effective_deadline, poole
 use crate::db::Identity;
 use crate::ref_store::contract::{OperationIdentity, OperationLookup, OperationRecord};
 use crate::ref_store::core::publication_decision::{self, CancelOutcome};
-use crate::ref_store::pg::PgRefStore;
+use crate::ref_store::pg::{LegacyStatusLookup, PgRefStore};
+use crate::ref_store::serving::ServingRepository;
 use crate::ref_store::tx::{begin_bounded, commit_bounded};
 use tokio::time::{Instant, timeout_at};
 use tokio_postgres::Transaction;
@@ -48,7 +49,82 @@ impl AuthorizedCancelReceipt {
     }
 }
 
+enum GatewayCancellation {
+    Missing,
+    Legacy,
+    Public(OperationRecord),
+}
+
 impl PgAuthorizedCommit {
+    /// Resolve the stable HTTP identifier and cancel its exact current attempt.
+    /// The coordinator rechecks live owner/admin authority before committing.
+    pub(crate) async fn cancel_gateway_operation(
+        &self,
+        pool: &deadpool_postgres::Pool,
+        actor: &Identity,
+        serving: &ServingRepository,
+        public_id: Uuid,
+        reason: &str,
+        deadline: Instant,
+    ) -> Result<Option<OperationRecord>, AuthorizedCommitError> {
+        let deadline = effective_deadline(deadline)?;
+        let repository_id = serving.gate.repository_id();
+        let mut client = pooled_client(pool, deadline).await?;
+        let tx = begin_bounded(&mut client, deadline).await?;
+        let stage = async {
+            let route = PgRefStore.get_legacy_status(&tx, repository_id, public_id, deadline).await?;
+            match route {
+                LegacyStatusLookup::PrivateIdentifier | LegacyStatusLookup::Unknown => {
+                    return Ok(GatewayCancellation::Missing);
+                }
+                LegacyStatusLookup::Legacy(_) => return Ok(GatewayCancellation::Legacy),
+                LegacyStatusLookup::PublicWrapper => {}
+            }
+            super::super::pg::set_ack_durability(&tx, deadline).await?;
+            let cancellation = PgRefStore
+                .lock_public_cancellation(&tx, serving, self.store.backend_identity().as_hex(), public_id, deadline)
+                .await?;
+            publication_decision::cancel::coordinator_cancel_public_attempt(
+                &tx,
+                actor,
+                &cancellation,
+                reason,
+                deadline,
+            )
+            .await
+            .map_err(super::decision_error)?;
+            let private_id = cancellation.identity().operation_id();
+            let OperationLookup::Known(record) = PgRefStore.get(&tx, repository_id, private_id, deadline).await? else {
+                return Err(AuthorizedCommitError::Ledger("public cancellation current attempt disappeared"));
+            };
+            PgRefStore.finish_public_cancellation(&tx, &cancellation, &record, deadline).await?;
+            Ok(GatewayCancellation::Public(record))
+        };
+        match timeout_at(deadline, stage).await {
+            Ok(Ok(GatewayCancellation::Public(record))) => {
+                commit_bounded(tx, deadline, repository_id, Some(public_id)).await.map_err(PackCommitError::from)?;
+                Ok(Some(record))
+            }
+            Ok(Ok(GatewayCancellation::Missing)) => {
+                super::rollback(tx, deadline).await?;
+                Ok(None)
+            }
+            Ok(Ok(GatewayCancellation::Legacy)) => {
+                super::rollback(tx, deadline).await?;
+                drop(client);
+                self.cancel_known(pool, actor, repository_id, public_id, reason, deadline).await
+            }
+            Ok(Err(error)) => {
+                let _ = super::rollback(tx, deadline).await;
+                Err(error)
+            }
+            Err(_) => {
+                let _ = super::rollback(tx, deadline).await;
+                Err(AuthorizedCommitError::Timeout)
+            }
+        }
+    }
+
     /// Cancel one publication before it installs (or after it installed but before
     /// it consumed).
     ///
@@ -103,7 +179,8 @@ impl PgAuthorizedCommit {
     /// the registry read, so this resolution is linearized with a concurrent
     /// begin/commit on the same UUID. A known record must also have its exact
     /// migration-147 producer binding; a missing or inconsistent binding is a
-    /// ledger refusal, never a weaker cancellation.
+    /// ledger refusal, never a weaker cancellation. Wrapper and attempt UUIDs
+    /// are conflicts at this legacy entrypoint.
     ///
     /// `Ok(None)` means no operation row exists for this repository; the
     /// transaction is rolled back and **no cancellation tombstone is written**.
@@ -197,7 +274,7 @@ async fn resolve_registered_operation(
     operation_id: Uuid,
     deadline: Instant,
 ) -> Result<Option<OperationRecord>, AuthorizedCommitError> {
-    let record = match PgRefStore.get(tx, repository_id, operation_id, deadline).await? {
+    let record = match PgRefStore.get_legacy_locked(tx, repository_id, operation_id, deadline).await? {
         OperationLookup::Unknown => return Ok(None),
         OperationLookup::Known(record) => record,
     };

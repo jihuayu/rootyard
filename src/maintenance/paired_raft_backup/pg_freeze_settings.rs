@@ -3,12 +3,12 @@
 
 use std::time::{Duration, Instant};
 
-use tokio_postgres::GenericClient;
+use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;
 
 use crate::config::Config;
 
-use super::pg_cutpoint::pg_err;
+use super::pg_cutpoint::{pg_err, require_pg_projection_resync_clear};
 use super::types::PairedBackupError;
 
 /// Database-wide durable freeze setting stored in PostgreSQL `pg_db_role_setting`
@@ -18,6 +18,10 @@ pub const PG_FREEZE_SETTING: &str = "rootyard.paired_backup_freeze";
 /// Advisory lock serializing exclusive freeze entry against `journal::retire` shared-lock
 /// transactions, so an in-flight resolution cannot race the durable read-only latch.
 pub const PAIRED_FREEZE_JOURNAL_LOCK_KEY: i64 = 738_390_153;
+
+// Serialize ownership of the provisional latch without taking the journal
+// retirement lock or touching the live Raft freeze.
+const PG_FREEZE_LATCH_LOCK_KEY: i64 = 738_391_153;
 
 pub async fn read_pg_database_freeze_marker(
     client: &(impl GenericClient + Sync),
@@ -218,6 +222,97 @@ pub(super) async fn set_pg_database_read_only(
     Ok(())
 }
 
+/// The per-database settings owned by the provisional PostgreSQL latch.
+pub(super) struct ProvisionalPgFreeze {
+    marker: String,
+    previous: Vec<String>,
+}
+
+impl ProvisionalPgFreeze {
+    pub(super) async fn begin(client: &mut Client, barrier_id: Uuid, epoch: u64) -> Result<Self, PairedBackupError> {
+        let marker = format!("{barrier_id}:{epoch}");
+        let tx = client.transaction().await.map_err(pg_err)?;
+        let owns_latch: bool = tx
+            .query_one("SELECT pg_try_advisory_xact_lock($1)", &[&PG_FREEZE_LATCH_LOCK_KEY])
+            .await
+            .map_err(pg_err)?
+            .get(0);
+        if !owns_latch {
+            return Err(PairedBackupError::FreezeNotHeld("another PostgreSQL freeze is entering"));
+        }
+        let previous = Self::read(&tx).await?;
+        if Self::setting(&previous, PG_FREEZE_SETTING).is_some() {
+            return Err(PairedBackupError::FreezeNotHeld("another PostgreSQL freeze marker is already active"));
+        }
+        set_pg_database_freeze_marker(&tx, Some(&marker)).await?;
+        set_pg_database_read_only(&tx, true).await?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(Self { marker, previous })
+    }
+
+    pub(super) async fn refuse_resync_before_raft(&self, client: &mut Client) -> Result<(), PairedBackupError> {
+        if let Err(error) = require_pg_projection_resync_clear(client).await {
+            if matches!(error, PairedBackupError::CutpointSkew(_)) {
+                // An already-open projector transaction committed after
+                // preflight. Drain connections while our marker still blocks
+                // another entrant, then reopen without further termination.
+                terminate_and_await_other_pg_sessions(client, Duration::from_secs(5)).await?;
+                self.restore_if_owned(client).await?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn read(client: &(impl GenericClient + Sync)) -> Result<Vec<String>, PairedBackupError> {
+        Ok(client
+            .query_one(
+                "SELECT COALESCE(
+                    (SELECT setconfig FROM pg_catalog.pg_db_role_setting
+                     WHERE setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
+                       AND setrole = 0), '{}'::text[])",
+                &[],
+            )
+            .await
+            .map_err(pg_err)?
+            .get(0))
+    }
+
+    fn setting<'a>(settings: &'a [String], name: &str) -> Option<&'a str> {
+        settings.iter().find_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            (key == name).then_some(value)
+        })
+    }
+
+    /// Revert only our provisional latch, before any Raft or ledger changes.
+    async fn restore_if_owned(&self, client: &mut Client) -> Result<(), PairedBackupError> {
+        let tx = client.transaction().await.map_err(pg_err)?;
+        tx.batch_execute("SET LOCAL lock_timeout = '5s'").await.map_err(pg_err)?;
+        // Retake the ALTER DATABASE settings row lock with a latch write.
+        // A competing marker update cannot interleave between the ownership
+        // check and our reset. On mismatch this transaction rolls back.
+        set_pg_database_read_only(&tx, true).await?;
+        if Self::setting(&Self::read(&tx).await?, PG_FREEZE_SETTING) != Some(self.marker.as_str()) {
+            return Err(PairedBackupError::FreezeNotHeld("provisional PostgreSQL freeze marker ownership changed"));
+        }
+        let db_name: String = tx.query_one("SELECT current_database()", &[]).await.map_err(pg_err)?.get(0);
+        let quoted_db = db_name.replace('"', "\"\"");
+        for name in [PG_FREEZE_SETTING, "default_transaction_read_only", "lock_timeout"] {
+            let sql = if let Some(value) = Self::setting(&self.previous, name) {
+                let quoted: String =
+                    tx.query_one("SELECT pg_catalog.quote_literal($1::text)", &[&value]).await.map_err(pg_err)?.get(0);
+                format!("ALTER DATABASE \"{quoted_db}\" SET {name} = {quoted}")
+            } else {
+                format!("ALTER DATABASE \"{quoted_db}\" RESET {name}")
+            };
+            tx.batch_execute(&sql).await.map_err(pg_err)?;
+        }
+        tx.commit().await.map_err(pg_err)?;
+        Ok(())
+    }
+}
+
 /// Provision an ephemeral dedicated backup login role with
 /// `ALTER ROLE "<role>" IN DATABASE "<db>" SET default_transaction_read_only = off`
 /// so `crate::backup::create` (`LOCK TABLE ... IN SHARE MODE` + `pg_dump`) runs without
@@ -266,5 +361,49 @@ pub(super) async fn drop_ephemeral_backup_role(
          DROP ROLE IF EXISTS \"{role_name}\";"
     );
     client.batch_execute(&sql).await.map_err(pg_err)?;
+    Ok(())
+}
+
+pub(super) async fn verify_pg_quiescent_before_freeze(
+    client: &(impl GenericClient + Sync),
+) -> Result<(), PairedBackupError> {
+    let row = client
+        .query_one(
+            "SELECT \
+               (SELECT count(*)::bigint FROM public.repositories WHERE transition_state <> 'stable'), \
+               (SELECT count(*)::bigint FROM public.git_operations WHERE outcome = 'unknown') \
+               + (SELECT count(*)::bigint FROM public.ref_store_operations WHERE state NOT IN ('committed','rejected','cancelled')) \
+               + (SELECT count(*)::bigint FROM public.ref_store_publication_decisions WHERE state = 'OPEN'), \
+               EXISTS(SELECT 1 FROM public.schema_migrations WHERE version = 152), \
+               to_regclass('public.ref_store_public_operations') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(pg_err)?;
+    let (transitioning, inflight): (i64, i64) = (row.get(0), row.get(1));
+    if transitioning != 0 {
+        return Err(PairedBackupError::FreezeNotHeld("repository storage transition in progress"));
+    }
+    if inflight != 0 {
+        return Err(PairedBackupError::UnknownInFlightOperations(inflight as usize));
+    }
+
+    let registered: bool = row.get(2);
+    let public_operations_present: bool = row.get(3);
+    if registered != public_operations_present {
+        return Err(PairedBackupError::FreezeNotHeld("migration 152 public operation catalog is incomplete"));
+    }
+    if public_operations_present {
+        // A private A4 terminal can commit before its separate A5 public mirror.
+        // The wrapper remains unresolved even when every core operation is terminal.
+        let pending: i64 = client
+            .query_one("SELECT count(*)::bigint FROM public.ref_store_public_operations WHERE state = 'pending'", &[])
+            .await
+            .map_err(pg_err)?
+            .get(0);
+        if pending != 0 {
+            return Err(PairedBackupError::UnknownInFlightOperations(pending as usize));
+        }
+    }
     Ok(())
 }

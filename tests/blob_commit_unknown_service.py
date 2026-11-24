@@ -160,6 +160,7 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         "_create_commit_gate", "_validate_blocker_application_name",
         "_long_http", "_json_rows", "exact_ledger", "pack_identity", "operation_row",
         "operation_row_optional", "cancellation_snapshot", "insert_unbound_operation",
+        "current_public_attempt", "assert_no_public_operation", "assert_private_id_hidden",
         "add_write_collaborator",
     })
     _SAFE_FAILURE_CONTEXT_LIMIT = 5
@@ -291,7 +292,43 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             "gate": self._json_rows(repo_id, "ref_store_core_gates", "t.repository_id"),
             "events": self._json_rows(repo_id, "ref_store_core_events", "t.event_id"),
             "operations": self._json_rows(repo_id, "ref_store_operations", "t.operation_id"),
+            "public_operations": self._json_rows(repo_id, "ref_store_public_operations", "t.public_id"),
+            "private_attempts": self._json_rows(repo_id, "ref_store_private_attempts", "t.public_id,t.slot"),
+            "attempt_retirements": self._json_rows(repo_id, "ref_store_attempt_retirements", "t.public_id,t.slot"),
         }
+
+    def current_public_attempt(self, repo_id, public_id, state):
+        rid = str(uuid.UUID(repo_id))
+        public_id = str(uuid.UUID(public_id))
+        bindings = rows(self.sql(
+            "SELECT coalesce(jsonb_agg(jsonb_build_object('wrapper',to_jsonb(w),'attempt',to_jsonb(a))),"
+            "'[]'::jsonb)::text FROM ref_store_public_operations w "
+            "JOIN ref_store_private_attempts a ON "
+            "(a.repository_id,a.public_id,a.slot)=(w.repository_id,w.public_id,w.current_slot) "
+            "WHERE w.repository_id='" + rid + "' AND w.public_id='" + public_id + "'"))
+        assert len(bindings) == 1, "public operation must select exactly one current attempt"
+        wrapper = bindings[0]["wrapper"]
+        attempt = bindings[0]["attempt"]
+        assert wrapper["state"] == state, wrapper["state"]
+        assert wrapper["current_slot"] == attempt["slot"] == 0, "this fixture has no rotation"
+        assert attempt["private_id"] != public_id, "public and private operation identities must differ"
+        assert self.operation_row_optional(repo_id, public_id) is None, "public id has a physical operation row"
+        return wrapper, attempt
+
+    def assert_no_public_operation(self, repo_id, operation):
+        rid = str(uuid.UUID(repo_id))
+        operation = str(uuid.UUID(operation))
+        assert self.sql(
+            "SELECT NOT EXISTS (SELECT 1 FROM ref_store_public_operations w "
+            "WHERE w.repository_id='" + rid + "' AND w.public_id='" + operation + "') "
+            "AND NOT EXISTS (SELECT 1 FROM ref_store_private_attempts a "
+            "WHERE a.repository_id='" + rid + "' AND a.private_id='" + operation + "')") == "t"
+
+    @staticmethod
+    def assert_private_id_hidden(payload, headers, private_id):
+        assert private_id.encode("ascii") not in payload, "HTTP body exposed a private operation identity"
+        assert all(private_id not in value for value in headers.values()), \
+            "HTTP headers exposed a private operation identity"
 
     def pack_identity(self, repo_id, operation):
         rid = str(uuid.UUID(repo_id))
@@ -628,6 +665,18 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         seed_operations = rows(before["operations"])
         assert len(seed_operations) == 1, seed_operations
         seed_operation = seed_operations[0]
+        seed_wrappers = rows(before["public_operations"])
+        assert len(seed_wrappers) == 1, seed_wrappers
+        seed_public_id = seed_wrappers[0]["public_id"]
+        seed_wrapper, seed_attempt = self.current_public_attempt(repo["id"], seed_public_id, "committed")
+        seed_private_id = seed_attempt["private_id"]
+        assert seed_operation["operation_id"] == seed_private_id
+        assert seed_wrapper["issuer_id"] == seed_operation["issuer_id"] == self.alice["user_id"]
+        seed_event = row_for(rows(before["events"]), "operation_id", seed_private_id)
+        assert seed_event["event_id"] == seed_wrapper["event_id"]
+        assert rows(before["private_attempts"]) == [seed_attempt]
+        assert rows(before["attempt_retirements"]) == []
+        private_ids = {seed_public_id: seed_private_id}
         base_revision = rows(before["gate"])[0]["revision"]
         assert base_revision >= 2, base_revision
         new_revision = base_revision + 1
@@ -668,17 +717,27 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             inflight_operations = rows(inflight["operations"])
             assert len(inflight_operations) == 2, inflight_operations
             assert row_for(inflight_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
-            inflight_operation = self.operation_row(repo["id"], operation)
-            assert inflight_operation == row_for(inflight_operations, "operation_id", operation)
+            inflight_wrapper, inflight_attempt = self.current_public_attempt(repo["id"], operation, "pending")
+            private_id = inflight_attempt["private_id"]
+            private_ids[operation] = private_id
+            self.assert_private_id_hidden(response, response_headers, private_id)
+            assert inflight_wrapper["issuer_id"] == self.alice["user_id"]
+            assert len(rows(inflight["public_operations"])) == 2
+            assert len(rows(inflight["private_attempts"])) == 2
+            assert inflight["attempt_retirements"] == before["attempt_retirements"]
+            assert row_for(rows(inflight["public_operations"]), "public_id", seed_public_id) == seed_wrapper
+            assert row_for(rows(inflight["private_attempts"]), "private_id", seed_private_id) == seed_attempt
+            inflight_operation = self.operation_row(repo["id"], private_id)
+            assert inflight_operation == row_for(inflight_operations, "operation_id", private_id)
             assert inflight_operation["state"] == "pending", inflight_operation
             assert inflight_operation["terminal_result"] is None, inflight_operation
-            inflight_pack = self.pack_identity(repo["id"], operation)
+            inflight_pack = self.pack_identity(repo["id"], private_id)
             inflight_publications = rows(inflight_pack["publications"])
             inflight_artifacts = rows(inflight_pack["artifacts"])
             assert len(inflight_publications) == 1, inflight_publications
             assert len(inflight_artifacts) == 2, inflight_artifacts
             assert sorted(item["role"] for item in inflight_artifacts) == ["idx", "pack"], inflight_artifacts
-            assert inflight_publications[0]["plan_operation_id"] == operation, inflight_publications
+            assert inflight_publications[0]["plan_operation_id"] == private_id, inflight_publications
             assert ({item["registration_id"] for item in inflight_artifacts}
                     == {inflight_publications[0]["registration_id"]}), inflight_artifacts
             # Force a deterministic durable-pending settlement: terminate only
@@ -717,6 +776,7 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             assert status == 200, "GET operation " + label + ": " + str(status) + ": " + repr(raw[:300])
             assert blob.header_value(headers, "cache-control") == "no-store", headers
             parsed = json.loads(raw)
+            self.assert_private_id_hidden(raw, headers, private_ids[target_operation])
             assert parsed["operation_id"] == target_operation, parsed
             if expected is not None:
                 assert parsed["state"] == expected, parsed
@@ -725,6 +785,8 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         def post_cancel(target_operation, token=None):
             status, raw, headers = self.http(cancel_path_for(target_operation), token=token, method="POST")
             assert blob.header_value(headers, "cache-control") == "no-store", headers
+            if target_operation in private_ids:
+                self.assert_private_id_hidden(raw, headers, private_ids[target_operation])
             return status, raw, headers
 
         def assert_error(raw):
@@ -748,12 +810,13 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         settled_operations = rows(settled["operations"])
         assert len(settled_operations) == 2, settled_operations
         assert row_for(settled_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
-        settled_operation = self.operation_row(repo["id"], operation)
-        assert row_for(settled_operations, "operation_id", operation) == settled_operation
+        settled_operation = self.operation_row(repo["id"], private_id)
+        assert row_for(settled_operations, "operation_id", private_id) == settled_operation
         assert settled_operation["state"] == "pending", settled_operation
         assert settled_operation["terminal_result"] is None, settled_operation
-        assert self.pack_identity(repo["id"], operation) == inflight_pack, \
+        assert self.pack_identity(repo["id"], private_id) == inflight_pack, \
             "pending settlement changed the durable pack identity"
+        assert settled == inflight, "terminated COMMIT changed the pending ledger"
 
         cancel_status, cancel_raw, _ = post_cancel(operation, self.alice)
         assert cancel_status == 200, "pending cancel: " + str(cancel_status) + ": " + repr(cancel_raw[:300])
@@ -772,21 +835,29 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert cancelled["gate"] == before["gate"], "cancel moved the gate"
         assert gate_identity(cancelled["gate"]) == baseline_gate_identity, cancelled["gate"]
         assert cancelled["events"] == before["events"], "cancel wrote an event"
-        cancelled_operation = self.operation_row(repo["id"], operation)
+        cancelled_wrapper, cancelled_attempt = self.current_public_attempt(repo["id"], operation, "cancelled")
+        assert cancelled_attempt == inflight_attempt
+        assert cancelled_wrapper == {**inflight_wrapper, "state": "cancelled", "cancelled_private_id": private_id}
+        assert len(rows(cancelled["public_operations"])) == 2
+        assert row_for(rows(cancelled["public_operations"]), "public_id", seed_public_id) == seed_wrapper
+        assert cancelled["private_attempts"] == settled["private_attempts"]
+        assert cancelled["attempt_retirements"] == settled["attempt_retirements"]
+        cancelled_operation = self.operation_row(repo["id"], private_id)
         assert cancelled_operation["state"] == "cancelled", cancelled_operation
         assert cancelled_operation["terminal_result"] == cancel_terminal, cancelled_operation
         assert row_for(rows(cancelled["operations"]), "operation_id",
                        seed_operation["operation_id"]) == seed_operation
-        assert self.pack_identity(repo["id"], operation) == inflight_pack, \
+        assert self.pack_identity(repo["id"], private_id) == inflight_pack, \
             "cancel changed the durable pack identity"
 
-        tombstones = self.cancellation_snapshot(repo["id"], operation)
+        tombstones = self.cancellation_snapshot(repo["id"], private_id)
         assert len(tombstones["legacy"]) == 1, tombstones
         legacy = tombstones["legacy"][0]
-        assert legacy["operation_id"] == operation, legacy
+        assert legacy["operation_id"] == private_id, legacy
         assert legacy["request_digest"] == settled_operation["request_digest"], legacy
         assert len(tombstones["decision"]) == 1, tombstones
         decision = tombstones["decision"][0]
+        assert decision["operation_id"] == private_id, decision
         assert decision["reason"] == "http_cancel_requested", decision
         assert decision["actor_id"] == self.alice["user_id"], decision
 
@@ -797,13 +868,14 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert same_wire_status == 200, ("same-wire cancellation replay: "
                                          + str(same_wire_status) + " " + repr(same_wire_body[:300]))
         assert blob.header_value(same_wire_headers, "x-rootyard-operation") == operation, same_wire_headers
+        self.assert_private_id_hidden(same_wire_body, same_wire_headers, private_id)
         unpack, statuses = blob.parse_receive_report(same_wire_body)
         assert unpack == "unpack ok", unpack
         assert statuses == ["ng refs/heads/main operation was cancelled"], statuses
         after_replay = self.exact_ledger(repo["id"])
         assert after_replay == cancelled, "same-wire cancellation replay changed durable state"
-        assert self.pack_identity(repo["id"], operation) == inflight_pack
-        assert self.cancellation_snapshot(repo["id"], operation) == tombstones, \
+        assert self.pack_identity(repo["id"], private_id) == inflight_pack
+        assert self.cancellation_snapshot(repo["id"], private_id) == tombstones, \
             "same-wire cancellation replay changed a tombstone"
         _, replay_view = get_view(operation, "after same-wire replay", "cancelled")
         assert replay_view == cancel_view
@@ -823,14 +895,15 @@ class CheckpointHarness(blob.BlobOnlyHarness):
                                          + str(divergent_status) + " " + repr(divergent_raw[:300]))
         assert blob.header_value(divergent_headers, "x-rootyard-operation") == operation, divergent_headers
         assert blob.header_value(divergent_headers, "cache-control") == "no-store", divergent_headers
+        self.assert_private_id_hidden(divergent_raw, divergent_headers, private_id)
         divergent_error = assert_error(divergent_raw)
         assert "different request" in divergent_error, divergent_error
         for marker in (b"unpack ok", b"ok refs/heads/main", b"ng refs/heads/main"):
             assert marker not in divergent_raw, "divergent replay carried a Git report: " + repr(divergent_raw[:300])
         after_divergent = self.exact_ledger(repo["id"])
         assert after_divergent == cancelled, "divergent-wire conflict changed durable state"
-        assert self.pack_identity(repo["id"], operation) == inflight_pack
-        assert self.cancellation_snapshot(repo["id"], operation) == tombstones, \
+        assert self.pack_identity(repo["id"], private_id) == inflight_pack
+        assert self.cancellation_snapshot(repo["id"], private_id) == tombstones, \
             "divergent-wire conflict changed a tombstone"
         _, divergent_view = get_view(operation, "after divergent wire", "cancelled")
         assert divergent_view == cancel_view
@@ -844,6 +917,11 @@ class CheckpointHarness(blob.BlobOnlyHarness):
                                    + str(new_status) + " " + repr(new_body[:300]))
         assert blob.header_value(new_headers, "x-rootyard-operation") == new_operation, new_headers
         blob.assert_receive_report_ok(new_body, "refs/heads/main")
+        new_wrapper, new_attempt = self.current_public_attempt(repo["id"], new_operation, "committed")
+        new_private_id = new_attempt["private_id"]
+        private_ids[new_operation] = new_private_id
+        self.assert_private_id_hidden(new_body, new_headers, new_private_id)
+        assert new_wrapper["issuer_id"] == self.alice["user_id"]
         _, new_view = get_view(new_operation, "new operation", "committed")
         new_terminal = new_view["terminal"]
         assert new_terminal is not None and new_terminal["kind"] == "committed", new_view
@@ -852,11 +930,18 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         resolved_operations = rows(resolved["operations"])
         assert len(resolved_operations) == 3, resolved_operations
         assert row_for(resolved_operations, "operation_id", seed_operation["operation_id"]) == seed_operation
-        assert row_for(resolved_operations, "operation_id", operation) == cancelled_operation
-        new_operation_row = self.operation_row(repo["id"], new_operation)
-        assert row_for(resolved_operations, "operation_id", new_operation) == new_operation_row
+        assert row_for(resolved_operations, "operation_id", private_id) == cancelled_operation
+        new_operation_row = self.operation_row(repo["id"], new_private_id)
+        assert row_for(resolved_operations, "operation_id", new_private_id) == new_operation_row
         assert new_operation_row["state"] == "committed", new_operation_row
         assert new_operation_row["terminal_result"] == new_terminal, new_operation_row
+        assert len(rows(resolved["public_operations"])) == 3
+        assert len(rows(resolved["private_attempts"])) == 3
+        for prior in rows(cancelled["public_operations"]):
+            assert row_for(rows(resolved["public_operations"]), "public_id", prior["public_id"]) == prior
+        for prior in rows(cancelled["private_attempts"]):
+            assert row_for(rows(resolved["private_attempts"]), "private_id", prior["private_id"]) == prior
+        assert resolved["attempt_retirements"] == cancelled["attempt_retirements"]
 
         ref_rows = rows(resolved["refs"])
         assert len(ref_rows) == 1, ref_rows
@@ -872,13 +957,14 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         for prior_event in rows(before["events"]):
             assert row_for(event_rows, "event_id", prior_event["event_id"]) == prior_event, \
                 "an existing event changed during the new operation"
-        event = row_for(event_rows, "operation_id", new_operation)
+        event = row_for(event_rows, "operation_id", new_private_id)
+        assert event["event_id"] == new_wrapper["event_id"]
         assert event["outcome"] == "committed" and event["revision"] == new_revision, event
         assert event["payload"] == new_terminal, "new event payload differs from its terminal"
 
-        assert self.pack_identity(repo["id"], operation) == inflight_pack, \
+        assert self.pack_identity(repo["id"], private_id) == inflight_pack, \
             "the new operation changed the cancelled pack snapshot"
-        new_pack = self.pack_identity(repo["id"], new_operation)
+        new_pack = self.pack_identity(repo["id"], new_private_id)
         new_publications = rows(new_pack["publications"])
         new_artifacts = rows(new_pack["artifacts"])
         assert len(new_publications) == 1, new_publications
@@ -899,26 +985,27 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         seed_terminal = seed_operation["terminal_result"]
         assert isinstance(seed_terminal, dict), seed_operation
         seed_ledger_before = self.exact_ledger(repo["id"])
-        seed_pack_before = self.pack_identity(repo["id"], seed_operation["operation_id"])
-        seed_cancel_status, seed_cancel_raw, _ = post_cancel(seed_operation["operation_id"], self.alice)
+        seed_pack_before = self.pack_identity(repo["id"], seed_private_id)
+        seed_cancel_status, seed_cancel_raw, _ = post_cancel(seed_public_id, self.alice)
         assert seed_cancel_status == 200, (seed_cancel_status, seed_cancel_raw[:300])
         seed_view = json.loads(seed_cancel_raw)
         assert set(seed_view) == {"operation_id", "state", "terminal"}, seed_view
         assert seed_view == {
-            "operation_id": seed_operation["operation_id"],
+            "operation_id": seed_public_id,
             "state": "committed",
             "terminal": seed_terminal,
         }, seed_view
         seed_ledger_after = self.exact_ledger(repo["id"])
         assert seed_ledger_after == seed_ledger_before, "committed cancel changed durable state"
-        assert self.pack_identity(repo["id"], seed_operation["operation_id"]) == seed_pack_before
-        seed_tombstones = self.cancellation_snapshot(repo["id"], seed_operation["operation_id"])
+        assert self.pack_identity(repo["id"], seed_private_id) == seed_pack_before
+        seed_tombstones = self.cancellation_snapshot(repo["id"], seed_private_id)
         assert len(seed_tombstones["legacy"]) == 1, seed_tombstones
+        assert seed_tombstones["legacy"][0]["operation_id"] == seed_private_id, seed_tombstones
         # A committed operation returns AlreadyConsumed before bind_cancellation,
         # so it gets only the migration-138 tombstone; no decision-level
         # cancellation row is fabricated for a commit that already won.
         assert not seed_tombstones["decision"], seed_tombstones
-        _, seed_get = get_view(seed_operation["operation_id"], "seed commit-wins", "committed")
+        _, seed_get = get_view(seed_public_id, "seed commit-wins", "committed")
         assert seed_get == seed_view
 
         # Refusals must not reveal operation existence or write a tombstone. The
@@ -931,6 +1018,17 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert assert_error(unknown_raw) == "not found"
         assert self.operation_row_optional(repo["id"], unknown) is None
         assert self.cancellation_snapshot(repo["id"], unknown) == {"legacy": [], "decision": []}
+        self.assert_no_public_operation(repo["id"], unknown)
+
+        # Neither endpoint may treat the physical UUID as a public operation.
+        private_get_status, private_get_raw, private_get_headers = self.http(
+            repo_operation_path(private_id), token=self.alice)
+        private_cancel_status, private_cancel_raw, private_cancel_headers = post_cancel(private_id, self.alice)
+        assert private_get_status == private_cancel_status == 404
+        assert private_get_raw == private_cancel_raw == unknown_raw
+        self.assert_private_id_hidden(private_get_raw, private_get_headers, private_id)
+        self.assert_private_id_hidden(private_cancel_raw, private_cancel_headers, private_id)
+        assert self.exact_ledger(repo["id"]) == seed_ledger_after
 
         other_repo, _ = self.create("commit-unknown-other", self.alice)
         other_path = ("/api/repos/" + urllib.parse.quote(other_repo["owner"], safe="") + "/"
@@ -939,8 +1037,13 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert crossrepo_status == 404, (crossrepo_status, crossrepo_raw[:300])
         assert assert_error(crossrepo_raw) == "not found"
         assert self.operation_row_optional(other_repo["id"], operation) is None
+        assert self.operation_row_optional(other_repo["id"], private_id) is None
         assert self.cancellation_snapshot(other_repo["id"], operation) == {"legacy": [], "decision": []}
-        assert self.operation_row(repo["id"], operation) == final_operation
+        assert self.cancellation_snapshot(other_repo["id"], private_id) == {"legacy": [], "decision": []}
+        self.assert_no_public_operation(other_repo["id"], operation)
+        self.assert_no_public_operation(other_repo["id"], private_id)
+        assert self.operation_row(repo["id"], private_id) == final_operation
+        assert self.cancellation_snapshot(repo["id"], private_id) == tombstones
 
         unbound = str(uuid.uuid4())
         unbound_before = self.exact_ledger(repo["id"])
@@ -949,11 +1052,14 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert no_a3_status == 409, (no_a3_status, no_a3_raw[:300])
         assert set(json.loads(no_a3_raw)) == {"error"}
         assert self.operation_row(repo["id"], unbound)["state"] == "pending"
+        self.assert_no_public_operation(repo["id"], unbound)
         assert self.cancellation_snapshot(repo["id"], unbound) == {"legacy": [], "decision": []}
         unbound_after = self.exact_ledger(repo["id"])
         assert unbound_after["refs"] == unbound_before["refs"]
         assert unbound_after["gate"] == unbound_before["gate"]
         assert unbound_after["events"] == unbound_before["events"]
+        for key in ("public_operations", "private_attempts", "attempt_retirements"):
+            assert unbound_after[key] == unbound_before[key]
 
         # Bob is a real write collaborator but not an owner/admin. The standalone
         # serve-blob router does not mount the product collaborator-management
@@ -961,7 +1067,7 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         # after a separate repository has been created by the real API and
         # seeded with stock Git. Keeping this proof on its own repository leaves
         # the original unknown/commit-wins ledger counts and hashes untouched.
-        seed_before = self.cancellation_snapshot(repo["id"], seed_operation["operation_id"])
+        seed_before = self.cancellation_snapshot(repo["id"], seed_private_id)
         original_strict_before_rbac = self.exact_ledger(repo["id"])
 
         rbac_repo, _ = self.create("commit-unknown-rbac", self.alice)
@@ -1019,7 +1125,11 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert row_for(rbac_ref_rows, "ref_name", "refs/heads/main")["oid"] == rbac_base_oid
         rbac_operation_rows = rows(rbac_after_push["operations"])
         assert len(rbac_operation_rows) == len(rbac_seed_operations) + 1, rbac_operation_rows
-        bob_operation_row = self.operation_row(rbac_repo["id"], bob_operation)
+        bob_wrapper, bob_attempt = self.current_public_attempt(rbac_repo["id"], bob_operation, "committed")
+        bob_private_id = bob_attempt["private_id"]
+        assert bob_wrapper["issuer_id"] == self.bob["user_id"]
+        bob_operation_row = self.operation_row(rbac_repo["id"], bob_private_id)
+        assert row_for(rbac_operation_rows, "operation_id", bob_private_id) == bob_operation_row
         assert bob_operation_row["issuer_id"] == self.bob["user_id"], (
             "phase=bob-write-ledger: operation issuer is not Bob", bob_operation_row)
         assert bob_operation_row["state"] == "committed", bob_operation_row
@@ -1027,14 +1137,15 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert isinstance(bob_terminal, dict) and bob_terminal.get("kind") == "committed", bob_terminal
         rbac_event_rows = rows(rbac_after_push["events"])
         assert len(rbac_event_rows) == len(rbac_seed_events) + 1, rbac_event_rows
-        bob_event = row_for(rbac_event_rows, "operation_id", bob_operation)
+        bob_event = row_for(rbac_event_rows, "operation_id", bob_private_id)
+        assert bob_event["event_id"] == bob_wrapper["event_id"]
         assert bob_event["outcome"] == "committed" and bob_event["payload"] == bob_terminal, bob_event
         assert gate_identity(rbac_after_push["gate"]) == rbac_gate_identity, rbac_after_push["gate"]
-        bob_pack = self.pack_identity(rbac_repo["id"], bob_operation)
+        bob_pack = self.pack_identity(rbac_repo["id"], bob_private_id)
         bob_publications = rows(bob_pack["publications"])
         bob_artifacts = rows(bob_pack["artifacts"])
         assert len(bob_publications) == 1 and len(bob_artifacts) == 2, bob_pack
-        assert bob_publications[0]["plan_operation_id"] == bob_operation, bob_publications
+        assert bob_publications[0]["plan_operation_id"] == bob_private_id, bob_publications
         assert {(item["pack_id"], item["registration_id"], item["artifact_set_digest"])
                 for item in bob_publications} == {
                     (item["pack_id"], item["registration_id"], item["artifact_set_digest"])
@@ -1057,8 +1168,8 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             return rbac_path + "/operations/" + target_operation + "/cancel"
 
         rbac_ledger_before_refusals = self.exact_ledger(rbac_repo["id"])
-        rbac_pack_before_refusals = self.pack_identity(rbac_repo["id"], bob_operation)
-        rbac_known_tombstones = self.cancellation_snapshot(rbac_repo["id"], bob_operation)
+        rbac_pack_before_refusals = self.pack_identity(rbac_repo["id"], bob_private_id)
+        rbac_known_tombstones = self.cancellation_snapshot(rbac_repo["id"], bob_private_id)
         rbac_unknown_tombstones = self.cancellation_snapshot(rbac_repo["id"], unknown)
         nonadmin_status, nonadmin_raw, nonadmin_headers = self.http(
             rbac_cancel_path(bob_operation), token=self.bob, method="POST")
@@ -1073,24 +1184,27 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         assert assert_error(nonadmin_raw) == "operation is cancellable only by a repository owner or admin"
         assert blob.header_value(nonadmin_headers, "cache-control") == "no-store"
         assert blob.header_value(nonadmin_unknown_headers, "cache-control") == "no-store"
-        assert self.operation_row(rbac_repo["id"], bob_operation) == bob_operation_row
+        self.assert_private_id_hidden(nonadmin_raw, nonadmin_headers, bob_private_id)
+        self.assert_private_id_hidden(nonadmin_unknown_raw, nonadmin_unknown_headers, bob_private_id)
+        assert self.operation_row(rbac_repo["id"], bob_private_id) == bob_operation_row
         assert self.operation_row_optional(rbac_repo["id"], unknown) is None
+        self.assert_no_public_operation(rbac_repo["id"], unknown)
         assert self.exact_ledger(rbac_repo["id"]) == rbac_ledger_before_refusals, \
             "phase=bob-cancel-nonadmin: refusals changed the RBAC proof ledger"
-        assert self.pack_identity(rbac_repo["id"], bob_operation) == rbac_pack_before_refusals
-        assert self.cancellation_snapshot(rbac_repo["id"], bob_operation) == rbac_known_tombstones
+        assert self.pack_identity(rbac_repo["id"], bob_private_id) == rbac_pack_before_refusals
+        assert self.cancellation_snapshot(rbac_repo["id"], bob_private_id) == rbac_known_tombstones
         assert self.cancellation_snapshot(rbac_repo["id"], unknown) == rbac_unknown_tombstones
         assert rbac_known_tombstones == {"legacy": [], "decision": []}, rbac_known_tombstones
         assert self.exact_ledger(repo["id"]) == original_strict_before_rbac, \
             "the separate RBAC proof repo changed the original strict ledger"
 
-        read_only_status, read_only_raw, _ = post_cancel(seed_operation["operation_id"], self.reader)
+        read_only_status, read_only_raw, _ = post_cancel(seed_public_id, self.reader)
         assert read_only_status == 403, (read_only_status, read_only_raw[:300])
         invalid_status, invalid_raw, _ = post_cancel(
-            seed_operation["operation_id"], {"username": "alice", "token": "ryt_" + "0" * 64})
+            seed_public_id, {"username": "alice", "token": "ryt_" + "0" * 64})
         assert invalid_status == 401, (invalid_status, invalid_raw[:300])
         assert set(json.loads(invalid_raw)) == {"error"}
-        assert self.cancellation_snapshot(repo["id"], seed_operation["operation_id"]) == seed_before
+        assert self.cancellation_snapshot(repo["id"], seed_private_id) == seed_before
 
         for raw_id in ("not-a-uuid", "00000000-0000-0000-0000-000000000000"):
             malformed_status, malformed_raw, _ = post_cancel(raw_id, self.alice)
@@ -1118,7 +1232,7 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             "unknown_commit_landed": False,
             "cancel_won": True,
             "new_operation_committed": True,
-            "seed_commit_wins_operation": seed_operation["operation_id"],
+            "seed_commit_wins_operation": seed_public_id,
             "seed_commit_wins_state": seed_view["state"],
             "seed_commit_wins_terminal_sha256": digest(
                 json.dumps(seed_view["terminal"], sort_keys=True, separators=(",", ":"))),

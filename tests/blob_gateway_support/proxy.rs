@@ -303,10 +303,16 @@ impl Poll {
             .get()
             .await?
             .query_opt(
-                "SELECT o.state FROM ref_store_operations o
-                   JOIN repositories r ON r.id=o.repository_id
+                "SELECT coalesce(w.state, o.state)
+                   FROM repositories r
                    JOIN namespaces ns ON ns.id=r.owner_id
-                  WHERE ns.slug=$1 AND r.name=$2 AND o.operation_id=$3",
+                   LEFT JOIN ref_store_public_operations w ON w.repository_id=r.id AND w.public_id=$3
+                   LEFT JOIN ref_store_operations o ON o.repository_id=r.id AND o.operation_id=$3
+                     AND NOT EXISTS (
+                       SELECT 1 FROM ref_store_private_attempts a
+                       WHERE a.repository_id=r.id AND a.private_id=$3
+                     )
+                  WHERE ns.slug=$1 AND r.name=$2 AND (w.public_id IS NOT NULL OR o.operation_id IS NOT NULL)",
                 &[&self.owner, &self.name, &self.operation],
             )
             .await?;

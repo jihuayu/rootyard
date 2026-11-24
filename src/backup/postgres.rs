@@ -124,6 +124,36 @@ pub(super) async fn database_scope(client: &(impl GenericClient + Sync), empty: 
     ensure!(extras == 0, "dedicated Rootyard database must not contain extra schemas, routines, types or extensions");
     Ok(())
 }
+
+/// The reviewed structural catalog does not contain function privileges.
+async fn verify_public_attempt_cancellation_acl(client: &(impl GenericClient + Sync)) -> Result<()> {
+    let signature = "public.rootyard_ref_store_private_cancellation_evidence()";
+    let restricted: bool = client
+        .query_one(
+            "SELECT p.prosecdef AND NOT EXISTS (
+                 SELECT FROM pg_catalog.aclexplode(COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) AS acl
+                 WHERE acl.grantee = 0::pg_catalog.oid AND acl.privilege_type = 'EXECUTE'
+             ) FROM pg_catalog.pg_proc p WHERE p.oid = pg_catalog.to_regprocedure($1)",
+            &[&signature],
+        )
+        .await?
+        .get(0);
+    ensure!(restricted, "public attempt cancellation function must deny PUBLIC EXECUTE");
+    Ok(())
+}
+
+/// pg_restore --no-privileges intentionally does not carry source ACLs.
+pub(super) async fn restore_schema_privileges(client: &Client, format: u32) -> Result<()> {
+    if catalog::has_public_attempts(format) {
+        client
+            .batch_execute(
+                "REVOKE EXECUTE ON FUNCTION public.rootyard_ref_store_private_cancellation_evidence() FROM PUBLIC",
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn schema(client: &(impl GenericClient + Sync), format: u32) -> Result<Vec<i32>> {
     database_scope(client, false).await?;
     let tables = catalog::relations(format, true)?;
@@ -149,6 +179,9 @@ pub(super) async fn schema(client: &(impl GenericClient + Sync), format: u32) ->
         schema_catalogs(format)?.contains(&actual),
         "schema structure or protection differs from reviewed migrations"
     );
+    if catalog::has_public_attempts(format) {
+        verify_public_attempt_cancellation_acl(client).await?;
+    }
     let incomplete: bool = client
         .query_one("SELECT EXISTS (SELECT 1 FROM public.forge_creation_requests WHERE response IS NULL)", &[])
         .await?

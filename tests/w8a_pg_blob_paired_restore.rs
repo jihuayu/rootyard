@@ -208,7 +208,7 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
     seed::write_volume(&source_config.data_dir)?;
     let archive = temp.path().join("archive");
     let created = create(&source_config, &archive).await?;
-    ensure!(created.format == 30 && created.sidecar.schema_head >= 151, "paired format/schema differs");
+    ensure!(created.format == 32 && created.sidecar.schema_head == 152, "paired format/schema differs");
     let checked = check(&archive)?;
     ensure!(checked.w8a_backup_id == created.w8a_backup_id, "check receipt differs from creation");
 
@@ -316,6 +316,8 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
         "old browser credential survived"
     );
     let client = destination_pool.get().await?;
+    lifecycle_guards::verify_restore_lineage(&client, seeded.cluster_incarnation, restored.new_cluster_incarnation)
+        .await?;
     let ci: Vec<String> = client.query("SELECT state FROM ci_runs", &[]).await?.iter().map(|row| row.get(0)).collect();
     ensure!(ci.iter().all(|state| state == "cancelled"), "CI runs were not cancelled: {ci:?}");
     let checkout: Vec<(bool, bool, bool)> = client

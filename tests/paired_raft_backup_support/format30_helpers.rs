@@ -91,20 +91,29 @@ pub fn make_backup_config(database_url: String, data_dir: PathBuf, git: PathBuf)
 /// unrelated pending work visible to the pre-freeze and cutpoint guards.
 pub async fn settle_target_audit_deliveries(pool: &Pool) -> Result<()> {
     let owner = Uuid::new_v4();
-    loop {
-        let settled = events::worker_once_with_lease_scoped(
-            pool,
-            events::TARGET_AUDIT_CONSUMER,
-            Some(events::TARGET_AUDIT_KIND),
-            owner,
-            100,
-            60,
-        )
-        .await?;
-        if settled == 0 {
-            return Ok(());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let settled = events::worker_once_with_lease_scoped(
+                pool,
+                events::TARGET_AUDIT_CONSUMER,
+                Some(events::TARGET_AUDIT_KIND),
+                owner,
+                100,
+                60,
+            )
+            .await?;
+            if events::pending_count(pool).await? == 0 {
+                return Ok(());
+            }
+            if settled == 0 {
+                // A live lease or an earlier delivery can prevent a claim.
+                // Freeze only after the durable outbox actually drains.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
-    }
+    })
+    .await
+    .map_err(|_| anyhow!("target audit deliveries did not settle before the freeze deadline"))?
 }
 
 pub fn init_volume_dir(root: &Path) -> Result<()> {

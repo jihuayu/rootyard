@@ -23,5 +23,17 @@
    - Positive proof additionally requires `0` live references across `ref_store_core_pack_memberships`, `ref_store_core_snapshot_packs`, `ref_store_core_serving_read_packs`, active (`state = 'active'`) `ref_store_core_root_heads`/`ref_store_core_root_packs`, and `ref_store_publication_decisions` in `'OPEN'`/`'CONSUMED'`.
 
 6. **Strict Replay Zero-Write Contract (`src/blob_git_gateway/receive.rs`, `reclaim_sweeper.rs`)**:
-   - `sweep_gateway_reclaim_ledger` runs strictly AFTER `operation::probe` resolves `Claim::Fresh`, so `Claim::Pending`, `Claim::Cancelled` and `Claim::Replay` never sweep. The sweeper also resolves the reclaim operator and requires an existing private ledger directory before opening the ledger, so a no-op sweep never creates `reclaim-*.json`.
-   - An HTTP `Claim::Replay` is therefore 100% zero-write: `0` reclaim-ledger files or `modified()` timestamps changed, `0` PostgreSQL rows changed across the operation/decision/event/hold/membership/cancellation ledgers, and `0` S3 `PUT`/`DELETE` mutations.
+   - The gateway sweeps only on the fresh receive path. Pending, cancelled and replayed operations bypass the sweep. The sweeper requires a configured reclaim operator and an existing private ledger directory.
+   - A request that finds an exact durable terminal at its first probe leaves the reclaim ledger, PostgreSQL operation and artifact ledgers, and S3 objects unchanged.
+
+## Concurrent Smart HTTP Receive
+
+On `rootyard serve-blob`, migration 152 gives one public push ID up to three private attempts. Body transfer and pack proving can overlap across independent refs. If an admitted attempt loses its repository revision to a verified concurrent commit, the gateway can prove the same received pack against a fresh snapshot before giving stock Git its final response. PostgreSQL records each retirement against the superseding event and binds the final result to the public push ID.
+
+The gateway rechecks the requested old OIDs at each attempt. A conflicting old OID retains the native stale-ref result. An ambiguous commit remains subject to durable resolution for the same operation. The final Git report preserves the request's atomic or accepted-subset semantics.
+
+Operation reads and owner/admin cancellation use the stable public ID. Cancellation settles the current attempt and public result in a single PostgreSQL transaction, preserving an already committed or rejected terminal. Public responses omit private attempt IDs.
+
+The reclaim ledger retains that same public ID. Before deleting staging bytes for a rejected or cancelled push, PostgreSQL must verify every attempt in the wrapper history, the exact tenant and backend, and the absence of live references.
+
+The GitHub RefStore protocol native acceptance job runs slow-body overlap, same-ref CAS, and two- and three-writer first-request cases with stock Git, PostgreSQL 17, and Garage. The three-writer case uses an owned PostgreSQL fixture that can create an isolated database. It checks all three first responses, exact retirement rows, fresh clone refs, and strict Git fsck.

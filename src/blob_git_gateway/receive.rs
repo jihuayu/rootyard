@@ -4,10 +4,9 @@
 //! migration-138 operation registry **before** any native child or A3/A4 write (a durable terminal replays from its
 //! persisted receipt, a pending operation is an unknown `503`, only an unknown one proceeds); build the sealed view,
 //! run native `receive-pack`, stage pairs; then `prepare -> select -> verify -> commit`, rendering `report-status` only from the terminal.
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+#[cfg(test)]
+use std::path::Path;
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -19,30 +18,134 @@ use uuid::Uuid;
 
 use super::{
     error::GatewayError,
-    native,
-    operation::{self, Claim},
+    native, operation,
     protocol::{self, PushRequest},
-    publish::{self, Pair, PushOutcome},
-    repo_session::CommittedWriteSessionProof,
+    publish::{self, Pair, PrivatePushOutcome},
     serving::{ServingRepository, lookup},
     session::{authenticate, authorize_write, operation_id, validate_git_protocol},
     snapshot,
     state::BlobGitState,
 };
 use crate::{
+    db::Identity,
     namespace_service::push_causal_stream::{
-        DurableGatewayReceiptArgs, GatewayIncomingProofArgs, GatewayPairSummary, UploadReclaimState,
-        classify_gateway_reclaim_error, materialize_durable_gateway_receipt, prove_gateway_incoming_pack_closure,
-        record_gateway_staging_inflight, settle_aborted_gateway_reclaim, spool_receive_stream_shared_deadline,
-        sweep_gateway_reclaim_ledger, verify_gateway_authority_closure,
+        GatewayIncomingProofArgs, GatewayPairSummary, UploadReclaimState, classify_gateway_reclaim_error,
+        prove_gateway_incoming_pack_closure, record_gateway_staging_inflight, settle_aborted_gateway_reclaim,
+        spool_receive_stream_shared_deadline, sweep_gateway_reclaim_ledger, verify_gateway_authority_closure,
     },
-    ref_store::{CommitMode, CommitRejectCode, RefCommitResult},
+    ref_store::{CommitMode, GitObjectFormat, RequestDigest},
 };
+
+mod pack_files;
+mod response;
+
+use pack_files::{collect_pairs, pack_stems};
+
+use response::{ReceiveDisposition, cancelled_response, paired_write_raft_gate};
+
+struct ReceiveContext<'a> {
+    state: &'a BlobGitState,
+    serving: &'a ServingRepository,
+    owner: &'a str,
+    name: &'a str,
+    deadline: tokio::time::Instant,
+}
 
 const MAX_NEW_PACKS: usize = 8;
 
-/// Every refusal is rendered with `GatewayError::git`, so the push endpoint keeps its Smart HTTP
-/// `Basic` challenge; only the success/`report-status` answers below are built directly.
+/// Producer-owned receive identity created exactly where the parsed request,
+/// commit mode and producer digest are derived from the same spooled body.
+///
+/// The type is private to this module, so only the normal receive path can
+/// create it. Its fields are moved into [`VerifiedReceive`] only after the
+/// native receive-pack stage has produced the ordered staged pair set.
+struct ReceiveInput<'a> {
+    actor: &'a Identity,
+    operation: Uuid,
+    repository_id: Uuid,
+    object_format: GitObjectFormat,
+    request: PushRequest,
+    mode: CommitMode,
+    digest: RequestDigest,
+}
+
+/// The completed receive input. Only [`ReceiveInput::complete`] can build this
+/// value, and that method is private to the producer module; sibling modules can
+/// borrow it but cannot construct an alternate request/mode/digest/pair set.
+pub(super) struct VerifiedReceive<'a> {
+    actor: &'a Identity,
+    operation: Uuid,
+    repository_id: Uuid,
+    object_format: GitObjectFormat,
+    request: PushRequest,
+    mode: CommitMode,
+    digest: RequestDigest,
+    pairs: Vec<Pair>,
+}
+
+impl<'a> ReceiveInput<'a> {
+    /// Complete the same receive value with the pairs produced from this exact
+    /// staged native view. Consuming `self` makes a second completion or a
+    /// different pair set impossible.
+    fn complete(self, pairs: Vec<Pair>) -> VerifiedReceive<'a> {
+        VerifiedReceive {
+            actor: self.actor,
+            operation: self.operation,
+            repository_id: self.repository_id,
+            object_format: self.object_format,
+            request: self.request,
+            mode: self.mode,
+            digest: self.digest,
+            pairs,
+        }
+    }
+
+    fn request(&self) -> &PushRequest {
+        &self.request
+    }
+
+    fn digest(&self) -> RequestDigest {
+        self.digest
+    }
+}
+
+impl<'a> VerifiedReceive<'a> {
+    pub(super) fn actor(&self) -> &Identity {
+        self.actor
+    }
+
+    pub(super) fn operation_id(&self) -> Uuid {
+        self.operation
+    }
+
+    pub(super) fn repository_id(&self) -> Uuid {
+        self.repository_id
+    }
+
+    pub(super) fn object_format(&self) -> GitObjectFormat {
+        self.object_format
+    }
+
+    pub(super) fn request(&self) -> &PushRequest {
+        &self.request
+    }
+
+    pub(super) fn mode(&self) -> CommitMode {
+        self.mode
+    }
+
+    pub(super) fn digest(&self) -> RequestDigest {
+        self.digest
+    }
+
+    pub(super) fn pairs(&self) -> &[Pair] {
+        &self.pairs
+    }
+}
+
+/// Every refusal of this route is rendered with `GatewayError::git`, so the
+/// push endpoint keeps its Smart HTTP `Basic` challenge; only the success and
+/// `report-status` answers below are built directly.
 pub(super) async fn receive_pack(
     state: State<Arc<BlobGitState>>,
     path: AxumPath<(String, String)>,
@@ -96,50 +199,35 @@ async fn receive_pack_authorized(
     if !prefix.starts_with(&streamed_prefix) {
         return Err(GatewayError::Internal("spooled push command prefix disagrees with streamed pkt-lines"));
     }
-    let request = protocol::parse_push(&streamed_prefix, format)?;
-    let mode = if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
+    let parsed_request = protocol::parse_push(&streamed_prefix, format)?;
+    let mode = if parsed_request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
     let digest =
-        operation::request_digest(repository_id, operation, format, &request, mode, &request_path, deadline).await?;
-
-    let backend_hex = state.store().backend_identity().as_hex();
-    let receipt_args = |settle_reclaim: bool| DurableGatewayReceiptArgs {
-        pool: state.pool(),
-        store: state.store(),
-        git_binary: state.git_binary(),
-        scratch_root: settle_reclaim.then(|| state.scratch_root()),
-        sandbox_root: Some(state.scratch_root()),
+        operation::request_digest(repository_id, operation, format, &parsed_request, mode, &request_path, deadline)
+            .await?;
+    // The only production construction of the receive identity: the digest and
+    // mode were just derived from this exact parsed request and spooled body.
+    let receive = ReceiveInput {
+        actor: &identity,
+        operation,
         repository_id,
-        operation_id: operation,
-        deadline,
+        object_format: format,
+        request: parsed_request,
+        mode,
+        digest,
     };
 
-    match operation::probe(&state, &serving, &identity, operation, &request, digest, deadline).await? {
-        Claim::Pending => return Err(GatewayError::OutcomeUnknown),
-        Claim::Cancelled(reason) => {
-            return terminal_response(&request, &cancelled_results(&request, reason), operation);
+    let backend_hex = state.store().backend_identity().as_hex();
+    let context = ReceiveContext { state: &state, serving: &serving, owner: &owner, name, deadline };
+    // Probe before native Git or staged writes. Only a fresh operation can
+    // sweep old staging. A proven retirement can resume without that sweep.
+    let pending_retirement = match context.probe(&receive).await? {
+        ReceiveDisposition::Fresh => {
+            let _ = sweep_gateway_reclaim_ledger(state.pool(), state.scratch_root(), backend_hex, deadline).await;
+            None
         }
-        Claim::Replay(terminal) => {
-            materialize_durable_gateway_receipt(receipt_args(false)).await?;
-            paired_write_raft_gate(&state, repository_id, terminal.is_committed()).await?;
-            let results = report_results(&request, &terminal)?;
-            let body = protocol::report_status(request.wants_report(), &results);
-            return committed_response(CommittedResponse {
-                state: &state,
-                identity: &identity,
-                owner: &owner,
-                name,
-                authorized: &serving,
-                terminal: &terminal,
-                body,
-                operation,
-                deadline,
-            })
-            .await;
-        }
-        Claim::Fresh => {}
-    }
-    // A pending, cancelled or replayed claim must never mutate the reclaim ledger or a staging object.
-    let _ = sweep_gateway_reclaim_ledger(state.pool(), state.scratch_root(), backend_hex, deadline).await;
+        ReceiveDisposition::Respond(response) => return Ok(response),
+        ReceiveDisposition::Retire(evidence, retirement) => Some((evidence, retirement)),
+    };
 
     // Sealed read view; the authority snapshot closure is verified before any base pack is used.
     let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
@@ -154,7 +242,8 @@ async fn receive_pack_authorized(
         };
     let view = snapshot::build_view(&state, &refs, deadline).await?;
     let before = pack_stems(view.repo())?;
-    let target_oids: Vec<String> = request.commands.iter().filter(|c| !c.is_delete()).map(|c| c.new.clone()).collect();
+    let target_oids: Vec<String> =
+        receive.request().commands.iter().filter(|c| !c.is_delete()).map(|c| c.new.clone()).collect();
     prove_gateway_incoming_pack_closure(GatewayIncomingProofArgs {
         operation_id: operation,
         git_binary: state.git_binary(),
@@ -172,9 +261,21 @@ async fn receive_pack_authorized(
     command.arg("receive-pack").arg("--stateless-rpc").arg(view.repo());
     let captured = native::run_capture(command, Some(request_path.as_path()), 4 * 1024 * 1024, deadline).await?;
     if !captured.success {
+        // Raw native rejection is authoritative only before admission. An
+        // existing wrapper must follow its exact durable outcome.
+        match context.probe(&receive).await? {
+            ReceiveDisposition::Fresh if pending_retirement.is_none() => {}
+            ReceiveDisposition::Respond(response) => return Ok(response),
+            ReceiveDisposition::Fresh | ReceiveDisposition::Retire(..) => return Err(GatewayError::OutcomeUnknown),
+        }
         // Unknown when probed, so only an all-`ng`/unpack-failure report passes through.
         if protocol::native_report_is_rejection(&captured.stdout) {
-            return response(StatusCode::OK, "application/x-git-receive-pack-result", captured.stdout, operation);
+            return response::git_response(
+                StatusCode::OK,
+                "application/x-git-receive-pack-result",
+                captured.stdout,
+                operation,
+            );
         }
         return Err(GatewayError::BadRequest("push was refused by native Git validation"));
     }
@@ -195,6 +296,9 @@ async fn receive_pack_authorized(
         });
         pairs.push(staged);
     }
+    // Only the normal native receive-pack stage of this same receive input can
+    // complete the producer value with these ordered staged pairs.
+    let receive = receive.complete(pairs);
     record_gateway_staging_inflight(
         state.scratch_root(),
         operation,
@@ -204,29 +308,65 @@ async fn receive_pack_authorized(
     )?;
 
     paired_write_raft_gate(&state, repository_id, false).await?;
-    let published =
-        publish::push(&state, &serving, &identity, operation, digest, &request, &pairs, mode, deadline).await;
-    match published {
-        // Only the persisted terminal is rendered as a Git report-status; mixed and accepted-subset terminals replay as recorded.
-        Ok(PushOutcome::Terminal(terminal)) => {
-            materialize_durable_gateway_receipt(receipt_args(true)).await?;
-            paired_write_raft_gate(&state, repository_id, terminal.is_committed()).await?;
-            let results = report_results(&request, &terminal)?;
-            let body = protocol::report_status(request.wants_report(), &results);
-            committed_response(CommittedResponse {
-                state: &state,
-                identity: &identity,
-                owner: &owner,
-                name,
-                authorized: &serving,
-                terminal: &terminal,
-                body,
-                operation,
-                deadline,
-            })
+    if let Some((evidence, retirement)) = pending_retirement {
+        // Re-authenticate the live serving realm after native ingestion. The
+        // gate revision may legitimately have advanced (that is exactly the
+        // stale-retirement condition), but tenant/format/history/authority/
+        // group/restore/backend may not move. The rotation primitive performs
+        // its own final realm/restore proof under the slot-one locks.
+        let refreshed = lookup(state.pool(), &identity, &owner, name, true, state.store().backend_identity(), deadline)
             .await
+            .map_err(GatewayError::from)?;
+        if refreshed.gate.repository_id() != repository_id
+            || refreshed.gate.tenant_id() != serving.gate.tenant_id()
+            || refreshed.gate.object_format() != serving.gate.object_format()
+            || refreshed.gate.history_incarnation() != serving.gate.history_incarnation()
+            || refreshed.gate.authority_epoch() != serving.gate.authority_epoch()
+            || refreshed.gate.group_epoch() != serving.gate.group_epoch()
+            || refreshed.cluster_incarnation != serving.cluster_incarnation
+        {
+            return Err(GatewayError::Conflict("repository authority changed; retry"));
         }
-        Ok(PushOutcome::Cancelled(reason)) => {
+        let retired = publish::retire_slot_one(&state, &refreshed, &receive, &evidence, &retirement, deadline).await;
+        return match retired {
+            Ok(retired) => {
+                ReceiveContext { serving: &refreshed, ..context }
+                    .render_terminal(
+                        &identity,
+                        receive.request(),
+                        operation,
+                        &retired.terminal,
+                        Some(retired.private_id),
+                        true,
+                    )
+                    .await
+            }
+            Err(error) => {
+                let st = classify_gateway_reclaim_error(&error);
+                let _ = settle_aborted_gateway_reclaim(
+                    state.pool(),
+                    state.scratch_root(),
+                    repository_id,
+                    operation,
+                    backend_hex,
+                    st,
+                    error.message(),
+                )
+                .await;
+                Err(error)
+            }
+        };
+    }
+
+    let published = publish::push_private(&state, &serving, &receive, deadline).await;
+    match published {
+        // Only the persisted private/legacy terminal is rendered as a Git
+        // report-status. The private durable id is used only as the receipt
+        // row key; the public operation header stays unchanged.
+        Ok(PrivatePushOutcome::Terminal { terminal, private_id }) => {
+            context.render_terminal(&identity, receive.request(), operation, &terminal, private_id, true).await
+        }
+        Ok(PrivatePushOutcome::Cancelled(reason)) => {
             let s = state.scratch_root();
             let _ = settle_aborted_gateway_reclaim(
                 state.pool(),
@@ -238,7 +378,7 @@ async fn receive_pack_authorized(
                 reason,
             )
             .await;
-            terminal_response(&request, &cancelled_results(&request, reason), operation)
+            cancelled_response(receive.request(), reason, operation)
         }
         Err(error) => {
             let st = classify_gateway_reclaim_error(&error);
@@ -256,24 +396,6 @@ async fn receive_pack_authorized(
             Err(error)
         }
     }
-}
-
-/// Refuse a paired write while frozen; once the durable terminal is committed, mirror the exact PostgreSQL -> Raft delta into the database-bound live cluster before responding.
-async fn paired_write_raft_gate(
-    state: &BlobGitState,
-    repository_id: Uuid,
-    committed: bool,
-) -> Result<(), GatewayError> {
-    let outcome = if committed {
-        crate::maintenance::paired_raft_backup::startup_wiring::mirror_gateway_push_to_paired_raft(
-            state.pool(),
-            repository_id,
-        )
-        .await
-    } else {
-        crate::maintenance::paired_raft_backup::startup_wiring::check_paired_write_unfrozen(state.pool()).await
-    };
-    outcome.map_err(|_| GatewayError::OutcomeUnknown)
 }
 
 fn repository_name(raw: &str) -> Result<&str, GatewayError> {
@@ -303,192 +425,55 @@ fn require_receive_content_type(headers: &HeaderMap) -> Result<(), GatewayError>
     }
 }
 
-fn pack_stems(repo: &Path) -> Result<std::collections::BTreeSet<String>, GatewayError> {
-    let directory = repo.join("objects").join("pack");
-    let mut stems = std::collections::BTreeSet::new();
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(stems),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|_| GatewayError::Internal("temporary pack directory is unreadable"))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if let Some(stem) = name.strip_suffix(".pack")
-            && stem.starts_with("pack-")
-        {
-            stems.insert(stem.to_owned());
-        }
-    }
-    Ok(stems)
-}
+#[cfg(test)]
+mod tests;
 
-fn collect_pairs(
-    repo: &Path,
-    before: &std::collections::BTreeSet<String>,
-) -> Result<Vec<(PathBuf, PathBuf)>, GatewayError> {
-    let directory = repo.join("objects").join("pack");
-    let mut pairs = Vec::new();
-    let entries =
-        std::fs::read_dir(&directory).map_err(|_| GatewayError::Internal("temporary pack directory is unreadable"))?;
-    let mut names = entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-        .collect::<Vec<_>>();
-    names.sort();
-    for name in names {
-        let Some(stem) = name.strip_suffix(".pack") else { continue };
-        if !stem.starts_with("pack-") || before.contains(stem) {
-            continue;
-        }
-        let pack = directory.join(&name);
-        let idx = directory.join(format!("{stem}.idx"));
-        if !idx.is_file() {
-            return Err(GatewayError::Internal("native receive-pack produced a pack without an index"));
-        }
-        pairs.push((pack, idx));
-    }
-    Ok(pairs)
-}
-
-fn report_results(
-    request: &PushRequest,
-    terminal: &crate::ref_store::core::pack_commit::PackCommitTerminal,
-) -> Result<Vec<(String, Result<(), &'static str>)>, GatewayError> {
-    if terminal.refs.len() != request.commands.len() {
-        return Err(GatewayError::Internal("durable terminal does not cover every pushed ref"));
-    }
-    let mut results = Vec::with_capacity(request.commands.len());
-    for command in &request.commands {
-        match terminal.refs.iter().find(|result| operation::result_name(result) == command.name) {
-            Some(RefCommitResult::Applied { name, .. }) => results.push((name.clone(), Ok(()))),
-            Some(RefCommitResult::NotApplied { name, reason }) => {
-                results.push((name.clone(), Err(reason_text(*reason))))
-            }
-            None => return Err(GatewayError::Internal("durable terminal is missing a pushed ref")),
-        }
-    }
-    Ok(results)
-}
-
-fn cancelled_results(request: &PushRequest, reason: &'static str) -> Vec<(String, Result<(), &'static str>)> {
-    request.commands.iter().map(|command| (command.name.clone(), Err(reason))).collect()
-}
-
-fn terminal_response(
-    request: &PushRequest,
-    results: &[(String, Result<(), &'static str>)],
+/// Test-only digest derivation for the same exact producer body a fixture will
+/// later hand to [`verified_receive_from_test_wire`]. The operation id is
+/// supplied by the caller because the durable public identity is chosen before
+/// admission; nothing here invents a request or a mode.
+#[cfg(test)]
+pub(super) async fn producer_request_digest(
+    repository_id: Uuid,
     operation: Uuid,
-) -> Result<Response, GatewayError> {
-    let body = protocol::report_status(request.wants_report(), results);
-    response(StatusCode::OK, "application/x-git-receive-pack-result", body, operation)
-}
-
-/// The single generic, retryable failure for a committed push whose session
-/// could not be issued after the durable commit. It names no repository,
-/// incarnation or underlying error; the request middleware re-attaches the
-/// same `x-rootyard-operation` so the client resolves that exact operation.
-const COMMITTED_SESSION_UNAVAILABLE: &str = "push committed but its repository session could not be issued; resolve this same operation and retry against the authoritative store";
-
-/// Collapse any failure after the commit into the single generic retryable
-/// [`COMMITTED_SESSION_UNAVAILABLE`]: the final lookup's own differentiated
-/// error, a proof refusal, an issue refusal and the outer timeout all map here.
-fn refused<E>(_: E) -> GatewayError {
-    GatewayError::Unavailable(COMMITTED_SESSION_UNAVAILABLE)
-}
-
-/// Render the `report-status` of an already encoded durable terminal. With a key set, a committed
-/// terminal additionally gets exactly one fresh writable lookup taken only after the whole body
-/// exists, issuing a session from the opaque committed-write proof bound to its exact revision; the
-/// lookup's own bounded connection is released before returning. Any such failure is the fixed
-/// retryable [`COMMITTED_SESSION_UNAVAILABLE`], never a token-free `200`.
-///
-/// Everything one committed push response needs after the durable terminal exists; bundling it keeps
-/// the async boundary readable without suppressing Clippy's argument-count lint.
-struct CommittedResponse<'a> {
-    state: &'a BlobGitState,
-    identity: &'a crate::db::Identity,
-    owner: &'a str,
-    name: &'a str,
-    authorized: &'a ServingRepository,
-    terminal: &'a crate::ref_store::core::pack_commit::PackCommitTerminal,
-    body: Vec<u8>,
-    operation: Uuid,
+    format: GitObjectFormat,
+    body: &Path,
     deadline: tokio::time::Instant,
+) -> Result<RequestDigest, GatewayError> {
+    let prefix = native::read_prefix(body, protocol::MAX_COMMAND_BYTES).await?;
+    let request = protocol::parse_push(&prefix, format)?;
+    let mode = if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
+    operation::request_digest(repository_id, operation, format, &request, mode, body, deadline).await
 }
 
-async fn committed_response(request: CommittedResponse<'_>) -> Result<Response, GatewayError> {
-    let mut response =
-        response(StatusCode::OK, "application/x-git-receive-pack-result", request.body, request.operation)?;
-    let Some(tokens) = request.state.sessions() else { return Ok(response) };
-    if !request.terminal.is_committed() {
-        return Ok(response);
-    }
-    let issue = async {
-        let final_lookup = lookup(
-            request.state.pool(),
-            request.identity,
-            request.owner,
-            request.name,
-            true,
-            request.state.store().backend_identity(),
-            request.deadline,
-        )
-        .await
-        .map_err(refused)?;
-        let proof =
-            CommittedWriteSessionProof::new(request.terminal, request.authorized, &final_lookup).map_err(refused)?;
-        let issued = tokens.issue_from_committed_write(&proof).map_err(refused)?;
-        Ok::<_, GatewayError>(issued)
-    };
-    let issued = tokio::time::timeout_at(request.deadline, issue).await.map_err(refused)??;
-    issued.apply(&mut response);
-    Ok(response)
-}
-
-/// Git wire reason literals; fixed text only, never a SQL/native message.
-fn reason_text(reason: CommitRejectCode) -> &'static str {
-    match reason {
-        CommitRejectCode::OldOidMismatch => "stale info",
-        CommitRejectCode::MissingTarget => "missing necessary objects",
-        CommitRejectCode::BadObjectType => "bad object type",
-        CommitRejectCode::PrefixConflict => "funny refname",
-        CommitRejectCode::HeadDeletedWithoutRetarget => "deletion of the current branch prohibited",
-        CommitRejectCode::HeadTargetMissing => "head target missing",
-        CommitRejectCode::NoRefApplied => "no refs applied",
-        CommitRejectCode::PolicyDenied
-        | CommitRejectCode::ProtectedBranch
-        | CommitRejectCode::MissingApprovals
-        | CommitRejectCode::RequiredCheckFailed
-        | CommitRejectCode::LfsLocked
-        | CommitRejectCode::RefNotWritable
-        | CommitRejectCode::HeadDependencyMissing => "policy denied",
-        CommitRejectCode::GateNotFound
-        | CommitRejectCode::TenantMismatch
-        | CommitRejectCode::ObjectFormatMismatch
-        | CommitRejectCode::HistoryIncarnationMismatch
-        | CommitRejectCode::AuthorityEpochMismatch
-        | CommitRejectCode::GroupEpochMismatch
-        | CommitRejectCode::RevisionMismatch => "internal error",
-    }
-}
-
-fn response(
-    status: StatusCode,
-    content_type: &'static str,
-    body: Vec<u8>,
+/// Test-only completion of one [`VerifiedReceive`] from the exact producer body
+/// and already-staged pairs. It uses the production parser and digest assembly,
+/// and only [`ReceiveInput::complete`] constructs the value, so it cannot accept
+/// independent commands, mode, digest or pair metadata as the handoff input.
+#[cfg(test)]
+pub(super) async fn verified_receive_from_test_wire<'a>(
+    actor: &'a Identity,
     operation: Uuid,
-) -> Result<Response, GatewayError> {
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
-    let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(content_type));
-    headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
-    headers.insert(
-        header::HeaderName::from_static("x-rootyard-operation"),
-        header::HeaderValue::from_str(&operation.to_string())
-            .map_err(|_| GatewayError::Internal("operation header is invalid"))?,
-    );
-    Ok(response)
+    serving: &ServingRepository,
+    body: &Path,
+    pairs: Vec<Pair>,
+    deadline: tokio::time::Instant,
+) -> Result<VerifiedReceive<'a>, GatewayError> {
+    let format = serving.gate.object_format();
+    let prefix = native::read_prefix(body, protocol::MAX_COMMAND_BYTES).await?;
+    let request = protocol::parse_push(&prefix, format)?;
+    let mode = if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
+    let digest =
+        operation::request_digest(serving.gate.repository_id(), operation, format, &request, mode, body, deadline)
+            .await?;
+    Ok(ReceiveInput {
+        actor,
+        operation,
+        repository_id: serving.gate.repository_id(),
+        object_format: format,
+        request,
+        mode,
+        digest,
+    }
+    .complete(pairs))
 }

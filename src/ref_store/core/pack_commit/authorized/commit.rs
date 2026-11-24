@@ -9,7 +9,7 @@ use super::super::{pg, pg_commit, registration, sql, usage};
 use super::{
     AuthorizedCommitError, PgAuthorizedCommit, VerifiedAuthorizedPublication, effective_deadline, pooled_client,
 };
-use crate::ref_store::contract::{OperationRecord, OperationState, RequestDigest, TerminalOutcome};
+use crate::ref_store::contract::{OperationRecord, OperationState, RefStoreError, RequestDigest, TerminalOutcome};
 use crate::ref_store::core::decision_commit::{self, RealmExpectation};
 use crate::ref_store::core::publication_decision::{self as decisions, ConsumptionRecord};
 use crate::ref_store::core::subset::RefRejectReason;
@@ -78,7 +78,13 @@ impl PgAuthorizedCommit {
         deadline: Instant,
     ) -> Result<AuthorizedCommitReceipt, AuthorizedCommitError> {
         let deadline = effective_deadline(deadline)?;
-        let plan = verified.selection().prepared().plan();
+        let prepared = verified.selection().prepared();
+        let plan = prepared.plan();
+        if let Some(public) = prepared.public_attempt()
+            && self.store.backend_identity().as_hex() != public.backend_identity
+        {
+            return Err(pg::reject(PackCommitRejectCode::PublicationMismatch, "private attempt backend differs").into());
+        }
         ensure_pack_terminal_budget(plan)?;
         let mut client = pooled_client(pool, deadline).await?;
         let tx = begin_bounded(&mut client, deadline).await?;
@@ -117,44 +123,55 @@ async fn commit_in_tx(
     let selection = verified.selection();
     let prepared = selection.prepared();
     let plan = prepared.plan();
-    // The cluster anchor is taken first, exactly like the serving read capture:
-    // before the operation/repository/gate/usage prefix. `NOWAIT` keeps it out
-    // of a restore-fence lock cycle; the absolute A4 deadline remains the outer
-    // bound. A mismatch is only enforced for a non-replay pending commit.
-    let captured_cluster_incarnation = match expected_cluster_incarnation {
-        Some(expected) => {
-            crate::ref_store::pg::bound(tx, deadline).await?;
-            let current = crate::ref_store::pg::public_cluster_incarnation_nowait(tx).await?;
-            Some((current, current != expected))
-        }
-        None => None,
-    };
+    let public = prepared.public_attempt();
     pg::set_ack_durability(tx, deadline).await?;
-    let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
-    match begun.record.state() {
-        OperationState::Committed | OperationState::Rejected => {
-            return Ok(receipt(pg::replay_terminal(begun)?, *selection.selection_digest(), false));
+    let captured_cluster_incarnation = if let Some(public) = public {
+        if expected_cluster_incarnation.is_some_and(|expected| expected != public.restore_incarnation) {
+            return Err(RefStoreError::RestoreIncarnationMismatch.into());
         }
-        OperationState::Cancelled => {
-            return Err(super::reject(PackCommitRejectCode::Cancelled, "cancellation tombstone won"));
-        }
-        OperationState::Pending if begun.created => {
-            return Err(super::reject(
-                PackCommitRejectCode::PendingMissing,
-                "publication needs an existing pending operation",
-            ));
-        }
-        OperationState::Pending => {
-            if let Some((_, true)) = captured_cluster_incarnation {
-                return Err(AuthorizedCommitError::from(
-                    crate::ref_store::contract::RefStoreError::RestoreIncarnationMismatch,
+        // The wrapper lock serializes the private attempt before the restore fence.
+        PgRefStore.lock_private_pending_attempt(tx, public, plan, deadline).await?;
+        expected_cluster_incarnation
+    } else {
+        // Preserve the legacy serving capture lock order and terminal replay.
+        let cluster = match expected_cluster_incarnation {
+            Some(expected) => {
+                crate::ref_store::pg::bound(tx, deadline).await?;
+                let current = crate::ref_store::pg::public_cluster_incarnation_nowait(tx).await?;
+                Some((current, expected))
+            }
+            None => None,
+        };
+        let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
+        match begun.record.state() {
+            OperationState::Committed | OperationState::Rejected => {
+                return Ok(receipt(pg::replay_terminal(begun)?, *selection.selection_digest(), false));
+            }
+            OperationState::Cancelled => {
+                return Err(super::reject(PackCommitRejectCode::Cancelled, "cancellation tombstone won"));
+            }
+            OperationState::Pending if begun.created => {
+                return Err(super::reject(
+                    PackCommitRejectCode::PendingMissing,
+                    "publication needs an existing pending operation",
                 ));
             }
+            OperationState::Pending => {
+                if cluster.is_some_and(|(current, expected)| current != expected) {
+                    return Err(RefStoreError::RestoreIncarnationMismatch.into());
+                }
+            }
         }
-    }
+        cluster.map(|(current, _)| current)
+    };
     // SHARE NOWAIT is taken before any authorization reads and retained through COMMIT.
     decisions::sql_locks::lock_source_tables(tx, selection.selected().action()).await.map_err(super::decision_error)?;
-    pg::ensure_repository(tx, plan, true).await?;
+    let repository_scope = pg::ensure_repository(tx, plan, true).await?;
+    if let Some(public) = public {
+        repository_scope
+            .require_serving(public.admission_owner_id, &public.backend_identity)
+            .map_err(|refusal| RefStoreError::Unsupported(refusal.reason()))?;
+    }
     decisions::sql_locks::lock_usage(tx, plan.repository_id(), plan.tenant_id())
         .await
         .map_err(super::decision_error)?;
@@ -297,11 +314,9 @@ async fn commit_in_tx(
         // The new target-audit outbox kind is opt-in only to the serving
         // gateway's captured-and-matched A4 path. Generic `commit` callers
         // (including namespace push) keep their previous behavior: no target
-        // audit row and therefore no wakeable job. `false` is the equality
-        // already established before the operation prefix; a mismatch was
-        // refused above, and an immutable replay returned before any write, so
-        // only the exact trusted capture is stamped here.
-        if let Some((incarnation, false)) = captured_cluster_incarnation {
+        // audit row and therefore no wakeable job. The restore fence above
+        // proves the captured incarnation before a fresh terminal is written.
+        if let Some(incarnation) = captured_cluster_incarnation {
             audit_enqueued = enqueue_core_audit(
                 tx,
                 plan,

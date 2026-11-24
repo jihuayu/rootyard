@@ -17,6 +17,7 @@ MOD_DIR = ROOT / "src" / "maintenance" / "paired_raft_backup"
 RUST_FILES = [
     ROOT / "src" / "standalone.rs",
     ROOT / "src" / "blob_git_gateway" / "receive.rs",
+    ROOT / "src" / "blob_git_gateway" / "receive" / "response.rs",
     ROOT / "src" / "maintenance" / "paired_raft_backup.rs",
     *sorted(MOD_DIR.glob("*.rs")),
     ROOT / "tests" / "paired_raft_backup_restore.rs",
@@ -368,9 +369,12 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         require(read("startup_wiring.rs") + read("startup_wiring_tests.rs"), ("PairedWriteRaftScopeGuard", "install_paired_write_raft_binding", "mirror_gateway_push_to_paired_raft", "run_serialized_pg_to_raft_step",
                 "tokio::sync::Mutex", "lock_owned", "cancelled_caller_keeps_serialization_lock_until_blocking_raft_apply_finishes"), "database-keyed paired write binding contract")
         receive_src = (ROOT / "src" / "blob_git_gateway" / "receive.rs").read_text(encoding="utf-8")
+        self.assertIn("paired_write_raft_gate(&state, repository_id, false).await?", receive_src)
+        response_src = (ROOT / "src" / "blob_git_gateway" / "receive" / "response.rs").read_text(encoding="utf-8")
         require(
-            receive_src,
-            ("check_paired_write_unfrozen", "mirror_gateway_push_to_paired_raft", "GatewayError::OutcomeUnknown"),
+            response_src,
+            ("check_paired_write_unfrozen", "mirror_gateway_push_to_paired_raft", "GatewayError::OutcomeUnknown",
+             "paired_write_raft_gate(self.state, self.serving.gate.repository_id(), terminal.is_committed()).await?"),
             "normal paired Smart-HTTP write-path mirror contract",
         )
         for gate in (
