@@ -1,5 +1,4 @@
--- Experimental M152 with a directly created three-attempt catalog.
--- Included only by the PostgreSQL qualification fixture.
+-- Durable public push identity with up to three private attempts.
 -- A writer must claim all operation keys before the issuer lane and then use
 -- the existing serving, gate, and decision lock order. Legacy reserve, begin,
 -- cancel and replay need reciprocal UUID checks before a producer is enabled.
@@ -59,6 +58,14 @@ CREATE TABLE ref_store_attempt_retirements (
     FOREIGN KEY (repository_id, public_id, slot)
         REFERENCES ref_store_private_attempts(repository_id, public_id, slot)
         ON DELETE CASCADE
+);
+
+-- Inserted by the verified restore fence when it rotates cluster authority.
+-- Terminal proof reads can follow this chain without rewriting restored evidence.
+CREATE TABLE ref_store_restore_lineage (
+    target_incarnation uuid PRIMARY KEY CHECK (target_incarnation <> '00000000-0000-0000-0000-000000000000'::uuid),
+    source_incarnation uuid NOT NULL CHECK (source_incarnation <> '00000000-0000-0000-0000-000000000000'::uuid),
+    CHECK (target_incarnation <> source_incarnation)
 );
 
 CREATE FUNCTION rootyard_ref_store_attempt_key(repo uuid, op uuid) RETURNS bigint LANGUAGE sql IMMUTABLE STRICT AS $$

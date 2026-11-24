@@ -13579,6 +13579,28 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "target_incarnation",
+      "not_null": true,
+      "position": 1,
+      "table": "ref_store_restore_lineage",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "source_incarnation",
+      "not_null": true,
+      "position": 2,
+      "table": "ref_store_restore_lineage",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "repository_id",
       "not_null": true,
       "position": 1,
@@ -26930,6 +26952,42 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK ((target_incarnation <> source_incarnation))",
+      "name": "ref_store_restore_lineage_check",
+      "table": "ref_store_restore_lineage",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (target_incarnation)",
+      "name": "ref_store_restore_lineage_pkey",
+      "table": "ref_store_restore_lineage",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((source_incarnation <> '00000000-0000-0000-0000-000000000000'::uuid))",
+      "name": "ref_store_restore_lineage_source_incarnation_check",
+      "table": "ref_store_restore_lineage",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((target_incarnation <> '00000000-0000-0000-0000-000000000000'::uuid))",
+      "name": "ref_store_restore_lineage_target_incarnation_check",
+      "table": "ref_store_restore_lineage",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "PRIMARY KEY (repository_id, operation_id)",
       "name": "ref_store_serving_operations_pkey",
       "table": "ref_store_serving_operations",
@@ -32999,6 +33057,15 @@
       "valid": true
     },
     {
+      "definition": "CREATE UNIQUE INDEX ref_store_restore_lineage_pkey ON public.ref_store_restore_lineage USING btree (target_incarnation)",
+      "live": true,
+      "name": "ref_store_restore_lineage_pkey",
+      "ready": true,
+      "table": "ref_store_restore_lineage",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX ref_store_serving_operations_pkey ON public.ref_store_serving_operations USING btree (repository_id, operation_id)",
       "live": true,
       "name": "ref_store_serving_operations_pkey",
@@ -35069,6 +35136,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "ref_store_publication_decisions",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "ref_store_restore_lineage",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
