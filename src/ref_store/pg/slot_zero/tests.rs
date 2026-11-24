@@ -1340,13 +1340,18 @@ async fn slot_zero_public_attempt_lookup_is_exact_and_read_only() -> anyhow::Res
         let private = Uuid::new_v4();
         let admission_request = slot_zero_request(&fixture, public, private);
         let mut client = fixture.pool.get().await?;
+        let mut admitted_plan = None;
 
         let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, receipt) = PgRefStore
             .admit_slot_zero_in_tx(
                 tx,
                 &admission_request,
-                |preview| plan_for(&fixture, &admission_request, preview),
+                |preview| {
+                    let plan = plan_for(&fixture, &admission_request, preview)?;
+                    admitted_plan = Some(plan.clone());
+                    Ok(plan)
+                },
                 deadline(),
             )
             .await?
@@ -1404,6 +1409,18 @@ async fn slot_zero_public_attempt_lookup_is_exact_and_read_only() -> anyhow::Res
         assert_eq!(lookup_request.wire_digest, receipt.wire_digest);
 
         let before = attempt_ledger_facts(&client, &fixture).await?;
+        let admitted_plan = admitted_plan.context("slot zero did not build a plan")?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
+        assert!(matches!(
+            PgRefStore.begin(&tx, admitted_plan.identity(), deadline()).await,
+            Err(RefStoreError::IdentityConflict)
+        ));
+        tx.rollback().await?;
+
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
+        PgRefStore.lock_private_pending_attempt(&tx, &lookup_request, &admitted_plan, deadline()).await?;
+        tx.commit().await?;
+
         let tx = tokio_postgres::Client::transaction(&mut client).await?;
         tx.batch_execute("SET TRANSACTION READ ONLY").await?;
         let read_only: String = tx.query_one("SHOW transaction_read_only", &[]).await?.get(0);
@@ -1446,8 +1463,22 @@ async fn slot_zero_public_attempt_lookup_is_exact_and_read_only() -> anyhow::Res
         }
 
         tx.rollback().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
+        assert!(matches!(
+            PgRefStore.lock_private_pending_attempt(&tx, &wrong_wire, &admitted_plan, deadline()).await,
+            Err(PackCommitError::RefStore(RefStoreError::DigestConflict))
+        ));
+        tx.rollback().await?;
+
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
+        assert!(matches!(
+            PgRefStore.lock_private_pending_attempt(&tx, &unknown_request, &admitted_plan, deadline()).await,
+            Err(PackCommitError::RefStore(RefStoreError::IdentityConflict))
+        ));
+        tx.rollback().await?;
+
         let after = attempt_ledger_facts(&client, &fixture).await?;
-        assert_eq!(before, after, "read-only public attempt lookup changed the attempt ledger");
+        assert_eq!(before, after, "public attempt lookup or prefix lock changed the attempt ledger");
         Ok(())
     })
     .await

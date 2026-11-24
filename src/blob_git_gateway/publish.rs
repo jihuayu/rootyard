@@ -257,7 +257,7 @@ pub(super) async fn push(
                 for (index, pair) in pairs.iter().enumerate() {
                     let planned =
                         plan.packs().get(index).ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
-                    publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
+                    publish_pair(state, &plan, planned.pack_id(), pair, None, deadline).await?;
                 }
                 decide(state, actor, (*plan).clone(), mode, deadline).await
             }
@@ -370,13 +370,21 @@ pub(super) async fn push_private(
                 // durable and before A3/A4; absent from non-test builds.
                 #[cfg(test)]
                 state.pause_after_admission(verified.operation_id()).await;
+                let public_request = public_attempt_request_from_serving(
+                    serving,
+                    verified.actor(),
+                    verified.operation_id(),
+                    verified.digest(),
+                    verified.mode(),
+                    state.store().backend_identity().as_hex().to_owned(),
+                )?;
                 let result = async {
                     for (index, pair) in verified.pairs().iter().enumerate() {
                         let planned = plan
                             .packs()
                             .get(index)
                             .ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
-                        publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
+                        publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline).await?;
                     }
                     decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline).await
                 }
@@ -405,14 +413,6 @@ pub(super) async fn push_private(
                 let private_id = plan.identity().operation_id();
                 let record =
                     load_terminal_record(state, serving.gate.repository_id(), private_id, deadline).await?;
-                let public_request = public_attempt_request_from_serving(
-                    serving,
-                    verified.actor(),
-                    verified.operation_id(),
-                    verified.digest(),
-                    verified.mode(),
-                    state.store().backend_identity().as_hex().to_owned(),
-                )?;
                 match mirror_public_terminal_with_request(
                     state,
                     serving,
@@ -883,7 +883,7 @@ pub(super) async fn retire_slot_one(
             for (index, pair) in verified.pairs().iter().enumerate() {
                 let planned =
                     plan.packs().get(index).ok_or(GatewayError::Internal("slot one planned pack set is incomplete"))?;
-                publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
+                publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline).await?;
             }
             let terminal = decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline).await?;
             let private_id = plan.identity().operation_id();
@@ -1741,6 +1741,7 @@ async fn publish_pair(
     plan: &PackCommitPlan,
     pack_id: Uuid,
     pair: &Pair,
+    public: Option<&PublicAttemptRequest>,
     deadline: Instant,
 ) -> Result<(), GatewayError> {
     let scope = HoldScope::new(
@@ -1795,7 +1796,14 @@ async fn publish_pair(
         .map_err(map_protected_upload)?;
     let mut client = state.pooled(deadline).await?;
     let registration = PackRegistrationRequest::new(plan, pack_id, &publication)?;
-    let _ = PgPackCommit.register_publication(&mut client, registration, deadline).await?;
+    match public {
+        Some(public) => {
+            PgPackCommit.register_private_publication(&mut client, registration, public, deadline).await?;
+        }
+        None => {
+            PgPackCommit.register_publication(&mut client, registration, deadline).await?;
+        }
+    }
     Ok(())
 }
 

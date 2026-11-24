@@ -60,7 +60,10 @@
 use super::bound;
 use crate::ref_store::{
     CommitMode, GitObjectFormat, IssuerLane, OperationState, PgRefStore, RefStoreError, RequestDigest,
-    core::pack_commit::{PackCommitError, PackCommitRejectCode, PackCommitRejection},
+    core::{
+        pack_commit::{PackCommitError, PackCommitPlan, PackCommitRejectCode, PackCommitRejection},
+        pack_snapshot::lock_cluster_incarnation,
+    },
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -511,6 +514,70 @@ impl fmt::Debug for PublicAttempt {
 }
 
 impl PgRefStore {
+    /// Lock an already admitted attempt for private A4 staging in the caller's
+    /// transaction. The legacy begin path still reserves no private UUIDs.
+    pub(crate) async fn lock_private_pending_attempt(
+        &self,
+        tx: &Transaction<'_>,
+        public: &PublicAttemptRequest,
+        plan: &PackCommitPlan,
+        deadline: Instant,
+    ) -> Result<(), PackCommitError> {
+        let identity = plan.identity();
+        if public.repository_id != plan.repository_id()
+            || public.admission_owner_id != plan.owner_id()
+            || public.admission_owner_id != plan.tenant_id()
+            || public.issuer_id != identity.issuer_id()
+            || public.request_mode != plan.commit_mode()
+            || public.object_format != plan.object_format()
+            || public.history_incarnation != plan.history_incarnation()
+            || public.authority_epoch != plan.authority_epoch()
+            || public.group_epoch != plan.group_epoch()
+        {
+            return Err(RefStoreError::IdentityConflict.into());
+        }
+        self.lock_public_attempt(tx, public, identity.operation_id(), deadline).await?;
+        let current = match self.lookup_public_attempt(tx, public, deadline).await? {
+            PublicAttemptLookup::Pending(evidence) => evidence.current,
+            PublicAttemptLookup::Cancelled(_) => {
+                return Err(PackCommitError::Rejected(PackCommitRejection::new(
+                    PackCommitRejectCode::Cancelled,
+                    "cancellation tombstone won",
+                )));
+            }
+            _ => return Err(RefStoreError::IdentityConflict.into()),
+        };
+        if current.private_id != identity.operation_id()
+            || current.plan_digest != *plan.parent_digest()
+            || current.base_revision != plan.expected().revision()
+            || current.lane != *identity.lane()
+            || current.sequence != identity.sequence()
+        {
+            return Err(RefStoreError::IdentityConflict.into());
+        }
+
+        // Match admission's restore -> issuer lane order and lock the existing
+        // lane without reserving a sequence or writing to the operation ledger.
+        bound(tx, deadline).await?;
+        if lock_cluster_incarnation(tx).await? != public.restore_incarnation {
+            return Err(RefStoreError::IdentityConflict.into());
+        }
+        bound(tx, deadline).await?;
+        let lane = tx
+            .query_opt(
+                "SELECT 1 FROM ref_store_issuer_lanes
+                   WHERE (repository_id,issuer_id,lane)=($1,$2,$3)
+                     AND last_reserved_sequence >= $4 FOR NO KEY UPDATE",
+                &[&identity.repository_id(), &identity.issuer_id(), &identity.lane().as_str(), &identity.sequence()],
+            )
+            .await
+            .map_err(lookup_db_error)?;
+        if lane.is_none() {
+            return Err(ledger("private attempt issuer lane is missing or behind its sequence"));
+        }
+        Ok(())
+    }
+
     /// Take migration 152's normalized public/attempt advisory lock set before
     /// an authorized private-mode preflight reads a wrapper.
     ///

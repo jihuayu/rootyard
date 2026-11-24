@@ -29,6 +29,95 @@ use rootyard::ref_store::{
 use std::path::Path;
 use uuid::Uuid;
 
+#[tokio::test]
+#[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
+async fn slot_zero_private_pack_registration_uses_the_exact_public_attempt() -> Result<()> {
+    use super::{common, setup};
+    use rootyard::ref_store::{
+        RefStoreError, RequestDigest,
+        core::pack_commit::{PackRegistrationRequest, PgPackCommit},
+    };
+
+    setup::require_owned_disposable_fixture()?;
+    let db = db::Db::setup().await?;
+    let outcome: Result<()> = async {
+        setup::require_postgres_17(&db).await?;
+        let store = common::open_store()?;
+        let git = git::git_binary()?;
+        let actor = db::serving_actor(&db.pool, "slot-zero-owner-").await?;
+        let repo = db::provision_serving(&db.pool, &actor, &store, "slot-zero-register").await?;
+        let baseline = capture_baseline(&db, repo.id, actor.id).await?;
+        let gate = baseline.gate();
+        let fixture = git::GitRepo::new(git, gate.object_format()).await?;
+        let oid = fixture.build_commit("new-ref", b"new\n", "slot zero").await?;
+        fixture.update_ref(REF_RETRY, &oid).await?;
+        let files = fixture.pack_all("slot-zero-register").await?;
+        let public = PublicAttemptRequest {
+            repository_id: repo.id,
+            admission_owner_id: actor.id,
+            issuer_id: actor.id,
+            public_id: Uuid::new_v4(),
+            wire_digest: wire_digest(gate.object_format(), REF_RETRY, None, &oid, CommitMode::Atomic),
+            request_mode: CommitMode::Atomic,
+            backend_identity: store.backend_identity().as_hex().to_owned(),
+            object_format: gate.object_format(),
+            history_incarnation: gate.history_incarnation(),
+            authority_epoch: gate.authority_epoch(),
+            group_epoch: gate.group_epoch(),
+            restore_incarnation: db::cluster_incarnation(&db.pool).await?,
+        };
+        let (admitted, plan) = admit_slot_zero(
+            &db,
+            &public,
+            Uuid::new_v4(),
+            &IssuerLane::new(SLOT_ZERO_LANE)?,
+            &baseline,
+            vec![ref_update(gate.object_format(), REF_RETRY, None, &oid)?],
+            std::slice::from_ref(&files),
+        )
+        .await?;
+        let publication = pack::publish(&db, &store, &plan, &files).await?;
+        let pack_id = plan.packs()[0].pack_id();
+        let request = || PackRegistrationRequest::new(&plan, pack_id, &publication);
+        let mut client = db.pool.get().await?;
+        ensure!(
+            matches!(
+                PgPackCommit.register_publication(&mut client, request()?, deadline()).await,
+                Err(PackCommitError::RefStore(RefStoreError::IdentityConflict))
+            ),
+            "legacy registration accepted a claimed private UUID"
+        );
+        let first = PgPackCommit.register_private_publication(&mut client, request()?, &public, deadline()).await?;
+        ensure!(!first.replayed, "first private registration must be fresh");
+        let second = PgPackCommit.register_private_publication(&mut client, request()?, &public, deadline()).await?;
+        ensure!(second.replayed && second.ack == first.ack, "an exact private registration did not replay");
+        ensure!(
+            matches!(
+                PgPackCommit.register_publication(&mut client, request()?, deadline()).await,
+                Err(PackCommitError::RefStore(RefStoreError::IdentityConflict))
+            ),
+            "legacy registration replayed a claimed private UUID"
+        );
+        let mut wrong_wire = public.clone();
+        wrong_wire.wire_digest = RequestDigest::of("unrelated-wire", &[b"wrong"]);
+        ensure!(
+            matches!(
+                PgPackCommit.register_private_publication(&mut client, request()?, &wrong_wire, deadline()).await,
+                Err(PackCommitError::RefStore(RefStoreError::DigestConflict))
+            ),
+            "a different wire digest replayed the committed private registration"
+        );
+        drop(client);
+        let stored = publication_for(&db, repo.id, admitted.private_id).await?;
+        ensure!(stored.parent_digest == plan.parent_digest().as_hex());
+        ensure!(stored_ref(&db, repo.id, REF_RETRY).await?.is_none(), "registration published a ref");
+        ensure!(db::gate_version(&db.pool, repo.id, actor.id).await?.revision() == gate.revision());
+        Ok(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
 /// Admit P0 for the exact ref A wire command, stage its real A3/A4 artifacts,
 /// advance the gate through a separate authorized P1 ref B command, refuse P0
 /// through the production superseded writer, and select the retirement through
