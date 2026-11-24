@@ -32,6 +32,7 @@ ADDITIONAL_FOUNDATION_CASES = [
     "blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit",
     "blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request",
     "blob_git_gateway::session_http_acceptance::public_operation_tests::public_operation_get_is_owned_pending_and_private_safe",
+    "blob_git_gateway::session_http_acceptance::public_operation_tests::public_cancel_rolls_back_if_the_repository_archives_while_waiting_for_its_lane",
 ]
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -1740,7 +1741,7 @@ pathlib.Path.replace = fail_replace
                 fixture,
                 environment={**os.environ, "ROOTYARD_282_ADMITTED_REFUSAL_WITNESS": ""})
             self.assertEqual(preflight["required_names"], base_names + ADDITIONAL_FOUNDATION_CASES)
-            self.assertEqual(len(preflight["required_names"]), 22)
+            self.assertEqual(len(preflight["required_names"]), 23)
             self.assertEqual(preflight["required_names"][17], CASE18_PRE_ADMISSION)
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -1749,7 +1750,7 @@ pathlib.Path.replace = fail_replace
                 fixture,
                 environment={**os.environ, "ROOTYARD_282_ADMITTED_REFUSAL_WITNESS": "1"})
             self.assertEqual(preflight["required_names"], base_names + [CASE19_ADMITTED_REFUSAL] + ADDITIONAL_FOUNDATION_CASES)
-            self.assertEqual(len(preflight["required_names"]), 23)
+            self.assertEqual(len(preflight["required_names"]), 24)
             self.assertEqual(preflight["required_names"][18], CASE19_ADMITTED_REFUSAL)
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -1768,12 +1769,12 @@ pathlib.Path.replace = fail_replace
                 f"runner failed:\n{process.stdout[-2000:]}\n{process.stderr[-2000:]}")
             aggregate = json.loads((evidence / "session174-foundation.json").read_text())
             self.assertEqual(aggregate["required_cases"], base_names + ADDITIONAL_FOUNDATION_CASES)
-            self.assertEqual(aggregate["cases_required"], 22)
+            self.assertEqual(aggregate["cases_required"], 23)
             self.assertTrue(aggregate["ok"])
-            self.assertEqual(aggregate["summary"], "22 passed, 0 failed, 0 ignored")
+            self.assertEqual(aggregate["summary"], "23 passed, 0 failed, 0 ignored")
             self.assertFalse((evidence / "case-19.json").exists())
             self.assertFalse((evidence / "case-19.log").exists())
-            self.assertEqual([row["index"] for row in aggregate["cases"][-4:]], [20, 21, 22, 23])
+            self.assertEqual([row["index"] for row in aggregate["cases"][-5:]], [20, 21, 22, 23, 24])
 
         with tempfile.TemporaryDirectory() as temporary:
             process, evidence, secret = self.run_case_runner(
@@ -1784,9 +1785,10 @@ pathlib.Path.replace = fail_replace
             aggregate = json.loads((evidence / "session174-foundation.json").read_text())
             self.assertEqual(aggregate["required_cases"],
                              base_names + [CASE19_ADMITTED_REFUSAL] + ADDITIONAL_FOUNDATION_CASES)
-            self.assertEqual(aggregate["cases_required"], 23)
+            self.assertEqual(aggregate["cases_required"], 24)
             self.assertTrue(aggregate["ok"])
-            self.assertEqual(aggregate["summary"], "23 passed, 0 failed, 0 ignored")
+            self.assertEqual(aggregate["summary"], "24 passed, 0 failed, 0 ignored")
+            self.assertEqual([row["index"] for row in aggregate["cases"][-5:]], [20, 21, 22, 23, 24])
             witness = aggregate["cases"][18]
             self.assertEqual(
                 witness,
