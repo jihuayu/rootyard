@@ -17,12 +17,15 @@ use deadpool_postgres::Pool;
 use opendal::services::S3;
 use opendal::{ErrorKind, Operator};
 use tokio::time::{Instant as TokioInstant, timeout_at};
+use tokio_postgres::{GenericClient, IsolationLevel};
 use uuid::Uuid;
 
 use crate::blob_store::BlobLocator;
 use crate::blob_store::config::BlobProfile;
+use crate::blob_store::opendal::BlobStore;
 
 use super::gateway_bridge::open_gateway_reclaim_ledger;
+use super::gateway_durable_binding::{ReclaimBinding, reclaim_binding, verify_reclaim_wrapper};
 use super::reclaim::{BlobUploadReclaimRecord, UploadReclaimState};
 use super::types::PushCausalError;
 
@@ -80,6 +83,11 @@ fn resolve_reclaim_operator(backend_hex: &str) -> Option<Operator> {
         return None;
     }
     let profile = BlobProfile::from_env().ok()?;
+    if profile.provider().as_str() != "s3"
+        || BlobStore::open(profile.clone()).ok()?.backend_identity().as_hex() != backend_hex
+    {
+        return None;
+    }
     let ak = std::env::var("ROOTYARD_BLOB_ACCESS_KEY_ID").ok()?;
     let sk = std::env::var("ROOTYARD_BLOB_SECRET_ACCESS_KEY").ok()?;
     let mut builder = S3::default()
@@ -103,7 +111,8 @@ fn resolve_reclaim_operator(backend_hex: &str) -> Option<Operator> {
     Some(Operator::new(builder).ok()?.finish())
 }
 
-/// Read ALL `0..=8` `.pack` and `.idx` remote `BlobLocator` paths recorded in `artifact_holds` for `operation_id`.
+/// Read the exact hold locators for a legacy operation or all attempts of a
+/// public operation, excluding any hold outside its backend and tenant.
 pub async fn query_operation_hold_blob_paths(
     pool: &Pool,
     repository_id: Uuid,
@@ -111,23 +120,74 @@ pub async fn query_operation_hold_blob_paths(
     backend_hex: &str,
     deadline: TokioInstant,
 ) -> Result<(Vec<String>, u64), PushCausalError> {
-    let client = timeout_at(deadline, pool.get())
-        .await
-        .map_err(|_| PushCausalError::DeadlineExceeded)?
-        .map_err(|e| PushCausalError::Io(e.to_string()))?;
-    let rows = timeout_at(
-        deadline,
-        client.query(
-            "SELECT storage_tenant_id, authority_id, authority_generation, attempt_id, namespace, sha256, content_length
-             FROM artifact_holds
-             WHERE repository_id = $1 AND operation_id = $2 AND backend_identity = $3
-             ORDER BY request_id ASC, slot ASC",
-            &[&repository_id, &operation_id, &backend_hex],
-        ),
-    )
+    Ok(reclaim_read(pool, repository_id, operation_id, backend_hex, None, deadline)
+        .await?
+        .map_or_else(Default::default, |read| (read.paths, read.bytes)))
+}
+
+struct ReclaimRead {
+    paths: Vec<String>,
+    bytes: u64,
+    proven: bool,
+    public: bool,
+}
+
+/// Resolve the stable ledger key, collect locators and prove abort/zero references
+/// in one bounded snapshot. A pending or committed public wrapper never deletes
+/// staged objects, even when an earlier private attempt was retired as rejected.
+async fn reclaim_read(
+    pool: &Pool,
+    repository_id: Uuid,
+    operation_id: Uuid,
+    backend_hex: &str,
+    ledger_tenant: Option<Uuid>,
+    deadline: TokioInstant,
+) -> Result<Option<ReclaimRead>, PushCausalError> {
+    timeout_at(deadline, async {
+        let mut client = pool.get().await.map_err(|e| PushCausalError::Io(e.to_string()))?;
+        let tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|e| PushCausalError::Io(e.to_string()))?;
+        let Some(binding) = reclaim_binding(&tx, repository_id, operation_id).await? else { return Ok(None) };
+        let (attempts, tenant, may_abort, public) = match binding {
+            ReclaimBinding::Legacy => (vec![operation_id], ledger_tenant, true, false),
+            ReclaimBinding::Public { owner, backend, attempts, terminal_abort } => {
+                if backend != backend_hex || ledger_tenant.is_some_and(|tenant| tenant != owner) {
+                    return Ok(None);
+                }
+                if terminal_abort {
+                    verify_reclaim_wrapper(&tx, repository_id, operation_id).await?;
+                }
+                (attempts, Some(owner), terminal_abort, true)
+            }
+        };
+        let (paths, bytes) = read_hold_paths(&*tx, repository_id, &attempts, backend_hex, tenant).await?;
+        let proven = may_abort && prove_aborts_without_references(&*tx, repository_id, &attempts).await?;
+        Ok(Some(ReclaimRead { paths, bytes, proven, public }))
+    })
     .await
     .map_err(|_| PushCausalError::DeadlineExceeded)?
-    .map_err(|e| PushCausalError::Io(e.to_string()))?;
+}
+
+async fn read_hold_paths(
+    client: &(impl GenericClient + Sync),
+    repository_id: Uuid,
+    attempts: &[Uuid],
+    backend_hex: &str,
+    tenant_id: Option<Uuid>,
+) -> Result<(Vec<String>, u64), PushCausalError> {
+    let rows = client.query(
+            "SELECT storage_tenant_id, authority_id, authority_generation, attempt_id, namespace, sha256, content_length
+             FROM artifact_holds
+             WHERE repository_id = $1 AND operation_id = ANY($2) AND backend_identity = $3
+               AND ($4::uuid IS NULL OR storage_tenant_id = $4)
+             ORDER BY request_id ASC, slot ASC",
+            &[&repository_id, &attempts, &backend_hex, &tenant_id],
+        ).await.map_err(|e| PushCausalError::Io(e.to_string()))?;
 
     let mut paths = Vec::with_capacity(rows.len());
     let mut total_bytes = 0u64;
@@ -164,76 +224,78 @@ pub async fn is_operation_proven_aborted_and_unreferenced(
     operation_id: Uuid,
     deadline: TokioInstant,
 ) -> Result<bool, PushCausalError> {
-    let client = timeout_at(deadline, pool.get())
-        .await
-        .map_err(|_| PushCausalError::DeadlineExceeded)?
-        .map_err(|e| PushCausalError::Io(e.to_string()))?;
-    let op_row = timeout_at(
-        deadline,
-        client.query_opt(
-            "SELECT state FROM ref_store_operations WHERE repository_id = $1 AND operation_id = $2",
-            &[&repository_id, &operation_id],
-        ),
-    )
+    timeout_at(deadline, async {
+        let mut client = pool.get().await.map_err(|e| PushCausalError::Io(e.to_string()))?;
+        let tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|e| PushCausalError::Io(e.to_string()))?;
+        let attempts = match reclaim_binding(&tx, repository_id, operation_id).await? {
+            Some(ReclaimBinding::Legacy) => vec![operation_id],
+            Some(ReclaimBinding::Public { attempts, terminal_abort: true, .. }) => {
+                verify_reclaim_wrapper(&tx, repository_id, operation_id).await?;
+                attempts
+            }
+            _ => return Ok(false),
+        };
+        prove_aborts_without_references(&*tx, repository_id, &attempts).await
+    })
     .await
     .map_err(|_| PushCausalError::DeadlineExceeded)?
-    .map_err(|e| PushCausalError::Io(e.to_string()))?;
+}
 
-    let proven_terminal_abort = match op_row {
-        Some(row) => {
-            let state: &str = row.get(0);
-            matches!(state, "rejected" | "cancelled")
-        }
-        None => {
-            let tomb_row = timeout_at(
-                deadline,
-                client.query_one(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM ref_store_cancellations
-                         WHERE repository_id = $1 AND operation_id = $2
-                     ) OR EXISTS(
-                         SELECT 1 FROM ref_store_publication_decisions
-                         WHERE repository_id = $1 AND operation_id = $2 AND state IN ('REJECTED', 'CANCELLED')
-                     )",
-                    &[&repository_id, &operation_id],
-                ),
-            )
-            .await
-            .map_err(|_| PushCausalError::DeadlineExceeded)?
-            .map_err(|e| PushCausalError::Io(e.to_string()))?;
-            tomb_row.get::<_, bool>(0)
-        }
-    };
+async fn prove_aborts_without_references(
+    client: &(impl GenericClient + Sync),
+    repository_id: Uuid,
+    attempts: &[Uuid],
+) -> Result<bool, PushCausalError> {
+    let proven_terminal_abort: bool = client
+        .query_one(
+            "SELECT coalesce(bool_and(CASE WHEN o.operation_id IS NOT NULL
+                    THEN o.state IN ('rejected','cancelled')
+                    ELSE EXISTS(SELECT 1 FROM ref_store_cancellations c
+                                WHERE c.repository_id=$1 AND c.operation_id=a.id)
+                      OR EXISTS(SELECT 1 FROM ref_store_publication_decisions d
+                                WHERE d.repository_id=$1 AND d.operation_id=a.id
+                                  AND d.state IN ('REJECTED','CANCELLED'))
+                    END), false)
+         FROM unnest($2::uuid[]) a(id)
+         LEFT JOIN ref_store_operations o ON o.repository_id=$1 AND o.operation_id=a.id",
+            &[&repository_id, &attempts],
+        )
+        .await
+        .map_err(|e| PushCausalError::Io(e.to_string()))?
+        .get(0);
     if !proven_terminal_abort {
         return Ok(false);
     }
 
-    let ref_row = timeout_at(
-        deadline,
-        client.query_one(
+    let ref_row = client
+        .query_one(
             "SELECT
                (SELECT COUNT(*) FROM ref_store_core_pack_memberships m
                 JOIN ref_store_core_pack_publications p ON p.repository_id = m.repository_id AND p.pack_id = m.pack_id
-                WHERE m.repository_id = $1 AND p.plan_operation_id = $2)
+                WHERE m.repository_id = $1 AND p.plan_operation_id = ANY($2))
              + (SELECT COUNT(*) FROM ref_store_core_snapshot_packs sp
                 JOIN ref_store_core_pack_publications p ON p.registration_id = sp.registration_id
-                WHERE p.repository_id = $1 AND p.plan_operation_id = $2)
+                WHERE p.repository_id = $1 AND p.plan_operation_id = ANY($2))
              + (SELECT COUNT(*) FROM ref_store_core_serving_read_packs srp
                 JOIN ref_store_core_pack_publications p ON p.registration_id = srp.registration_id
-                WHERE p.repository_id = $1 AND p.plan_operation_id = $2)
+                WHERE p.repository_id = $1 AND p.plan_operation_id = ANY($2))
              + (SELECT COUNT(*) FROM ref_store_core_root_packs rp
                 JOIN ref_store_core_root_heads rh
                   ON rh.repository_id = rp.repository_id AND rh.root_id = rp.root_id AND rh.state = 'active'
                 JOIN ref_store_core_pack_publications p ON p.registration_id = rp.registration_id
-                WHERE rp.repository_id = $1 AND p.plan_operation_id = $2)
+                WHERE rp.repository_id = $1 AND p.plan_operation_id = ANY($2))
              + (SELECT COUNT(*) FROM ref_store_publication_decisions d
-                WHERE d.repository_id = $1 AND d.operation_id = $2 AND d.state IN ('OPEN', 'CONSUMED'))",
-            &[&repository_id, &operation_id],
-        ),
-    )
-    .await
-    .map_err(|_| PushCausalError::DeadlineExceeded)?
-    .map_err(|e| PushCausalError::Io(e.to_string()))?;
+                WHERE d.repository_id = $1 AND d.operation_id = ANY($2) AND d.state IN ('OPEN', 'CONSUMED'))",
+            &[&repository_id, &attempts],
+        )
+        .await
+        .map_err(|e| PushCausalError::Io(e.to_string()))?;
     let live_refs: i64 = ref_row.get(0);
     Ok(live_refs == 0)
 }
@@ -262,23 +324,19 @@ pub async fn settle_aborted_gateway_reclaim(
         return Some(existing);
     }
     let dl = TokioInstant::now() + Duration::from_secs(5);
-    let proven =
-        is_operation_proven_aborted_and_unreferenced(pool, repository_id, operation_id, dl).await.unwrap_or(false);
-    let (hold_paths, hold_bytes) =
-        query_operation_hold_blob_paths(pool, repository_id, operation_id, backend_hex, dl).await.unwrap_or_default();
-    let mut merged: BTreeSet<String> = existing.recorded_blob_paths.into_iter().collect();
-    merged.extend(hold_paths);
-    let all_paths: Vec<String> = merged.into_iter().collect();
+    let read =
+        reclaim_read(pool, repository_id, operation_id, backend_hex, Some(existing.tenant_id), dl).await.ok()??;
+    let all_paths = verified_paths(&existing, &read)?;
     // Never relabel an unproven attempt as aborted. Unknown/unresolved records
     // keep their staged paths and remain in the recoverable retention state.
-    let state = if fallback_state == UploadReclaimState::AbortUnpromoted && !proven {
+    let state = if fallback_state == UploadReclaimState::AbortUnpromoted && !read.proven {
         UploadReclaimState::OutcomeUnknown
     } else {
         fallback_state
     };
-    let updated = ledger.transition(operation_id, state, all_paths.clone(), hold_bytes, detail).ok()?;
+    let updated = ledger.transition(operation_id, state, all_paths.clone(), read.bytes, detail).ok()?;
 
-    if proven
+    if read.proven
         && let Some(op) = resolve_reclaim_operator(backend_hex)
         && delete_and_verify_absent(&op, &all_paths, dl).await.is_ok()
     {
@@ -315,24 +373,45 @@ pub async fn sweep_gateway_reclaim_ledger(
         if rec.backend_identity != backend_hex {
             continue;
         }
-        let (hold_paths, hold_bytes) =
-            query_operation_hold_blob_paths(pool, rec.repository_id, rec.operation_id, backend_hex, deadline).await?;
-        let mut merged: BTreeSet<String> = rec.recorded_blob_paths.iter().cloned().collect();
-        merged.extend(hold_paths);
-        let all_paths: Vec<String> = merged.into_iter().collect();
+        let Some(read) =
+            reclaim_read(pool, rec.repository_id, rec.operation_id, backend_hex, Some(rec.tenant_id), deadline).await?
+        else {
+            continue;
+        };
+        let Some(all_paths) = verified_paths(&rec, &read) else { continue };
         if all_paths != rec.recorded_blob_paths {
-            let _ = ledger.transition(rec.operation_id, rec.state, all_paths.clone(), hold_bytes, &rec.detail);
+            let _ = ledger.transition(rec.operation_id, rec.state, all_paths.clone(), read.bytes, &rec.detail);
         }
         // A missing operation row or a still-`pending` row is NOT positive durable abort proof, so the
         // quarantined record and every staged remote object stay intact (`0` deletes, `0` transitions).
-        let (rid, oid) = (rec.repository_id, rec.operation_id);
-        if is_operation_proven_aborted_and_unreferenced(pool, rid, oid, deadline).await? {
+        if read.proven {
             delete_and_verify_absent(&op, &all_paths, deadline).await?;
-            ledger.mark_reclaimed_if_proven_aborted(oid, true)?;
+            ledger.mark_reclaimed_if_proven_aborted(rec.operation_id, true)?;
             swept += 1;
         }
     }
     Ok(swept)
+}
+
+fn verified_paths(record: &BlobUploadReclaimRecord, read: &ReclaimRead) -> Option<Vec<String>> {
+    let mut paths: BTreeSet<_> = read.paths.iter().cloned().collect();
+    let prefix = format!("v1/tenants/{}/", record.tenant_id);
+    for path in &record.recorded_blob_paths {
+        // A public record can contain paths from older attempts, but only the
+        // exact PG hold history authorizes them. Legacy upload records also
+        // support paths persisted before a hold was written.
+        if read.public {
+            if !paths.contains(path) {
+                return None;
+            }
+        } else {
+            if !path.starts_with(&prefix) || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+                return None;
+            }
+            paths.insert(path.clone());
+        }
+    }
+    Some(paths.into_iter().collect())
 }
 
 async fn delete_and_verify_absent(
