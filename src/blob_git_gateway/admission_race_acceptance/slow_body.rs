@@ -40,9 +40,9 @@ use super::super::session_http_acceptance::fixtures::{
     git::{self, Git},
 };
 use super::{
-    Captures, INDEPENDENT_A, INDEPENDENT_B, SEED_CONTENT, SEED_FILE, SEED_REF, WitnessResources, clone_url,
-    create_repository, durable_ref, gate_revision, open_store, pinned_operation, provision_decision_realm,
-    report_status, require_owned_disposable_blob_fixture, require_per_run_blob_prefix,
+    Captures, INDEPENDENT_A, INDEPENDENT_B, SEED_CONTENT, SEED_FILE, SEED_REF, WitnessResources,
+    capture_receive_responses, clone_url, create_repository, durable_ref, gate_revision, open_store, pinned_operation,
+    provision_decision_realm, report_status, require_owned_disposable_blob_fixture, require_per_run_blob_prefix,
 };
 use crate::{
     blob_git_gateway::{
@@ -758,9 +758,9 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             FIXTURE_HTTP_POST_BUFFER_BYTES > SLOW_PACK_BYTES && FIXTURE_HTTP_POST_BUFFER_BYTES < 16 * 1024 * 1024,
             "the command-local fixture post buffer is outside its exact fixture pack bound"
         );
-        *resources.first_push =
+        resources.first_push =
             Some(spawn_fixture_push_ref(git, first_dir, direct_url.clone(), first_operation, INDEPENDENT_A));
-        *resources.second_push =
+        resources.second_push =
             Some(spawn_fixture_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
 
         // Both stock children were spawned before either join; the second body
@@ -774,7 +774,7 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
                 .ok_or_else(|| anyhow!("the first slow-body push task was not created"))?;
             first_handle.await
         };
-        *resources.first_push = None;
+        resources.first_push = None;
         let first_output = first_join
             .map_err(|_| anyhow!("the first slow-body stock push task failed"))?
             .map_err(|_| anyhow!("the first slow-body stock push failed"))?;
@@ -785,7 +785,7 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
                 .ok_or_else(|| anyhow!("the second slow-body push task was not created"))?;
             second_handle.await
         };
-        *resources.second_push = None;
+        resources.second_push = None;
         let second_output = second_join
             .map_err(|_| anyhow!("the second slow-body stock push task failed"))?
             .map_err(|_| anyhow!("the second slow-body stock push failed"))?;

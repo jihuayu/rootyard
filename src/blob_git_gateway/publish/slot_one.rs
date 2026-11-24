@@ -589,8 +589,6 @@ mod tests {
         },
     };
 
-    const LANE: &str = "blob-git-receive";
-
     fn serving() -> ServingRepository {
         let repository_id = Uuid::new_v4();
         let tenant_id = Uuid::new_v4();
