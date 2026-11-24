@@ -208,7 +208,7 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
     seed::write_volume(&source_config.data_dir)?;
     let archive = temp.path().join("archive");
     let created = create(&source_config, &archive).await?;
-    ensure!(created.format == 30 && created.sidecar.schema_head >= 151, "paired format/schema differs");
+    ensure!(created.format == 32 && created.sidecar.schema_head == 152, "paired format/schema differs");
     let checked = check(&archive)?;
     ensure!(checked.w8a_backup_id == created.w8a_backup_id, "check receipt differs from creation");
 

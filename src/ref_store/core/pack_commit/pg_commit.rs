@@ -23,7 +23,7 @@ use crate::ref_store::contract::{OperationState, RefStoreError, TerminalOutcome,
 use crate::ref_store::core::artifact_hold::{ArtifactHoldPurpose, HoldScope, read_registration_ledger};
 use crate::ref_store::core::terminal::RefCommitResult;
 use crate::ref_store::core::types::RefTarget;
-use crate::ref_store::pg::PgRefStore;
+use crate::ref_store::pg::{LegacyStatusLookup, PgRefStore, public_attempt::PublicAttemptRequest};
 use crate::ref_store::tx::{begin_bounded, commit_bounded};
 use tokio::time::Instant;
 use tokio_postgres::{Client, Transaction};
@@ -44,34 +44,69 @@ impl pg::PgPackCommit {
         request: PackRegistrationRequest<'_>,
         deadline: Instant,
     ) -> Result<PackRegistrationReceipt, PackCommitError> {
+        self.register_publication_inner(client, request, None, deadline).await
+    }
+
+    /// Stage an A3 pair for the exact current serving attempt inside its
+    /// public wrapper. The caller resolved the authenticated wire request.
+    pub(crate) async fn register_private_publication(
+        &self,
+        client: &mut Client,
+        request: PackRegistrationRequest<'_>,
+        public: &PublicAttemptRequest,
+        deadline: Instant,
+    ) -> Result<PackRegistrationReceipt, PackCommitError> {
+        if publication_backend(request.publication())? != public.backend_identity {
+            return Err(pg::reject(PackCommitRejectCode::PublicationMismatch, "private attempt backend differs"));
+        }
+        self.register_publication_inner(client, request, Some(public), deadline).await
+    }
+
+    async fn register_publication_inner(
+        &self,
+        client: &mut Client,
+        request: PackRegistrationRequest<'_>,
+        public: Option<&PublicAttemptRequest>,
+        deadline: Instant,
+    ) -> Result<PackRegistrationReceipt, PackCommitError> {
         let plan = request.plan();
         let publication = request.publication();
-        let replay = {
+        if public.is_none() {
             let tx = begin_bounded(client, deadline).await?;
-            let existing = pg::stage_bounded(
-                deadline,
-                registration::by_request(
+            let replay = pg::stage_bounded(deadline, async {
+                let existing = registration::by_request(
                     &tx,
                     plan.scope(),
                     publication.acquire_request_id(),
                     publication.consume_request_id(),
                     request.planned_pack().registration_id(),
                     deadline,
-                ),
-            )
+                )
+                .await?;
+                let Some(stored) = existing else {
+                    return Ok(None);
+                };
+                let receipt = exact_replay(&stored, plan, &request)?;
+                let status = PgRefStore
+                    .get_legacy_status(&tx, plan.repository_id(), plan.identity().operation_id(), deadline)
+                    .await?;
+                if matches!(status, LegacyStatusLookup::PrivateIdentifier | LegacyStatusLookup::PublicWrapper) {
+                    return Err(RefStoreError::IdentityConflict.into());
+                }
+                Ok(Some(receipt))
+            })
             .await;
             let _ = tx.rollback().await;
-            existing?
-        };
-        if let Some(stored) = replay {
-            return exact_replay(&stored, plan, &request);
+            if let Some(receipt) = replay? {
+                return Ok(receipt);
+            }
         }
         let tx = begin_bounded(client, deadline).await?;
         let result = pg::stage_bounded(deadline, async {
             // Transaction-local durability: never inherit an external
             // synchronous_commit=off session/role/database policy.
             pg::set_ack_durability(&tx, deadline).await?;
-            self.register_in_tx(&tx, &request, deadline).await
+            self.register_in_tx(&tx, &request, public, deadline).await
         })
         .await;
         match result {
@@ -92,16 +127,24 @@ impl pg::PgPackCommit {
         &self,
         tx: &Transaction<'_>,
         request: &PackRegistrationRequest<'_>,
+        public: Option<&PublicAttemptRequest>,
         deadline: Instant,
     ) -> Result<PackRegistrationReceipt, PackCommitError> {
         let plan = request.plan();
         let publication = request.publication();
-        // Exact migration-138 prefix (operation key + repository existence +
-        // issuer lane) held until COMMIT; a missing pending row is never created
-        // here (typed refusal, whole transaction rolled back).
-        pg::acquire_pending_prefix(tx, plan, deadline).await?;
+        // Keep the operation and issuer lane locked until the stage commits.
+        if let Some(public) = public {
+            PgRefStore.lock_private_pending_attempt(tx, public, plan, deadline).await?;
+        } else {
+            pg::acquire_pending_prefix(tx, plan, deadline).await?;
+        }
         crate::ref_store::pg::bound(tx, deadline).await?;
         let repository_scope = pg::ensure_repository(tx, plan, true).await?;
+        if let Some(public) = public {
+            repository_scope
+                .require_serving(public.admission_owner_id, &public.backend_identity)
+                .map_err(|refusal| RefStoreError::Unsupported(refusal.reason()))?;
+        }
         // Tenant -> repository quota rows are locked BEFORE the core gate.
         let locked = lock_quota(tx, plan.repository_id(), plan.tenant_id()).await?;
         // Authoritative re-check of the same bounded immutable lookup before the

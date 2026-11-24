@@ -4,8 +4,35 @@
 //! `check`/`restore` entrypoints remain defined in `src/backup/restore.rs`.
 use super::*;
 
-/// Immediate previous current paired archive format (frozen schema 150).
-const HISTORICAL_FORMAT_PAIRED_28: u32 = 28;
+pub(crate) struct VerifiedArchiveIdentity {
+    pub(crate) format: u32,
+    pub(crate) backup_id: Uuid,
+    pub(crate) schema_head: i32,
+    pub(crate) schema_contract_sha256: String,
+    pub(crate) repository_count: usize,
+}
+
+/// The two outer paired protocols were introduced with format 30. Their
+/// version-one envelopes keep their existing paths and seal domains.
+pub(crate) fn paired_envelope_schema_head(format: u32) -> Option<i32> {
+    match format {
+        30 | FORMAT_PAIRED => schema_versions(format).ok()?.last().copied(),
+        _ => None,
+    }
+}
+
+/// Verify the actual inner archive and return the identity covered by its
+/// manifest and COMPLETE marker without re-parsing an unchecked manifest.
+pub(crate) fn verify_archive_identity(source: &Path) -> Result<VerifiedArchiveIdentity> {
+    let manifest = verify(&absolute(source, true)?)?;
+    Ok(VerifiedArchiveIdentity {
+        format: manifest.format,
+        backup_id: manifest.backup_id,
+        schema_head: manifest.schema_versions.last().copied().context("inner archive has no schema version")?,
+        schema_contract_sha256: manifest.schema_contract_sha256,
+        repository_count: manifest.repositories.len(),
+    })
+}
 
 pub(super) fn verify(source: &Path) -> Result<Manifest> {
     let manifest_meta = fs::symlink_metadata(source.join("manifest.json"))?;
@@ -25,7 +52,7 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     ensure!(expected.len() == 64 && hash(&source.join("manifest.json"))? == expected, "incomplete or damaged manifest");
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        matches!(manifest.format, 4..=30)
+        matches!(manifest.format, 4..=32)
             && manifest.schema_versions == schema_versions(manifest.format)?
             && manifest.schema_contract_sha256 == schema_contract_digest(manifest.format)?,
         "unsupported backup format"
@@ -92,12 +119,8 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     // The archive version and its members must agree exactly: a paired archive
     // carries locators, a closure summary and a blob/ tree; a format21 archive
     // carries none of them and is never presented as an independent backup.
-    // Format 28 is the immediate previous current paired layout. Its schema
-    // catalog is frozen, but its archive members remain the same paired Blob
-    // closure/locator/RefStore carry that format 30 uses. Keep format 27
-    // metadata-only and preserve the current format 30 paired branch.
     match manifest.format {
-        FORMAT_PAIRED | HISTORICAL_FORMAT_PAIRED_28 => {
+        format if catalog::is_paired(format) => {
             let closure = manifest.blob_closure.as_ref().context("paired archive carries no Blob closure")?;
             ensure!(has_blob, "paired archive is missing its Blob byte closure");
             ensure!(
@@ -274,8 +297,8 @@ mod tests {
     }
 
     #[test]
-    fn frozen_paired_28_and_current_paired_30_layouts_verify() -> Result<()> {
-        for format in [28, 30] {
+    fn frozen_and_current_paired_layouts_verify() -> Result<()> {
+        for format in [28, 30, 32] {
             let temp = tempfile::tempdir()?;
             write_archive(temp.path(), format, false)?;
             let manifest = verify(temp.path())?;
@@ -288,17 +311,19 @@ mod tests {
     }
 
     #[test]
-    fn metadata_formats_and_malformed_paired_28_stay_rejected() -> Result<()> {
-        for format in [27, 29] {
+    fn metadata_formats_and_malformed_paired_layouts_stay_rejected() -> Result<()> {
+        for format in [27, 29, 31] {
             let temp = tempfile::tempdir()?;
             write_archive(temp.path(), format, false)?;
             let error = verify(temp.path()).unwrap_err().to_string();
             assert!(error.contains("must not carry"), "format {format}: {error}");
         }
-        let temp = tempfile::tempdir()?;
-        write_archive(temp.path(), 28, true)?;
-        let error = verify(temp.path()).unwrap_err().to_string();
-        assert!(error.contains("Blob closure count"), "{error}");
+        for format in [28, 30, 32] {
+            let temp = tempfile::tempdir()?;
+            write_archive(temp.path(), format, true)?;
+            let error = verify(temp.path()).unwrap_err().to_string();
+            assert!(error.contains("Blob closure count"), "format {format}: {error}");
+        }
         Ok(())
     }
 }

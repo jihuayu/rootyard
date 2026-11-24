@@ -1537,6 +1537,7 @@ jobs:
           # per-run prefix. This job-owned Garage is disposed as a whole after
           # the run; no per-key deletion is attempted.
           export ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1
+          export ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1
           export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
           export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
           lib="$evidence/session174-lib-tests"
@@ -1756,6 +1757,11 @@ jobs:
               fail('ROOTYARD_282_ADMITTED_REFUSAL_WITNESS must be empty or 1')
           if witness == '1':
               names.append(CASE19_ADMITTED_REFUSAL)
+          names.extend([
+              'blob_git_gateway::admission_race_acceptance::post_admission_independent_refs_both_commit',
+              'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
+              'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
+          ])
           lib = readonly_alias(lib, 'lib alias')
           cli = readonly_alias(cli, 'CLI alias')
 
@@ -2331,6 +2337,11 @@ jobs:
           ]
           if witness == '1':
               names.append(CASE19_ADMITTED_REFUSAL)
+          names.extend([
+              'blob_git_gateway::admission_race_acceptance::post_admission_independent_refs_both_commit',
+              'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
+              'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
+          ])
           if required_names != names:
               raise SystemExit('session174 cases: preflight required_names differs from the selected inventory')
           names = required_names
@@ -2520,8 +2531,13 @@ jobs:
                       phase = read_witness_phase(marker)
               return result, phase
 
+          # Reserve ordinal 19 for the #282 witness, even in the ordinary run.
+          required = [
+              (index + int(witness == '' and index >= 19), name)
+              for index, name in enumerate(names, 1)
+          ]
           results = []
-          for index, name in enumerate(names, 1):
+          for index, name in required:
               witness_case = index == 19 and name == witness_case_name
               if witness_case:
                   command = [lib, '--ignored', '--exact', name, '--test-threads=1']
@@ -2620,7 +2636,6 @@ jobs:
               else:
                   for error in record['errors']:
                       print('  failure: ' + error)
-          required = [(index, name) for index, name in enumerate(names, 1)]
           complete = len(results) == len(required) and all(
               (record['index'], record['name']) == (index, name) for record, (index, name) in zip(results, required))
           passed_total = sum(item['passed'] for item in results)

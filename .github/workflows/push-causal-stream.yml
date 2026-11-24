@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/push-causal-stream.yml'
       - 'src/blob_git_gateway/receive.rs'
+      - 'src/blob_git_gateway/receive/**'
       - 'src/namespace_service.rs'
       - 'src/namespace_service/push_causal_stream.rs'
       - 'src/namespace_service/push_causal_stream/**'

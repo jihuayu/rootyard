@@ -8,14 +8,19 @@ use super::super::request::PackPendingToken;
 use super::super::{pg, producer, sql, usage};
 use super::{AuthorizedCommitError, PgAuthorizedCommit, effective_deadline, pooled_client};
 use crate::db::Identity;
-use crate::ref_store::contract::{OperationState, RequestDigest, TerminalOutcome};
+use crate::ref_store::contract::{OperationState, RefStoreError, RequestDigest, TerminalOutcome};
 use crate::ref_store::core::decision_commit::{self, RealmExpectation};
 use crate::ref_store::core::publication_decision as decisions;
 use crate::ref_store::core::terminal::{CommitRejectCode, RefCommitResult};
-use crate::ref_store::pg::PgRefStore;
+use crate::ref_store::pg::{PgRefStore, db_error, public_attempt::PublicAttemptRequest};
 use crate::ref_store::tx::{begin_bounded, commit_bounded};
 use tokio::time::{Instant, timeout_at};
 use tokio_postgres::Transaction;
+
+enum AdmittedPush<'a> {
+    Legacy(RequestDigest),
+    Private(&'a PublicAttemptRequest),
+}
 
 impl PgAuthorizedCommit {
     /// Close only a previously admitted served plan whose exact base revision
@@ -30,6 +35,35 @@ impl PgAuthorizedCommit {
         producer_digest: RequestDigest,
         deadline: Instant,
     ) -> Result<Option<PackCommitTerminal>, AuthorizedCommitError> {
+        self.reject_superseded(pool, token, plan, actor, AdmittedPush::Legacy(producer_digest), deadline).await
+    }
+
+    /// Record a definite stale outcome for the selected private attempt.
+    /// Only the public wrapper path can mirror or retire the resulting terminal.
+    pub(crate) async fn reject_superseded_private(
+        &self,
+        pool: &deadpool_postgres::Pool,
+        token: &PackPendingToken,
+        plan: &PackCommitPlan,
+        actor: &Identity,
+        public: &PublicAttemptRequest,
+        deadline: Instant,
+    ) -> Result<Option<PackCommitTerminal>, AuthorizedCommitError> {
+        if self.store.backend_identity().as_hex() != public.backend_identity {
+            return Err(super::reject(PackCommitRejectCode::PublicationMismatch, "private attempt backend differs"));
+        }
+        self.reject_superseded(pool, token, plan, actor, AdmittedPush::Private(public), deadline).await
+    }
+
+    async fn reject_superseded(
+        &self,
+        pool: &deadpool_postgres::Pool,
+        token: &PackPendingToken,
+        plan: &PackCommitPlan,
+        actor: &Identity,
+        admitted: AdmittedPush<'_>,
+        deadline: Instant,
+    ) -> Result<Option<PackCommitTerminal>, AuthorizedCommitError> {
         if !token.binds(plan) || plan.identity().issuer_id() != actor.id {
             return Err(AuthorizedCommitError::Denied("issuer_mismatch"));
         }
@@ -37,7 +71,7 @@ impl PgAuthorizedCommit {
         ensure_pack_terminal_budget(plan)?;
         let mut client = pooled_client(pool, deadline).await?;
         let tx = begin_bounded(&mut client, deadline).await?;
-        let result = match timeout_at(deadline, reject_in_tx(&tx, plan, actor, producer_digest, deadline)).await {
+        let result = match timeout_at(deadline, reject_in_tx(&tx, plan, actor, admitted, deadline)).await {
             Ok(value) => value,
             Err(_) => Err(AuthorizedCommitError::Timeout),
         };
@@ -64,27 +98,44 @@ async fn reject_in_tx(
     tx: &Transaction<'_>,
     plan: &PackCommitPlan,
     actor: &Identity,
-    producer_digest: RequestDigest,
+    admitted: AdmittedPush<'_>,
     deadline: Instant,
 ) -> Result<Option<PackCommitTerminal>, AuthorizedCommitError> {
     pg::set_ack_durability(tx, deadline).await?;
-    let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
-    if begun.created {
-        return Err(super::reject(PackCommitRejectCode::PendingMissing, "refusal requires admitted operation"));
-    }
-    let binding = producer::read_serving_operation(tx, plan.repository_id(), plan.identity().operation_id(), deadline)
-        .await?
-        .ok_or(AuthorizedCommitError::Ledger("refusal has no served request binding"))?;
-    if binding.parent_digest() != plan.parent_digest() || binding.producer_digest() != &producer_digest {
-        return Err(AuthorizedCommitError::Ledger("refusal served request binding differs"));
-    }
-    match begun.record.state() {
-        OperationState::Committed | OperationState::Rejected => return Ok(Some(pg::replay_terminal(begun)?.terminal)),
-        OperationState::Cancelled => return Ok(None),
-        OperationState::Pending => {}
-    }
+    let public = match admitted {
+        AdmittedPush::Private(public) => {
+            PgRefStore.lock_private_pending_attempt(tx, public, plan, deadline).await?;
+            Some(public)
+        }
+        AdmittedPush::Legacy(producer_digest) => {
+            let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
+            if begun.created {
+                return Err(super::reject(PackCommitRejectCode::PendingMissing, "refusal requires admitted operation"));
+            }
+            let binding =
+                producer::read_serving_operation(tx, plan.repository_id(), plan.identity().operation_id(), deadline)
+                    .await?
+                    .ok_or(AuthorizedCommitError::Ledger("refusal has no served request binding"))?;
+            if binding.parent_digest() != plan.parent_digest() || binding.producer_digest() != &producer_digest {
+                return Err(AuthorizedCommitError::Ledger("refusal served request binding differs"));
+            }
+            match begun.record.state() {
+                OperationState::Committed | OperationState::Rejected => {
+                    return Ok(Some(pg::replay_terminal(begun)?.terminal));
+                }
+                OperationState::Cancelled => return Ok(None),
+                OperationState::Pending => {}
+            }
+            None
+        }
+    };
     decisions::lock_source_tables(tx, &decisions::PublicationAction::Push).await.map_err(super::decision_error)?;
-    pg::ensure_repository(tx, plan, true).await?;
+    let repository_scope = pg::ensure_repository(tx, plan, true).await?;
+    if let Some(public) = public {
+        repository_scope
+            .require_serving(public.admission_owner_id, &public.backend_identity)
+            .map_err(|refusal| RefStoreError::Unsupported(refusal.reason()))?;
+    }
     decisions::lock_usage(tx, plan.repository_id(), plan.tenant_id()).await.map_err(super::decision_error)?;
     let locked = usage::lock(tx, plan.repository_id(), plan.tenant_id()).await?;
     let (gate, mode) = sql::gate_locked(tx, plan.repository_id())
@@ -106,6 +157,9 @@ async fn reject_in_tx(
     // proof. Only the locked authoritative gate moving forward is sufficient.
     if gate.revision() <= plan.expected().revision() {
         return Ok(None);
+    }
+    if public.is_some() {
+        verify_private_refusal_authority(tx, plan, actor, deadline).await?;
     }
     decisions::reject_superseded_push(tx, plan, actor).await.map_err(super::decision_error)?;
     let terminal = PackCommitTerminal::rejected(
@@ -139,4 +193,43 @@ async fn reject_in_tx(
     .await?;
     usage::apply(tx, &quota).await?;
     Ok(Some(terminal))
+}
+
+/// The stale attempt may never have reached SELECT. Recheck the credential and
+/// current writable repository access under the already-held source-table locks.
+async fn verify_private_refusal_authority(
+    tx: &Transaction<'_>,
+    plan: &PackCommitPlan,
+    actor: &Identity,
+    deadline: Instant,
+) -> Result<(), AuthorizedCommitError> {
+    crate::ref_store::pg::bound(tx, deadline).await?;
+    let token_matches: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM tokens WHERE id=$1 AND user_id=$2 AND digest=$3)",
+            &[&actor.token_id, &actor.id, &actor.token_digest],
+        )
+        .await
+        .map_err(db_error)?
+        .get(0);
+    if !token_matches {
+        return Err(AuthorizedCommitError::Denied("token_invalid"));
+    }
+    crate::auth::verify_repo_write_access_with_parent(
+        tx,
+        actor.id,
+        actor.token_id,
+        actor.parent_token_id,
+        plan.repository_id(),
+        crate::auth::web_scope_enabled(),
+        crate::token_scopes::RepoAction::ContentsWrite,
+    )
+    .await
+    .map_err(|error| {
+        if error.0.is_client_error() {
+            AuthorizedCommitError::Denied("private_refusal_not_authorized")
+        } else {
+            AuthorizedCommitError::Unverifiable("private refusal authorization could not be verified")
+        }
+    })
 }

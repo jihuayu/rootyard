@@ -3,6 +3,7 @@ use super::*;
 
 mod verify;
 use self::verify::verify;
+pub(crate) use self::verify::{paired_envelope_schema_head, verify_archive_identity};
 
 pub(in crate::backup) struct W8aRestorePlan<'a> {
     pub sidecar: &'a w8a_paired::W8aPairedSidecarManifest,
@@ -176,6 +177,9 @@ async fn restore_inner(
     let target = absolute(&config.data_dir, false)?;
     disjoint(&source, &target)?;
     let manifest = verify(&source)?;
+    if let Some(plan) = &w8a_plan {
+        plan.sidecar.verify_archive_identity(&manifest)?;
+    }
     ensure!(
         u8::from(allow_legacy_schema007)
             + u8::from(allow_legacy_schema130)
@@ -319,6 +323,7 @@ async fn restore_inner(
         ])
         .arg(source.join("metadata.dump"));
     checked(&mut restore).await?;
+    restore_schema_privileges(&client, manifest.format).await?;
     ensure!(schema(&client, manifest.format).await? == manifest.schema_versions, "restored schema mismatch");
     // The catalog projection ends with SET search_path=pg_catalog; restore public first.
     client.batch_execute("SET search_path=public").await?;
@@ -368,7 +373,8 @@ async fn restore_inner(
             .get(0);
         ensure!(!unsafe_grants, "restored checkout credentials were not invalidated");
     }
-    if manifest.format >= 6 && manifest.format != FORMAT_PAIRED {
+    let paired = catalog::is_paired(manifest.format);
+    if manifest.format >= 6 && !paired {
         authority::fence(&client).await?;
         // Rotate the storage authority exactly once for the whole restored
         // database before importing any repository closure. Per-repository
@@ -405,17 +411,16 @@ async fn restore_inner(
             }
         }
     }
-    if manifest.format == FORMAT_PAIRED {
+    if paired {
         let closure = manifest.blob_closure.as_ref().context("paired archive carries no Blob closure")?;
         ensure!(
             manifest.repositories.iter().all(|r| r.backend.as_deref() == Some("pg_refstore")),
             "mixed legacy/Blob restore is unsupported"
         );
+        let until = tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600));
+        ledger::require_closed_public_attempts(&client, manifest.format, until).await?;
         ensure!(
-            Some(
-                ledger::carry(&client, tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600)))
-                    .await?
-            ) == manifest.refstore,
+            Some(ledger::carry(&client, manifest.format, until).await?) == manifest.refstore,
             "restored RefStore rows differ from the archive cut"
         );
         if let Some(plan) = &w8a_plan {
@@ -431,11 +436,9 @@ async fn restore_inner(
             "restore target Blob backend identity differs from the archive"
         );
         // The caller's one absolute restore deadline bounds every read and rebuild.
-        let until = tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600));
         blob_closure::import(&client, &transfer, &manifest.blob_artifacts, &source, until, &mutex).await?;
     }
     let w8a_outcome = if let Some(plan) = w8a_plan {
-        ensure!(manifest.format == FORMAT_PAIRED, "W8-A paired restore requires format30");
         let outcome = w8a_paired::finish_guarded_restore(
             config,
             &mut client,

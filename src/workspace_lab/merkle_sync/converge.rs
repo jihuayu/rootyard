@@ -51,7 +51,7 @@ pub struct WatcherBatch {
 #[derive(Clone, Debug, Default)]
 pub struct WatcherCoalescer {
     last_seq: u64,
-    saw_overflow_or_drop: bool,
+    full_rescan_pending: bool,
     dirty_paths: BTreeSet<Vec<u8>>,
     dirty_dirs: BTreeSet<Vec<u8>>,
     force_rehash_dirs: BTreeSet<Vec<u8>>,
@@ -72,7 +72,7 @@ impl WatcherCoalescer {
 
     pub fn ingest(&mut self, batch: WatcherBatch) {
         if batch.seq_start > self.last_seq + 1 && self.last_seq > 0 {
-            self.saw_overflow_or_drop = true;
+            self.full_rescan_pending = true;
             self.overflow_or_drop_escalations += 1;
         }
         if batch.seq_end <= self.last_seq {
@@ -98,7 +98,7 @@ impl WatcherCoalescer {
     fn record_event(&mut self, ev: WatcherEvent) {
         match ev {
             WatcherEvent::Overflow | WatcherEvent::Dropped(_) => {
-                self.saw_overflow_or_drop = true;
+                self.full_rescan_pending = true;
                 self.overflow_or_drop_escalations += 1;
             }
             WatcherEvent::GitAdminChanged(p) => {
@@ -148,7 +148,7 @@ impl WatcherCoalescer {
     }
 
     pub fn into_dirty_scope(&mut self) -> (DirtyScope, CoalescerStats) {
-        let used_full_rescan = self.saw_overflow_or_drop || self.force_rehash_dirs.contains(b"".as_slice());
+        let used_full_rescan = self.full_rescan_pending || self.force_rehash_dirs.contains(b"".as_slice());
         let scope = if used_full_rescan {
             DirtyScope::FullRescan
         } else {
@@ -165,7 +165,7 @@ impl WatcherCoalescer {
             overflow_or_drop_escalations: self.overflow_or_drop_escalations,
             used_full_rescan,
         };
-        self.saw_overflow_or_drop = false;
+        self.full_rescan_pending = false;
         self.dirty_dirs.clear();
         self.dirty_paths.clear();
         self.force_rehash_dirs.clear();
@@ -393,6 +393,9 @@ pub fn capture_with_quiescence_barrier(
         let pre_stamp = barrier_step!(capture_stamp(req.repo_root, pre_seq, pre_rev, pre_epoch));
 
         let (mut dirty_scope, mut stats) = coalescer.into_dirty_scope();
+        // The scanner consumed the hints. A cancelled or rejected capture will
+        // retry from the committed manifest, so keep a full rescan pending.
+        coalescer.full_rescan_pending = true;
         if escalate_full || attempt > 1 {
             dirty_scope = DirtyScope::FullRescan;
             stats.used_full_rescan = true;
@@ -432,6 +435,7 @@ pub fn capture_with_quiescence_barrier(
             escalate_full = true;
             continue;
         }
+        coalescer.full_rescan_pending = false;
         return Ok(ConvergeOutcome::Converged { scan: Box::new(scan), git_bundle, attempts: attempt, stats });
     }
     Ok(ConvergeOutcome::NotQuiescent { reason: last_reason, attempts: req.max_attempts })

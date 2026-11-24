@@ -60,11 +60,7 @@ pub struct BlobGitState {
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
     #[cfg(test)]
-    admission_pause: Option<Arc<AdmissionPause>>,
-    /// Acceptance-only rendezvous after the admission `COMMIT` and before the
-    /// first protected upload. Also absent from every non-test build.
-    #[cfg(test)]
-    publication_pause: Option<Arc<AdmissionPause>>,
+    admission_pauses: Vec<Arc<AdmissionPause>>,
     /// Acceptance-only rendezvous reached after an exact commit-preview cache
     /// lookup and before the final encoded-response fence. It is absent in
     /// every non-test build and cannot be selected by a request or config.
@@ -96,9 +92,7 @@ impl BlobGitState {
             dispatch: dispatch::Signals::default(),
             packfile_offload: None,
             #[cfg(test)]
-            admission_pause: None,
-            #[cfg(test)]
-            publication_pause: None,
+            admission_pauses: Vec::new(),
             #[cfg(test)]
             read_pause: None,
         })

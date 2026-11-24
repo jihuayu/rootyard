@@ -14,45 +14,34 @@ use uuid::Uuid;
 use super::{BlobGitState, GatewayError};
 
 impl BlobGitState {
-    /// Acceptance-only: attach a private rendezvous to this gateway instance.
-    /// The production constructor has no parameter, environment variable or
-    /// route that can reach this field.
+    /// Attach a private test rendezvous to this gateway instance.
     pub(crate) fn with_admission_pause(mut self, pause: Arc<AdmissionPause>) -> Self {
-        self.admission_pause = Some(pause);
+        self.admission_pauses.push(pause);
         self
     }
 
-    /// Acceptance-only: attach a private rendezvous that fires after the
-    /// admission transaction committed and before the first protected upload.
-    /// It is a distinct hook from the pre-admission pause so one fixture can
-    /// hold either side of the immutable `COMMIT` without changing production
-    /// behavior.
-    pub(crate) fn with_publication_pause(mut self, pause: Arc<AdmissionPause>) -> Self {
-        self.publication_pause = Some(pause);
-        self
-    }
-
-    /// Called after the publish baseline was captured and before the admission
-    /// transaction starts. In production this method does not exist.
+    /// Pause after baseline capture and before the admission transaction.
     pub(crate) async fn pause_before_admission(&self, operation_id: Uuid) {
-        if let Some(pause) = &self.admission_pause {
-            let _ = pause.pause(operation_id).await;
+        for pause in &self.admission_pauses {
+            let _ = pause.pause_once(operation_id, AdmissionPhase::BeforeAdmission).await;
         }
     }
 
-    /// Called after the caller-owned admission transaction returned a definite
-    /// `COMMIT` and before any A3 hold/upload. The pause therefore never holds a
-    /// PostgreSQL transaction open. In production this method does not exist.
-    ///
-    /// An armed test-side release guard can abandon the rendezvous on an early
-    /// failure or panic. The selected operation then returns this fixed refusal
-    /// before the first protected upload instead of continuing into a write.
+    /// Pause after the slot-zero admission COMMIT and before protected upload.
     pub(crate) async fn pause_after_admission(&self, operation_id: Uuid) -> Result<(), GatewayError> {
-        if let Some(pause) = &self.publication_pause
-            && pause.pause(operation_id).await
-            && pause.was_abandoned()
-        {
-            return Err(GatewayError::Conflict("acceptance publication was abandoned before upload"));
+        self.pause_before_upload(operation_id, AdmissionPhase::AfterAdmission).await
+    }
+
+    /// Pause after the slot-one admission COMMIT and before protected upload.
+    pub(crate) async fn pause_after_slot_one(&self, operation_id: Uuid) -> Result<(), GatewayError> {
+        self.pause_before_upload(operation_id, AdmissionPhase::AfterSlotOne).await
+    }
+
+    async fn pause_before_upload(&self, operation_id: Uuid, phase: AdmissionPhase) -> Result<(), GatewayError> {
+        for pause in &self.admission_pauses {
+            if pause.pause_once(operation_id, phase).await && pause.abandoned.load(Ordering::Acquire) {
+                return Err(GatewayError::Conflict("acceptance publication was abandoned before upload"));
+            }
         }
         Ok(())
     }
@@ -72,10 +61,17 @@ impl BlobGitState {
     }
 }
 
-/// Acceptance-only rendezvous used by the deterministic stale-baseline cases.
-/// The pause is keyed by operation UUID and can fire at most once.
+/// Each rendezvous matches one exact public operation and phase.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AdmissionPhase {
+    BeforeAdmission,
+    AfterAdmission,
+    AfterSlotOne,
+}
+
 pub(crate) struct AdmissionPause {
     operation: Uuid,
+    phase: AdmissionPhase,
     paused: AtomicBool,
     abandoned: AtomicBool,
     reached: tokio::sync::Notify,
@@ -84,8 +80,21 @@ pub(crate) struct AdmissionPause {
 
 impl AdmissionPause {
     pub(crate) fn new(operation: Uuid) -> Self {
+        Self::with_phase(operation, AdmissionPhase::BeforeAdmission)
+    }
+
+    pub(crate) fn new_after_admission(operation: Uuid) -> Self {
+        Self::with_phase(operation, AdmissionPhase::AfterAdmission)
+    }
+
+    pub(crate) fn new_after_slot_one(operation: Uuid) -> Self {
+        Self::with_phase(operation, AdmissionPhase::AfterSlotOne)
+    }
+
+    fn with_phase(operation: Uuid, phase: AdmissionPhase) -> Self {
         Self {
             operation,
+            phase,
             paused: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             reached: tokio::sync::Notify::new(),
@@ -93,37 +102,28 @@ impl AdmissionPause {
         }
     }
 
-    async fn pause(&self, operation: Uuid) -> bool {
-        if operation != self.operation || self.paused.swap(true, Ordering::AcqRel) {
+    async fn pause_once(&self, operation: Uuid, phase: AdmissionPhase) -> bool {
+        if phase != self.phase || operation != self.operation || self.paused.swap(true, Ordering::AcqRel) {
             return false;
         }
-        // `notify_one` stores a permit, so a test that starts waiting after the
-        // request arrived still observes the rendezvous.
         self.reached.notify_one();
         self.release.notified().await;
         true
     }
 
-    /// Wait until the selected operation reached the post-capture pause.
+    /// Wait until the selected operation reaches this rendezvous.
     pub(crate) async fn wait_reached(&self) {
         self.reached.notified().await;
     }
 
-    /// Let the paused operation continue into admission.
     pub(crate) fn release(&self) {
         self.release.notify_one();
     }
 
-    /// Mark the rendezvous abandoned and let the paused operation return. The
-    /// release permit is stored even if the request has not reached the pause
-    /// yet, so an early failure cannot leave a server-side handler waiting.
+    /// Let a handler at a post-admission pause return before uploading.
     pub(crate) fn abandon(&self) {
         self.abandoned.store(true, Ordering::Release);
         self.release.notify_one();
-    }
-
-    fn was_abandoned(&self) -> bool {
-        self.abandoned.load(Ordering::Acquire)
     }
 }
 
@@ -192,7 +192,7 @@ async fn acceptance_pause_waits_once_for_only_its_operation() {
     let pause = Arc::new(AdmissionPause::new(target));
     let waiting = {
         let pause = pause.clone();
-        tokio::spawn(async move { pause.pause(target).await })
+        tokio::spawn(async move { pause.pause_once(target, AdmissionPhase::BeforeAdmission).await })
     };
     pause.wait_reached().await;
     assert!(!waiting.is_finished(), "the selected operation must remain paused until release");
@@ -200,6 +200,6 @@ async fn acceptance_pause_waits_once_for_only_its_operation() {
     waiting.await.expect("pause task");
     // The rendezvous is one-shot and keyed by operation: a rebase retry or
     // any other operation passes without blocking.
-    pause.pause(target).await;
-    pause.pause(Uuid::new_v4()).await;
+    pause.pause_once(target, AdmissionPhase::BeforeAdmission).await;
+    pause.pause_once(Uuid::new_v4(), AdmissionPhase::BeforeAdmission).await;
 }

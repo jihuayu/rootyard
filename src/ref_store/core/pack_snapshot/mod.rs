@@ -96,7 +96,7 @@ pub(crate) use backup_read::{ServingCaptureDigest, captured_logical_bytes, captu
 pub(crate) use backup_read::{
     check_canonical_serving, check_membership, check_refs_and_membership, descriptor_membership,
 };
-pub(crate) use serving_read_sql::ServingReadRow;
+pub(crate) use serving_read_sql::{ServingReadRow, lock_cluster_incarnation};
 pub(crate) mod usage;
 
 pub(crate) use contract::history_logical_bytes;

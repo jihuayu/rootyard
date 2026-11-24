@@ -27,7 +27,7 @@ use std::{
         ffi::OsStringExt,
         fs::{OpenOptionsExt, PermissionsExt, symlink},
     },
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -54,6 +54,18 @@ pub(crate) struct RemoteManifest {
     pub tenant_id: Uuid,
     pub captured_revision: i64,
     pub entries: Vec<RemoteEntry>,
+}
+
+pub(super) struct ManifestBinding {
+    pub(super) digest: String,
+    pub(super) size: i64,
+    pub(super) captured_revision: i64,
+}
+
+pub(super) struct MaterializedCheckpoint {
+    pub(super) repo: PathBuf,
+    pub(super) stage: super::blocking::DirCleanupGuard,
+    pub(super) binding: ManifestBinding,
 }
 
 pub(super) fn remote_store(state: &AppState) -> Result<RemoteObjectStore, Error> {
@@ -128,6 +140,16 @@ pub(super) async fn load_manifest(
     repo: Uuid,
     tenant: Uuid,
 ) -> Result<RemoteManifest, Error> {
+    let (manifest, _) = load_manifest_with_binding(state, cp, repo, tenant).await?;
+    Ok(manifest)
+}
+
+async fn load_manifest_with_binding(
+    state: &AppState,
+    cp: Uuid,
+    repo: Uuid,
+    tenant: Uuid,
+) -> Result<(RemoteManifest, ManifestBinding), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt(
@@ -180,7 +202,7 @@ pub(super) async fn load_manifest(
     if !manifest_binding_matches(&manifest, cp, repo, tenant, captured_revision) {
         return Err(Error::bad_request());
     }
-    Ok(manifest)
+    Ok((manifest, ManifestBinding { digest, size, captured_revision }))
 }
 
 pub async fn publish(
@@ -380,13 +402,65 @@ pub async fn publish(
     Ok((StatusCode::OK, Json(report(cp, &digest, raw_len as i64, captured))))
 }
 
+async fn initialize_restore_stage(
+    stage: PathBuf,
+    initialize: impl FnOnce() -> Result<(), Error> + Send + 'static,
+) -> Result<super::blocking::DirCleanupGuard, Error> {
+    let stage_guard = super::blocking::DirCleanupGuard::new(stage);
+    // The worker can still create the staging tree after the caller stops waiting.
+    let (stage_guard, initialized) = super::blocking::run(move || {
+        let initialized = initialize();
+        Ok((stage_guard, initialized))
+    })
+    .await?;
+    if let Err(error) = initialized {
+        stage_guard.cleanup().await;
+        return Err(error);
+    }
+    Ok(stage_guard)
+}
+
 pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) -> Result<(), Error> {
     let final_path = service::checkpoint_repo(state, cp);
     let check_path = final_path.clone();
     if super::blocking::run(move || Ok(check_path.is_dir())).await? {
         return Ok(());
     }
-    let manifest = load_manifest(state, cp, repo, tenant).await?;
+    let MaterializedCheckpoint { repo, stage, .. } = materialize_committed(state, cp, repo, tenant).await?;
+    let (stage, publication) = super::blocking::run(move || {
+        let publication = publish_checkpoint_cache(&repo, &final_path).and_then(|()| {
+            if final_path.is_dir() { Ok(()) } else { Err(Error::internal("checkpoint restore publication failed")) }
+        });
+        Ok((stage, publication))
+    })
+    .await?;
+    stage.cleanup().await;
+    publication
+}
+
+pub(super) fn publish_checkpoint_cache(repo: &FsPath, cache: &FsPath) -> Result<(), Error> {
+    let parent = cache.parent().ok_or_else(Error::bad_request)?;
+    fs::create_dir_all(parent).map_err(Error::internal)?;
+    if fs::symlink_metadata(cache).is_ok() {
+        return Ok(());
+    }
+    match super::snapshot::publish(repo, cache) {
+        Ok(published) => {
+            published.keep();
+            Ok(())
+        }
+        Err(_) if fs::symlink_metadata(cache).is_ok() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) async fn materialize_committed(
+    state: &AppState,
+    cp: Uuid,
+    repo: Uuid,
+    tenant: Uuid,
+) -> Result<MaterializedCheckpoint, Error> {
+    let (manifest, binding) = load_manifest_with_binding(state, cp, repo, tenant).await?;
     let store = remote_store(state)?;
     let mut paths = BTreeSet::new();
     let mut symlinks = BTreeSet::new();
@@ -417,12 +491,11 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     }
 
     let stage = state.storage.root.join("workspace-service/staging").join(format!("restore-{cp}-{}", Uuid::new_v4()));
-    let stage_guard = super::blocking::DirCleanupGuard::new(stage.clone());
     let root = stage.join("repo");
     let root_init = root.clone();
     let stage_init = stage.clone();
     let rels: Vec<PathBuf> = downloads.iter().map(|(rel, _, _)| rel.clone()).collect();
-    if let Err(err) = super::blocking::run(move || {
+    let stage_guard = initialize_restore_stage(stage, move || {
         fs::create_dir_all(&stage_init).map_err(Error::internal)?;
         fs::create_dir(&root_init).map_err(Error::internal)?;
         for rel in rels {
@@ -431,11 +504,7 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
         }
         Ok(())
     })
-    .await
-    {
-        stage_guard.cleanup().await;
-        return Err(err);
-    }
+    .await?;
 
     let download_outcome: Result<(), Error> = async {
         for (rel, obj_key, size) in &downloads {
@@ -451,7 +520,7 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     }
 
     let entries = manifest.entries;
-    let finalize = super::blocking::run(move || {
+    let (root, stage_guard, validated) = super::blocking::run(move || {
         let outcome = (|| -> Result<(), Error> {
             let mut expected = Vec::with_capacity(entries.len());
             for entry in entries {
@@ -489,33 +558,54 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
                 return Err(Error(StatusCode::CONFLICT, super::compat::CONFLICT_HEAD));
             }
             core::sync_tree(&root).map_err(Error::internal)?;
-            if let Some(parent) = final_path.parent() {
-                fs::create_dir_all(parent).map_err(Error::internal)?;
-            }
-            if fs::rename(&root, &final_path).is_err() && !final_path.is_dir() {
-                return Err(Error::internal("checkpoint restore publication failed"));
-            }
             Ok(())
         })();
-        let _ = fs::remove_dir_all(&stage);
-        outcome
+        Ok((root, stage_guard, outcome))
     })
-    .await;
-    match finalize {
-        Ok(()) => {
-            stage_guard.keep();
-            Ok(())
-        }
-        Err(err) => {
-            stage_guard.cleanup().await;
-            Err(err)
-        }
+    .await?;
+    if let Err(error) = validated {
+        stage_guard.cleanup().await;
+        return Err(error);
     }
+    Ok(MaterializedCheckpoint { repo: root, stage: stage_guard, binding })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_restore_cleans_stage_created_after_request_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("workspace-service/staging");
+        fs::create_dir_all(&staging).unwrap();
+        let stage = staging.join("restore-stage");
+        let work_stage = stage.clone();
+        let (running_tx, running_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(initialize_restore_stage(stage.clone(), move || {
+            running_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            fs::create_dir(&work_stage).map_err(Error::internal)?;
+            created_tx.send(()).unwrap();
+            Ok(())
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), running_rx).await.unwrap().unwrap();
+        request.abort();
+        assert!(request.await.err().unwrap().is_cancelled());
+        assert!(!stage.exists(), "the initializer is still blocked");
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), created_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::read_dir(&staging).unwrap().next().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the cancelled request left a restore staging directory");
+    }
 
     fn manifest(captured_revision: i64) -> RemoteManifest {
         RemoteManifest {
