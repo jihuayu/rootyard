@@ -43,24 +43,22 @@ pub(super) async fn fence(client: &mut Client, lineage: RestoreLineage) -> Resul
         RestoreLineage::None => false,
         RestoreLineage::VerifiedArchive => true,
         RestoreLineage::VerifiedW8aSource(source) => {
-            let carries_lineage: bool =
-                tx.query_one("SELECT to_regclass('public.ref_store_restore_lineage') IS NOT NULL", &[]).await?.get(0);
-            if carries_lineage {
-                // The signed path first performs the guarded inner restore.
-                // Continue its exact edge only when it began at the signed source.
-                tx.query_one(
+            // The signed path first performs the guarded inner restore.
+            // Pin its intermediate incarnation and require an exact first edge.
+            let has_first_edge: bool = tx
+                .query_one(
                     "SELECT EXISTS (
-                         SELECT FROM public.ref_store_restore_lineage l JOIN public.cluster_authority c
-                           ON c.singleton AND c.incarnation=l.target_incarnation
-                          WHERE l.source_incarnation=$1
-                     )",
+                     SELECT FROM public.ref_store_restore_lineage l
+                      WHERE l.target_incarnation=(SELECT incarnation FROM public.cluster_authority
+                                                  WHERE singleton FOR UPDATE)
+                        AND l.source_incarnation=$1
+                 )",
                     &[&source],
                 )
                 .await?
-                .get(0)
-            } else {
-                false
-            }
+                .get(0);
+            ensure!(has_first_edge, "paired restore lineage does not connect to the verified source");
+            true
         }
     };
     if record_lineage {
@@ -115,8 +113,31 @@ pub async fn fence_w8a_fresh_incarnation(
     source_cluster_incarnation: Uuid,
     source_storage_authority_epoch: i64,
 ) -> Result<W8aFenceReceipt> {
+    fence_w8a(client, source_cluster_incarnation, source_storage_authority_epoch, RestoreLineage::None).await
+}
+
+pub(super) async fn fence_w8a_fresh_incarnation_from_restore(
+    client: &mut Client,
+    source_cluster_incarnation: Uuid,
+    source_storage_authority_epoch: i64,
+    carry_lineage: bool,
+) -> Result<W8aFenceReceipt> {
+    let lineage = if carry_lineage {
+        RestoreLineage::VerifiedW8aSource(source_cluster_incarnation)
+    } else {
+        RestoreLineage::None
+    };
+    fence_w8a(client, source_cluster_incarnation, source_storage_authority_epoch, lineage).await
+}
+
+async fn fence_w8a(
+    client: &mut Client,
+    source_cluster_incarnation: Uuid,
+    source_storage_authority_epoch: i64,
+    lineage: RestoreLineage,
+) -> Result<W8aFenceReceipt> {
     ensure!(source_storage_authority_epoch >= 1, "source storage authority epoch is invalid");
-    fence(client, RestoreLineage::VerifiedW8aSource(source_cluster_incarnation)).await?;
+    fence(client, lineage).await?;
     let tx = client.transaction().await?;
     tx.execute("UPDATE public.tokens SET revoked=true WHERE NOT revoked", &[]).await?;
     tx.execute("UPDATE public.web_sessions SET revoked=true WHERE NOT revoked", &[]).await?;

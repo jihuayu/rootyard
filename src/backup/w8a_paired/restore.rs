@@ -382,10 +382,11 @@ pub(in crate::backup) async fn finish_guarded_restore(
         )));
     }
     mutex.ensure_held(client).await.map_err(|error| W8aError::RestoreFailed(format!("{error:#}")))?;
-    let fence = super::super::authority::fence_w8a_fresh_incarnation(
+    let fence = super::super::authority::fence_w8a_fresh_incarnation_from_restore(
         client,
         sidecar.source_cluster_incarnation,
         sidecar.source_storage_authority_epoch,
+        sidecar.schema_head == 152,
     )
     .await
     .map_err(|error| W8aError::RestoreFailed(format!("restored_incarnation fence: {error:#}")))?;
