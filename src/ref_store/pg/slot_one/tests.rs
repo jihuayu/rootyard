@@ -477,3 +477,142 @@ fn source_keeps_the_reviewed_lock_and_write_order() {
 }
 
 mod native;
+
+#[test]
+fn preserved_slot_one_v1_wire_vector() {
+    let request = public_request();
+    let zero = retired_facts();
+    let one = pending_facts(&zero);
+    let facts = proof_facts(&request, &zero, &one);
+    let fields = slot_one_proof_fields(&facts);
+
+    let mut bytes = b"rootyard-ref-store-request-v1\0".to_vec();
+    for field in std::iter::once(SLOT_ONE_PROOF_DOMAIN.as_bytes()).chain(fields.iter().map(Vec::as_slice)) {
+        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    let expected_bytes = include_str!("slot_one_proof_v1_fixture.hex").trim();
+    assert_eq!(bytes.len(), 595);
+    assert_eq!(hex::encode(bytes), expected_bytes);
+    assert_eq!(
+        slot_one_proof_digest(&facts).as_hex(),
+        "1f7f9c6e1c529900b3e33d2076b39202a06a20a337f7dad71d85c602420bf590"
+    );
+    assert_eq!(
+        recompute_slot_one_proof(&request, &public_attempt(&zero), &public_attempt(&one)).unwrap(),
+        slot_one_proof_digest(&facts)
+    );
+}
+
+fn experimental_slot_two_v1_fields(
+    request: &PublicAttemptRequest,
+    predecessors: [&AttemptFacts; 2],
+    current: &AttemptFacts,
+) -> Vec<Vec<u8>> {
+    let mut fields = vec![
+        request.repository_id.as_bytes().to_vec(),
+        request.public_id.as_bytes().to_vec(),
+        request.issuer_id.as_bytes().to_vec(),
+        request.admission_owner_id.as_bytes().to_vec(),
+        current.lane.as_str().as_bytes().to_vec(),
+        request.wire_digest.as_bytes().to_vec(),
+        request.backend_identity.as_bytes().to_vec(),
+        request.object_format.as_str().as_bytes().to_vec(),
+        request.history_incarnation.as_bytes().to_vec(),
+        request.authority_epoch.to_be_bytes().to_vec(),
+        request.group_epoch.to_be_bytes().to_vec(),
+        request.restore_incarnation.as_bytes().to_vec(),
+        request.request_mode.as_str().as_bytes().to_vec(),
+    ];
+    for predecessor in predecessors {
+        fields.extend([
+            predecessor.slot.to_be_bytes().to_vec(),
+            predecessor.private_id.as_bytes().to_vec(),
+            predecessor.sequence.to_be_bytes().to_vec(),
+            predecessor.base_revision.to_be_bytes().to_vec(),
+            predecessor.event_id.unwrap().as_bytes().to_vec(),
+            predecessor.event_revision.unwrap().to_be_bytes().to_vec(),
+            predecessor.plan_digest.as_bytes().to_vec(),
+            predecessor.proof_digest.as_bytes().to_vec(),
+        ]);
+    }
+    fields.extend([
+        current.slot.to_be_bytes().to_vec(),
+        current.private_id.as_bytes().to_vec(),
+        current.sequence.to_be_bytes().to_vec(),
+        current.base_revision.to_be_bytes().to_vec(),
+        current.plan_digest.as_bytes().to_vec(),
+    ]);
+    fields
+}
+
+fn experimental_slot_two_v1_digest(
+    request: &PublicAttemptRequest,
+    predecessors: [&AttemptFacts; 2],
+    current: &AttemptFacts,
+) -> RequestDigest {
+    // This codec is a qualification fixture. The SQL contract stores opaque
+    // digests and does not assign a production slot-two codec version.
+    let fields = experimental_slot_two_v1_fields(request, predecessors, current);
+    let fields = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    RequestDigest::of("ref-store-slot-two-proof-v1", &fields)
+}
+
+#[test]
+fn experimental_slot_two_v1_binds_ordered_retirements_wire_and_current() {
+    let request = public_request();
+    let zero = retired_facts();
+    let mut one = pending_facts(&zero);
+    one.state = OperationState::Rejected;
+    one.event_id = Some(event_one());
+    one.event_revision = Some(4);
+    one.revision_mismatch_rejection = true;
+    let two = AttemptFacts {
+        slot: 2,
+        private_id: id(11),
+        plan_digest: RequestDigest::from_bytes([0x41; 32]),
+        proof_digest: RequestDigest::from_bytes([0x42; 32]),
+        base_revision: 4,
+        lane: lane(),
+        sequence: 4, // The database requires strictly increasing, not consecutive, sequences.
+        state: OperationState::Pending,
+        event_id: None,
+        event_revision: None,
+        revision_mismatch_rejection: false,
+    };
+    let original_slot_one = one.proof_digest;
+    let expected = experimental_slot_two_v1_digest(&request, [&zero, &one], &two);
+    assert_eq!(expected.as_hex(), "b3cf45c3418253089791084f1758e39ff1bbd292235838e7fd330f79af4ba82f");
+    assert_ne!(expected, original_slot_one);
+
+    let mut forged_zero = zero.clone();
+    forged_zero.event_id = Some(id(19));
+    assert_ne!(expected, experimental_slot_two_v1_digest(&request, [&forged_zero, &one], &two));
+    forged_zero.event_id = zero.event_id;
+    forged_zero.proof_digest = RequestDigest::from_bytes([0x23; 32]);
+    assert_ne!(expected, experimental_slot_two_v1_digest(&request, [&forged_zero, &one], &two));
+
+    let mut forged_one = one.clone();
+    forged_one.event_revision = Some(5);
+    assert_ne!(expected, experimental_slot_two_v1_digest(&request, [&zero, &forged_one], &two));
+    forged_one.event_revision = one.event_revision;
+    forged_one.proof_digest = RequestDigest::from_bytes([0x33; 32]);
+    assert_ne!(expected, experimental_slot_two_v1_digest(&request, [&zero, &forged_one], &two));
+
+    let mut other_wire = request.clone();
+    other_wire.wire_digest = RequestDigest::from_bytes([0x12; 32]);
+    assert_ne!(expected, experimental_slot_two_v1_digest(&other_wire, [&zero, &one], &two));
+
+    let mut forged_two = two.clone();
+    forged_two.private_id = id(20);
+    assert_ne!(expected, experimental_slot_two_v1_digest(&request, [&zero, &one], &forged_two));
+    forged_two.private_id = two.private_id;
+    forged_two.plan_digest = RequestDigest::from_bytes([0x43; 32]);
+    assert_ne!(expected, experimental_slot_two_v1_digest(&request, [&zero, &one], &forged_two));
+    assert_ne!(expected, experimental_slot_two_v1_digest(&request, [&one, &zero], &two));
+
+    assert_eq!(
+        recompute_slot_one_proof(&request, &public_attempt(&zero), &public_attempt(&one)).unwrap(),
+        original_slot_one
+    );
+}
