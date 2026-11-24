@@ -118,7 +118,7 @@ use crate::{
         core::{
             decision_commit::{PgDecisionProtocol, RealmExpectation},
             pack_commit::{PackCommitRejectCode, PackCommitTerminal},
-            publication_decision::DenialCode,
+            publication_decision::contract::DenialCode,
         },
         serving::lookup,
     },
