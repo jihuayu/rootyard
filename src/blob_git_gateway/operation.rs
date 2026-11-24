@@ -33,7 +33,7 @@ use crate::ref_store::{
     RequestDigest, TerminalKind,
     core::pack_commit::{PackCommitTerminal, read_serving_operation},
     pg::{
-        public_attempt::{PublicAttemptEvidence, PublicAttemptFinishLookup, PublicAttemptRequest},
+        public_attempt::{PublicAttemptEvidence, PublicAttemptFinishLookup, PublicAttemptRequest, PublicReplayRestore},
         slot_one, slot_zero,
     },
 };
@@ -101,9 +101,16 @@ pub(super) enum Probe {
     Fresh,
     Pending,
     Replay { terminal: PackCommitTerminal, private_id: Option<Uuid> },
+    HistoricalReplay { terminal: PackCommitTerminal, private_id: Uuid, restore: PublicReplayRestore },
     Cancelled { reason: &'static str },
     Finish { terminal: PackCommitTerminal, private_id: Uuid, evidence: PublicAttemptEvidence, record: OperationRecord },
     FinishCancelled,
+}
+
+/// Only the early receive probe can serve an archived terminal report.
+pub(super) enum ReplayBoundary {
+    EarlyReceive,
+    ActivePublication,
 }
 
 /// Compute the operation-level request digest over the **decoded** wire body.
@@ -298,6 +305,7 @@ pub(super) async fn probe_public(
     request: &PushRequest,
     digest: RequestDigest,
     mode: CommitMode,
+    boundary: ReplayBoundary,
     deadline: Instant,
 ) -> Result<Probe, GatewayError> {
     let repository_id = serving.gate.repository_id();
@@ -352,11 +360,15 @@ pub(super) async fn probe_public(
         {
             return Err(GatewayError::Conflict("repository authority changed; retry"));
         }
-        match crate::ref_store::PgRefStore
-            .lookup_public_attempt_finish(&tx, &public_request, deadline)
-            .await
-            .map_err(GatewayError::from)?
-        {
+        let (outcome, historical) = match boundary {
+            ReplayBoundary::EarlyReceive => {
+                PgRefStore.lookup_public_attempt_receive(&tx, &public_request, deadline).await?
+            }
+            ReplayBoundary::ActivePublication => {
+                (PgRefStore.lookup_public_attempt_finish(&tx, &public_request, deadline).await?, None)
+            }
+        };
+        match outcome {
             PublicAttemptFinishLookup::Unknown => Ok(Probe::Fresh),
             PublicAttemptFinishLookup::PrivateIdentifier => {
                 Err(GatewayError::Conflict("operation identifier is already a private attempt"))
@@ -380,9 +392,19 @@ pub(super) async fn probe_public(
                 let evidence = found.evidence;
                 let wrapper_state = found.wrapper_state;
                 let private_id = evidence.current.private_id;
-                let resolved =
-                    lookup_public_private_in_tx(&tx, &public_request, &evidence, request, digest, deadline).await?;
-                let ResolvedPublicPrivate { claim, record } = resolved;
+                let proof_request = PublicAttemptRequest {
+                    restore_incarnation: historical.map_or(public_request.restore_incarnation, |scope| scope.original),
+                    ..public_request
+                };
+                let ResolvedPublicPrivate { claim, record } =
+                    lookup_public_private_in_tx(&tx, &proof_request, &evidence, request, digest, deadline).await?;
+                if let Some(restore) = historical {
+                    return match claim {
+                        Claim::Replay(terminal) => Ok(Probe::HistoricalReplay { terminal, private_id, restore }),
+                        Claim::Cancelled(reason) => Ok(Probe::Cancelled { reason }),
+                        _ => Err(GatewayError::Internal("restored operation terminal evidence disagrees")),
+                    };
+                }
                 match (wrapper_state, claim) {
                     (OperationState::Pending, Claim::Pending) => Ok(Probe::Pending),
                     (OperationState::Pending, Claim::Replay(terminal)) => {

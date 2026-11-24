@@ -17,7 +17,9 @@ use crate::{
         state::BlobGitState,
     },
     db::Identity,
-    namespace_service::push_causal_stream::{DurableGatewayReceiptArgs, materialize_durable_gateway_receipt},
+    namespace_service::push_causal_stream::{
+        DurableGatewayReceiptArgs, materialize_durable_gateway_receipt, materialize_historical_gateway_receipt,
+    },
     ref_store::{
         CommitRejectCode, RefCommitResult,
         core::pack_commit::PackCommitTerminal,
@@ -44,6 +46,7 @@ impl ReceiveContext<'_> {
             receive.request(),
             receive.digest(),
             receive.mode,
+            operation::ReplayBoundary::EarlyReceive,
             self.deadline,
         )
         .await?;
@@ -55,6 +58,33 @@ impl ReceiveContext<'_> {
                     .map(ReceiveDisposition::Respond);
             }
             operation::Probe::Replay { terminal, private_id } => (terminal, private_id),
+            operation::Probe::HistoricalReplay { terminal, private_id, restore } => {
+                // The archived effect is already complete. Reconstruct its
+                // causal proof and report without mirroring or issuing a session.
+                materialize_historical_gateway_receipt(
+                    DurableGatewayReceiptArgs {
+                        pool: self.state.pool(),
+                        store: self.state.store(),
+                        git_binary: self.state.git_binary(),
+                        scratch_root: None,
+                        sandbox_root: Some(self.state.scratch_root()),
+                        repository_id: receive.repository_id,
+                        operation_id: receive.operation,
+                        private_operation_id: Some(private_id),
+                        deadline: self.deadline,
+                    },
+                    restore,
+                )
+                .await?;
+                let results = report_results(receive.request(), &terminal)?;
+                return git_response(
+                    StatusCode::OK,
+                    "application/x-git-receive-pack-result",
+                    protocol::report_status(receive.request().wants_report(), &results),
+                    receive.operation,
+                )
+                .map(ReceiveDisposition::Respond);
+            }
             operation::Probe::Finish { terminal, private_id, evidence, record } => {
                 paired_write_raft_gate(self.state, receive.repository_id, false).await?;
                 match publish::finish_public_terminal(

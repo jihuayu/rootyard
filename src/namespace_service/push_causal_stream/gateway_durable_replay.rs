@@ -19,6 +19,7 @@ use crate::blob_git_gateway::GatewayError;
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::core::pack_commit::PackCommitTerminal;
 use crate::ref_store::core::ref_version::{AuthorityKind, RefVersionRealm};
+use crate::ref_store::pg::public_attempt::PublicReplayRestore;
 
 use super::closure_prove::verify_base_packs_and_dependencies;
 use super::gateway_bridge::{
@@ -61,7 +62,22 @@ pub struct DurableGatewayReceiptArgs<'a> {
 pub async fn materialize_durable_gateway_receipt(
     args: DurableGatewayReceiptArgs<'_>,
 ) -> Result<CausalPushProofReceipt, GatewayError> {
-    let maybe = load_durable_gateway_push_receipt(&args)
+    materialize_gateway_receipt(args, None).await
+}
+
+pub(crate) async fn materialize_historical_gateway_receipt(
+    mut args: DurableGatewayReceiptArgs<'_>,
+    restore: PublicReplayRestore,
+) -> Result<CausalPushProofReceipt, GatewayError> {
+    args.scratch_root = None;
+    materialize_gateway_receipt(args, Some(restore)).await
+}
+
+async fn materialize_gateway_receipt(
+    args: DurableGatewayReceiptArgs<'_>,
+    restore: Option<PublicReplayRestore>,
+) -> Result<CausalPushProofReceipt, GatewayError> {
+    let maybe = load_gateway_receipt(&args, restore)
         .await
         .map_err(|_| GatewayError::Internal("failed to materialize durable gateway causal receipt"))?;
     maybe.ok_or(GatewayError::Internal("durable operation terminal missing in PostgreSQL"))
@@ -72,9 +88,17 @@ pub async fn materialize_durable_gateway_receipt(
 pub async fn load_durable_gateway_push_receipt(
     args: &DurableGatewayReceiptArgs<'_>,
 ) -> Result<Option<CausalPushProofReceipt>, PushCausalError> {
+    load_gateway_receipt(args, None).await
+}
+
+async fn load_gateway_receipt(
+    args: &DurableGatewayReceiptArgs<'_>,
+    restore: Option<PublicReplayRestore>,
+) -> Result<Option<CausalPushProofReceipt>, PushCausalError> {
     let durable_operation_id = args.private_operation_id.unwrap_or(args.operation_id);
     if durable_operation_id.is_nil()
         || (args.private_operation_id.is_some() && durable_operation_id == args.operation_id)
+        || (restore.is_some() && args.private_operation_id.is_none())
     {
         return Err(PushCausalError::StateMachine("durable gateway operation identity is invalid".into()));
     }
@@ -92,6 +116,7 @@ pub async fn load_durable_gateway_push_receipt(
                 args.operation_id,
                 private_id,
                 backend_hex,
+                restore,
                 args.deadline,
             )
             .await?,

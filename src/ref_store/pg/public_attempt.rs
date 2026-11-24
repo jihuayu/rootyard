@@ -66,7 +66,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
 use tokio::time::{Instant, timeout_at};
-use tokio_postgres::{Transaction, error::SqlState, types::ToSql};
+use tokio_postgres::{GenericClient, Transaction, error::SqlState, types::ToSql};
 use uuid::Uuid;
 
 mod status_terminal;
@@ -87,6 +87,49 @@ pub(super) const SCHEMA_PROBE: &str = "SELECT EXISTS(SELECT 1 FROM schema_migrat
 /// pre-migration-152 catalog. Any other `Unsupported` value stays a typed
 /// refusal and is never treated as a legacy fallback.
 pub(crate) const PUBLIC_ATTEMPT_SCHEMA_REQUIRED: &str = "public attempt lookup requires migration 152";
+
+/// Admission used the archive's original incarnation. Replay uses that
+/// immutable value for attempt proofs and proves reachability from live.
+#[derive(Clone, Copy)]
+pub(crate) struct PublicReplayRestore {
+    pub(crate) original: Uuid,
+    pub(crate) live: Uuid,
+}
+
+pub(crate) async fn prove_historical_public_scope(
+    client: &(impl GenericClient + Sync),
+    repository_id: Uuid,
+    public_id: Uuid,
+    restore: PublicReplayRestore,
+    deadline: Instant,
+) -> Result<bool, PackCommitError> {
+    let row = timeout_at(
+        deadline,
+        client.query_opt(
+            "WITH RECURSIVE ancestors(incarnation) AS (
+             SELECT $4::uuid
+             UNION
+             SELECT l.source_incarnation FROM ref_store_restore_lineage l
+             JOIN ancestors a ON a.incarnation=l.target_incarnation
+         )
+         SELECT rootyard_ref_store_attempt_current_scope(
+             jsonb_populate_record(w, jsonb_build_object('restore_incarnation', $4::uuid))
+         )
+         FROM ref_store_public_operations w
+         WHERE (w.repository_id,w.public_id,w.restore_incarnation)=($1,$2,$3)
+           AND w.state IN ('committed','rejected','cancelled')
+           AND $3::uuid<>$4::uuid AND EXISTS (SELECT FROM ancestors WHERE incarnation=$3)",
+            &[&repository_id, &public_id, &restore.original, &restore.live],
+        ),
+    )
+    .await
+    .map_err(|_| PackCommitError::from(RefStoreError::Timeout))?
+    .map_err(|error| match error.code() {
+        Some(&SqlState::CHECK_VIOLATION) => stale_realm(),
+        _ => PackCommitError::from(lookup_db_error(error)),
+    })?;
+    Ok(row.is_some_and(|row| row.get::<_, i64>(0) > 0))
+}
 
 /// One statement snapshot. The wrapper and attempt subqueries deliberately use
 /// plain reads; the migration-152 binding predicate is a SQL `STABLE` function
@@ -691,6 +734,38 @@ impl PgRefStore {
         evaluate_finish(snapshot, request)
     }
 
+    /// Resolve an exact HTTP receive before any native work. A restored terminal
+    /// may replay across a trusted cluster-incarnation edge, but a pending
+    /// wrapper must pass the original strict finish path.
+    pub(crate) async fn lookup_public_attempt_receive(
+        &self,
+        tx: &Transaction<'_>,
+        request: &PublicAttemptRequest,
+        deadline: Instant,
+    ) -> Result<(PublicAttemptFinishLookup, Option<PublicReplayRestore>), PackCommitError> {
+        request.validate()?;
+        timeout_at(deadline, async {
+            let snapshot = read_public_snapshot(tx, request.repository_id, request.public_id, deadline).await?;
+            let Some(wrapper) = snapshot.wrapper.as_ref().filter(|wrapper| {
+                wrapper.restore_incarnation != request.restore_incarnation
+                    && matches!(wrapper.state.as_str(), "committed" | "rejected" | "cancelled")
+            }) else {
+                return Ok((evaluate_finish(snapshot, request)?, None));
+            };
+            let restore =
+                PublicReplayRestore { original: wrapper.restore_incarnation, live: request.restore_incarnation };
+            let proof_request = PublicAttemptRequest { restore_incarnation: restore.original, ..request.clone() };
+            let terminal = evaluate_finish_in_scope(snapshot, &proof_request, true)?;
+            bound(tx, deadline).await?;
+            if !prove_historical_public_scope(tx, request.repository_id, request.public_id, restore, deadline).await? {
+                return Err(RefStoreError::IdentityConflict.into());
+            }
+            Ok((terminal, Some(restore)))
+        })
+        .await
+        .map_err(|_| PackCommitError::from(RefStoreError::Timeout))?
+    }
+
     /// Resolve only the current public operation state for a future GET inside
     /// the same caller-owned, caller-preauthorized read transaction.
     ///
@@ -948,6 +1023,15 @@ fn evaluate_finish(
     snapshot: RawSnapshot,
     request: &PublicAttemptRequest,
 ) -> Result<PublicAttemptFinishLookup, PackCommitError> {
+    let realm_matches = snapshot.realm_matches;
+    evaluate_finish_in_scope(snapshot, request, realm_matches)
+}
+
+fn evaluate_finish_in_scope(
+    snapshot: RawSnapshot,
+    request: &PublicAttemptRequest,
+    realm_matches: bool,
+) -> Result<PublicAttemptFinishLookup, PackCommitError> {
     validate_request(request)?;
     let Some(wrapper) = snapshot.wrapper.as_ref() else {
         if snapshot.private_occupied {
@@ -967,7 +1051,7 @@ fn evaluate_finish(
     }
 
     let state = validate_wrapper(wrapper, request)?;
-    if !snapshot.realm_matches {
+    if !realm_matches {
         return Err(stale_realm());
     }
     let evidence = validate_current_attempts(&snapshot, wrapper, state, true)?;
