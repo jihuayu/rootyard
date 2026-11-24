@@ -1722,6 +1722,7 @@ jobs:
               'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
               'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
               'blob_git_gateway::session_http_acceptance::public_operation_tests::public_operation_get_is_owned_pending_and_private_safe',
+              'blob_git_gateway::session_http_acceptance::public_operation_tests::public_cancel_rolls_back_if_the_repository_archives_while_waiting_for_its_lane',
           ]
           # Exact argv recorded by the builder invocations above, as emitted by the
           # current scripts/build_native_test.py --lib and scripts/build_native.py.
@@ -2299,6 +2300,7 @@ jobs:
               'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
               'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
               'blob_git_gateway::session_http_acceptance::public_operation_tests::public_operation_get_is_owned_pending_and_private_safe',
+              'blob_git_gateway::session_http_acceptance::public_operation_tests::public_cancel_rolls_back_if_the_repository_archives_while_waiting_for_its_lane',
           ]
           summary = re.compile(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; '
                                r'(\d+) measured; (\d+) filtered out; finished in ([0-9.]+)s$', re.M)
