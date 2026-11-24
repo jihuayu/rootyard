@@ -466,6 +466,7 @@ class Drill(BlobOnlyHarness):
         self.cli("reconcile")
         assert self.source_volume.joinpath(".volume-id").is_file()
         self.alice = self.account("create-user", "alice")
+        self.bob = self.account("create-user", "bob")
         self.reader = self.account("create-token", "alice", "--read-only")
         self.revoked = self.account("create-token", "alice")
         self.start()
@@ -480,6 +481,11 @@ class Drill(BlobOnlyHarness):
                      "payload.bin": bytes(range(256)) * 128}
             oid = self.commit_files(work, "offline backup boundary", files)
             if fmt == "sha1":
+                repo_id = str(uuid.UUID(repo["id"]))
+                self.query(self.source_db,
+                    "INSERT INTO public.repository_collaborators(repository_id,tenant_id,user_id,role) "
+                    "SELECT r.id,r.owner_id,u.id,'write' FROM public.repositories r CROSS JOIN public.users u "
+                    f"WHERE r.id='{repo_id}' AND u.username='bob'")
                 pack = self.run([str(self.profile.git), "pack-objects", "--stdout", "--all"],
                                 cwd=work, data=b"").stdout
                 assert pack.startswith(b"PACK")
@@ -512,6 +518,9 @@ class Drill(BlobOnlyHarness):
         self.start(label="after-barrier-loss")
         self.stop()
         self.source_rows = self.ledger_digests(self.source_db)
+        self.source_incarnation = str(uuid.UUID(self.query(
+            self.source_db, "SELECT incarnation FROM public.cluster_authority WHERE singleton")))
+        assert self.source_rows["ref_store_restore_lineage"]["count"] == 0
         for table in ("ref_store_serving_repositories", "ref_store_serving_operations",
                       "ref_store_core_pack_publications", "ref_store_operations"):
             assert self.source_rows[table]["count"] >= 2, table + " was not populated by real serving"
@@ -749,7 +758,7 @@ class Drill(BlobOnlyHarness):
         assert restored["restored"] is True and restored["started_service"] is False
         assert restored["blob_artifacts"] == self.closure_rows["count"]
         assert self.advisory_holds(self.target_db) == 0, "restore did not release its exclusive barrier"
-        assert self.ledger_digests(self.target_db) == self.source_rows, "restored core/serving ledger differs from the backup cut"
+        self.assert_restored_ledgers(self.target_db)
         assert self.artifact_rows(self.target_db) == self.closure_rows, "restored locators were rewritten"
         assert self.original_locators(self.target_db) == self.originals, "restored ledger changed the original locators"
         # Every rebuilt object must live at its exact original coordinate with
@@ -794,19 +803,52 @@ class Drill(BlobOnlyHarness):
         count = int(self.query(database, "SELECT count(*) FROM public.ref_store_core_pack_artifacts"))
         return {"count": count, "sha256": raw}
 
+    def assert_restored_ledgers(self, database):
+        restored = self.ledger_digests(database)
+        lineage_table = "ref_store_restore_lineage"
+        lineage = restored.pop(lineage_table)
+        assert restored == {table: digest for table, digest in self.source_rows.items() if table != lineage_table}, \
+            "restored core/serving ledger differs from the backup cut"
+        assert lineage["count"] == 1 and self.query(database,
+            "SELECT EXISTS(SELECT FROM public.ref_store_restore_lineage l "
+            "JOIN public.cluster_authority c ON c.singleton AND c.incarnation=l.target_incarnation "
+            f"WHERE l.source_incarnation='{self.source_incarnation}' AND l.target_incarnation<>l.source_incarnation)") == "t", \
+            "restore did not record the single exact source-to-target cluster incarnation edge"
+
     def restored_replay(self):
         repo = self.specs[0]["repo"]
         before = pg_replay_counts(self, repo["id"])
-        code, body, _ = self.http(self.replay_destination, token=self.alice, method="POST", body=self.replay_body,
-                                 content_type="application/x-git-receive-pack-request",
-                                 extra_headers={"X-Rootyard-Operation": self.replay_operation})
+        def replay(token, body):
+            return self.http(self.replay_destination, token=token, method="POST", body=body,
+                             content_type="application/x-git-receive-pack-request",
+                             extra_headers={"X-Rootyard-Operation": self.replay_operation})
+
+        code, body, _ = replay(self.alice, self.replay_body)
         assert code == 200 and body == self.replay_report, "restored operation did not return its exact original report"
         assert_receive_report_ok(body, "refs/heads/main")
-        assert pg_replay_counts(self, repo["id"]) == before, "restored exact replay produced another effect"
+        changed = self.replay_body.replace(b"refs/heads/main", b"refs/heads/test", 1)
+        assert changed != self.replay_body, "changed replay must have another digest"
+        code, body, _ = replay(self.alice, changed)
+        assert code == 409 and b"already used with a different request" in body
+        self.expect(repo["clone_path"] + "/info/refs?service=git-receive-pack", 200, token=self.bob)
+        code, body, _ = replay(self.bob, self.replay_body)
+        assert code == 409 and b"operation identity conflicts with a durable record" in body
+
+        live = str(uuid.UUID(self.query(self.target_db, "SELECT incarnation FROM public.cluster_authority WHERE singleton")))
+        unrelated = str(uuid.uuid4())
+        self.query(self.target_db, f"UPDATE public.cluster_authority SET incarnation='{unrelated}' WHERE singleton")
+        try:
+            code, body, _ = replay(self.alice, self.replay_body)
+            assert code == 409 and b"operation identity conflicts with a durable record" in body
+        finally:
+            self.query(self.target_db, f"UPDATE public.cluster_authority SET incarnation='{live}' WHERE singleton")
+
+        assert pg_replay_counts(self, repo["id"]) == before, "restored replay produced another effect"
         assert self.remote_refs(self.specs[0]["remote"], self.alice) == self.specs[0]["refs"]
         self.stop()
-        assert self.ledger_digests(self.target_db) == self.source_rows
-        return {"exact_original_report": True, "ledger_counters_unchanged": True, "immutable_rows_unchanged": True}
+        self.assert_restored_ledgers(self.target_db)
+        return {"exact_original_report": True, "ledger_counters_unchanged": True, "immutable_rows_unchanged": True,
+                "different_digest_refused": True, "different_writer_refused": True, "unrelated_incarnation_refused": True}
 
     # --- issue #169: fail-closed source validation and format22 roots -------------
     def use_blob_suffix(self, suffix):
@@ -1183,8 +1225,8 @@ class Drill(BlobOnlyHarness):
                                         database=database, check=False)
         assert restored.returncode == 0, "the uncorrupted archive does not restore after the negatives: " + \
             self.redact(restored.stderr[-2000:])
+        self.assert_restored_ledgers(database)
         digests = self.ledger_digests(database)
-        assert digests == self.source_rows, "the restore target changed during the corruption negatives"
         assert self.artifact_rows(database) == self.closure_rows, "the clean archive lost its locators"
         assert self.original_locators(database) == self.originals, "the restore target changed its locators"
         shutil.rmtree(target)

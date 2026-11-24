@@ -375,7 +375,7 @@ async fn restore_inner(
     }
     let paired = catalog::is_paired(manifest.format);
     if manifest.format >= 6 && !paired {
-        authority::fence(&client).await?;
+        authority::fence(&mut client, authority::RestoreLineage::None).await?;
         // Rotate the storage authority exactly once for the whole restored
         // database before importing any repository closure. Per-repository
         // rotation would invalidate paths imported for earlier repositories.
@@ -426,7 +426,12 @@ async fn restore_inner(
         if let Some(plan) = &w8a_plan {
             w8a_paired::verify_restored_source_snapshot(&client, plan.sidecar).await.map_err(anyhow::Error::new)?;
         }
-        authority::fence(&client).await?;
+        let lineage = if catalog::has_public_attempts(manifest.format) {
+            authority::RestoreLineage::VerifiedArchive
+        } else {
+            authority::RestoreLineage::None
+        };
+        authority::fence(&mut client, lineage).await?;
         crate::pando_gateway::retention::reset_authority(&mut client).await?;
         let profile = crate::blob_store::config::BlobProfile::from_env()?;
         let store = crate::blob_store::opendal::BlobStore::open(profile)?;

@@ -342,6 +342,7 @@ pub(super) async fn push_private(
             verified.request(),
             verified.digest(),
             verified.mode(),
+            operation::ReplayBoundary::ActivePublication,
             deadline,
         )
         .await?;
@@ -412,6 +413,7 @@ pub(super) async fn push_private(
                             verified.request(),
                             verified.digest(),
                             verified.mode(),
+                            operation::ReplayBoundary::ActivePublication,
                             deadline,
                         )
                         .await?;
@@ -430,6 +432,7 @@ pub(super) async fn push_private(
                     verified.request(),
                     verified.digest(),
                     verified.mode(),
+                    operation::ReplayBoundary::ActivePublication,
                     deadline,
                 )
                 .await?;
@@ -455,6 +458,7 @@ async fn complete_private_probe(
         operation::Probe::Pending => Err(GatewayError::OutcomeUnknown),
         operation::Probe::Cancelled { reason } => Ok(PrivatePushOutcome::Cancelled(reason)),
         operation::Probe::Replay { terminal, private_id } => Ok(PrivatePushOutcome::Terminal { terminal, private_id }),
+        operation::Probe::HistoricalReplay { .. } => Err(GatewayError::Conflict("repository authority changed; retry")),
         operation::Probe::Finish { terminal, private_id, evidence, record } => {
             let public_request = public_attempt_request_from_serving(
                 serving,
@@ -866,6 +870,7 @@ pub(super) async fn retire_slot_one(
                     verified.request(),
                     verified.digest(),
                     verified.mode(),
+                    operation::ReplayBoundary::ActivePublication,
                     deadline,
                 )
                 .await?;

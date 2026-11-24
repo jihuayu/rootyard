@@ -31,11 +31,63 @@ pub struct W8aFenceReceipt {
     pub reset_deliveries: i64,
 }
 
-pub(super) async fn fence(client: &Client) -> Result<()> {
-    client.batch_execute(
-        "BEGIN;
-         UPDATE public.cluster_authority SET incarnation=gen_random_uuid(),rotated_at=clock_timestamp() WHERE singleton=true;
-         DELETE FROM public.cluster_transport_nonces;
+pub(super) enum RestoreLineage {
+    None,
+    VerifiedArchive,
+    VerifiedW8aSource(Uuid),
+}
+
+pub(super) async fn fence(client: &mut Client, lineage: RestoreLineage) -> Result<()> {
+    let tx = client.transaction().await?;
+    let record_lineage = match lineage {
+        RestoreLineage::None => false,
+        RestoreLineage::VerifiedArchive => true,
+        RestoreLineage::VerifiedW8aSource(source) => {
+            let carries_lineage: bool =
+                tx.query_one("SELECT to_regclass('public.ref_store_restore_lineage') IS NOT NULL", &[]).await?.get(0);
+            if carries_lineage {
+                // The signed path first performs the guarded inner restore.
+                // Continue its exact edge only when it began at the signed source.
+                tx.query_one(
+                    "SELECT EXISTS (
+                         SELECT FROM public.ref_store_restore_lineage l JOIN public.cluster_authority c
+                           ON c.singleton AND c.incarnation=l.target_incarnation
+                          WHERE l.source_incarnation=$1
+                     )",
+                    &[&source],
+                )
+                .await?
+                .get(0)
+            } else {
+                false
+            }
+        }
+    };
+    if record_lineage {
+        let added = tx
+            .execute(
+                "WITH prior AS (
+                 SELECT incarnation FROM public.cluster_authority WHERE singleton FOR UPDATE
+             ), rotated AS (
+                 UPDATE public.cluster_authority c
+                    SET incarnation=gen_random_uuid(), rotated_at=clock_timestamp()
+                   FROM prior WHERE c.singleton
+                RETURNING c.incarnation AS target, prior.incarnation AS source
+             )
+             INSERT INTO public.ref_store_restore_lineage(target_incarnation, source_incarnation)
+             SELECT target, source FROM rotated",
+                &[],
+            )
+            .await?;
+        ensure!(added == 1, "restored cluster authority must have one lineage edge");
+    } else {
+        tx.execute(
+            "UPDATE public.cluster_authority SET incarnation=gen_random_uuid(),rotated_at=clock_timestamp() WHERE singleton=true",
+            &[],
+        ).await?;
+    }
+    tx.batch_execute(
+        "DELETE FROM public.cluster_transport_nonces;
          UPDATE public.ci_runs SET state='cancelled',lease_generation=lease_generation+1,
              lease_expires_unix=0,runner_id=NULL,updated_at=clock_timestamp()
              WHERE state IN ('queued','leased');
@@ -50,9 +102,10 @@ pub(super) async fn fence(client: &Client) -> Result<()> {
          UPDATE public.sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp()
              WHERE state IN ('queued','preparing','running');
          UPDATE public.tokens SET revoked=true WHERE kind='browser';
-         UPDATE public.web_sessions SET revoked=true;
-         COMMIT;"
-    ).await?;
+         UPDATE public.web_sessions SET revoked=true;",
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -63,7 +116,7 @@ pub async fn fence_w8a_fresh_incarnation(
     source_storage_authority_epoch: i64,
 ) -> Result<W8aFenceReceipt> {
     ensure!(source_storage_authority_epoch >= 1, "source storage authority epoch is invalid");
-    fence(client).await?;
+    fence(client, RestoreLineage::VerifiedW8aSource(source_cluster_incarnation)).await?;
     let tx = client.transaction().await?;
     tx.execute("UPDATE public.tokens SET revoked=true WHERE NOT revoked", &[]).await?;
     tx.execute("UPDATE public.web_sessions SET revoked=true WHERE NOT revoked", &[]).await?;

@@ -3,6 +3,8 @@ use tokio::time::{Instant as TokioInstant, timeout_at};
 use tokio_postgres::Transaction;
 use uuid::Uuid;
 
+use crate::ref_store::pg::public_attempt::{PublicReplayRestore, prove_historical_public_scope};
+
 use super::types::PushCausalError;
 
 pub(super) enum ReclaimBinding {
@@ -113,6 +115,7 @@ pub(super) async fn require_public_private_binding(
     public_id: Uuid,
     private_id: Uuid,
     backend_hex: &str,
+    restore: Option<PublicReplayRestore>,
     deadline: TokioInstant,
 ) -> Result<PublicPrivateBinding, PushCausalError> {
     let schema =
@@ -164,20 +167,27 @@ pub(super) async fn require_public_private_binding(
         return Err(PushCausalError::StateMachine("private receipt backend substitution".into()));
     }
 
-    let scope = timeout_at(
-        deadline,
-        client.query_one(
-            "SELECT rootyard_ref_store_attempt_current_scope(w)
-               FROM ref_store_public_operations w
-              WHERE w.repository_id = $1 AND w.public_id = $2",
-            &[&repository_id, &public_id],
-        ),
-    )
-    .await
-    .map_err(|_| PushCausalError::DeadlineExceeded)?
-    .map_err(|_| PushCausalError::StateMachine("private receipt current scope is invalid".into()))?
-    .get::<_, i64>(0);
-    if scope <= 0 {
+    let scope = if let Some(restore) = restore {
+        prove_historical_public_scope(&***client, repository_id, public_id, restore, deadline)
+            .await
+            .map_err(|_| PushCausalError::StateMachine("private receipt restore scope is invalid".into()))?
+    } else {
+        timeout_at(
+            deadline,
+            client.query_one(
+                "SELECT rootyard_ref_store_attempt_current_scope(w)
+                   FROM ref_store_public_operations w
+                  WHERE w.repository_id = $1 AND w.public_id = $2",
+                &[&repository_id, &public_id],
+            ),
+        )
+        .await
+        .map_err(|_| PushCausalError::DeadlineExceeded)?
+        .map_err(|_| PushCausalError::StateMachine("private receipt current scope is invalid".into()))?
+        .get::<_, i64>(0)
+            > 0
+    };
+    if !scope {
         return Err(PushCausalError::StateMachine("private receipt current scope is invalid".into()));
     }
 
