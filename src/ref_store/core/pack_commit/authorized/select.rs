@@ -15,9 +15,10 @@ use super::{
     pooled_client,
 };
 use crate::db::Identity;
-use crate::ref_store::contract::RequestDigest;
+use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::core::decision_commit::{self, RealmExpectation};
 use crate::ref_store::core::publication_decision::{SelectedDecision, select_and_install};
+use crate::ref_store::pg::PgRefStore;
 use crate::ref_store::tx::{begin_bounded, commit_bounded};
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
@@ -116,6 +117,12 @@ impl PgAuthorizedCommit {
             return Err(AuthorizedCommitError::Denied("issuer_mismatch"));
         }
         let deadline = effective_deadline(deadline)?;
+        let public = prepared.public_attempt();
+        if let Some(public) = public
+            && self.store.backend_identity().as_hex() != public.backend_identity
+        {
+            return Err(pg::reject(PackCommitRejectCode::PublicationMismatch, "private attempt backend differs").into());
+        }
         // No PostgreSQL client is held here: the native permit works alone.
         let kind = mode.decision_kind();
         if prepared.plan().commit_mode().as_str() != kind.as_str() {
@@ -130,8 +137,17 @@ impl PgAuthorizedCommit {
         let tx = begin_bounded(&mut client, deadline).await?;
         let stage = async {
             pg::set_ack_durability(&tx, deadline).await?;
-            pg::acquire_pending_prefix(&tx, prepared.plan(), deadline).await?;
-            pg::ensure_repository(&tx, prepared.plan(), true).await?;
+            if let Some(public) = public {
+                PgRefStore.lock_private_pending_attempt(&tx, public, prepared.plan(), deadline).await?;
+            } else {
+                pg::acquire_pending_prefix(&tx, prepared.plan(), deadline).await?;
+            }
+            let repository_scope = pg::ensure_repository(&tx, prepared.plan(), true).await?;
+            if let Some(public) = public {
+                repository_scope
+                    .require_serving(public.admission_owner_id, &public.backend_identity)
+                    .map_err(|refusal| RefStoreError::Unsupported(refusal.reason()))?;
+            }
             crate::ref_store::core::publication_decision::sql_locks::lock_source_tables(
                 &tx,
                 &crate::ref_store::core::publication_decision::contract::PublicationAction::Push,

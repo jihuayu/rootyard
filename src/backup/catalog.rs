@@ -2,19 +2,21 @@
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-/// Current archives use format 29 / schema 151 (repository archive, rename
-/// aliases, soft-delete/restore/purge lifecycle, and recoverable ownership
-/// transfers). Prior format catalogs remain frozen; formats 27 and 28 are
-/// schema 150, formats 25 and 26 are schema 149, formats 23 and 24 are
-/// schema 148, formats 21 and 22 are schema 147, and format 20 is schema 144.
-/// The new schema catalogs were generated from real PostgreSQL, never copied
-/// from a previous schema.
-pub(super) const FORMAT: u32 = 29;
+/// Current metadata archives use schema 152, including public attempt history.
+pub(super) const FORMAT: u32 = 31;
 
 /// Paired PG + OpenDAL Blob closure archive (#120). The schema does not change:
 /// format tags the archive layout, not the frozen PostgreSQL catalog, so every
 /// same-schema archive maps unchanged to the same reviewed catalog/versions.
-pub(super) const FORMAT_PAIRED: u32 = 30;
+pub(super) const FORMAT_PAIRED: u32 = 32;
+
+pub(super) fn is_paired(format: u32) -> bool {
+    matches!(format, 28 | 30 | FORMAT_PAIRED)
+}
+
+pub(super) fn has_public_attempts(format: u32) -> bool {
+    matches!(format, 31 | 32)
+}
 
 pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
     let raw = match format {
@@ -128,6 +130,11 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../../schema/151_restored_catalog.json"),
             include_str!("../../schema/151_upgraded_catalog.json"),
         ],
+        31 | 32 => [
+            include_str!("../../schema/152_catalog.json"),
+            include_str!("../../schema/152_restored_catalog.json"),
+            include_str!("../../schema/152_upgraded_catalog.json"),
+        ],
         _ => bail!("unsupported backup format"),
     };
     Ok([serde_json::from_str(raw[0])?, serde_json::from_str(raw[1])?, serde_json::from_str(raw[2])?])
@@ -157,6 +164,7 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         25 | 26 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 149).collect()),
         27 | 28 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 150).collect()),
         29 | 30 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 151).collect()),
+        31 | 32 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 152).collect()),
         _ => bail!("unsupported backup format"),
     }
 }

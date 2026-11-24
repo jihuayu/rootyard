@@ -199,6 +199,7 @@ where
     // and RefStore carry; it is never restarted.
     let until = tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600));
     let (blob_closure, blob_artifacts) = if format == FORMAT_PAIRED {
+        ledger::require_closed_public_attempts(&tx, format, until).await?;
         // Fail closed before the Blob export: every declared registration must
         // have its exact pack/idx pair, hold binding and recomputed digest on
         // this same exported-snapshot transaction, never a second snapshot.
@@ -227,7 +228,7 @@ where
     };
     // Durable RefStore rows the paired closure depends on; the restore compares
     // them with the restored database before rebuilding any byte.
-    let refstore = if format == FORMAT_PAIRED { Some(ledger::carry(&tx, until).await?) } else { None };
+    let refstore = if format == FORMAT_PAIRED { Some(ledger::carry(&tx, format, until).await?) } else { None };
     let paired = blob_closure.is_some();
     let manifest = Manifest {
         format,

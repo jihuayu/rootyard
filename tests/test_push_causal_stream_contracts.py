@@ -17,6 +17,8 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parents[1]
 RUST_FILES = [
     ROOT / "src" / "blob_git_gateway" / "receive.rs",
+    ROOT / "src" / "blob_git_gateway" / "receive" / "response.rs",
+    ROOT / "src" / "blob_git_gateway" / "receive" / "pack_files.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "types.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "receipt.rs",
@@ -35,6 +37,7 @@ RUST_FILES = [
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_prover.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_prover_pack.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_durable_replay.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_durable_binding.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_durable_sql.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "reclaim_carrier.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "reclaim_sweeper.rs",
@@ -75,13 +78,14 @@ class PushCausalStreamContractsTest(unittest.TestCase):
         self.assertIn("spool_receive_stream_shared_deadline", receive_src)
         self.assertIn("verify_gateway_authority_closure", receive_src)
         self.assertIn("prove_gateway_incoming_pack_closure", receive_src)
-        self.assertIn("materialize_durable_gateway_receipt", receive_src)
-        self.assertIn("sweep_gateway_reclaim_ledger", receive_src)
-        self.assertLess(
-            receive_src.index("Claim::Fresh"),
-            receive_src.index("sweep_gateway_reclaim_ledger("),
-            "Claim::Fresh must precede sweep_gateway_reclaim_ledger for request-entry zero-write replay",
+        response_src = (ROOT / "src" / "blob_git_gateway" / "receive" / "response.rs").read_text(encoding="utf-8")
+        self.assertIn("materialize_durable_gateway_receipt", response_src)
+        self.assertRegex(
+            receive_src,
+            r"ReceiveDisposition::Fresh => \{\s+let _ = sweep_gateway_reclaim_ledger\(",
+            "only a freshly probed request may sweep the reclaim ledger",
         )
+        self.assertEqual(receive_src.count("sweep_gateway_reclaim_ledger("), 1)
 
         commit_gate_src = (ROOT / "src" / "namespace_service" / "push_causal_stream" / "commit_gate.rs").read_text(
             encoding="utf-8"
@@ -120,6 +124,7 @@ class PushCausalStreamContractsTest(unittest.TestCase):
             paths = on_cfg["pull_request"]["paths"]
             for required in (
                 "src/blob_git_gateway/receive.rs",
+                "src/blob_git_gateway/receive/**",
                 "src/namespace_service.rs",
                 "src/namespace_service/push_causal_stream.rs",
                 "src/namespace_service/push_causal_stream/**",

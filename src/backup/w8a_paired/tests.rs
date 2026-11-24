@@ -119,7 +119,11 @@ fn manifest_seal_covers_every_sidecar_field() {
 #[test]
 fn format_version_is_frozen() {
     assert_eq!(super::W8A_FORMAT_VERSION, "rootyard-w8a-pg-blob-v1");
-    assert_eq!(sample_sidecar().format, super::super::FORMAT_PAIRED);
+    assert_eq!(super::super::paired_envelope_schema_head(30), Some(151));
+    assert_eq!(super::super::paired_envelope_schema_head(32), Some(152));
+    for format in [28, 29, 31, 33] {
+        assert_eq!(super::super::paired_envelope_schema_head(format), None);
+    }
 }
 
 #[test]
@@ -213,6 +217,10 @@ fn artifact(repo: Uuid, pack: Uuid, role: &str, bytes: &[u8]) -> super::super::l
 }
 
 fn fixture() -> Fixture {
+    fixture_for_format(30)
+}
+
+fn fixture_for_format(format: u32) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("archive");
     std::fs::create_dir(&root).unwrap();
@@ -221,18 +229,18 @@ fn fixture() -> Fixture {
     let files = [b"pack".to_vec(), b"idx".to_vec()];
     let artifacts = vec![artifact(repo, pack, "pack", &files[0]), artifact(repo, pack, "idx", &files[1])];
     let closure = super::super::ledger::closure_of(&artifacts, "backend", "opendal");
-    let manifest = super::super::Manifest {
-        format: 30,
+    let mut manifest = super::super::Manifest {
+        format,
         backup_id: Uuid::new_v4(),
         volume_id: Uuid::new_v4(),
-        schema_contract_sha256: super::super::schema_contract_digest(30).unwrap(),
+        schema_contract_sha256: super::super::schema_contract_digest(format).unwrap(),
         boundary_unix_seconds: 0,
         rootyard_version: "w8a-test".into(),
         binary_sha256: "0".repeat(64),
         postgres_version: "17".into(),
         pg_dump_version: "17".into(),
         git_version: "2.43".into(),
-        schema_versions: super::super::schema_versions(30).unwrap(),
+        schema_versions: super::super::schema_versions(format).unwrap(),
         consistency: "test".into(),
         journal_record_files: 0,
         repositories: Vec::new(),
@@ -246,24 +254,36 @@ fn fixture() -> Fixture {
             digest: closure.digest,
         }),
         blob_artifacts: artifacts.clone(),
-        refstore: None,
+        refstore: Some(BTreeMap::new()),
         files: BTreeMap::new(),
     };
     let metadata = b"metadata";
     let inner = root.join("format30");
     std::fs::create_dir(&inner).unwrap();
     std::fs::write(inner.join("metadata.dump"), metadata).unwrap();
+    let volume = inner.join("volume");
+    super::super::private_dir(&volume).unwrap();
+    let mut volume_id =
+        std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(volume.join(".volume-id")).unwrap();
+    write!(volume_id, "{}", manifest.volume_id).unwrap();
     for (index, artifact) in artifacts.iter().enumerate() {
         let path = inner.join(artifact.archive_path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, &files[index]).unwrap();
     }
+    for kind in ["volume", "blob"] {
+        let members = super::super::inventory(&inner.join(kind)).unwrap();
+        manifest.files.extend(members.into_iter().map(|(name, entry)| (format!("{kind}/{name}"), entry)));
+    }
+    manifest
+        .files
+        .extend(super::super::inventory(&inner).unwrap().into_iter().filter(|(name, _)| name == "metadata.dump"));
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     std::fs::write(inner.join("manifest.json"), &manifest_bytes).unwrap();
     std::fs::write(inner.join("COMPLETE"), sha(&manifest_bytes)).unwrap();
     let mut sidecar = sample_sidecar();
-    sidecar.format = 30;
-    sidecar.schema_head = *super::super::schema_versions(30).unwrap().last().unwrap();
+    sidecar.format = format;
+    sidecar.schema_head = *manifest.schema_versions.last().unwrap();
     sidecar.schema_contract_sha256 = manifest.schema_contract_sha256.clone();
     sidecar.metadata_dump_sha256 = sha(metadata);
     sidecar.inner_manifest_sha256 = sha(&manifest_bytes);
@@ -279,6 +299,28 @@ fn fixture() -> Fixture {
     std::fs::write(root.join("w8a-paired.json"), &sidecar_bytes).unwrap();
     std::fs::write(root.join("W8A_COMPLETE"), sha(&sidecar_bytes)).unwrap();
     Fixture { _temp: temp, root, manifest, artifacts }
+}
+
+#[test]
+fn check_reads_historical_and_current_inner_archives_in_the_same_envelope() {
+    for (format, schema) in [(30, 151), (32, 152)] {
+        let fixture = fixture_for_format(format);
+        let inner = check(&fixture.root).unwrap();
+        assert_eq!((inner.format, inner.schema_head), (format, schema));
+        assert_eq!(inner.inner_backup_id, fixture.manifest.backup_id);
+    }
+}
+
+#[test]
+fn check_rejects_a_resealed_crossed_format_schema() {
+    let fixture = fixture_for_format(32);
+    let path = fixture.root.join("w8a-paired.json");
+    let mut sidecar: W8aPairedSidecarManifest = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    sidecar.schema_head = 151;
+    let bytes = serde_json::to_vec(&sidecar.seal().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::write(fixture.root.join("W8A_COMPLETE"), sha(&bytes)).unwrap();
+    assert!(matches!(check(&fixture.root), Err(W8aError::MixedPointInTime(_))));
 }
 
 #[test]

@@ -6,8 +6,6 @@
 //! view inside an owned RAII directory that is deleted when the request
 //! finishes. Durable refs live in the PostgreSQL core and durable bytes in Blob,
 //! so deleting a compute view can never lose an acknowledged ref or byte.
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -30,6 +28,11 @@ use super::{
     repo_session::SessionTokens,
 };
 use crate::{blob_store::opendal::BlobStore, cache_wake::ServingCache, dispatch};
+#[cfg(test)]
+mod acceptance_pauses;
+#[cfg(test)]
+pub(crate) use acceptance_pauses::{AdmissionPause, ReadPause};
+
 mod signals;
 tokio::task_local! {
     pub(super) static REQUEST_DEADLINE: Instant;
@@ -57,7 +60,7 @@ pub struct BlobGitState {
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
     #[cfg(test)]
-    admission_pause: Option<Arc<AdmissionPause>>,
+    admission_pauses: Vec<Arc<AdmissionPause>>,
     /// Acceptance-only rendezvous reached after an exact commit-preview cache
     /// lookup and before the final encoded-response fence. It is absent in
     /// every non-test build and cannot be selected by a request or config.
@@ -89,7 +92,7 @@ impl BlobGitState {
             dispatch: dispatch::Signals::default(),
             packfile_offload: None,
             #[cfg(test)]
-            admission_pause: None,
+            admission_pauses: Vec::new(),
             #[cfg(test)]
             read_pause: None,
         })
@@ -121,40 +124,6 @@ impl BlobGitState {
     pub fn with_packfile_offload(mut self, offload: Arc<crate::browse::packfile_uri::GatewayPackfileOffload>) -> Self {
         self.packfile_offload = Some(offload);
         self
-    }
-
-    /// Acceptance-only: attach a private rendezvous to this gateway instance.
-    /// The production constructor has no parameter, environment variable or
-    /// route that can reach this field.
-    #[cfg(test)]
-    pub(crate) fn with_admission_pause(mut self, pause: Arc<AdmissionPause>) -> Self {
-        self.admission_pause = Some(pause);
-        self
-    }
-
-    /// Called after the publish baseline was captured and before the admission
-    /// transaction starts. In production this method does not exist.
-    #[cfg(test)]
-    pub(crate) async fn pause_before_admission(&self, operation_id: Uuid) {
-        if let Some(pause) = &self.admission_pause {
-            pause.pause(operation_id).await;
-        }
-    }
-
-    /// Acceptance-only: attach a private read rendezvous to this gateway.
-    #[cfg(test)]
-    pub(crate) fn with_read_pause(mut self, pause: Arc<ReadPause>) -> Self {
-        self.read_pause = Some(pause);
-        self
-    }
-
-    /// Acceptance-only: pause one exact commit-preview request after its
-    /// advisory payload lookup and before response encoding/final fences.
-    #[cfg(test)]
-    pub(crate) async fn pause_before_commit_finalize(&self, oid: &str) {
-        if let Some(pause) = &self.read_pause {
-            pause.pause(oid).await;
-        }
     }
 
     pub fn pool(&self) -> &Pool {
@@ -257,109 +226,6 @@ impl BlobGitState {
     /// Create one canonical private per-request directory.
     pub(super) fn temp_dir(&self, prefix: &str) -> Result<TempDir, GatewayError> {
         TempDir::create(&self.scratch, prefix)
-    }
-}
-
-/// Acceptance-only rendezvous used by the deterministic pre-admission race
-/// case. The pause is keyed by operation UUID and can fire at most once.
-#[cfg(test)]
-pub(crate) struct AdmissionPause {
-    operation: Uuid,
-    paused: AtomicBool,
-    reached: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl AdmissionPause {
-    pub(crate) fn new(operation: Uuid) -> Self {
-        Self {
-            operation,
-            paused: AtomicBool::new(false),
-            reached: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        }
-    }
-
-    async fn pause(&self, operation: Uuid) {
-        if operation != self.operation || self.paused.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        // `notify_one` stores a permit, so a test that starts waiting after the
-        // request arrived still observes the rendezvous.
-        self.reached.notify_one();
-        self.release.notified().await;
-    }
-
-    /// Wait until the selected operation reached the post-capture pause.
-    pub(crate) async fn wait_reached(&self) {
-        self.reached.notified().await;
-    }
-
-    /// Let the paused operation continue into admission.
-    pub(crate) fn release(&self) {
-        self.release.notify_one();
-    }
-}
-
-/// Acceptance-only rendezvous reached after an exact commit-preview payload
-/// lookup and before the final encoded-response authorization fence. It is
-/// keyed by the exact OID admitted by the route and fires at most once; the
-/// wait has a fixed bounded timeout so a missing release fails the test rather
-/// than hanging the process.
-#[cfg(test)]
-pub(crate) struct ReadPause {
-    target: std::sync::Mutex<Option<String>>,
-    paused: AtomicBool,
-    reached: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl ReadPause {
-    pub(crate) fn new() -> Self {
-        Self {
-            target: std::sync::Mutex::new(None),
-            paused: AtomicBool::new(false),
-            reached: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        }
-    }
-
-    /// Select the one exact OID whose next commit-preview request pauses.
-    pub(crate) fn target(&self, oid: impl Into<String>) {
-        *self.target.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(oid.into());
-    }
-
-    async fn pause(&self, oid: &str) {
-        let matches = self
-            .target
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            .is_some_and(|target| target == oid);
-        if !matches || self.paused.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        // `notify_one` stores a permit, so a test that starts waiting after the
-        // request arrived still observes the rendezvous.
-        self.reached.notify_one();
-        let _ = tokio::time::timeout(Duration::from_secs(30), self.release.notified()).await;
-    }
-
-    /// Wait until the selected exact-OID request reached the pre-finalize pause.
-    /// The caller's one deadline bounds the wait; expiration is a normal error so
-    /// the fixture can still release, reap and finish the database.
-    pub(crate) async fn wait_reached(&self, deadline: Instant) -> anyhow::Result<()> {
-        tokio::time::timeout_at(deadline, self.reached.notified())
-            .await
-            .map(|_| ())
-            .map_err(|_| anyhow::anyhow!("deterministic commit-finalize pause was not reached"))
-    }
-
-    /// Let the paused request continue into response encoding and final fences.
-    pub(crate) fn release(&self) {
-        self.release.notify_one();
     }
 }
 
@@ -477,23 +343,5 @@ mod tests {
         let path = dir.path().to_path_buf();
         drop(dir);
         assert!(!path.exists(), "temp dir subtree must be removed");
-    }
-
-    #[tokio::test]
-    async fn acceptance_pause_waits_once_for_only_its_operation() {
-        let target = Uuid::new_v4();
-        let pause = Arc::new(AdmissionPause::new(target));
-        let waiting = {
-            let pause = pause.clone();
-            tokio::spawn(async move { pause.pause(target).await })
-        };
-        pause.wait_reached().await;
-        assert!(!waiting.is_finished(), "the selected operation must remain paused until release");
-        pause.release();
-        waiting.await.expect("pause task");
-        // The rendezvous is one-shot and keyed by operation: a rebase retry or
-        // any other operation passes without blocking.
-        pause.pause(target).await;
-        pause.pause(Uuid::new_v4()).await;
     }
 }

@@ -1,5 +1,6 @@
-//! Standard `schema 151` / `format 30` full PostgreSQL (`pg_dump`) + OpenDAL Blob closure
-//! + live 3-voter mTLS Raft paired backup and archive verification (#153).
+//! Full PostgreSQL + OpenDAL Blob closure + live 3-voter mTLS Raft paired
+//! backup and archive verification (#153). The v1 envelope supports historical
+//! format 30 / schema 151 and current format 32 / schema 152.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -34,15 +35,16 @@ use super::quorum_wal::DurableRaftBackend;
 use super::raft_barrier::SealedArchiveReceipt;
 use super::types::{
     BlobArtifactEntry, BlobClosureManifest, COMPLETE_MARKER, MANIFEST_FILE, MAX_MANIFEST_BYTES,
-    PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PgCutpointProof, RaftCutpointProof, sha256_json_tagged, validate_hex64,
+    PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PgCutpointProof, RaftCutpointProof, sha256_json_tagged,
 };
 
 pub use super::format30_boot::{
     restore_and_boot_format30_new_incarnation, restore_and_boot_format30_with_pre_thaw_hook,
 };
 
-pub const STANDARD_PAIRED_PG_FORMAT: u32 = 30;
-pub const STANDARD_SCHEMA_HEAD: i32 = 151;
+pub const STANDARD_PAIRED_PG_FORMAT: u32 = 32;
+pub const STANDARD_SCHEMA_HEAD: i32 = 152;
+/// Frozen path inside a v1 envelope. The inner archive declares its own format.
 pub const FORMAT30_SUBDIR: &str = "format30";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -90,7 +92,7 @@ pub struct Format30PairedBackupRequest<'a> {
     pub destination: &'a Path,
 }
 
-/// Capture a complete `schema 151` / `format 30` PostgreSQL (`pg_dump`) + OpenDAL Blob closure
+/// Capture a complete current PostgreSQL (`pg_dump`) + OpenDAL Blob closure
 /// archive via `crate::backup::create` paired with live 3-voter mTLS Raft cutpoints across all groups.
 pub async fn create_format30_paired_raft_backup(
     req: Format30PairedBackupRequest<'_>,
@@ -160,8 +162,6 @@ pub async fn create_format30_paired_raft_backup(
     cleanup_res?;
     freeze.maybe_inject_fence_fault(1).await?;
     freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await?;
-    crate::backup::check(&fmt30_dir).map_err(|_| PairedBackupError::IncompleteCut("inner format 30 check failed"))?;
-
     let (fmt30_binding, blob_closure) =
         extract_format30_binding_and_closure(&fmt30_dir, &pg_proof, req.store.backend_identity().as_hex())?;
     verify_blob_closure_against_durable_raft(
@@ -271,7 +271,7 @@ pub(super) fn enforce_blob_closure_verifier_budget(entries: &[BlobArtifactEntry]
     Ok(())
 }
 
-/// Independently verify both outer paired manifest/COMPLETE and inner `format 30` (`schema 151`)
+/// Independently verify both outer paired manifest/COMPLETE and inner PG archive
 /// `metadata.dump` + `blob/...` + active & peer 3-voter Raft cutpoints.
 pub fn verify_format30_paired_archive(
     archive_dir: &Path,
@@ -291,13 +291,25 @@ pub fn verify_format30_paired_archive(
     if manifest.clone().seal()?.paired_cut_digest != manifest.paired_cut_digest {
         return Err(PairedBackupError::CorruptBlobOrDigest("paired_cut_digest mismatch".into()));
     }
-    if manifest.format30_pg.format != STANDARD_PAIRED_PG_FORMAT
-        || manifest.format30_pg.schema_head != STANDARD_SCHEMA_HEAD
+    let binding = &manifest.format30_pg;
+    if manifest.format_version != PAIRED_BACKUP_FORMAT_V1
+        || crate::backup::paired_envelope_schema_head(binding.format) != Some(binding.schema_head)
+        || i64::from(binding.schema_head) != manifest.pg_cutpoint.schema_head_version
     {
-        return Err(PairedBackupError::IncompleteCut("inner PG archive is not standard format 30 / schema 151"));
+        return Err(PairedBackupError::IncompleteCut("inner PG archive format does not match the PG cutpoint"));
     }
     let fmt30_dir = archive_dir.join(FORMAT30_SUBDIR);
-    crate::backup::check(&fmt30_dir).map_err(|_| PairedBackupError::IncompleteCut("inner format 30 check failed"))?;
+    let inner = crate::backup::verify_archive_identity(&fmt30_dir)
+        .map_err(|_| PairedBackupError::IncompleteCut("inner PG archive verification failed"))?;
+    if inner.format != binding.format
+        || inner.schema_head != binding.schema_head
+        || inner.backup_id != binding.inner_backup_id
+        || inner.schema_contract_sha256 != binding.schema_contract_sha256
+        || inner.repository_count != binding.repository_count
+        || inner.repository_count != manifest.pg_cutpoint.repositories.len()
+    {
+        return Err(PairedBackupError::IncompleteCut("inner PG archive identity does not match the sealed binding"));
+    }
     let (_, dump_sha) = stream_sha256_file(&fmt30_dir.join("metadata.dump"))?;
     let (_, inner_comp_sha) = stream_sha256_file(&fmt30_dir.join(COMPLETE_MARKER))?;
     if dump_sha != manifest.format30_pg.metadata_dump_sha256
@@ -364,25 +376,19 @@ fn extract_format30_binding_and_closure(
     pg_proof: &PgCutpointProof,
     expected_backend_hex: &str,
 ) -> Result<(Format30PgArchiveBinding, BlobClosureManifest), PairedBackupError> {
-    let raw: Value = serde_json::from_slice(&fs::read(fmt30_dir.join(MANIFEST_FILE))?)
-        .map_err(|_| PairedBackupError::IncompleteCut("parse inner format 30 manifest"))?;
-    let format = raw["format"].as_u64().unwrap_or(0) as u32;
-    let schema_head =
-        raw["schema_versions"].as_array().and_then(|v| v.last()).and_then(Value::as_i64).unwrap_or(0) as i32;
-    if format != STANDARD_PAIRED_PG_FORMAT || schema_head != STANDARD_SCHEMA_HEAD {
+    let inner = crate::backup::verify_archive_identity(fmt30_dir)
+        .map_err(|_| PairedBackupError::IncompleteCut("inner PG archive verification failed"))?;
+    if inner.format != STANDARD_PAIRED_PG_FORMAT
+        || inner.schema_head != STANDARD_SCHEMA_HEAD
+        || i64::from(inner.schema_head) != pg_proof.schema_head_version
+        || inner.repository_count != pg_proof.repositories.len()
+    {
         return Err(PairedBackupError::IncompleteCut(
-            "crate::backup::create did not emit format 30 / schema 151 archive",
+            "current inner PG archive identity does not match the PG cutpoint",
         ));
     }
-    let inner_backup_id: Uuid = raw["backup_id"]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .ok_or(PairedBackupError::IncompleteCut("missing inner format 30 backup_id"))?;
-    let schema_contract_sha256 = raw["schema_contract_sha256"]
-        .as_str()
-        .filter(|s| validate_hex64(s))
-        .ok_or(PairedBackupError::IncompleteCut("invalid inner schema_contract_sha256"))?
-        .to_owned();
+    let raw: Value = serde_json::from_slice(&fs::read(fmt30_dir.join(MANIFEST_FILE))?)
+        .map_err(|_| PairedBackupError::IncompleteCut("parse staged inner PG archive manifest"))?;
     let (_, metadata_dump_sha256) = stream_sha256_file(&fmt30_dir.join("metadata.dump"))?;
     let (_, inner_complete_sha256) = stream_sha256_file(&fmt30_dir.join(COMPLETE_MARKER))?;
 
@@ -447,13 +453,13 @@ fn extract_format30_binding_and_closure(
     .seal()?;
     closure.verify()?;
     let binding = Format30PgArchiveBinding {
-        format,
-        inner_backup_id,
-        schema_head,
-        schema_contract_sha256,
+        format: inner.format,
+        inner_backup_id: inner.backup_id,
+        schema_head: inner.schema_head,
+        schema_contract_sha256: inner.schema_contract_sha256,
         metadata_dump_sha256,
         inner_complete_sha256,
-        repository_count: pg_proof.repositories.len(),
+        repository_count: inner.repository_count,
     };
     Ok((binding, closure))
 }

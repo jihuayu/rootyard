@@ -9,6 +9,7 @@ and the source binding. They cannot stand in for the native run and never claim
 it passed.
 """
 import ast
+import json
 from pathlib import Path
 import re
 import sys
@@ -426,10 +427,27 @@ class DrillWiringTest(unittest.TestCase):
         self.assertIn('self.env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))',
                       method_source("offline_backup_and_fresh_database_restore"))
 
-    def test_drill_stays_on_the_format21_gitfs_family(self):
+    def test_drill_requires_the_current_metadata_only_archive(self):
         self.assertNotIn("serve-blob", self.source)
-        self.assertIn("== 29", self.source)
-        self.assertIn("blob_closure", self.source)
+        with tempfile.TemporaryDirectory() as directory:
+            harness = mock.Mock(backup=Path(directory))
+            harness.backup_command.return_value.stdout = "{}"
+            manifest_file = harness.backup / "manifest.json"
+            manifest = {
+                "format": drill.CURRENT_BACKUP_FORMAT,
+                "schema_versions": [drill.CURRENT_SCHEMA_VERSION],
+                "consistency": "offline",
+            }
+            check = drill.AuditSequenceLegacyHarness.metadata_only_format_without_blob_service
+            manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertEqual(check(harness)["backup_format"], drill.CURRENT_BACKUP_FORMAT)
+            harness.cli.assert_called_once_with("backup-verify", directory)
+
+            for incompatible in (dict(manifest, format=29), dict(manifest, blob_closure={"artifacts": 1})):
+                with self.subTest(manifest=incompatible):
+                    manifest_file.write_text(json.dumps(incompatible), encoding="utf-8")
+                    with self.assertRaises(AssertionError):
+                        check(harness)
 
 
 class SourceBindingTest(unittest.TestCase):

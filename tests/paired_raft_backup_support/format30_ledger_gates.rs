@@ -1,4 +1,4 @@
-//! Explicit A3/A4 ledger gates for the format 30 paired restore.
+//! Explicit A3/A4 ledger gates for paired restore.
 //!
 //! Source-realm receipts stay byte-for-byte immutable; the new realm is re-established
 //! canonically and every cross-incarnation replay is refused with its exact typed error.
@@ -23,6 +23,9 @@ use rootyard::ref_store::{CoreGate, GitObjectFormat, PgRefStore};
 const REQUESTS: &str = "SELECT request_id,request_digest,consume_request_id,ack_body,history_incarnation,authority_epoch,group_epoch FROM artifact_hold_requests WHERE repository_id=$1 ORDER BY request_id";
 const CONSUMES: &str = "SELECT r.hold_id,r.consume_digest,r.body,q.history_incarnation,q.authority_epoch,q.group_epoch FROM artifact_hold_consume_receipts r JOIN artifact_hold_requests q ON q.request_id=r.request_id WHERE r.repository_id=$1 ORDER BY r.hold_id";
 const PUBLICATIONS: &str = "SELECT registration_id,pack_id,parent_digest,ack_body,history_incarnation,authority_epoch,group_epoch FROM ref_store_core_pack_publications WHERE repository_id=$1 ORDER BY registration_id";
+
+#[path = "format30_ledger_gates/public_restore.rs"]
+mod public_restore;
 
 type Realm = (Uuid, i64, i64);
 /// Immutable pre-backup A3/A4 ledger evidence captured under the source realm.
@@ -97,6 +100,7 @@ pub async fn verify_post_restore_ledger_immutability_and_denials(
     let mut c = dst_pool.get().await?;
     let old = (pre.old_history_inc, pre.old_authority_epoch, pre.old_group_epoch);
     let new = (inc.new_history_incarnation, inc.new_authority_epoch, inc.new_group_epoch);
+    public_restore::verify_historical_wrapper_realm_refusal(&c, pre.repo_id, old, inc.new_cluster_incarnation).await?;
     let requests: Vec<(Uuid, String, Uuid, String, Realm)> = c
         .query(REQUESTS, &[&pre.repo_id])
         .await?

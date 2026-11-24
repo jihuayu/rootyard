@@ -146,6 +146,7 @@ use lifetime::BackupMutex;
 pub(crate) use lifetime::{BarrierBusy, ensure_database_available, prepare_serving_database};
 use postgres::*;
 pub use restore::{check, restore};
+pub(crate) use restore::{paired_envelope_schema_head, verify_archive_identity};
 pub use snapshot::create;
 
 /// Offline read-only export witness for the Blob byte layer.

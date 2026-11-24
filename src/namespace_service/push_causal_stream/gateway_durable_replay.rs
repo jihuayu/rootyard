@@ -19,12 +19,14 @@ use crate::blob_git_gateway::GatewayError;
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::core::pack_commit::PackCommitTerminal;
 use crate::ref_store::core::ref_version::{AuthorityKind, RefVersionRealm};
+use crate::ref_store::pg::public_attempt::PublicReplayRestore;
 
 use super::closure_prove::verify_base_packs_and_dependencies;
 use super::gateway_bridge::{
     ClosureGraphSpec, build_closure_graph_from_spec, gateway_auth_context, open_gateway_reclaim_ledger,
     push_observed_gateway_receipt,
 };
+use super::gateway_durable_binding::{reject_private_claim_for_legacy_receipt, require_public_private_binding};
 use super::gateway_durable_sql::{
     DecisionMeta, load_all_operation_pack_pairs, load_decision_or_gate_meta, load_historical_pack_descs,
     load_historical_refs_at_revision,
@@ -45,7 +47,14 @@ pub struct DurableGatewayReceiptArgs<'a> {
     pub scratch_root: Option<&'a Path>,
     pub sandbox_root: Option<&'a Path>,
     pub repository_id: Uuid,
+    /// Stable public operation identity. This is the receipt/ring key and the
+    /// identity rendered to callers.
     pub operation_id: Uuid,
+    /// Exact private migration-152 attempt that owns the durable migration-138
+    /// operation, decision, pack registrations and event rows. `None` is the
+    /// legacy one-identity path. This is never derived from, or written into,
+    /// the public identity.
+    pub private_operation_id: Option<Uuid>,
     pub deadline: TokioInstant,
 }
 
@@ -53,7 +62,22 @@ pub struct DurableGatewayReceiptArgs<'a> {
 pub async fn materialize_durable_gateway_receipt(
     args: DurableGatewayReceiptArgs<'_>,
 ) -> Result<CausalPushProofReceipt, GatewayError> {
-    let maybe = load_durable_gateway_push_receipt(&args)
+    materialize_gateway_receipt(args, None).await
+}
+
+pub(crate) async fn materialize_historical_gateway_receipt(
+    mut args: DurableGatewayReceiptArgs<'_>,
+    restore: PublicReplayRestore,
+) -> Result<CausalPushProofReceipt, GatewayError> {
+    args.scratch_root = None;
+    materialize_gateway_receipt(args, Some(restore)).await
+}
+
+async fn materialize_gateway_receipt(
+    args: DurableGatewayReceiptArgs<'_>,
+    restore: Option<PublicReplayRestore>,
+) -> Result<CausalPushProofReceipt, GatewayError> {
+    let maybe = load_gateway_receipt(&args, restore)
         .await
         .map_err(|_| GatewayError::Internal("failed to materialize durable gateway causal receipt"))?;
     maybe.ok_or(GatewayError::Internal("durable operation terminal missing in PostgreSQL"))
@@ -64,10 +88,43 @@ pub async fn materialize_durable_gateway_receipt(
 pub async fn load_durable_gateway_push_receipt(
     args: &DurableGatewayReceiptArgs<'_>,
 ) -> Result<Option<CausalPushProofReceipt>, PushCausalError> {
+    load_gateway_receipt(args, None).await
+}
+
+async fn load_gateway_receipt(
+    args: &DurableGatewayReceiptArgs<'_>,
+    restore: Option<PublicReplayRestore>,
+) -> Result<Option<CausalPushProofReceipt>, PushCausalError> {
+    let durable_operation_id = args.private_operation_id.unwrap_or(args.operation_id);
+    if durable_operation_id.is_nil()
+        || (args.private_operation_id.is_some() && durable_operation_id == args.operation_id)
+        || (restore.is_some() && args.private_operation_id.is_none())
+    {
+        return Err(PushCausalError::StateMachine("durable gateway operation identity is invalid".into()));
+    }
     let client = timeout_at(args.deadline, args.pool.get())
         .await
         .map_err(|_| PushCausalError::DeadlineExceeded)?
         .map_err(|e| PushCausalError::Io(e.to_string()))?;
+
+    let backend_hex = args.store.backend_identity().as_hex();
+    let private_binding = if let Some(private_id) = args.private_operation_id {
+        Some(
+            require_public_private_binding(
+                &client,
+                args.repository_id,
+                args.operation_id,
+                private_id,
+                backend_hex,
+                restore,
+                args.deadline,
+            )
+            .await?,
+        )
+    } else {
+        reject_private_claim_for_legacy_receipt(&client, args.repository_id, args.operation_id, args.deadline).await?;
+        None
+    };
 
     let op_row = timeout_at(
         args.deadline,
@@ -75,7 +132,7 @@ pub async fn load_durable_gateway_push_receipt(
             "SELECT issuer_id, lane, sequence, state, terminal_result
              FROM ref_store_operations
              WHERE repository_id = $1 AND operation_id = $2",
-            &[&args.repository_id, &args.operation_id],
+            &[&args.repository_id, &durable_operation_id],
         ),
     )
     .await
@@ -99,10 +156,18 @@ pub async fn load_durable_gateway_push_receipt(
         serde_json::from_value(terminal_json).map_err(|e| PushCausalError::Io(e.to_string()))?;
 
     let meta =
-        load_decision_or_gate_meta(&client, args.repository_id, args.operation_id, &terminal, args.deadline).await?;
+        load_decision_or_gate_meta(&client, args.repository_id, durable_operation_id, &terminal, args.deadline).await?;
+    if let Some(binding) = private_binding.as_ref()
+        && (meta.tenant_id != binding.admission_owner_id
+            || meta.object_format.as_str() != binding.object_format.as_str()
+            || meta.history_incarnation != binding.history_incarnation
+            || meta.authority_epoch != binding.authority_epoch
+            || meta.group_epoch != binding.group_epoch)
+    {
+        return Err(PushCausalError::StateMachine("private receipt realm substitution".into()));
+    }
     let current_refs =
         load_historical_refs_at_revision(&client, args.repository_id, meta.base_revision, args.deadline).await?;
-    let backend_hex = args.store.backend_identity().as_hex();
     let (snapshot, base_version_ids, base_closure_digest) = build_post_cas_snapshot(
         &client,
         args.repository_id,
@@ -115,7 +180,7 @@ pub async fn load_durable_gateway_push_receipt(
     .await?;
 
     let (pack_pairs, all_hold_paths) =
-        load_all_operation_pack_pairs(&client, args.repository_id, args.operation_id, args.deadline).await?;
+        load_all_operation_pack_pairs(&client, args.repository_id, durable_operation_id, args.deadline).await?;
     drop(client);
 
     if let Some(sr) = args.scratch_root {
@@ -133,6 +198,8 @@ pub async fn load_durable_gateway_push_receipt(
                 );
             }
         } else {
+            // The local intent is keyed by the public UUID. Reclaim resolves
+            // that exact wrapper and its complete private hold history.
             let _ = settle_aborted_gateway_reclaim(
                 args.pool,
                 sr,

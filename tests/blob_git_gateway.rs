@@ -357,19 +357,30 @@ impl Case {
         Ok(rows.into_iter().map(|row| (row.get(0), row.get(1))).collect())
     }
 
-    /// `(state, terminal value)`; read-only observation of the durable registry.
+    /// `(state, terminal value)`; read-only observation of the public result.
     async fn operation_row(&self, operation: Uuid) -> Result<Option<(String, Option<Value>)>> {
-        let row = self
+        Ok(self.operation_rows(Some(operation)).await?.pop().map(|(_, state, terminal)| (state, terminal)))
+    }
+
+    async fn operation_rows(&self, operation: Option<Uuid>) -> Result<Vec<(Uuid, String, Option<Value>)>> {
+        let rows = self
             .db
             .pool
             .get()
             .await?
-            .query_opt(
-                "SELECT state, terminal_result FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
+            .query(
+                "SELECT coalesce(w.public_id, o.operation_id), coalesce(w.state, o.state), o.terminal_result
+                 FROM ref_store_operations o
+                 LEFT JOIN ref_store_private_attempts a ON a.repository_id = o.repository_id
+                    AND a.private_id = o.operation_id
+                 LEFT JOIN ref_store_public_operations w ON w.repository_id = a.repository_id
+                    AND w.public_id = a.public_id AND w.current_slot = a.slot
+                 WHERE o.repository_id = $1 AND (a.private_id IS NULL OR w.public_id IS NOT NULL)
+                    AND ($2::uuid IS NULL OR coalesce(w.public_id, o.operation_id) = $2)",
                 &[&self.repository, &operation],
             )
             .await?;
-        Ok(row.map(|row| (row.get(0), row.get(1))))
+        Ok(rows.into_iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect())
     }
 
     /// Fresh stock clone through the proxy, over the protocol the case needs;
@@ -685,16 +696,9 @@ async fn operation_state(case: &Case, operation: Uuid) -> Result<String> {
     }
 }
 
-/// Operation ids of the durable rows of this repository, newest first.
+/// Public operation ids of this repository, with their visible states.
 async fn operation_states(case: &Case) -> Result<Vec<(Uuid, String)>> {
-    let rows = case
-        .db
-        .pool
-        .get()
-        .await?
-        .query("SELECT operation_id, state FROM ref_store_operations WHERE repository_id=$1", &[&case.repository])
-        .await?;
-    Ok(rows.into_iter().map(|row| (row.get(0), row.get(1))).collect())
+    Ok(case.operation_rows(None).await?.into_iter().map(|(id, state, _)| (id, state)).collect())
 }
 
 async fn race_case(case: &Case, git: &'static Git) -> Result<Value> {

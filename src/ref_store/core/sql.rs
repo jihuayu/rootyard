@@ -176,7 +176,7 @@ pub(super) async fn reject(
     Ok(CommitRefsReceipt { replayed: receipt.replayed, record: receipt.record, terminal })
 }
 
-pub(super) async fn insert_event(
+pub(crate) async fn insert_event(
     tx: &Transaction<'_>,
     repository_id: Uuid,
     revision: i64,

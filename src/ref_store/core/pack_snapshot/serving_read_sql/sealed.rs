@@ -1,4 +1,4 @@
-//! #174 cluster-authority lock shared by the serving capture and T2.
+//! #174 cluster-authority lock shared by the serving capture, T2 and slot-zero admission.
 use crate::ref_store::contract::RefStoreError;
 use crate::ref_store::core::pack_commit::PackCommitError;
 use crate::ref_store::pg;
@@ -10,9 +10,12 @@ use uuid::Uuid;
 /// The capture and its T2 recheck both call this **first** in their short
 /// transaction, before any repository/gate/usage lock, so the read lock only
 /// ever conflicts with `src/backup/authority::fence`'s `UPDATE` of the singleton
-/// and never participates in an A5 lock cycle. Exactly one valid non-nil row is
-/// required: a missing, duplicated or nil incarnation is a typed database
-/// refusal, never a silently empty anchor.
+/// and never participates in an A5 lock cycle. Slot-zero admission calls it
+/// after its operation-key/wrapper lock and before its issuer-lane and
+/// repository/gate locks for the same reason; the shared lock stays held until
+/// that caller commits or rolls back. Exactly one valid non-nil row is required:
+/// a missing, duplicated or nil incarnation is a typed database refusal, never a
+/// silently empty anchor.
 pub(crate) async fn lock_cluster_incarnation(tx: &Transaction<'_>) -> Result<Uuid, RefStoreError> {
     let rows = tx
         .query("SELECT incarnation FROM public.cluster_authority WHERE singleton=true FOR SHARE", &[])

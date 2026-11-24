@@ -1,7 +1,7 @@
 //! W8-A paired archive verification and fresh-incarnation restore.
 //!
 //! Verification is read-only. Restore delegates PostgreSQL + Blob rebuild to the
-//! shared format30 path, proves no raft projection rows, applies the W8-A
+//! shared paired archive path, proves no raft projection rows, applies the W8-A
 //! fresh-incarnation fence, and runs stock Git fsck on bytes re-exported from
 //! the target Blob backend.
 use std::ffi::OsString;
@@ -52,6 +52,22 @@ struct Checked {
     root: PathBuf,
     sidecar: W8aPairedSidecarManifest,
 }
+
+impl W8aPairedSidecarManifest {
+    pub(in crate::backup) fn verify_archive_identity(&self, manifest: &super::super::Manifest) -> W8aResult<()> {
+        if super::super::paired_envelope_schema_head(self.format) != Some(self.schema_head)
+            || manifest.format != self.format
+            || manifest.schema_versions.last() != Some(&self.schema_head)
+            || manifest.backup_id != self.inner_backup_id
+            || manifest.volume_id != self.inner_volume_id
+            || manifest.schema_contract_sha256 != self.schema_contract_sha256
+        {
+            return Err(W8aError::MixedPointInTime("sidecar and inner manifest identities differ".into()));
+        }
+        Ok(())
+    }
+}
+
 pub fn check(source: &Path) -> W8aResult<W8aPairedSidecarManifest> {
     Ok(inspect(source)?.sidecar)
 }
@@ -158,8 +174,7 @@ fn inspect(source: &Path) -> W8aResult<Checked> {
     if sidecar.w8a_backup_id.is_nil()
         || sidecar.source_cluster_incarnation.is_nil()
         || sidecar.source_storage_authority_id.is_nil()
-        || sidecar.format != super::super::FORMAT_PAIRED
-        || sidecar.schema_head != crate::db::SCHEMA_VERSIONS.last().copied().unwrap_or(0)
+        || super::super::paired_envelope_schema_head(sidecar.format) != Some(sidecar.schema_head)
         || sidecar.blob_backend_identity.is_empty()
         || sidecar.blob_provider.is_empty()
         || !sidecar.single_node_w8a
@@ -179,19 +194,7 @@ fn inspect(source: &Path) -> W8aResult<Checked> {
             .map_err(|error| W8aError::MixedPointInTime(format!("reading inner manifest: {error}")))?,
     )
     .map_err(|error| W8aError::MixedPointInTime(format!("parsing inner manifest: {error}")))?;
-    let schema_head = manifest
-        .schema_versions
-        .last()
-        .copied()
-        .ok_or_else(|| W8aError::MixedPointInTime("inner manifest has no schema version".into()))?;
-    if manifest.format != sidecar.format
-        || schema_head != sidecar.schema_head
-        || manifest.backup_id != sidecar.inner_backup_id
-        || manifest.volume_id != sidecar.inner_volume_id
-        || manifest.schema_contract_sha256 != sidecar.schema_contract_sha256
-    {
-        return Err(W8aError::MixedPointInTime("sidecar and inner manifest identities differ".into()));
-    }
+    sidecar.verify_archive_identity(&manifest)?;
     if super::super::schema_contract_digest(sidecar.format).map_err(map_archive_error)?
         != sidecar.schema_contract_sha256
     {
@@ -379,10 +382,11 @@ pub(in crate::backup) async fn finish_guarded_restore(
         )));
     }
     mutex.ensure_held(client).await.map_err(|error| W8aError::RestoreFailed(format!("{error:#}")))?;
-    let fence = super::super::authority::fence_w8a_fresh_incarnation(
+    let fence = super::super::authority::fence_w8a_fresh_incarnation_from_restore(
         client,
         sidecar.source_cluster_incarnation,
         sidecar.source_storage_authority_epoch,
+        sidecar.schema_head == 152,
     )
     .await
     .map_err(|error| W8aError::RestoreFailed(format!("restored_incarnation fence: {error:#}")))?;

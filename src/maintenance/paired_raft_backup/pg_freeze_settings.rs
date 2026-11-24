@@ -268,3 +268,47 @@ pub(super) async fn drop_ephemeral_backup_role(
     client.batch_execute(&sql).await.map_err(pg_err)?;
     Ok(())
 }
+
+pub(super) async fn verify_pg_quiescent_before_freeze(
+    client: &(impl GenericClient + Sync),
+) -> Result<(), PairedBackupError> {
+    let row = client
+        .query_one(
+            "SELECT \
+               (SELECT count(*)::bigint FROM public.repositories WHERE transition_state <> 'stable'), \
+               (SELECT count(*)::bigint FROM public.git_operations WHERE outcome = 'unknown') \
+               + (SELECT count(*)::bigint FROM public.ref_store_operations WHERE state NOT IN ('committed','rejected','cancelled')) \
+               + (SELECT count(*)::bigint FROM public.ref_store_publication_decisions WHERE state = 'OPEN'), \
+               EXISTS(SELECT 1 FROM public.schema_migrations WHERE version = 152), \
+               to_regclass('public.ref_store_public_operations') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(pg_err)?;
+    let (transitioning, inflight): (i64, i64) = (row.get(0), row.get(1));
+    if transitioning != 0 {
+        return Err(PairedBackupError::FreezeNotHeld("repository storage transition in progress"));
+    }
+    if inflight != 0 {
+        return Err(PairedBackupError::UnknownInFlightOperations(inflight as usize));
+    }
+
+    let registered: bool = row.get(2);
+    let public_operations_present: bool = row.get(3);
+    if registered != public_operations_present {
+        return Err(PairedBackupError::FreezeNotHeld("migration 152 public operation catalog is incomplete"));
+    }
+    if public_operations_present {
+        // A private A4 terminal can commit before its separate A5 public mirror.
+        // The wrapper remains unresolved even when every core operation is terminal.
+        let pending: i64 = client
+            .query_one("SELECT count(*)::bigint FROM public.ref_store_public_operations WHERE state = 'pending'", &[])
+            .await
+            .map_err(pg_err)?
+            .get(0);
+        if pending != 0 {
+            return Err(PairedBackupError::UnknownInFlightOperations(pending as usize));
+        }
+    }
+    Ok(())
+}

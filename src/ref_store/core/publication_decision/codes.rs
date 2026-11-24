@@ -113,6 +113,41 @@ pub(crate) enum DenialCode {
 }
 
 impl DenialCode {
+    /// Every literal this closed vocabulary can persist or report. The GET
+    /// terminal projection uses this to reject an arbitrary stored detail.
+    pub(crate) const ALL: &[Self] = &[
+        Self::TokenInvalid,
+        Self::TokenExpired,
+        Self::TokenReadOnly,
+        Self::BrowserTokenUnsupported,
+        Self::ScopeDenied,
+        Self::RoleDenied,
+        Self::RepositoryNotFound,
+        Self::RepositoryUnserved,
+        Self::GateNotFound,
+        Self::TenantMismatch,
+        Self::ObjectFormatMismatch,
+        Self::HistoryIncarnationMismatch,
+        Self::AuthorityEpochMismatch,
+        Self::GroupEpochMismatch,
+        Self::GateDigestMismatch,
+        Self::RevisionMismatch,
+        Self::ProtocolStateMissing,
+        Self::FactsUnverifiable,
+        Self::ProofMismatch,
+        Self::AuthorizationChanged,
+        Self::PolicyChanged,
+        Self::DependencyChanged,
+        Self::SelectionChanged,
+        Self::Expired,
+        Self::RejectedBatch,
+        Self::AllRejected,
+        Self::Cancelled,
+        Self::ScopeClosing,
+        Self::UnsupportedAction,
+        Self::LedgerIntegrity,
+    ];
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::TokenInvalid => "token_invalid",

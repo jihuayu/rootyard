@@ -1,0 +1,193 @@
+name: Pando Git pack compression & delta evaluation (#178)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: Evaluation corpus scale ('quick' or 'full')
+        required: false
+        default: 'full'
+  pull_request:
+    paths:
+      - '.github/workflows/pando-pack-compression-eval.yml'
+      - 'scripts/pando_pack_compression_eval.py'
+      - 'scripts/pack_compression_eval/**'
+      - 'tests/test_pando_pack_compression_eval.py'
+      - 'docs/pando-pack-compression-eval.md'
+      - 'scripts/build_native.py'
+      - 'scripts/native_build_receipt.py'
+      - 'scripts/native_artifact_store.py'
+      - 'scripts/install_ci_native_tools.sh'
+      - 'scripts/install_ci_cargo_fork.sh'
+      - 'scripts/owned_garage_fixture.sh'
+      - 'scripts/owned_object_store_env.py'
+      - 'src/blob_git_gateway/**'
+      - 'src/blob_store/**'
+      - 'src/ref_store/core/pack_commit/**'
+      - 'src/standalone/**'
+      - 'src/storage_lifecycle/pando.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pando-pack-compression-eval-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pack-compression-eval:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_pack_eval
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_pack_eval"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_pack_eval
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify design docs, workflow triggers, and #178 unit contracts
+        run: |
+          set -euo pipefail
+          git --version
+          python3 scripts/check_design_docs.py
+          python3 -m unittest -v \
+            tests.test_ci_workflow_triggers \
+            tests.test_ci_cargo_fork_workflows \
+            tests.test_pando_pack_compression_eval
+      - name: Install native CI toolchain (postgresql-client-17, Git 2.43, LFS)
+        timeout-minutes: 20
+        run: |
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/pando-pack-compression/native-tools.json
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+      - name: Verify native CI tool profile
+        timeout-minutes: 5
+        run: |
+          echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
+          scripts/install_ci_native_tools.sh preflight \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/pando-pack-compression/native-tools.json
+      - name: Install pinned Rust 1.99.1
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/pando-pack-compression/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pando-pack-compression-eval
+          workspaces: ". -> target"
+      - name: Start the job-owned Garage 2.1 S3 fixture
+        timeout-minutes: 12
+        run: |
+          scripts/owned_garage_fixture.sh start \
+            --directory "$RUNNER_TEMP/pack-eval-garage" \
+            --output-env "$RUNNER_TEMP/pack-eval-object-store.env" \
+            --bucket-prefix rootyard-pack-eval --region garage
+      - name: Build attested rootyard binary for Pando pack evaluation
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          artifact_store="$HOME/.cache/rootyard/native-artifacts"
+          bin_dir="$RUNNER_TEMP/pack-eval-bin"
+          mkdir -p "$bin_dir" test-results/pando-pack-compression
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" \
+            --output "$bin_dir/rootyard" \
+            > test-results/pando-pack-compression/binary-build.json
+          cp "$bin_dir/rootyard.build.json" test-results/pando-pack-compression/rootyard.build.json
+      - name: Run full #178 stock-Git & live serve-blob PG17 + Garage S3 evaluation
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/pack-eval-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="pack-eval-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_GIT="$(command -v git)"
+          mkdir -p test-results/pando-pack-compression
+          env DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL" "$RUNNER_TEMP/pack-eval-bin/rootyard" migrate \
+            > "$RUNNER_TEMP/pack-eval-public-migrate.log" 2>&1
+          authority="$(psql "$ROOTYARD_TEST_DATABASE_URL" -X -t -A -v ON_ERROR_STOP=1 -c \
+            "SELECT to_regclass('public.cluster_authority') IS NOT NULL")"
+          [ "$authority" = "t" ]
+          scale="${{ inputs.scale || 'full' }}"
+          python3 scripts/pando_pack_compression_eval.py \
+            --mode full \
+            --scale "$scale" \
+            --binary "$RUNNER_TEMP/pack-eval-bin/rootyard" \
+            --git "$ROOTYARD_GIT" \
+            --report test-results/pando-pack-compression/report.json \
+            --summary-md test-results/pando-pack-compression/summary.md
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path("test-results/pando-pack-compression/report.json").read_text(encoding="utf-8"))
+          assert data["simulated"] is False
+          assert data["mode"] == "full"
+          assert data["correctness"]["passed"] is True
+          assert data["e2e_serve_blob"]["executed"] is True
+          assert data["e2e_serve_blob"]["physical_savings_claimed"] is False
+          conc = data["e2e_serve_blob"]["concurrent_push_and_browse"]
+          assert conc["acked_verified"] == conc["acked_total"] and conc["acked_total"] > 0
+          print(Path("test-results/pando-pack-compression/summary.md").read_text(encoding="utf-8"))
+          PY
+      - name: Stop the job-owned Garage S3 fixture
+        if: always()
+        run: |
+          scripts/owned_garage_fixture.sh stop --directory "$RUNNER_TEMP/pack-eval-garage"
+      - name: Upload Pando pack compression evaluation receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pando-pack-compression-eval-receipts
+          path: test-results/pando-pack-compression
+          if-no-files-found: warn
