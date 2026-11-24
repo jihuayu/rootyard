@@ -174,6 +174,7 @@ pub(super) type RefStoreCarry = BTreeMap<String, TableDigest>;
 /// retains one bounded row instead of copying the operation history to RAM.
 pub(super) async fn carry(
     client: &(impl GenericClient + Sync),
+    format: u32,
     deadline: tokio::time::Instant,
 ) -> Result<RefStoreCarry> {
     use futures_util::TryStreamExt;
@@ -188,7 +189,7 @@ pub(super) async fn carry(
         }
     }
     let mut result = BTreeMap::new();
-    for table in catalog::relations(FORMAT, true)?
+    for table in catalog::relations(format, true)?
         .into_iter()
         .filter(|name| name.starts_with("ref_store_") || name.starts_with("artifact_hold"))
     {
@@ -219,6 +220,29 @@ pub(super) async fn carry(
         result.insert(table, TableDigest { rows, sha256: hex::encode(digest.finalize()) });
     }
     Ok(result)
+}
+
+/// A private core result can be durable before its public attempt is settled.
+/// Carrying a pending wrapper in a paired cut would preserve a resumable write.
+pub(super) async fn require_closed_public_attempts(
+    client: &(impl GenericClient + Sync),
+    format: u32,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    if catalog::has_public_attempts(format) {
+        let pending: bool = tokio::time::timeout_at(
+            deadline,
+            client.query_one(
+                "SELECT EXISTS (SELECT 1 FROM public.ref_store_public_operations WHERE state='pending')",
+                &[],
+            ),
+        )
+        .await
+        .context("public attempt query deadline exceeded")??
+        .get(0);
+        ensure!(!pending, "paired backup requires every public attempt to have reached a terminal result");
+    }
+    Ok(())
 }
 
 /// Number of `pg_refstore` serving repositories in the snapshot. A non-zero
