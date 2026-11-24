@@ -14,6 +14,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+pub(super) const DIFFERENT_REQUEST: &str = "operation identifier was already used with a different request";
+
 /// One typed gateway refusal. `Internal` is deliberately opaque.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayError {
@@ -173,7 +175,7 @@ impl From<crate::ref_store::RefStoreError> for GatewayError {
             // A durable pending row is an unknown outcome. The client must query
             // the same operation id; it must never be reported as a ref result.
             Ref::OperationPending { .. } | Ref::CommitUnknown { .. } => Self::OutcomeUnknown,
-            Ref::DigestConflict => Self::Conflict("request identity was already used differently"),
+            Ref::DigestConflict => Self::Conflict(DIFFERENT_REQUEST),
             Ref::IdentityConflict => Self::Conflict("operation identity conflicts with a durable record"),
             Ref::CancellationConflict => Self::Conflict("cancellation tombstone conflicts with this operation"),
             // A cancellation without a decoded terminal is a definite no-effect

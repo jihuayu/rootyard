@@ -38,7 +38,12 @@ use crate::ref_store::{
     },
 };
 
-use super::{error::GatewayError, native, protocol::PushRequest, state::BlobGitState};
+use super::{
+    error::{DIFFERENT_REQUEST, GatewayError},
+    native,
+    protocol::PushRequest,
+    state::BlobGitState,
+};
 
 /// Domain separator of the producer operation digest. Changing it invalidates
 /// every durable producer digest, so it is versioned like any other contract.
@@ -436,7 +441,7 @@ pub(super) fn classify(
     // here (before the state match) makes a reused operation id with different
     // bytes a conflict even while the operation is still pending.
     if producer_digest != digest {
-        return Err(GatewayError::Conflict("operation identifier was already used with a different request"));
+        return Err(GatewayError::Conflict(DIFFERENT_REQUEST));
     }
     match record.state() {
         // An exact pending row is an open outcome: the caller answers "unknown"
