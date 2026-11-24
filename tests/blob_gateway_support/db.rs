@@ -225,6 +225,7 @@ impl Db {
     /// migrated. Migration 152 names `public.cluster_authority`, so the
     /// schema-isolated fixture above cannot host its wrapper functions. The
     /// caller must have CREATEDB; [`Db::finish`] drops this owned database.
+    #[allow(dead_code, reason = "the shared fixture is also compiled by integration tests that use schema isolation")]
     pub async fn setup_public_owned() -> Result<Self> {
         ensure!(
             std::env::var("ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES").as_deref() == Ok("1"),
