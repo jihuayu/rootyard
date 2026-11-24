@@ -1721,6 +1721,7 @@ jobs:
               'blob_git_gateway::admission_race_acceptance::post_admission_independent_refs_both_commit',
               'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
               'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
+              'blob_git_gateway::session_http_acceptance::public_operation_tests::public_operation_get_is_owned_pending_and_private_safe',
           ]
           # Exact argv recorded by the builder invocations above, as emitted by the
           # current scripts/build_native_test.py --lib and scripts/build_native.py.
@@ -2297,6 +2298,7 @@ jobs:
               'blob_git_gateway::admission_race_acceptance::post_admission_independent_refs_both_commit',
               'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
               'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
+              'blob_git_gateway::session_http_acceptance::public_operation_tests::public_operation_get_is_owned_pending_and_private_safe',
           ]
           summary = re.compile(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; '
                                r'(\d+) measured; (\d+) filtered out; finished in ([0-9.]+)s$', re.M)
@@ -2556,6 +2558,7 @@ jobs:
             --harness "src/blob_git_gateway/read_cache.rs" \
             --harness "src/blob_git_gateway/history.rs" \
             --harness "src/blob_git_gateway/state.rs" \
+            --harness "src/blob_git_gateway/state/acceptance_pauses.rs" \
             --fixture postgres=postgres:17 \
             --fixture "garage=Garage v2.1.0 sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78e93ee8da7cf6a" \
             --fixture-rust-from-receipt \
