@@ -888,6 +888,8 @@ pub(super) async fn retire_slot_one(
     let admission = slot_one::rotate_slot_one(state, serving, &handoff, &baseline, deadline).await?;
     match admission {
         slot_one::SlotOneAdmission::Fresh { plan, .. } => {
+            #[cfg(test)]
+            state.pause_after_slot_one(verified.operation_id()).await;
             for (index, pair) in verified.pairs().iter().enumerate() {
                 let planned =
                     plan.packs().get(index).ok_or(GatewayError::Internal("slot one planned pack set is incomplete"))?;

@@ -53,7 +53,7 @@ pub struct BlobGitState {
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
     #[cfg(test)]
-    admission_pause: Option<Arc<AdmissionPause>>,
+    admission_pauses: Vec<Arc<AdmissionPause>>,
 }
 
 impl BlobGitState {
@@ -78,7 +78,7 @@ impl BlobGitState {
             sessions: None,
             packfile_offload: None,
             #[cfg(test)]
-            admission_pause: None,
+            admission_pauses: Vec::new(),
         })
     }
 
@@ -102,7 +102,7 @@ impl BlobGitState {
     /// route that can reach this field.
     #[cfg(test)]
     pub(crate) fn with_admission_pause(mut self, pause: Arc<AdmissionPause>) -> Self {
-        self.admission_pause = Some(pause);
+        self.admission_pauses.push(pause);
         self
     }
 
@@ -110,7 +110,7 @@ impl BlobGitState {
     /// transaction starts. In production this method does not exist.
     #[cfg(test)]
     pub(crate) async fn pause_before_admission(&self, operation_id: Uuid) {
-        if let Some(pause) = &self.admission_pause {
+        for pause in &self.admission_pauses {
             pause.pause(operation_id).await;
         }
     }
@@ -119,8 +119,17 @@ impl BlobGitState {
     /// prepare/select/verify/commit. In production this method does not exist.
     #[cfg(test)]
     pub(crate) async fn pause_after_admission(&self, operation_id: Uuid) {
-        if let Some(pause) = &self.admission_pause {
+        for pause in &self.admission_pauses {
             pause.pause_after_admission(operation_id).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_slot_one(&self, operation_id: Uuid) {
+        for pause in &self.admission_pauses {
+            if pause.phase == AdmissionPhase::AfterSlotOne {
+                pause.pause_once(operation_id).await;
+            }
         }
     }
 
@@ -235,6 +244,7 @@ impl BlobGitState {
 enum AdmissionPhase {
     BeforeAdmission,
     AfterAdmission,
+    AfterSlotOne,
 }
 
 #[cfg(test)]
@@ -258,6 +268,10 @@ impl AdmissionPause {
     /// durable and before prepare/select/verify/commit.
     pub(crate) fn new_after_admission(operation: Uuid) -> Self {
         Self::with_phase(operation, AdmissionPhase::AfterAdmission)
+    }
+
+    pub(crate) fn new_after_slot_one(operation: Uuid) -> Self {
+        Self::with_phase(operation, AdmissionPhase::AfterSlotOne)
     }
 
     fn with_phase(operation: Uuid, phase: AdmissionPhase) -> Self {

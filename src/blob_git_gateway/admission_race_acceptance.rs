@@ -125,6 +125,7 @@ use crate::{
 
 #[cfg(test)]
 mod slow_body;
+mod three_way;
 
 const SEED_FILE: &str = "seed.txt";
 const SEED_CONTENT: &str = "seed\n";
@@ -141,12 +142,14 @@ type GitReport = (String, Vec<(String, Option<String>)>);
 #[derive(Default)]
 struct WitnessResources {
     pause: Option<Arc<AdmissionPause>>,
+    extra_pauses: Vec<Arc<AdmissionPause>>,
     scratch: Option<tempfile::TempDir>,
     work: Option<tempfile::TempDir>,
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<io::Result<()>>>,
     second_push: Option<JoinHandle<Result<git::Output>>>,
     first_push: Option<JoinHandle<Result<git::Output>>>,
+    third_push: Option<JoinHandle<Result<git::Output>>>,
 }
 
 impl WitnessResources {
@@ -154,7 +157,10 @@ impl WitnessResources {
         if let Some(pause) = &self.pause {
             pause.release();
         }
-        for push in [&mut self.second_push, &mut self.first_push] {
+        for pause in &self.extra_pauses {
+            pause.release();
+        }
+        for push in [&mut self.second_push, &mut self.first_push, &mut self.third_push] {
             if let Some(task) = push.take() {
                 task.abort();
                 let _ = task.await;
