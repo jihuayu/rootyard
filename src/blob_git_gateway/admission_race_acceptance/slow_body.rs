@@ -917,7 +917,7 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             &first_request,
             first_digest,
             CommitMode::AcceptedSubset,
-            &backend_identity,
+            backend_identity,
             INDEPENDENT_A,
             &first_new,
         )
@@ -930,7 +930,7 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
             &second_request,
             second_digest,
             CommitMode::AcceptedSubset,
-            &backend_identity,
+            backend_identity,
             INDEPENDENT_B,
             &second_new,
         )

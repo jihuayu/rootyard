@@ -79,7 +79,7 @@ impl From<SlotOneRotationReceipt> for ReceiptView {
 /// outer transaction acknowledged `COMMIT`; replay carries no plan, identity or
 /// sequence.
 pub(crate) enum Admission {
-    Fresh { plan: PackCommitPlan, receipt: ReceiptView },
+    Fresh { plan: Box<PackCommitPlan>, receipt: ReceiptView },
     Replayed(ReceiptView),
 }
 
@@ -148,9 +148,7 @@ pub(crate) async fn rotate_direct(
         SlotOneReceive::from_verified_rejection(serving, &verified, baseline, backend_identity, evidence, retirement)?;
     let admission = rotate_slot_one(state, serving, &handoff, baseline, deadline).await?;
     Ok(match admission {
-        SlotOneAdmission::Fresh { plan, receipt, .. } => {
-            Admission::Fresh { plan: *plan, receipt: ReceiptView::from(receipt) }
-        }
+        SlotOneAdmission::Fresh { plan, receipt, .. } => Admission::Fresh { plan, receipt: ReceiptView::from(receipt) },
         SlotOneAdmission::Replayed(receipt) => Admission::Replayed(ReceiptView::from(receipt)),
     })
 }

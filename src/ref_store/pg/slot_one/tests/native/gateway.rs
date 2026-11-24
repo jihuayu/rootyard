@@ -188,7 +188,7 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
         .await
         .map_err(acceptance::refusal)?;
         let (plan, receipt) = match admission {
-            acceptance::Admission::Fresh { plan, receipt } => (plan, receipt),
+            acceptance::Admission::Fresh { plan, receipt } => (*plan, receipt),
             acceptance::Admission::Replayed(_) => bail!("fresh direct handoff replayed"),
         };
         assert_fresh_receipt(&retired, &plan, &receipt)?;
@@ -428,7 +428,7 @@ async fn slot_one_handoff_revoked_fresh_rolls_back_and_replays_after_later_gate(
         .await
         .map_err(acceptance::refusal)?;
         let (fresh_plan, fresh) = match admission {
-            acceptance::Admission::Fresh { plan, receipt } => (plan, receipt),
+            acceptance::Admission::Fresh { plan, receipt } => (*plan, receipt),
             acceptance::Admission::Replayed(_) => bail!("restored fresh handoff replayed"),
         };
         assert_fresh_receipt(&retired, &fresh_plan, &fresh)?;

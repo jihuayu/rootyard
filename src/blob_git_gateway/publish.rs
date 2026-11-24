@@ -988,8 +988,8 @@ async fn slot_zero_public_preflight(
     deadline: Instant,
 ) -> Result<SlotZeroPreflight, GatewayError> {
     let repository_id = baseline.gate().repository_id();
-    PgRefStore.lock_public_attempt(&**tx, public_request, private_id, deadline).await.map_err(GatewayError::from)?;
-    crate::ref_store::pg::lock_operation(&**tx, repository_id, public_request.public_id, deadline)
+    PgRefStore.lock_public_attempt(tx, public_request, private_id, deadline).await.map_err(GatewayError::from)?;
+    crate::ref_store::pg::lock_operation(tx, repository_id, public_request.public_id, deadline)
         .await
         .map_err(GatewayError::from)?;
 
@@ -997,7 +997,7 @@ async fn slot_zero_public_preflight(
     // authority lock. A wrapper/private/legacy hit, or a malformed/restore
     // mismatch, is a known replay route and must stay read-only. Only an exact
     // `Unknown` may create/lock the lane before repository/binding locks.
-    let preliminary = PgRefStore.lookup_public_attempt(&**tx, public_request, deadline).await;
+    let preliminary = PgRefStore.lookup_public_attempt(tx, public_request, deadline).await;
     let (route, precheck_error) = match preliminary {
         Ok(PublicAttemptLookup::Unknown) => (SlotZeroRoute::Fresh, None),
         Ok(_) => (SlotZeroRoute::Replay, None),
@@ -1011,7 +1011,7 @@ async fn slot_zero_public_preflight(
         // overflow an exhausted lane. A concurrent first insert is waited out by
         // ON CONFLICT before any repository/binding read.
         PgRefStore
-            .lock_or_create_expected_lane(&**tx, repository_id, actor.id, lane, deadline)
+            .lock_or_create_expected_lane(tx, repository_id, actor.id, lane, deadline)
             .await
             .map_err(GatewayError::from)?;
     }
@@ -1044,7 +1044,7 @@ async fn slot_zero_public_preflight(
     // become fresh here; a fresh route that resolves to a known/malformed result
     // rolls back the provisionally created lane with the outer transaction.
     let final_lookup =
-        PgRefStore.lookup_public_attempt(&**tx, public_request, deadline).await.map_err(GatewayError::from)?;
+        PgRefStore.lookup_public_attempt(tx, public_request, deadline).await.map_err(GatewayError::from)?;
 
     match final_lookup {
         PublicAttemptLookup::Unknown if route == SlotZeroRoute::Fresh => {
@@ -1061,7 +1061,7 @@ async fn slot_zero_public_preflight(
             // lookup proved there is no wrapper or private claim for this UUID;
             // the migration-138 key is already held, so the guarded legacy
             // lookup can resolve only its own durable record.
-            match operation::lookup_in_tx(&**tx, repository_id, public_request.public_id, deadline).await? {
+            match operation::lookup_in_tx(tx, repository_id, public_request.public_id, deadline).await? {
                 operation::Lookup::Known(resolved) => Ok(SlotZeroPreflight::Claim(operation::classify(
                     resolved,
                     repository_id,
@@ -1080,7 +1080,7 @@ async fn slot_zero_public_preflight(
         | PublicAttemptLookup::Rejected(evidence)
         | PublicAttemptLookup::Cancelled(evidence) => Ok(SlotZeroPreflight::Claim(
             operation::lookup_public_private_in_tx(
-                &**tx,
+                tx,
                 public_request,
                 &evidence,
                 request,
