@@ -158,6 +158,7 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
         sandbox_root: None,
         repository_id: repo_id,
         operation_id: op2,
+        private_operation_id: None,
         deadline: dl,
     })
     .await?
@@ -218,7 +219,7 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
     ensure!(
         st_stale == StatusCode::OK && String::from_utf8_lossy(&body_stale).contains("ng refs/heads/main stale info\n")
     );
-    let (stale_paths, _) = query_operation_hold_blob_paths(env.pool, repo_id, op_stale, dl).await?;
+    let (stale_paths, _) = query_operation_hold_blob_paths(env.pool, repo_id, op_stale, env.backend_hex, dl).await?;
     ensure!(stale_paths.len() == 2, "expected 2 uploaded hold paths for rejected push, got {}", stale_paths.len());
     assert_s3_paths_swept(env.s3, &stale_paths)?;
     let gw2_ledger = open_gateway_reclaim_ledger(gw2.scratch.path()).map_err(|e| anyhow!("{e:?}"))?;
@@ -226,7 +227,7 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
 
     // 3B. MULTI-PAIR (`3` pairs = `6` S3 objects!) PARTIAL/ABORTED UPLOAD RECOVERY SWEEP ON NEXT GATEWAY REQUEST:
     let op_multi = stage_three_aborted_pairs_in_s3_and_ledger(env, gw2.scratch.path(), repo_id, &repo_name).await?;
-    let (multi_paths, _) = query_operation_hold_blob_paths(env.pool, repo_id, op_multi, dl).await?;
+    let (multi_paths, _) = query_operation_hold_blob_paths(env.pool, repo_id, op_multi, env.backend_hex, dl).await?;
     ensure!(multi_paths.len() == 6, "expected 6 S3 objects across 3 pack/idx pairs, got {}", multi_paths.len());
     for p in &multi_paths {
         let key = format!("push-causal-bucket/push-causal-it/{p}");

@@ -24,7 +24,7 @@ mod usage;
 pub(super) use insert::{ServingReadInsert, insert_read};
 pub(crate) use rows::ServingReadRow;
 pub(super) use rows::{check_capture_digest, delete_read, load_read, read_packs, read_refs};
-pub(super) use sealed::lock_cluster_incarnation;
+pub(crate) use sealed::lock_cluster_incarnation;
 pub(super) use usage::{has_expired, lock_usage, read_usage, reclaim_expired, recompute_usage};
 
 use super::super::pack_commit::PackMode;

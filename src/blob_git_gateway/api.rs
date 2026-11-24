@@ -20,15 +20,12 @@ use uuid::Uuid;
 
 use super::{
     error::GatewayError,
+    operation_read::{self, OperationRead},
     serving::{ProvisionRequest, lookup, provision},
     session::{authenticate, authority_error, authorize_write, read_authorization},
     state::BlobGitState,
 };
-use crate::{
-    db,
-    members::models::Role,
-    ref_store::{GitObjectFormat, OperationLookup, PgRefStore},
-};
+use crate::{db, members::models::Role, ref_store::GitObjectFormat};
 
 /// One page of repositories. A cursor names only the last returned
 /// `(namespace, name, id)` position, so an insert after it is seen on a later
@@ -300,19 +297,18 @@ async fn get_operation_authorized(
     let operation_id = parse_operation_id(&operation)?;
     let identity = authenticate(&state, &headers).await?;
     let deadline = state.deadline();
+    let backend = state.store().backend_identity();
     // Reading a historical operation is a read: it must not require write
     // visibility (a read-only token may resolve the operation it issued). The
     // shared read lookup still verifies the live token, RBAC, contents-read
     // scope, ready binding and actual Blob backend. A write-only scoped token
     // that issued the durable intent is distinguished here: it may use the
     // write lookup, but only for this historical read and never to publish.
-    let read_lookup =
-        lookup(state.pool(), &identity, &owner, name, false, state.store().backend_identity(), deadline).await;
+    let read_lookup = lookup(state.pool(), &identity, &owner, name, false, backend, deadline).await;
     let (serving, writable) = match read_lookup {
         Ok(serving) => (serving, false),
         Err(read_error) if !identity.read_only && read_error.0 == StatusCode::FORBIDDEN => {
-            match lookup(state.pool(), &identity, &owner, name, true, state.store().backend_identity(), deadline).await
-            {
+            match lookup(state.pool(), &identity, &owner, name, true, backend, deadline).await {
                 Ok(serving) => (serving, true),
                 Err(_) => return Err(authority_error(read_error)),
             }
@@ -327,51 +323,34 @@ async fn get_operation_authorized(
         .await
         .map_err(|_| GatewayError::Timeout)?
         .map_err(|_| GatewayError::Internal("authorization transaction failed"))?;
-    let loaded: Result<(OperationLookup, Option<Role>), GatewayError> = async {
-        crate::ref_store::pg::bound(&tx, deadline).await.map_err(GatewayError::from)?;
-        let fresh = crate::ref_store::serving::lookup_in_tx(
-            &tx,
-            &identity,
-            &owner,
-            name,
-            writable,
-            state.store().backend_identity(),
-            deadline,
-        )
-        .await
-        .map_err(authority_error)?;
+    let loaded: Result<OperationRead, GatewayError> = async {
+        // The status route is read-only and deliberately does not take the
+        // migration-138 operation advisory key, so a writer or test barrier that
+        // holds it cannot stall this view. Legacy fallthrough is reclassified in
+        // one atomic core snapshot by the operation reader.
+        let fresh = crate::ref_store::serving::lookup_in_tx(&tx, &identity, &owner, name, writable, backend, deadline)
+            .await
+            .map_err(authority_error)?;
+        // The fresh lookup rechecked the live tenant/backend/realm. Restore
+        // rotation is not part of the captured realm, so compare its exact
+        // incarnation here before any public or legacy classification.
+        if fresh.cluster_incarnation != serving.cluster_incarnation {
+            return Err(GatewayError::Conflict("repository authority changed after the read view was captured; retry"));
+        }
         authorization.ensure_same_realm(&fresh)?;
-        let lookup = PgRefStore.get(&tx, repository_id, operation_id, deadline).await.map_err(GatewayError::from)?;
-        // Distinguish a write intent from its reader: the durable issuer or a
-        // *current* repository admin may resolve it. Read access to the
-        // repository alone does not expose another actor's write facts.
-        let role = if matches!(lookup, OperationLookup::Known(_)) {
-            crate::members::rbac::resolve_effective_role(&*tx, repository_id, owner_id, identity.id)
-                .await
-                .map_err(GatewayError::from)?
-                .map(|(effective, _, _)| effective)
-        } else {
-            None
-        };
-        Ok((lookup, role))
+        operation_read::resolve(&tx, &identity, repository_id, owner_id, operation_id, deadline).await
     }
     .await;
     let _ = tokio::time::timeout_at(deadline, tx.rollback()).await;
     drop(client);
-    let (lookup, role) = loaded?;
-    let record = match lookup {
-        OperationLookup::Known(record) => record,
-        OperationLookup::Unknown => return Err(GatewayError::NotFound),
+    let read = loaded?;
+    let (operation_id, state, terminal) = match read {
+        OperationRead::Public(status) => (status.public_id, status.state.as_str(), status.terminal().cloned()),
+        OperationRead::Legacy(record) => {
+            (operation_id, record.state().as_str(), record.terminal_result().map(|result| result.value().clone()))
+        }
     };
-    let issued_by_actor = record.identity().issuer_id() == identity.id;
-    let owner_admin = role.is_some_and(|role| role >= Role::Admin);
-    if !issued_by_actor && !owner_admin {
-        return Err(GatewayError::Forbidden("operation is visible only to its issuer or a current repository admin"));
-    }
-    let current_state = record.state().as_str();
-    let terminal = record.terminal_result().map(|result| result.value().clone());
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(OperationView { operation_id, state: current_state, terminal }))
-        .into_response())
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(OperationView { operation_id, state, terminal })).into_response())
 }
 
 /// The one fixed server-side reason for an HTTP cancellation. It is not a

@@ -57,7 +57,7 @@ pub struct BlobGitState {
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
     #[cfg(test)]
-    admission_pause: Option<Arc<AdmissionPause>>,
+    admission_pauses: Vec<Arc<AdmissionPause>>,
     /// Acceptance-only rendezvous reached after an exact commit-preview cache
     /// lookup and before the final encoded-response fence. It is absent in
     /// every non-test build and cannot be selected by a request or config.
@@ -89,7 +89,7 @@ impl BlobGitState {
             dispatch: dispatch::Signals::default(),
             packfile_offload: None,
             #[cfg(test)]
-            admission_pause: None,
+            admission_pauses: Vec::new(),
             #[cfg(test)]
             read_pause: None,
         })
@@ -128,7 +128,7 @@ impl BlobGitState {
     /// route that can reach this field.
     #[cfg(test)]
     pub(crate) fn with_admission_pause(mut self, pause: Arc<AdmissionPause>) -> Self {
-        self.admission_pause = Some(pause);
+        self.admission_pauses.push(pause);
         self
     }
 
@@ -136,7 +136,7 @@ impl BlobGitState {
     /// transaction starts. In production this method does not exist.
     #[cfg(test)]
     pub(crate) async fn pause_before_admission(&self, operation_id: Uuid) {
-        if let Some(pause) = &self.admission_pause {
+        for pause in &self.admission_pauses {
             pause.pause(operation_id).await;
         }
     }
@@ -154,6 +154,24 @@ impl BlobGitState {
     pub(crate) async fn pause_before_commit_finalize(&self, oid: &str) {
         if let Some(pause) = &self.read_pause {
             pause.pause(oid).await;
+        }
+    }
+
+    /// Called after the pending operation is durable and before
+    /// prepare/select/verify/commit. In production this method does not exist.
+    #[cfg(test)]
+    pub(crate) async fn pause_after_admission(&self, operation_id: Uuid) {
+        for pause in &self.admission_pauses {
+            pause.pause_after_admission(operation_id).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_slot_one(&self, operation_id: Uuid) {
+        for pause in &self.admission_pauses {
+            if pause.phase == AdmissionPhase::AfterSlotOne {
+                pause.pause_once(operation_id).await;
+            }
         }
     }
 
@@ -260,11 +278,21 @@ impl BlobGitState {
     }
 }
 
-/// Acceptance-only rendezvous used by the deterministic pre-admission race
-/// case. The pause is keyed by operation UUID and can fire at most once.
+/// Acceptance-only rendezvous used by the deterministic admission race cases.
+/// The pause is keyed by operation UUID and can fire at most once in the
+/// selected phase.
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AdmissionPhase {
+    BeforeAdmission,
+    AfterAdmission,
+    AfterSlotOne,
+}
+
 #[cfg(test)]
 pub(crate) struct AdmissionPause {
     operation: Uuid,
+    phase: AdmissionPhase,
     paused: AtomicBool,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -272,9 +300,26 @@ pub(crate) struct AdmissionPause {
 
 #[cfg(test)]
 impl AdmissionPause {
+    /// Existing pre-admission default: pause after the publish baseline was
+    /// captured and before the admission transaction starts.
     pub(crate) fn new(operation: Uuid) -> Self {
+        Self::with_phase(operation, AdmissionPhase::BeforeAdmission)
+    }
+
+    /// Test-only post-admission phase: pause after the pending operation is
+    /// durable and before prepare/select/verify/commit.
+    pub(crate) fn new_after_admission(operation: Uuid) -> Self {
+        Self::with_phase(operation, AdmissionPhase::AfterAdmission)
+    }
+
+    pub(crate) fn new_after_slot_one(operation: Uuid) -> Self {
+        Self::with_phase(operation, AdmissionPhase::AfterSlotOne)
+    }
+
+    fn with_phase(operation: Uuid, phase: AdmissionPhase) -> Self {
         Self {
             operation,
+            phase,
             paused: AtomicBool::new(false),
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
@@ -282,6 +327,20 @@ impl AdmissionPause {
     }
 
     async fn pause(&self, operation: Uuid) {
+        if self.phase != AdmissionPhase::BeforeAdmission {
+            return;
+        }
+        self.pause_once(operation).await;
+    }
+
+    async fn pause_after_admission(&self, operation: Uuid) {
+        if self.phase != AdmissionPhase::AfterAdmission {
+            return;
+        }
+        self.pause_once(operation).await;
+    }
+
+    async fn pause_once(&self, operation: Uuid) {
         if operation != self.operation || self.paused.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -291,12 +350,12 @@ impl AdmissionPause {
         self.release.notified().await;
     }
 
-    /// Wait until the selected operation reached the post-capture pause.
+    /// Wait until the selected operation reached its phase's pause.
     pub(crate) async fn wait_reached(&self) {
         self.reached.notified().await;
     }
 
-    /// Let the paused operation continue into admission.
+    /// Let the paused operation continue.
     pub(crate) fn release(&self) {
         self.release.notify_one();
     }

@@ -108,6 +108,7 @@ pub async fn query_operation_hold_blob_paths(
     pool: &Pool,
     repository_id: Uuid,
     operation_id: Uuid,
+    backend_hex: &str,
     deadline: TokioInstant,
 ) -> Result<(Vec<String>, u64), PushCausalError> {
     let client = timeout_at(deadline, pool.get())
@@ -119,9 +120,9 @@ pub async fn query_operation_hold_blob_paths(
         client.query(
             "SELECT storage_tenant_id, authority_id, authority_generation, attempt_id, namespace, sha256, content_length
              FROM artifact_holds
-             WHERE repository_id = $1 AND operation_id = $2
+             WHERE repository_id = $1 AND operation_id = $2 AND backend_identity = $3
              ORDER BY request_id ASC, slot ASC",
-            &[&repository_id, &operation_id],
+            &[&repository_id, &operation_id, &backend_hex],
         ),
     )
     .await
@@ -255,15 +256,29 @@ pub async fn settle_aborted_gateway_reclaim(
     {
         return Some(existing);
     }
+    // The public ledger key is authoritative, but this run may only touch a
+    // record for the exact repository/backend it opened.
+    if existing.repository_id != repository_id || existing.backend_identity.as_str() != backend_hex {
+        return Some(existing);
+    }
     let dl = TokioInstant::now() + Duration::from_secs(5);
+    let proven =
+        is_operation_proven_aborted_and_unreferenced(pool, repository_id, operation_id, dl).await.unwrap_or(false);
     let (hold_paths, hold_bytes) =
-        query_operation_hold_blob_paths(pool, repository_id, operation_id, dl).await.unwrap_or_default();
+        query_operation_hold_blob_paths(pool, repository_id, operation_id, backend_hex, dl).await.unwrap_or_default();
     let mut merged: BTreeSet<String> = existing.recorded_blob_paths.into_iter().collect();
     merged.extend(hold_paths);
     let all_paths: Vec<String> = merged.into_iter().collect();
-    let updated = ledger.transition(operation_id, fallback_state, all_paths.clone(), hold_bytes, detail).ok()?;
+    // Never relabel an unproven attempt as aborted. Unknown/unresolved records
+    // keep their staged paths and remain in the recoverable retention state.
+    let state = if fallback_state == UploadReclaimState::AbortUnpromoted && !proven {
+        UploadReclaimState::OutcomeUnknown
+    } else {
+        fallback_state
+    };
+    let updated = ledger.transition(operation_id, state, all_paths.clone(), hold_bytes, detail).ok()?;
 
-    if is_operation_proven_aborted_and_unreferenced(pool, repository_id, operation_id, dl).await.unwrap_or(false)
+    if proven
         && let Some(op) = resolve_reclaim_operator(backend_hex)
         && delete_and_verify_absent(&op, &all_paths, dl).await.is_ok()
     {
@@ -301,7 +316,7 @@ pub async fn sweep_gateway_reclaim_ledger(
             continue;
         }
         let (hold_paths, hold_bytes) =
-            query_operation_hold_blob_paths(pool, rec.repository_id, rec.operation_id, deadline).await?;
+            query_operation_hold_blob_paths(pool, rec.repository_id, rec.operation_id, backend_hex, deadline).await?;
         let mut merged: BTreeSet<String> = rec.recorded_blob_paths.iter().cloned().collect();
         merged.extend(hold_paths);
         let all_paths: Vec<String> = merged.into_iter().collect();
