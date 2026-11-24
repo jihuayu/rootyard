@@ -380,6 +380,24 @@ pub async fn publish(
     Ok((StatusCode::OK, Json(report(cp, &digest, raw_len as i64, captured))))
 }
 
+async fn initialize_restore_stage(
+    stage: PathBuf,
+    initialize: impl FnOnce() -> Result<(), Error> + Send + 'static,
+) -> Result<super::blocking::DirCleanupGuard, Error> {
+    let stage_guard = super::blocking::DirCleanupGuard::new(stage);
+    // The worker can still create the staging tree after the caller stops waiting.
+    let (stage_guard, initialized) = super::blocking::run(move || {
+        let initialized = initialize();
+        Ok((stage_guard, initialized))
+    })
+    .await?;
+    if let Err(error) = initialized {
+        stage_guard.cleanup().await;
+        return Err(error);
+    }
+    Ok(stage_guard)
+}
+
 pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) -> Result<(), Error> {
     let final_path = service::checkpoint_repo(state, cp);
     let check_path = final_path.clone();
@@ -417,12 +435,11 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
     }
 
     let stage = state.storage.root.join("workspace-service/staging").join(format!("restore-{cp}-{}", Uuid::new_v4()));
-    let stage_guard = super::blocking::DirCleanupGuard::new(stage.clone());
     let root = stage.join("repo");
     let root_init = root.clone();
     let stage_init = stage.clone();
     let rels: Vec<PathBuf> = downloads.iter().map(|(rel, _, _)| rel.clone()).collect();
-    if let Err(err) = super::blocking::run(move || {
+    let stage_guard = initialize_restore_stage(stage.clone(), move || {
         fs::create_dir_all(&stage_init).map_err(Error::internal)?;
         fs::create_dir(&root_init).map_err(Error::internal)?;
         for rel in rels {
@@ -431,11 +448,7 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
         }
         Ok(())
     })
-    .await
-    {
-        stage_guard.cleanup().await;
-        return Err(err);
-    }
+    .await?;
 
     let download_outcome: Result<(), Error> = async {
         for (rel, obj_key, size) in &downloads {
@@ -516,6 +529,39 @@ pub async fn ensure_local(state: &AppState, cp: Uuid, repo: Uuid, tenant: Uuid) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_restore_cleans_stage_created_after_request_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("workspace-service/staging");
+        fs::create_dir_all(&staging).unwrap();
+        let stage = staging.join("restore-stage");
+        let work_stage = stage.clone();
+        let (running_tx, running_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(initialize_restore_stage(stage.clone(), move || {
+            running_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            fs::create_dir(&work_stage).map_err(Error::internal)?;
+            created_tx.send(()).unwrap();
+            Ok(())
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), running_rx).await.unwrap().unwrap();
+        request.abort();
+        assert!(request.await.err().unwrap().is_cancelled());
+        assert!(!stage.exists(), "the initializer is still blocked");
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), created_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::read_dir(&staging).unwrap().next().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the cancelled request left a restore staging directory");
+    }
 
     fn manifest(captured_revision: i64) -> RemoteManifest {
         RemoteManifest {
