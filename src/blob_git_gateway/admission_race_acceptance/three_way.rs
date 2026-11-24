@@ -1,4 +1,4 @@
-//! Disposable witness for the M152 two-slot limit under three stock clients.
+//! Deterministic first-attempt acceptance for three independent stock Git clients.
 
 use super::{
     AdmissionPause, BlobGitConfig, BlobGitState, Captures, Db, Git, INDEPENDENT_A, INDEPENDENT_B, SEED_CONTENT,
@@ -17,12 +17,12 @@ const INDEPENDENT_C: &str = "refs/heads/indep-c";
 
 #[tokio::test]
 #[ignore = "requires an owned disposable PostgreSQL 17, Garage and stock Git"]
-async fn three_independent_pushes_exhaust_the_two_slot_budget() -> Result<()> {
+async fn three_independent_pushes_succeed_on_their_first_request() -> Result<()> {
     require_owned_disposable_blob_fixture()?;
     let _serial = crate::blob_git_gateway::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     prepare()?;
     require_per_run_blob_prefix()?;
-    let db = Db::setup().await?;
+    let db = Db::setup_public_owned().await?;
     let mut resources = WitnessResources::default();
     let outcome = AssertUnwindSafe(qualify(&db, &mut resources)).catch_unwind().await;
     let mut fence = Vec::new();
@@ -124,7 +124,7 @@ async fn qualify(db: &Db, resources: &mut WitnessResources) -> Result<()> {
     ensure!(join_push(&mut resources.second_push).await?.success, "second stock push failed");
     ensure!(gate_revision(db, repo).await? == base + 2);
     third_one.release();
-    ensure!(!join_push(&mut resources.third_push).await?.success, "third stock push unexpectedly ACKed");
+    let third_output = join_push(&mut resources.third_push).await?;
 
     for (public, name) in [(first, INDEPENDENT_A), (second, INDEPENDENT_B)] {
         let capture = captures.take(public).context("winning request has no capture")?;
@@ -133,16 +133,16 @@ async fn qualify(db: &Db, resources: &mut WitnessResources) -> Result<()> {
     }
     let capture = captures.take(third).context("third request has no capture")?;
     ensure!(capture.status == 200 && !capture.truncated, "third HTTP status {}", capture.status);
+    let third_verdict = report_status(&capture.body)?;
     ensure!(
-        report_status(&capture.body)?
-            == ("ok".to_owned(), vec![(INDEPENDENT_C.to_owned(), Some("stale info".to_owned()))]),
-        "the final attempt did not return exactly one per-ref rejection"
+        third_output.success && third_verdict == ("ok".to_owned(), vec![(INDEPENDENT_C.to_owned(), None)]),
+        "third independent ref did not ACK on its first request: {third_verdict:?}"
     );
     ensure!(captures.is_empty(), "unexpected extra receive-pack request");
     ensure!(durable_ref(db, repo, INDEPENDENT_A).await?.as_deref() == Some(oids[0].as_str()));
     ensure!(durable_ref(db, repo, INDEPENDENT_B).await?.as_deref() == Some(oids[1].as_str()));
-    ensure!(durable_ref(db, repo, INDEPENDENT_C).await?.is_none());
-    ensure!(gate_revision(db, repo).await? == base + 2);
+    ensure!(durable_ref(db, repo, INDEPENDENT_C).await?.as_deref() == Some(oids[2].as_str()));
+    ensure!(gate_revision(db, repo).await? == base + 3);
 
     let a = attempts(db, repo, first).await?;
     let b = attempts(db, repo, second).await?;
@@ -154,21 +154,23 @@ async fn qualify(db: &Db, resources: &mut WitnessResources) -> Result<()> {
     );
     ensure!(
         c == json!([
-            "rejected",
-            1,
-            [retired, [1, base + 1, "rejected", "rejected", base + 2, "revision_mismatch", false, true]]
+            "committed",
+            2,
+            [
+                retired,
+                [1, base + 1, "rejected", "rejected", base + 2, "revision_mismatch", true, false],
+                [2, base + 2, "committed", "committed", base + 3, null, false, true]
+            ]
         ])
     );
 
     let clone = clone_one(git, root.path(), &url, "three-readback").await?;
     ensure!(git.run(&clone, &["fsck", "--full", "--strict"]).await?.success, "reclone strict fsck failed");
-    for (branch, oid) in ["indep-a", "indep-b"].into_iter().zip(&oids) {
+    for (branch, oid) in ["indep-a", "indep-b", "indep-c"].into_iter().zip(&oids) {
         let target = format!("refs/remotes/origin/{branch}");
         ensure!(git.text(&clone, &["rev-parse", &target]).await? == *oid);
     }
-    println!(
-        "three-way first ref verdicts: [ok, ok, ng stale info], gate movement: +2, third ref absent, reclone strict fsck: passed"
-    );
+    println!("three-way first ref verdicts: [ok, ok, ok], gate movement: +3, all refs match after strict fsck");
     println!("attempt evidence (wrapper state, current slot, attempts): A={a} B={b} C={c}");
     Ok(())
 }
@@ -222,11 +224,13 @@ async fn attempts(db: &Db, repo: Uuid, public_id: Uuid) -> Result<Value> {
         .query_one(
             "SELECT jsonb_build_array(w.state, w.current_slot, jsonb_agg(jsonb_build_array(
              a.slot, a.base_revision, o.state, e.outcome, e.revision, o.terminal_result#>>'{rejection,code}',
-             COALESCE(e.event_id=w.retired_event_id,false), COALESCE(e.event_id=w.event_id,false)) ORDER BY a.slot))
+             COALESCE(e.event_id=r.event_id,false), COALESCE(e.event_id=w.event_id,false)) ORDER BY a.slot))
          FROM ref_store_public_operations w
          JOIN ref_store_private_attempts a USING (repository_id, public_id)
          JOIN ref_store_operations o ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
          LEFT JOIN ref_store_core_events e ON e.repository_id=a.repository_id AND e.operation_id=a.private_id
+         LEFT JOIN ref_store_attempt_retirements r ON r.repository_id=a.repository_id
+           AND r.public_id=a.public_id AND r.slot=a.slot
          WHERE w.repository_id=$1 AND w.public_id=$2 GROUP BY w.repository_id,w.public_id",
             &[&repo, &public_id],
         )
