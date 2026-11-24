@@ -500,7 +500,7 @@ jobs:
             --harness tests/schema_baseline.py \
             --harness schema/142_catalog.json \
             --harness schema/143_catalog.json \
-            --harness schema/151_catalog.json; then
+            --harness schema/152_catalog.json; then
             echo 'Browse restore native manifest failed'
             exit 1
           fi
@@ -610,7 +610,7 @@ jobs:
       - name: Exercise offline backup and fresh database restore
         run: python3 tests/backup.py --binary "$ROOTYARD_BIN" --report test-results/backup.json
       # Kept beside (not in place of) tests/backup.py: this drill covers the
-      # audit-ID sequence across a format21 metadata-only backup and a fresh
+      # audit-ID sequence across a current metadata-only backup and a fresh
       # database restore. It reuses the job's PostgreSQL 17 service URL, the
       # source-bound binary and the job fixture env, and fails (never skips)
       # when a dependency is missing; the report feeds the native manifest.
