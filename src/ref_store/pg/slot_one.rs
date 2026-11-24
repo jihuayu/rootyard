@@ -1,48 +1,14 @@
-//! Crate-private slot-one rotation over migration 152's public wrapper.
+//! Bounded PostgreSQL private attempt rotation over the M152 public wrapper.
 //!
-//! This is the next product-path prerequisite for issue 42, not a serving
-//! cutover. Nothing here is selected by a feature flag, called by the legacy
-//! gateway or exposed as an HTTP route. It adds one narrow mutation: when the
-//! exact selected slot-zero private operation is a durable revision-mismatch
-//! rejection and the current gate has advanced, reserve exactly one new private
-//! attempt in slot one and retire the old event on the still-pending wrapper.
+//! The exact current revision-mismatch event admits at most one successor.
+//! Existing slots form an immutable ordered prefix. An exact replay of the
+//! latest pending rotation is read-only. A prior or unknown result cannot
+//! create a new identity or be reported as a completed rotation.
 //!
-//! # Inputs and identity
-//!
-//! The caller supplies the same immutable [`PublicAttemptRequest`] used by the
-//! read-only resolver and the slot-zero mirror, plus the exact
-//! [`PublicAttemptRetirement`] selected from that mirror. No retired private
-//! UUID, sequence, plan, closure, registration, A3/A4 identity or event is
-//! reused. The rotation stays on the retired operation's exact issuer lane,
-//! mints a fresh private UUID, reserves the next sequence in that lane, and
-//! asks the caller to build a new canonical [`PackCommitPlan`] from the locked
-//! preview. Its proof
-//! digest has the distinct `ref-store-slot-one-proof-v1` domain and binds the
-//! selected retirement as well as the new identity.
-//!
-//! # Lock and transaction order
-//!
-//! The method owns the outer transaction and must be its first lock-taking
-//! step. It takes migration 152's sorted public/retired/proposed advisory keys
-//! and row lock first, then the existing cluster restore-incarnation fence,
-//! then the issuer lane, then the ready `pg_refstore` repository/serving realm
-//! and current gate. All fresh writes run inside one named SDK savepoint:
-//! insert the slot-one attempt, advance the previewed sequence exactly once,
-//! insert the pending migration-138 operation, write its migration-147 binding,
-//! and only then flip the guarded wrapper from slot zero to slot one with the
-//! exact retired event id. The existing migration-152 evidence verifier runs
-//! before the savepoint is released. A failure rolls the savepoint back and
-//! releases it, or drops the owned outer transaction when cleanup/release is
-//! not confirmed, so no half-flip or commit-able partial rotation escapes.
-//!
-//! The caller's outer `COMMIT` is the only durability point. This method never
-//! begins, commits or rolls back that outer transaction, opens no connection,
-//! performs no Blob/Git IO and never retries an unknown COMMIT. There is no
-//! third attempt: an already-rotated wrapper is either replayed read-only after
-//! fully proving the stored slot-one/retired pair or refused closed. Only the
-//! exact pending replay is implemented here; a later terminal slot-one result
-//! is intentionally not re-labelled as a rotation replay and must be resolved
-//! through the read-only public-attempt resolver/terminal path.
+//! Take the normalized M138 advisory keys and wrapper lock before the shared
+//! restore fence, issuer lane, serving realm and gate. The SDK savepoint owns
+//! retirement insertion, plan reservation and wrapper CAS. If savepoint
+//! cleanup is uncertain, drop the outer transaction. No external IO runs here.
 use super::{
     LockedSequence, PgRefStore, advance_sequence, bound, ensure_repository, insert_operation,
     public_attempt::{
@@ -72,6 +38,8 @@ use uuid::Uuid;
 /// rotation proof can never be confused with an admission proof even if every
 /// other fact were equal.
 const SLOT_ONE_PROOF_DOMAIN: &str = "ref-store-slot-one-proof-v1";
+const SLOT_TWO_PROOF_DOMAIN: &str = "ref-store-slot-two-proof-v1";
+const LAST_ATTEMPT_SLOT: i16 = 2;
 
 /// The one named savepoint that owns every possible slot-one write.
 const SLOT_ONE_SAVEPOINT: &str = "rootyard_slot_one_rotation";
@@ -84,6 +52,7 @@ SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152),
        current_setting('transaction_isolation') = 'read committed',
        to_regclass('ref_store_public_operations') IS NOT NULL,
        to_regclass('ref_store_private_attempts') IS NOT NULL,
+       to_regclass('ref_store_attempt_retirements') IS NOT NULL,
        to_regclass('ref_store_serving_operations') IS NOT NULL,
        to_regprocedure('rootyard_ref_store_lock_public_operation(uuid,uuid,uuid)') IS NOT NULL,
        to_regprocedure('rootyard_ref_store_attempt_has_binding(ref_store_public_operations,ref_store_private_attempts)') IS NOT NULL,
@@ -92,7 +61,7 @@ SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152),
        to_regprocedure('rootyard_ref_store_verify_public_operation(uuid,uuid)') IS NOT NULL
 "#;
 
-/// One snapshot of the wrapper, both possible attempts, their migration-138
+/// One snapshot of the wrapper and all bounded attempts, their migration-138
 /// operations, migration-139 events, migration-147 bindings and cancellation
 /// tombstones. The terminal/event payload JSON never crosses into Rust: the
 /// SELECT projects only the finite exactness predicates the rotation needs.
@@ -103,7 +72,7 @@ SELECT jsonb_build_object(
             SELECT repository_id, public_id, admission_owner_id, issuer_id, wire_digest,
                    request_mode, backend_identity, object_format, history_incarnation,
                    authority_epoch, group_epoch, restore_incarnation, current_slot,
-                   state, event_id, retired_event_id, cancelled_private_id
+                   state, event_id, cancelled_private_id
               FROM ref_store_public_operations
              WHERE repository_id=$1 AND public_id=$2
         ) w
@@ -120,6 +89,7 @@ SELECT jsonb_build_object(
                    o.terminal_result IS NOT NULL AS terminal_present,
                    e.event_id,
                    e.revision AS event_revision,
+                   r.event_id AS retired_event_id,
                    COALESCE(e.event_id IS NOT NULL AND e.outcome = o.state, false)
                        AS event_outcome_matches,
                    COALESCE(e.event_id IS NOT NULL
@@ -146,6 +116,8 @@ SELECT jsonb_build_object(
               FROM ref_store_private_attempts a
               JOIN ref_store_public_operations w
                 ON w.repository_id=a.repository_id AND w.public_id=a.public_id
+              LEFT JOIN ref_store_attempt_retirements r
+                ON r.repository_id=a.repository_id AND r.public_id=a.public_id AND r.slot=a.slot
               LEFT JOIN ref_store_operations o
                 ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
               LEFT JOIN ref_store_core_events e
@@ -170,30 +142,33 @@ const CURRENT_SCOPE: &str = "SELECT rootyard_ref_store_attempt_current_scope(w)
 const STALE_GATE: &str = "SELECT rootyard_ref_store_attempt_stale_gate(w,a)
      FROM ref_store_public_operations w
      JOIN ref_store_private_attempts a
-       ON a.repository_id=w.repository_id AND a.public_id=w.public_id AND a.slot=0
+       ON a.repository_id=w.repository_id AND a.public_id=w.public_id AND a.slot=w.current_slot
      WHERE w.repository_id=$1 AND w.public_id=$2";
 
 const REQUIRE_UNCLAIMED: &str = "SELECT rootyard_ref_store_require_unclaimed_attempt($1,$2)";
 
+const INSERT_RETIREMENT: &str = "INSERT INTO ref_store_attempt_retirements(repository_id,public_id,slot,event_id)
+     VALUES($1,$2,$3,$4)";
+
 const INSERT_ATTEMPT: &str = "INSERT INTO ref_store_private_attempts(
         repository_id,public_id,slot,private_id,plan_digest,proof_digest,base_revision)
-     VALUES($1,$2,1,$3,$4,$5,$6)";
+     VALUES($1,$2,$3,$4,$5,$6,$7)";
 
 const UPDATE_WRAPPER: &str = "UPDATE ref_store_public_operations
-     SET current_slot=1,retired_event_id=$3
-     WHERE repository_id=$1 AND public_id=$2
-       AND current_slot=0 AND state='pending'
-       AND event_id IS NULL AND retired_event_id IS NULL
-       AND cancelled_private_id IS NULL";
+     SET current_slot=$4
+     WHERE repository_id=$1 AND public_id=$2 AND current_slot=$3 AND state='pending'
+       AND event_id IS NULL AND cancelled_private_id IS NULL
+       AND EXISTS (SELECT 1 FROM ref_store_attempt_retirements
+                   WHERE repository_id=$1 AND public_id=$2 AND slot=$3 AND event_id=$5)";
 
 const VERIFY_PUBLIC: &str = "SELECT rootyard_ref_store_verify_public_operation($1,$2)";
 
 const SELECT_PACK_MODE: &str = "SELECT pack_mode FROM ref_store_core_gates WHERE repository_id=$1";
 
-/// One trusted slot-one rotation input.
+/// The immutable public request and exact current retirement to rotate.
 ///
 /// The public request is the exact immutable wrapper identity. The retirement
-/// evidence is the exact selection returned by the slot-zero terminal mirror;
+/// evidence is the exact selection returned by the terminal mirror;
 /// it is revalidated here and never trusted on its own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SlotOneRotationRequest {
@@ -207,6 +182,7 @@ pub(crate) struct SlotOneRotationRequest {
 /// and `base_revision` are the exact preview values the plan must freeze.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct SlotOnePreview {
+    slot: i16,
     private_id: Uuid,
     sequence: i64,
     base_revision: i64,
@@ -215,7 +191,12 @@ pub(crate) struct SlotOnePreview {
 
 #[allow(dead_code)] // Crate-private foundation: the future wrapper gateway consumes it.
 impl SlotOnePreview {
-    /// The freshly minted private UUID this rotation will claim in slot one.
+    /// The successor generation selected under the wrapper lock.
+    pub(crate) fn slot(&self) -> i16 {
+        self.slot
+    }
+
+    /// The freshly minted private UUID this rotation will claim.
     pub(crate) fn private_id(&self) -> Uuid {
         self.private_id
     }
@@ -240,6 +221,7 @@ impl fmt::Debug for SlotOnePreview {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SlotOnePreview")
+            .field("slot", &self.slot)
             .field("private_id", &Redacted)
             .field("sequence", &self.sequence)
             .field("base_revision", &self.base_revision)
@@ -252,6 +234,7 @@ impl fmt::Debug for SlotOnePreview {
 #[allow(dead_code)] // Crate-private foundation: the future wrapper gateway consumes it.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct SlotOneRotationReceipt {
+    pub slot: i16,
     pub public_id: Uuid,
     pub private_id: Uuid,
     pub retired_private_id: Uuid,
@@ -270,6 +253,7 @@ impl fmt::Debug for SlotOneRotationReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SlotOneRotationReceipt")
+            .field("slot", &self.slot)
             .field("public_id", &Redacted)
             .field("private_id", &Redacted)
             .field("retired_private_id", &Redacted)
@@ -321,12 +305,12 @@ impl<'a> SlotOneRotation<'a> {
 }
 
 impl PgRefStore {
-    /// Rotate one exact pending slot-zero wrapper to slot one, or exactly
-    /// replay an already-pending stored rotation.
+    /// Rotate an exact current rejected attempt to its successor, or exactly
+    /// replay the latest pending stored rotation.
     ///
     /// The outer transaction is owned for the whole future. A fresh call mints
     /// the new private UUID internally, so an exact replay returns the stored
-    /// slot-one identity rather than any caller proposal. `build_plan` is called
+    /// successor identity rather than any caller proposal. `build_plan` is called
     /// at most once, only on a fresh rotation, after the wrapper, fence, lane,
     /// ready realm and gate are locked and validated, and before any write. It
     /// is never called for a read-only replay.
@@ -369,9 +353,9 @@ impl PgRefStore {
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(PackCommitError::from(RefStoreError::Timeout)),
         };
-        let retired = match preflight {
+        let (earlier, retired) = match preflight {
             SlotOnePreflight::Replay(receipt) => return Ok(SlotOneRotation::released(tx, receipt)),
-            SlotOnePreflight::Fresh(retired) => retired,
+            SlotOnePreflight::Fresh { earlier, retired } => (earlier, retired),
         };
         if Instant::now() >= deadline {
             return Err(PackCommitError::from(RefStoreError::Timeout));
@@ -386,7 +370,7 @@ impl PgRefStore {
         };
         let outcome = match timeout_at(
             deadline,
-            slot_one_fresh(&nested, request, &retired, proposed, build_plan, deadline),
+            slot_one_fresh(&nested, request, earlier.as_ref(), &retired, proposed, build_plan, deadline),
         )
         .await
         {
@@ -424,7 +408,10 @@ impl PgRefStore {
 }
 
 enum SlotOnePreflight {
-    Fresh(AttemptFacts),
+    Fresh {
+        earlier: Option<AttemptFacts>,
+        retired: AttemptFacts,
+    },
     /// Fully proved read-only replay; no plan builder or lane write ran.
     Replay(SlotOneRotationReceipt),
 }
@@ -452,7 +439,7 @@ async fn slot_one_preflight(
             "slot one rotation requires a read committed transaction",
         )));
     }
-    for index in 3usize..11 {
+    for index in 3usize..12 {
         if !schema.get::<_, bool>(index) {
             return Err(PackCommitError::from(RefStoreError::Unsupported(
                 "slot one rotation requires the migration 147/152 relations and functions",
@@ -486,55 +473,41 @@ async fn slot_one_preflight(
     let evidence = read_evidence(tx, request).await?;
     let wrapper = evidence.wrapper.ok_or_else(|| ledger("slot one rotation public operation is missing"))?;
     let wrapper_state = validate_wrapper(&wrapper, &request.public)?;
-    let (retired_raw, current_raw) = split_attempts(evidence.attempts)?;
-
-    match wrapper.current_slot() {
-        0 => {
-            if wrapper_state != OperationState::Pending
-                || wrapper.event_id().is_some()
-                || wrapper.retired_event_id().is_some()
-                || wrapper.cancelled_private_id().is_some()
-            {
-                return Err(PackCommitError::from(RefStoreError::Unsupported(
-                    "slot one rotation requires a pending slot-zero wrapper",
-                )));
-            }
-            if current_raw.is_some() {
-                return Err(ledger("slot one attempt exists while slot zero is current"));
-            }
-            let retired = validate_attempt(retired_raw, &request.public)?;
-            validate_retired(&retired, &request.retirement)?;
-            if retired.private_id == proposed || proposed == request.public.public_id {
-                return Err(ledger(
-                    "slot one rotation proposed private identity aliases the retired attempt or public id",
-                ));
-            }
-            Ok(SlotOnePreflight::Fresh(retired))
-        }
-        1 => {
-            if wrapper_state != OperationState::Pending {
-                return Err(PackCommitError::from(RefStoreError::Unsupported(
-                    "slot one rotation replay requires a pending slot-one wrapper",
-                )));
-            }
-            let current_raw =
-                current_raw.ok_or_else(|| ledger("slot one rotation current slot-one attempt is missing"))?;
-            let retired = validate_attempt(retired_raw, &request.public)?;
-            validate_retired(&retired, &request.retirement)?;
-            let current = validate_attempt(current_raw, &request.public)?;
-            let receipt = validate_replay(&wrapper, &request.public, &request.retirement, &retired, &current)?;
-
-            // Revalidate the ready realm/advanced gate read-only and then run
-            // the same migration-152 evidence verifier the write path uses.
-            let gate_revision = current_scope_revision(tx, &request.public).await?;
-            if gate_revision <= retired.base_revision || gate_revision < request.retirement.event_revision {
-                return Err(ledger("slot one replay current gate does not follow the retired rejection"));
-            }
-            verify_public_operation_preflight(tx, &request.public).await?;
-            Ok(SlotOnePreflight::Replay(receipt))
-        }
-        _ => Err(ledger("public operation current slot is not zero or one")),
+    if wrapper_state != OperationState::Pending
+        || wrapper.event_id().is_some()
+        || wrapper.cancelled_private_id().is_some()
+    {
+        return Err(PackCommitError::from(RefStoreError::Unsupported("rotation requires a pending public wrapper")));
     }
+
+    let mut attempts = validate_history(wrapper.current_slot(), evidence.attempts, &request.public)?;
+    let current = attempts.pop().ok_or_else(|| ledger("public operation current attempt is missing"))?;
+    if current.state == OperationState::Rejected && current.slot < LAST_ATTEMPT_SLOT {
+        validate_retired(&current, &request.retirement)?;
+        if proposed == request.public.public_id
+            || proposed == current.private_id
+            || attempts.iter().any(|prior| prior.private_id == proposed)
+        {
+            return Err(ledger("rotation proposed private identity aliases its public history"));
+        }
+        let earlier = attempts.pop();
+        if let Some(zero) = earlier.as_ref() {
+            validate_first_rotation(&request.public, zero, &current)?;
+        }
+        return Ok(SlotOnePreflight::Fresh { earlier, retired: current });
+    }
+
+    let retired = attempts.pop().ok_or_else(|| ledger("pending rotation does not have a retirement"))?;
+    let receipt = validate_replay(&wrapper, &request.public, &request.retirement, &retired, &current, attempts.last())?;
+
+    // The replay is read-only. The prior exact event might have been followed
+    // by unrelated publications, but the current gate must still include it.
+    let gate_revision = current_scope_revision(tx, &request.public).await?;
+    if gate_revision <= retired.base_revision || gate_revision < request.retirement.event_revision {
+        return Err(ledger("rotation replay gate does not follow the retired rejection"));
+    }
+    verify_public_operation_preflight(tx, &request.public).await?;
+    Ok(SlotOnePreflight::Replay(receipt))
 }
 
 /// The one write-capable prefix. Every statement runs inside the caller-created
@@ -542,6 +515,7 @@ async fn slot_one_preflight(
 async fn slot_one_fresh<F>(
     tx: &Transaction<'_>,
     request: &SlotOneRotationRequest,
+    earlier: Option<&AttemptFacts>,
     retired: &AttemptFacts,
     proposed: Uuid,
     build_plan: F,
@@ -601,26 +575,54 @@ where
         savepoint_sql_error(error, "slot one rotation proposed private identity is already claimed")
     })?;
 
-    let preview = SlotOnePreview { private_id: proposed, sequence, base_revision, lane: retired.lane.clone() };
+    let preview = SlotOnePreview {
+        slot: retired.slot + 1,
+        private_id: proposed,
+        sequence,
+        base_revision,
+        lane: retired.lane.clone(),
+    };
     let plan = build_plan(preview.clone())?;
     validate_plan(&plan, &request.public, &gate, pack_mode, &preview, retired.plan_digest)?;
 
     let plan_digest = *plan.parent_digest();
-    let proof = slot_one_proof_digest(&SlotOneProofFacts {
-        public: &request.public,
-        lane: &retired.lane,
-        retired_private_id: retired.private_id,
-        retired_event_id: request.retirement.event_id,
-        retired_event_revision: request.retirement.event_revision,
-        retired_plan_digest: retired.plan_digest,
+    let mut current = SlotOneProofAttempt {
+        slot: preview.slot(),
         private_id: proposed,
+        plan_digest,
+        proof_digest: RequestDigest::from_bytes([0; 32]),
+        lane: preview.lane.clone(),
         sequence,
         base_revision,
-        plan_digest,
-    });
-    if proof == retired.proof_digest {
-        return Err(ledger("slot one rotation proof aliases the retired proof"));
-    }
+        state: OperationState::Pending,
+        event_id: None,
+        event_revision: None,
+    };
+    let retired_proof = SlotOneProofAttempt::from_facts(retired);
+    let proof = if let Some(zero) = earlier {
+        let zero = SlotOneProofAttempt::from_facts(zero);
+        let proof = slot_two_proof_digest(&request.public, [&zero, &retired_proof], &current)?;
+        current.proof_digest = proof;
+        validate_slot_two_proof_invariants(&request.public, &zero, &retired_proof, &current)?;
+        proof
+    } else {
+        let proof = slot_one_proof_digest(&SlotOneProofFacts {
+            public: &request.public,
+            lane: &retired.lane,
+            retired_private_id: retired.private_id,
+            retired_event_id: request.retirement.event_id,
+            retired_event_revision: request.retirement.event_revision,
+            retired_plan_digest: retired.plan_digest,
+            private_id: proposed,
+            sequence,
+            base_revision,
+            plan_digest,
+        });
+        if proof == retired.proof_digest {
+            return Err(ledger("slot one rotation proof aliases the retired proof"));
+        }
+        proof
+    };
 
     // The trusted caller owns the acknowledgment; request WAL durability before
     // any attempt/operation/binding/wrapper row can be committed.
@@ -628,16 +630,14 @@ where
         .await
         .map_err(|error| savepoint_sql_error(error, "slot one rotation durability could not be requested"))?;
 
-    insert_slot_one_attempt(
-        tx,
-        request.public.repository_id,
-        request.public.public_id,
-        proposed,
-        plan_digest,
-        proof,
-        base_revision,
+    tx.execute(
+        INSERT_RETIREMENT,
+        &[&request.public.repository_id, &request.public.public_id, &retired.slot, &request.retirement.event_id],
     )
-    .await?;
+    .await
+    .map_err(|error| savepoint_sql_error(error, "current retirement insert was refused"))?;
+    insert_slot_one_attempt(tx, request.public.repository_id, request.public.public_id, &preview, plan_digest, proof)
+        .await?;
 
     // Advance exactly the previewed lane candidate and claim the private UUID.
     let reservation =
@@ -655,17 +655,23 @@ where
     PgPackCommit.bind_existing_serving_pending_in_tx(tx, &plan, request.public.wire_digest, deadline).await?;
 
     // Only after attempt/operation/binding exist does the guarded flip run. It
-    // must match exactly one still-pending slot-zero wrapper; the triggers then
+    // must match exactly one still-pending predecessor; the triggers then
     // re-prove the exact binding and selected retired event.
     let changed = tx
         .execute(
             UPDATE_WRAPPER,
-            &[&request.public.repository_id, &request.public.public_id, &request.retirement.event_id],
+            &[
+                &request.public.repository_id,
+                &request.public.public_id,
+                &retired.slot,
+                &preview.slot(),
+                &request.retirement.event_id,
+            ],
         )
         .await
         .map_err(|error| savepoint_sql_error(error, "slot one rotation wrapper update was refused"))?;
     if changed != 1 {
-        return Err(ledger("slot one wrapper flip did not match exactly one pending slot-zero row"));
+        return Err(ledger("wrapper advance did not match exactly one pending predecessor"));
     }
 
     // Run the existing migration-152 verifier before releasing the savepoint.
@@ -674,6 +680,7 @@ where
     verify_public_operation(tx, &request.public).await?;
 
     Ok(SlotOneRotationReceipt {
+        slot: preview.slot(),
         public_id: request.public.public_id,
         private_id: proposed,
         retired_private_id: retired.private_id,
@@ -751,6 +758,14 @@ fn validate_slot_one_proof_invariants(
     if retired.slot != 0 || current.slot != 1 {
         return Err(ledger("slot one proof evidence is not a slot-zero/slot-one pair"));
     }
+    validate_adjacent_proof(public_id, retired, current)
+}
+
+fn validate_adjacent_proof(
+    public_id: Uuid,
+    retired: &SlotOneProofAttempt,
+    current: &SlotOneProofAttempt,
+) -> Result<(Uuid, i64), PackCommitError> {
     if retired.private_id.is_nil()
         || current.private_id.is_nil()
         || retired.private_id == public_id
@@ -849,16 +864,33 @@ fn validate_replay(
     retirement: &PublicAttemptRetirement,
     retired: &AttemptFacts,
     current: &AttemptFacts,
+    earlier: Option<&AttemptFacts>,
 ) -> Result<SlotOneRotationReceipt, PackCommitError> {
-    if wrapper.current_slot() != 1
+    if wrapper.current_slot() != current.slot
         || wrapper.event_id().is_some()
-        || wrapper.retired_event_id() != Some(retirement.event_id)
         || wrapper.cancelled_private_id().is_some()
     {
-        return Err(ledger("slot one replay wrapper evidence differs"));
+        return Err(ledger("rotation replay wrapper evidence differs"));
     }
-    validate_slot_one_replay_evidence(retired, current, request, retirement)?;
+    if let Some(zero) = earlier {
+        if current.slot != LAST_ATTEMPT_SLOT || current.state != OperationState::Pending {
+            return Err(ledger("slot two replay current attempt is not pending"));
+        }
+        validate_retired(retired, retirement)?;
+        let computed = recompute_slot_two_proof_attempts(
+            request,
+            &SlotOneProofAttempt::from_facts(zero),
+            &SlotOneProofAttempt::from_facts(retired),
+            &SlotOneProofAttempt::from_facts(current),
+        )?;
+        if computed != current.proof_digest {
+            return Err(ledger("slot two replay proof does not bind the stored history"));
+        }
+    } else {
+        validate_slot_one_replay_evidence(retired, current, request, retirement)?;
+    }
     Ok(SlotOneRotationReceipt {
+        slot: current.slot,
         public_id: request.public_id,
         private_id: current.private_id,
         retired_private_id: retired.private_id,
@@ -886,8 +918,8 @@ fn validate_request(request: &SlotOneRotationRequest) -> Result<(), PackCommitEr
 }
 
 fn validate_attempt(attempt: StoredAttempt, request: &PublicAttemptRequest) -> Result<AttemptFacts, PackCommitError> {
-    if attempt.slot != 0 && attempt.slot != 1 {
-        return Err(ledger("private attempt slot is not zero or one"));
+    if !(0..=LAST_ATTEMPT_SLOT).contains(&attempt.slot) {
+        return Err(ledger("private attempt slot is outside the bounded history"));
     }
     if attempt.private_id.is_nil() || attempt.private_id == request.public_id {
         return Err(ledger("private attempt identity aliases the public identifier"));
@@ -987,8 +1019,8 @@ fn validate_attempt(attempt: StoredAttempt, request: &PublicAttemptRequest) -> R
 }
 
 fn validate_retired(retired: &AttemptFacts, retirement: &PublicAttemptRetirement) -> Result<(), PackCommitError> {
-    if retired.slot != 0 || retired.state != OperationState::Rejected {
-        return Err(ledger("retired public attempt is not a slot-zero rejection"));
+    if retired.slot >= LAST_ATTEMPT_SLOT || retired.state != OperationState::Rejected {
+        return Err(ledger("retired public attempt is not a retryable predecessor"));
     }
     let event_id = retired.event_id.ok_or_else(|| ledger("retired public attempt event is missing"))?;
     let event_revision =
@@ -1123,26 +1155,45 @@ fn validate_gate_realm(gate: &CoreGate, request: &PublicAttemptRequest) -> Resul
     Ok(())
 }
 
-fn split_attempts(attempts: Vec<StoredAttempt>) -> Result<(StoredAttempt, Option<StoredAttempt>), PackCommitError> {
-    let mut slot_zero = None;
-    let mut slot_one = None;
-    for attempt in attempts {
-        match attempt.slot {
-            0 => {
-                if slot_zero.replace(attempt).is_some() {
-                    return Err(ledger("public operation has multiple attempts in slot zero"));
-                }
-            }
-            1 => {
-                if slot_one.replace(attempt).is_some() {
-                    return Err(ledger("public operation has multiple attempts in slot one"));
-                }
-            }
-            _ => return Err(ledger("public operation has an attempt outside slot zero or one")),
-        }
+fn validate_history(
+    current_slot: i16,
+    attempts: Vec<StoredAttempt>,
+    request: &PublicAttemptRequest,
+) -> Result<Vec<AttemptFacts>, PackCommitError> {
+    if !(0..=LAST_ATTEMPT_SLOT).contains(&current_slot) || attempts.len() != current_slot as usize + 1 {
+        return Err(ledger("public operation attempt inventory does not match its current slot"));
     }
-    let slot_zero = slot_zero.ok_or_else(|| ledger("public operation retired slot-zero attempt is missing"))?;
-    Ok((slot_zero, slot_one))
+    let mut history = Vec::with_capacity(attempts.len());
+    for (index, row) in attempts.into_iter().enumerate() {
+        if row.slot as usize != index {
+            return Err(ledger("public operation attempt history is not a contiguous prefix"));
+        }
+        let marker = row.retired_event_id;
+        let facts = validate_attempt(row, request)?;
+        if facts.slot < current_slot {
+            let event_id = marker.ok_or_else(|| ledger("public operation prior attempt retirement is missing"))?;
+            let event_revision =
+                facts.event_revision.ok_or_else(|| ledger("public operation prior event revision is missing"))?;
+            validate_retired(&facts, &PublicAttemptRetirement { event_id, event_revision })?;
+        } else if marker.is_some() {
+            return Err(ledger("public operation current attempt already carries retirement evidence"));
+        }
+        history.push(facts);
+    }
+    Ok(history)
+}
+
+fn validate_first_rotation(
+    request: &PublicAttemptRequest,
+    zero: &AttemptFacts,
+    one: &AttemptFacts,
+) -> Result<(), PackCommitError> {
+    let zero = SlotOneProofAttempt::from_facts(zero);
+    let one = SlotOneProofAttempt::from_facts(one);
+    if recompute_slot_one_proof_attempts(request, &zero, &one)? != one.proof_digest {
+        return Err(ledger("slot one proof does not bind the stored predecessor"));
+    }
+    Ok(())
 }
 
 fn checked_prospective_sequence(previous: i64, candidate: i64) -> Result<i64, PackCommitError> {
@@ -1167,15 +1218,21 @@ async fn insert_slot_one_attempt(
     tx: &Transaction<'_>,
     repository_id: Uuid,
     public_id: Uuid,
-    private_id: Uuid,
+    preview: &SlotOnePreview,
     plan_digest: RequestDigest,
     proof_digest: RequestDigest,
-    base_revision: i64,
 ) -> Result<(), PackCommitError> {
     let plan_hex = plan_digest.as_hex();
     let proof_hex = proof_digest.as_hex();
-    let params: &[&(dyn ToSql + Sync)] =
-        &[&repository_id, &public_id, &private_id, &plan_hex, &proof_hex, &base_revision];
+    let params: &[&(dyn ToSql + Sync)] = &[
+        &repository_id,
+        &public_id,
+        &preview.slot,
+        &preview.private_id,
+        &plan_hex,
+        &proof_hex,
+        &preview.base_revision,
+    ];
     tx.execute(INSERT_ATTEMPT, params)
         .await
         .map_err(|error| savepoint_sql_error(error, "slot one attempt insert was refused"))?;
@@ -1263,6 +1320,7 @@ struct StoredAttempt {
     terminal_present: bool,
     event_id: Option<Uuid>,
     event_revision: Option<i64>,
+    retired_event_id: Option<Uuid>,
     event_outcome_matches: bool,
     event_body_matches: bool,
     tombstone_present: bool,
@@ -1307,10 +1365,20 @@ pub(crate) fn recompute_slot_one_proof(
     retired: &PublicAttempt,
     current: &PublicAttempt,
 ) -> Result<RequestDigest, PackCommitError> {
-    let retired = SlotOneProofAttempt::from_public(retired);
-    let current = SlotOneProofAttempt::from_public(current);
+    recompute_slot_one_proof_attempts(
+        public,
+        &SlotOneProofAttempt::from_public(retired),
+        &SlotOneProofAttempt::from_public(current),
+    )
+}
+
+fn recompute_slot_one_proof_attempts(
+    public: &PublicAttemptRequest,
+    retired: &SlotOneProofAttempt,
+    current: &SlotOneProofAttempt,
+) -> Result<RequestDigest, PackCommitError> {
     let (retired_event_id, retired_event_revision) =
-        validate_slot_one_proof_invariants(public.public_id, &retired, &current)?;
+        validate_slot_one_proof_invariants(public.public_id, retired, current)?;
     Ok(slot_one_proof_digest(&SlotOneProofFacts {
         public,
         lane: &retired.lane,
@@ -1323,6 +1391,103 @@ pub(crate) fn recompute_slot_one_proof(
         base_revision: current.base_revision,
         plan_digest: current.plan_digest,
     }))
+}
+
+/// Recompute the slot-two proof, including both predecessor events in order.
+/// The caller validates the recorded event bodies before using this digest.
+pub(crate) fn recompute_slot_two_proof(
+    public: &PublicAttemptRequest,
+    slot_zero: &PublicAttempt,
+    slot_one: &PublicAttempt,
+    current: &PublicAttempt,
+) -> Result<RequestDigest, PackCommitError> {
+    recompute_slot_two_proof_attempts(
+        public,
+        &SlotOneProofAttempt::from_public(slot_zero),
+        &SlotOneProofAttempt::from_public(slot_one),
+        &SlotOneProofAttempt::from_public(current),
+    )
+}
+
+fn recompute_slot_two_proof_attempts(
+    public: &PublicAttemptRequest,
+    zero: &SlotOneProofAttempt,
+    one: &SlotOneProofAttempt,
+    current: &SlotOneProofAttempt,
+) -> Result<RequestDigest, PackCommitError> {
+    validate_slot_two_proof_invariants(public, zero, one, current)?;
+    slot_two_proof_digest(public, [zero, one], current)
+}
+
+fn validate_slot_two_proof_invariants(
+    public: &PublicAttemptRequest,
+    zero: &SlotOneProofAttempt,
+    one: &SlotOneProofAttempt,
+    current: &SlotOneProofAttempt,
+) -> Result<(), PackCommitError> {
+    if one.slot != 1 || current.slot != LAST_ATTEMPT_SLOT {
+        return Err(ledger("slot two proof must select the ordered slot-zero and slot-one history"));
+    }
+    if recompute_slot_one_proof_attempts(public, zero, one)? != one.proof_digest {
+        return Err(ledger("slot one proof does not bind the stored predecessor"));
+    }
+    validate_adjacent_proof(public.public_id, one, current)?;
+    if one.base_revision <= zero.base_revision
+        || current.base_revision <= one.base_revision
+        || zero.private_id == current.private_id
+        || zero.plan_digest == current.plan_digest
+        || zero.proof_digest == current.proof_digest
+        || zero.event_id == one.event_id
+        || current.event_id.is_some_and(|event| Some(event) == zero.event_id || Some(event) == one.event_id)
+    {
+        return Err(ledger("slot two proof reuses or reorders earlier private attempt evidence"));
+    }
+    Ok(())
+}
+
+fn slot_two_proof_digest(
+    public: &PublicAttemptRequest,
+    predecessors: [&SlotOneProofAttempt; 2],
+    current: &SlotOneProofAttempt,
+) -> Result<RequestDigest, PackCommitError> {
+    let mut fields = vec![
+        public.repository_id.as_bytes().to_vec(),
+        public.public_id.as_bytes().to_vec(),
+        public.issuer_id.as_bytes().to_vec(),
+        public.admission_owner_id.as_bytes().to_vec(),
+        current.lane.as_str().as_bytes().to_vec(),
+        public.wire_digest.as_bytes().to_vec(),
+        public.backend_identity.as_bytes().to_vec(),
+        public.object_format.as_str().as_bytes().to_vec(),
+        public.history_incarnation.as_bytes().to_vec(),
+        public.authority_epoch.to_be_bytes().to_vec(),
+        public.group_epoch.to_be_bytes().to_vec(),
+        public.restore_incarnation.as_bytes().to_vec(),
+        public.request_mode.as_str().as_bytes().to_vec(),
+    ];
+    for predecessor in predecessors {
+        let event = predecessor.event_id.ok_or_else(|| ledger("slot two predecessor event is missing"))?;
+        let revision = predecessor.event_revision.ok_or_else(|| ledger("slot two predecessor revision is missing"))?;
+        fields.extend([
+            predecessor.slot.to_be_bytes().to_vec(),
+            predecessor.private_id.as_bytes().to_vec(),
+            predecessor.sequence.to_be_bytes().to_vec(),
+            predecessor.base_revision.to_be_bytes().to_vec(),
+            event.as_bytes().to_vec(),
+            revision.to_be_bytes().to_vec(),
+            predecessor.plan_digest.as_bytes().to_vec(),
+            predecessor.proof_digest.as_bytes().to_vec(),
+        ]);
+    }
+    fields.extend([
+        current.slot.to_be_bytes().to_vec(),
+        current.private_id.as_bytes().to_vec(),
+        current.sequence.to_be_bytes().to_vec(),
+        current.base_revision.to_be_bytes().to_vec(),
+        current.plan_digest.as_bytes().to_vec(),
+    ]);
+    let parts = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    Ok(RequestDigest::of(SLOT_TWO_PROOF_DOMAIN, &parts))
 }
 
 fn slot_one_proof_digest(facts: &SlotOneProofFacts<'_>) -> RequestDigest {

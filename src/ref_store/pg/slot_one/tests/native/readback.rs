@@ -81,7 +81,7 @@ pub(super) async fn private_retirement_evidence(
             "SELECT a.slot,a.private_id,a.plan_digest,a.proof_digest,a.base_revision,
                     o.lane,o.sequence,o.state,
                     e.event_id,e.revision,e.outcome,
-                    w.current_slot,w.state,w.event_id,w.retired_event_id,w.cancelled_private_id
+                    w.current_slot,w.state,w.event_id,r.event_id,w.cancelled_private_id
                FROM ref_store_private_attempts a
                JOIN ref_store_operations o
                  ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
@@ -89,6 +89,8 @@ pub(super) async fn private_retirement_evidence(
                  ON e.repository_id=a.repository_id AND e.operation_id=a.private_id
                JOIN ref_store_public_operations w
                  ON w.repository_id=a.repository_id AND w.public_id=a.public_id
+               LEFT JOIN ref_store_attempt_retirements r
+                 ON r.repository_id=a.repository_id AND r.public_id=a.public_id AND r.slot=a.slot
               WHERE a.repository_id=$1 AND a.public_id=$2 AND a.slot=0",
             &[&public.repository_id, &public.public_id],
         )
@@ -147,7 +149,7 @@ pub(super) async fn private_retirement_evidence(
             event_id: Some(event_id),
             event_revision: Some(event_revision),
         },
-        retired: None,
+        retired: vec![],
     })
 }
 

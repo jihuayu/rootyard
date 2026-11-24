@@ -1,8 +1,8 @@
 use super::{
     AttemptFacts, SLOT_ONE_PROOF_DOMAIN, SlotOneProofFacts, SlotOneRotationRequest, StoredAttempt,
-    checked_prospective_revision, checked_prospective_sequence, recompute_slot_one_proof, slot_one_proof_digest,
-    slot_one_proof_fields, split_attempts, validate_attempt, validate_replay, validate_request, validate_retired,
-    validate_retirement_at_gate, validate_slot_one_replay_evidence,
+    checked_prospective_revision, checked_prospective_sequence, recompute_slot_one_proof, recompute_slot_two_proof,
+    slot_one_proof_digest, slot_one_proof_fields, validate_attempt, validate_history, validate_replay,
+    validate_request, validate_retired, validate_retirement_at_gate, validate_slot_one_replay_evidence,
 };
 use crate::ref_store::{
     CommitMode, GitObjectFormat, IssuerLane, OperationState, RequestDigest,
@@ -119,6 +119,7 @@ fn stored_attempt(slot: i16) -> StoredAttempt {
         terminal_present: retired,
         event_id: retired.then_some(event_zero()),
         event_revision: retired.then_some(3),
+        retired_event_id: None,
         event_outcome_matches: retired,
         event_body_matches: retired,
         tombstone_present: false,
@@ -191,7 +192,6 @@ fn wrapper_json() -> serde_json::Value {
         "current_slot": 1,
         "state": "pending",
         "event_id": null,
-        "retired_event_id": event_zero(),
         "cancelled_private_id": null,
     })
 }
@@ -255,7 +255,7 @@ fn retired_attempt_must_be_the_selected_advanced_revision_mismatch() {
 
     let mut committed = retired_facts();
     committed.state = OperationState::Committed;
-    expect_ledger(validate_retired(&committed, &retirement()), "retired public attempt is not a slot-zero rejection");
+    expect_ledger(validate_retired(&committed, &retirement()), "retired public attempt is not a retryable predecessor");
 }
 
 #[test]
@@ -301,47 +301,47 @@ fn replay_requires_pending_slot_one_and_a_fresh_identity_plan_and_proof() {
     let request = public_request();
     let wrapper: RawWrapper = serde_json::from_value(wrapper_json()).expect("valid wrapper evidence");
 
-    validate_replay(&wrapper, &request, &retirement(), &retired, &current).expect("exact pending replay");
+    validate_replay(&wrapper, &request, &retirement(), &retired, &current, None).expect("exact pending replay");
 
     let mut same_private = current.clone();
     same_private.private_id = retired.private_id;
     expect_ledger(
-        validate_replay(&wrapper, &request, &retirement(), &retired, &same_private),
+        validate_replay(&wrapper, &request, &retirement(), &retired, &same_private, None),
         "slot one replay reuses retired identity, plan or proof",
     );
 
     let mut same_plan = current.clone();
     same_plan.plan_digest = retired.plan_digest;
     expect_ledger(
-        validate_replay(&wrapper, &request, &retirement(), &retired, &same_plan),
+        validate_replay(&wrapper, &request, &retirement(), &retired, &same_plan, None),
         "slot one replay reuses retired identity, plan or proof",
     );
 
     let mut same_proof = current.clone();
     same_proof.proof_digest = retired.proof_digest;
     expect_ledger(
-        validate_replay(&wrapper, &request, &retirement(), &retired, &same_proof),
+        validate_replay(&wrapper, &request, &retirement(), &retired, &same_proof, None),
         "slot one replay reuses retired identity, plan or proof",
     );
 
     let mut wrong_base = current.clone();
     wrong_base.base_revision = 4;
     expect_ledger(
-        validate_replay(&wrapper, &request, &retirement(), &retired, &wrong_base),
+        validate_replay(&wrapper, &request, &retirement(), &retired, &wrong_base, None),
         "slot one replay base revision differs from the retired event",
     );
 
     let mut wrong_lane = current.clone();
     wrong_lane.lane = IssuerLane::new("another-lane").expect("valid lane");
     expect_ledger(
-        validate_replay(&wrapper, &request, &retirement(), &retired, &wrong_lane),
+        validate_replay(&wrapper, &request, &retirement(), &retired, &wrong_lane, None),
         "slot one replay switched issuer lanes",
     );
 
     let mut terminal = current.clone();
     terminal.state = OperationState::Rejected;
     expect_ledger(
-        validate_replay(&wrapper, &request, &retirement(), &retired, &terminal),
+        validate_replay(&wrapper, &request, &retirement(), &retired, &terminal, None),
         "slot one replay current attempt is not pending slot one",
     );
 }
@@ -412,24 +412,37 @@ fn replay_evidence_validator_rejects_retired_or_duplicate_attempts() {
 }
 
 #[test]
-fn attempt_split_never_accepts_a_third_attempt_or_duplicate_slot() {
-    let (old, new) = split_attempts(vec![stored_attempt(0), stored_attempt(1)]).expect("two slots");
-    assert_eq!(old.slot, 0);
-    assert_eq!(new.expect("slot one").slot, 1);
+fn history_requires_contiguous_slots_and_exact_retirement_links() {
+    let request = public_request();
+    let mut zero = stored_attempt(0);
+    let one = stored_attempt(1);
+    assert_eq!(validate_history(0, vec![zero.clone()], &request).expect("single attempt")[0].slot, 0);
+    expect_ledger(
+        validate_history(1, vec![zero.clone(), one.clone()], &request),
+        "public operation prior attempt retirement is missing",
+    );
+    zero.retired_event_id = Some(event_one());
+    expect_ledger(
+        validate_history(1, vec![zero.clone(), one.clone()], &request),
+        "retired public attempt event differs from the selected retirement",
+    );
+    zero.retired_event_id = Some(event_zero());
+    assert_eq!(validate_history(1, vec![zero.clone(), one.clone()], &request).expect("two slots")[1].slot, 1);
 
-    let mut third = stored_attempt(1);
+    let mut third = one.clone();
     third.slot = 2;
     expect_ledger(
-        split_attempts(vec![stored_attempt(0), third]),
-        "public operation has an attempt outside slot zero or one",
+        validate_history(1, vec![zero.clone(), third], &request),
+        "public operation attempt history is not a contiguous prefix",
     );
-
     expect_ledger(
-        split_attempts(vec![stored_attempt(0), stored_attempt(1), stored_attempt(1)]),
-        "public operation has multiple attempts in slot one",
+        validate_history(2, vec![zero, one.clone(), one.clone()], &request),
+        "public operation prior attempt retirement is missing",
     );
-
-    expect_ledger(split_attempts(vec![stored_attempt(1)]), "public operation retired slot-zero attempt is missing");
+    expect_ledger(
+        validate_history(2, vec![one], &request),
+        "public operation attempt inventory does not match its current slot",
+    );
 }
 
 #[test]
@@ -454,6 +467,7 @@ fn source_keeps_the_reviewed_lock_and_write_order() {
         "LockedSequence::preview(",
         "LockedScope::lock(",
         "read_gate_in_tx(",
+        "\n        INSERT_RETIREMENT,",
         "insert_slot_one_attempt(",
         "advance_sequence(",
         "insert_operation(",
@@ -584,6 +598,26 @@ fn experimental_slot_two_v1_binds_ordered_retirements_wire_and_current() {
     let expected = experimental_slot_two_v1_digest(&request, [&zero, &one], &two);
     assert_eq!(expected.as_hex(), "b3cf45c3418253089791084f1758e39ff1bbd292235838e7fd330f79af4ba82f");
     assert_ne!(expected, original_slot_one);
+    assert_eq!(
+        recompute_slot_two_proof(&request, &public_attempt(&zero), &public_attempt(&one), &public_attempt(&two))
+            .unwrap(),
+        expected,
+    );
+
+    let mut stored_two = two.clone();
+    stored_two.proof_digest = expected;
+    let mut wrapper = wrapper_json();
+    wrapper["current_slot"] = json!(2);
+    let wrapper: RawWrapper = serde_json::from_value(wrapper).expect("valid slot-two wrapper");
+    let retirement_two = PublicAttemptRetirement { event_id: event_one(), event_revision: 4 };
+    let receipt = validate_replay(&wrapper, &request, &retirement_two, &one, &stored_two, Some(&zero))
+        .expect("replay of the newest rotation");
+    assert_eq!(receipt.slot, 2);
+    assert!(receipt.replayed);
+    expect_ledger(
+        validate_replay(&wrapper, &request, &retirement(), &one, &stored_two, Some(&zero)),
+        "retired public attempt event differs from the selected retirement",
+    );
 
     let mut forged_zero = zero.clone();
     forged_zero.event_id = Some(id(19));

@@ -318,7 +318,7 @@ async fn slot_one_handoff_commits_fresh_private_attempt_on_real_a3_a4_a5() -> Re
                 );
                 let retired_attempt = evidence
                     .retired
-                    .as_ref()
+                    .last()
                     .ok_or_else(|| anyhow!("mirrored wrapper has no retired slot-zero attempt"))?;
                 ensure!(retired_attempt.slot == 0, "mirrored retired attempt is not slot zero");
                 ensure!(
@@ -700,10 +700,12 @@ async fn wrapper_row(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Resul
         .get()
         .await?
         .query_one(
-            "SELECT current_slot,state,event_id,retired_event_id,cancelled_private_id,
-                    restore_incarnation,backend_identity,object_format
-               FROM ref_store_public_operations
-              WHERE repository_id=$1 AND public_id=$2",
+            "SELECT w.current_slot,w.state,w.event_id,r.event_id,w.cancelled_private_id,
+                    w.restore_incarnation,w.backend_identity,w.object_format
+               FROM ref_store_public_operations w
+               LEFT JOIN ref_store_attempt_retirements r
+                 ON r.repository_id=w.repository_id AND r.public_id=w.public_id AND r.slot=0
+              WHERE w.repository_id=$1 AND w.public_id=$2",
             &[&repository_id, &public_id],
         )
         .await?;

@@ -107,10 +107,8 @@ pub(super) async fn rotate_and_commit(
             ensure!(evidence.current.slot == 1, "rotated current attempt is not slot one");
             ensure!(evidence.current.private_id == receipt.private_id, "rotated current private id differs");
             ensure!(evidence.current.state == OperationState::Pending, "rotated current attempt is not pending");
-            let retired_attempt = evidence
-                .retired
-                .as_ref()
-                .ok_or_else(|| anyhow!("rotated wrapper has no retired slot-zero evidence"))?;
+            let retired_attempt =
+                evidence.retired.last().ok_or_else(|| anyhow!("rotated wrapper has no retired slot-zero evidence"))?;
             ensure!(retired_attempt.slot == 0, "rotated retired attempt is not slot zero");
             ensure!(
                 retired_attempt.private_id == retired.admission.private_id,
@@ -259,7 +257,7 @@ pub(super) async fn mirror_p2_terminal_and_prove_replay(
         "mirrored P2 current event revision differs"
     );
     let retired_attempt =
-        evidence.retired.as_ref().ok_or_else(|| anyhow!("mirrored P2 wrapper has no retired slot-zero attempt"))?;
+        evidence.retired.last().ok_or_else(|| anyhow!("mirrored P2 wrapper has no retired slot-zero attempt"))?;
     ensure!(retired_attempt.slot == 0, "mirrored P2 retired attempt is not slot zero");
     ensure!(retired_attempt.private_id == retired.admission.private_id, "mirrored P2 retired private id changed");
     ensure!(retired_attempt.state == OperationState::Rejected, "mirrored P2 retired attempt is not rejected");
