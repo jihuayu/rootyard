@@ -39,9 +39,12 @@ EXPECTED_CASES = (
     "missing_database_url_is_explicit_refusal_without_listener",
     "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
     "unavailable_postgres_refuses_startup_and_preserves_authority",
+    "running_postgres_disconnect_fails_closed_and_restart_preserves_authority",
 )
 DEPENDENCIES = (
     "blob_only_service.py",
+    "cluster_partition_native.py",
+    "cluster_workload_native.py",
     "e2e.py",
     "native_evidence.py",
     "ops_provenance.py",
@@ -330,9 +333,11 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertIn("FIRST_CHECKPOINT = CASES[:4]", self.harness)
         self.assertIn("SECOND_CHECKPOINT = CASES[4:5]", self.harness)
         self.assertIn("REFUSAL_CHECKPOINT = CASES[5:7]", self.harness)
-        self.assertIn("STARTUP_CHECKPOINT = CASES[7:]", self.harness)
+        self.assertIn("STARTUP_CHECKPOINT = CASES[7:10]", self.harness)
+        self.assertIn("RUNTIME_OUTAGE_CHECKPOINT = CASES[10:]", self.harness)
         self.assertIn('"refusal": list(REFUSAL_CHECKPOINT)', self.harness)
         self.assertIn('"startup": list(STARTUP_CHECKPOINT)', self.harness)
+        self.assertIn('"runtime_outage": list(RUNTIME_OUTAGE_CHECKPOINT)', self.harness)
         self.assertIn('assert client_result in ("RemoteDisconnected", "ConnectionReset")', self.harness)
 
     def test_harness_binds_its_own_and_transitive_sources(self) -> None:
@@ -375,7 +380,7 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         # this workflow when changed.
         self.assertEqual(self.workflow.count("      - 'tests/blob_only_service.py'"), 1)
         self.assertEqual(self.workflow.count("      - 'tests/blob_provisioning_service.py'"), 1)
-        for transitive in ("e2e.py", "native_evidence.py", "ops_provenance.py", "owned_fuse_cleanup.py"):
+        for transitive in DEPENDENCIES:
             with self.subTest(transitive=transitive):
                 self.assertEqual(self.workflow.count("      - 'tests/" + transitive + "'"), 1,
                                  "transitive harness input is missing from the CI path trigger")
@@ -735,10 +740,13 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertEqual(EXPECTED_CASES[4], "deferred_commit_barrier_kill_rolls_back_and_retry_converges")
         self.assertEqual(EXPECTED_CASES[5], "backend_identity_conflict_is_explicit_and_preserves_authority")
         self.assertEqual(EXPECTED_CASES[6], "unsupported_legacy_repository_format_is_explicitly_refused")
-        self.assertEqual(EXPECTED_CASES[7:], (
+        self.assertEqual(EXPECTED_CASES[7:10], (
             "missing_database_url_is_explicit_refusal_without_listener",
             "missing_blob_endpoint_is_explicit_refusal_without_legacy_fallback",
             "unavailable_postgres_refuses_startup_and_preserves_authority",
+        ))
+        self.assertEqual(EXPECTED_CASES[10:], (
+            "running_postgres_disconnect_fails_closed_and_restart_preserves_authority",
         ))
 
     def _run_failing_backend_case(self, harness):
@@ -1111,7 +1119,8 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertEqual(provisioning.FIRST_CHECKPOINT, EXPECTED_CASES[:4])
         self.assertEqual(provisioning.SECOND_CHECKPOINT, EXPECTED_CASES[4:5])
         self.assertEqual(provisioning.REFUSAL_CHECKPOINT, EXPECTED_CASES[5:7])
-        self.assertEqual(provisioning.STARTUP_CHECKPOINT, EXPECTED_CASES[7:])
+        self.assertEqual(provisioning.STARTUP_CHECKPOINT, EXPECTED_CASES[7:10])
+        self.assertEqual(provisioning.RUNTIME_OUTAGE_CHECKPOINT, EXPECTED_CASES[10:])
         harness = _BackendIdentityCaseDouble(fail_phase=Phase.initial_create)
         error = self._run_failing_backend_case(harness)
         self.assertEqual(len(harness.results), 1)

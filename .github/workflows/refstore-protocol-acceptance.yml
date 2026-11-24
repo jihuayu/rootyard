@@ -39,6 +39,8 @@ on:
       - 'tests/blob_gateway_browse.py'
       - 'tests/blob_gateway_history.py'
       - 'tests/blob_provisioning_service.py'
+      - 'tests/cluster_partition_native.py'
+      - 'tests/cluster_workload_native.py'
       - 'tests/backup_blob_serving147.py'
       - 'tests/backup_blob_serving169_support.py'
       - 'tests/test_backup_blob_serving169_support.py'
