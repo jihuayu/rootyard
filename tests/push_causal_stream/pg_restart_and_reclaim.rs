@@ -3,6 +3,7 @@
 //! 2. Production HTTP `receive-pack` object-level causal closure refusal before CAS
 //! 3. All `0..=8` `.pack`/`.idx` pair recording + production remote partial/rejected pack sweep (#183).
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -234,11 +235,38 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
     ensure!(
         st_stale == StatusCode::OK && String::from_utf8_lossy(&body_stale).contains("ng refs/heads/main stale info\n")
     );
+    let stale_private: Uuid = db_c
+        .query_one(
+            "SELECT a.private_id FROM ref_store_public_operations w
+             JOIN ref_store_private_attempts a
+               ON (a.repository_id,a.public_id,a.slot)=(w.repository_id,w.public_id,w.current_slot)
+             WHERE w.repository_id=$1 AND w.public_id=$2 AND w.state='rejected'",
+            &[&repo_id, &op_stale],
+        )
+        .await?
+        .get(0);
+    ensure!(stale_private != op_stale, "public reclaim key must differ from its private hold owner");
+    let hold_owners: Vec<Uuid> = db_c
+        .query(
+            "SELECT operation_id FROM artifact_holds
+             WHERE repository_id=$1 AND backend_identity=$2 AND operation_id IN ($3,$4)",
+            &[&repo_id, &env.backend_hex, &op_stale, &stale_private],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    ensure!(hold_owners == [stale_private; 2], "stale push hold ownership changed");
     let (stale_paths, _) = query_operation_hold_blob_paths(env.pool, repo_id, op_stale, env.backend_hex, dl).await?;
     ensure!(stale_paths.len() == 2, "expected 2 uploaded hold paths for rejected push, got {}", stale_paths.len());
+    let (foreign_paths, _) = query_operation_hold_blob_paths(env.pool, repo_id, op_stale, &"00".repeat(32), dl).await?;
+    ensure!(foreign_paths.is_empty(), "reclaim exposed locators from another backend");
     assert_s3_paths_swept(env.s3, &stale_paths)?;
     let gw2_ledger = open_gateway_reclaim_ledger(gw2.scratch.path()).map_err(|e| anyhow!("{e:?}"))?;
-    ensure!(gw2_ledger.load(op_stale)?.unwrap().state == UploadReclaimState::ReclaimedAfterAbort);
+    let stale_reclaim = gw2_ledger.load(op_stale)?.ok_or_else(|| anyhow!("missing public reclaim record"))?;
+    ensure!(stale_reclaim.state == UploadReclaimState::ReclaimedAfterAbort);
+    let recorded: BTreeSet<_> = stale_reclaim.recorded_blob_paths.into_iter().collect();
+    ensure!(recorded == stale_paths.into_iter().collect(), "public reclaim record lost an exact hold locator");
 
     // 3B. MULTI-PAIR (`3` pairs = `6` S3 objects!) PARTIAL/ABORTED UPLOAD RECOVERY SWEEP ON NEXT GATEWAY REQUEST:
     let op_multi = stage_three_aborted_pairs_in_s3_and_ledger(env, gw2.scratch.path(), repo_id, &repo_name).await?;

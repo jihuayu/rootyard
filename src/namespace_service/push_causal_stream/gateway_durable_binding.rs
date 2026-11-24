@@ -1,8 +1,92 @@
 use deadpool_postgres::Client;
 use tokio::time::{Instant as TokioInstant, timeout_at};
+use tokio_postgres::Transaction;
 use uuid::Uuid;
 
 use super::types::PushCausalError;
+
+pub(super) enum ReclaimBinding {
+    Legacy,
+    Public { owner: Uuid, backend: String, attempts: Vec<Uuid>, terminal_abort: bool },
+}
+
+/// Resolve a public reclaim key in a caller-owned snapshot. A private UUID
+/// presented as a public key and an incomplete schema both fail closed.
+pub(super) async fn reclaim_binding(
+    client: &Transaction<'_>,
+    repository_id: Uuid,
+    operation_id: Uuid,
+) -> Result<Option<ReclaimBinding>, PushCausalError> {
+    let schema = client
+        .query_one(
+            "SELECT (to_regclass('ref_store_public_operations') IS NOT NULL)::integer
+                    + (to_regclass('ref_store_private_attempts') IS NOT NULL)::integer
+                    + (to_regclass('ref_store_attempt_retirements') IS NOT NULL)::integer
+                    + (to_regprocedure('rootyard_ref_store_verify_public_operation(uuid,uuid)')
+                        IS NOT NULL)::integer",
+            &[],
+        )
+        .await
+        .map_err(reclaim_read_error)?
+        .get::<_, i32>(0);
+    match schema {
+        0 => return Ok(Some(ReclaimBinding::Legacy)),
+        4 => {}
+        _ => return Err(PushCausalError::StateMachine("incomplete public attempt reclaim schema".into())),
+    }
+    let wrapper = client
+        .query_opt(
+            "SELECT w.admission_owner_id, w.backend_identity, w.state, w.current_slot,
+                    ARRAY(SELECT a.private_id FROM ref_store_private_attempts a
+                         WHERE (a.repository_id,a.public_id) = (w.repository_id,w.public_id)
+                         ORDER BY a.slot)
+             FROM ref_store_public_operations w WHERE w.repository_id=$1 AND w.public_id=$2",
+            &[&repository_id, &operation_id],
+        )
+        .await
+        .map_err(reclaim_read_error)?;
+    let Some(row) = wrapper else {
+        let private = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM ref_store_private_attempts WHERE repository_id=$1 AND private_id=$2)",
+                &[&repository_id, &operation_id],
+            )
+            .await
+            .map_err(reclaim_read_error)?
+            .get::<_, bool>(0);
+        return Ok((!private).then_some(ReclaimBinding::Legacy));
+    };
+    let state: &str = row.get(2);
+    let current_slot: i16 = row.get(3);
+    let attempts: Vec<Uuid> = row.get(4);
+    if !(0..=2).contains(&current_slot) || attempts.len() != current_slot as usize + 1 {
+        return Err(PushCausalError::StateMachine("invalid reclaim attempt history".into()));
+    }
+    Ok(Some(ReclaimBinding::Public {
+        owner: row.get(0),
+        backend: row.get(1),
+        attempts,
+        terminal_abort: matches!(state, "rejected" | "cancelled"),
+    }))
+}
+
+/// Verify the original abort and all retired attempts once the exact public
+/// wrapper is durably terminal. Never inspect transitional attempts for deletion.
+pub(super) async fn verify_reclaim_wrapper(
+    client: &Transaction<'_>,
+    repository_id: Uuid,
+    public_id: Uuid,
+) -> Result<(), PushCausalError> {
+    client
+        .query_one("SELECT rootyard_ref_store_verify_public_operation($1,$2)", &[&repository_id, &public_id])
+        .await
+        .map_err(reclaim_read_error)?;
+    Ok(())
+}
+
+fn reclaim_read_error(error: tokio_postgres::Error) -> PushCausalError {
+    PushCausalError::Io(error.to_string())
+}
 
 /// Exact public-wrapper realm/backend binding proved at the receipt boundary.
 pub(super) struct PublicPrivateBinding {

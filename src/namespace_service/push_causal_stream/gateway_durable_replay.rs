@@ -173,6 +173,8 @@ pub async fn load_durable_gateway_push_receipt(
                 );
             }
         } else {
+            // The local intent is keyed by the public UUID. Reclaim resolves
+            // that exact wrapper and its complete private hold history.
             let _ = settle_aborted_gateway_reclaim(
                 args.pool,
                 sr,
