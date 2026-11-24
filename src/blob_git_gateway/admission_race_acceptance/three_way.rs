@@ -132,7 +132,12 @@ async fn qualify(db: &Db, resources: &mut WitnessResources) -> Result<()> {
         ensure!(report_status(&capture.body)? == ("ok".to_owned(), vec![(name.to_owned(), None)]));
     }
     let capture = captures.take(third).context("third request has no capture")?;
-    ensure!(capture.status == 409 && !capture.truncated, "third HTTP status {}", capture.status);
+    ensure!(capture.status == 200 && !capture.truncated, "third HTTP status {}", capture.status);
+    ensure!(
+        report_status(&capture.body)?
+            == ("ok".to_owned(), vec![(INDEPENDENT_C.to_owned(), Some("stale info".to_owned()))]),
+        "the final attempt did not return exactly one per-ref rejection"
+    );
     ensure!(captures.is_empty(), "unexpected extra receive-pack request");
     ensure!(durable_ref(db, repo, INDEPENDENT_A).await?.as_deref() == Some(oids[0].as_str()));
     ensure!(durable_ref(db, repo, INDEPENDENT_B).await?.as_deref() == Some(oids[1].as_str()));
@@ -147,7 +152,13 @@ async fn qualify(db: &Db, resources: &mut WitnessResources) -> Result<()> {
     ensure!(
         b == json!(["committed", 1, [retired, [1, base + 1, "committed", "committed", base + 2, null, false, true]]])
     );
-    ensure!(c == json!(["pending", 1, [retired, [1, base + 1, "pending", null, null, null, false, false]]]));
+    ensure!(
+        c == json!([
+            "rejected",
+            1,
+            [retired, [1, base + 1, "rejected", "rejected", base + 2, "revision_mismatch", false, true]]
+        ])
+    );
 
     let clone = clone_one(git, root.path(), &url, "three-readback").await?;
     ensure!(git.run(&clone, &["fsck", "--full", "--strict"]).await?.success, "reclone strict fsck failed");
@@ -156,7 +167,7 @@ async fn qualify(db: &Db, resources: &mut WitnessResources) -> Result<()> {
         ensure!(git.text(&clone, &["rev-parse", &target]).await? == *oid);
     }
     println!(
-        "three-way HTTP statuses: [200, 200, 409], gate movement: +2, third ref absent, reclone strict fsck: passed"
+        "three-way first ref verdicts: [ok, ok, ng stale info], gate movement: +2, third ref absent, reclone strict fsck: passed"
     );
     println!("attempt evidence (wrapper state, current slot, attempts): A={a} B={b} C={c}");
     Ok(())

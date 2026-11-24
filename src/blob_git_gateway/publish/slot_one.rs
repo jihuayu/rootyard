@@ -66,7 +66,7 @@ use crate::{
             RealmExpectation,
             pack_commit::{
                 GATE_REVISION_MISMATCH_DETAIL, PackCommitBaseline, PackCommitError, PackCommitPlan,
-                PackCommitRejectCode, PackCommitRejection,
+                PackCommitRejectCode, PackCommitRejection, PackPendingToken,
             },
         },
         pg::{
@@ -217,9 +217,8 @@ impl fmt::Debug for SlotOneReceive<'_, '_> {
 /// read-only exact pending replay and deliberately carries no plan, no new
 /// identity and no sequence.
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
-#[derive(Clone, Eq, PartialEq)]
 pub(in crate::blob_git_gateway) enum SlotOneAdmission {
-    Fresh { plan: Box<PackCommitPlan>, receipt: SlotOneRotationReceipt },
+    Fresh { plan: Box<PackCommitPlan>, receipt: SlotOneRotationReceipt, token: PackPendingToken },
     Replayed(SlotOneRotationReceipt),
 }
 
@@ -397,6 +396,20 @@ pub(in crate::blob_git_gateway) async fn rotate_slot_one(
         return Err(error);
     }
 
+    let token = match PackPendingToken::established(
+        repository_id,
+        plan.tenant_id(),
+        receipt.private_id,
+        receipt.plan_digest,
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            let _ = rollback_bounded(savepoint, deadline).await;
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
+            return Err(GatewayError::from(error));
+        }
+    };
+
     // Releasing the gateway savepoint only moves the already-written rows into
     // the deadpool-owned outer transaction; it is not a durability point.
     match super::commit_bounded(savepoint, deadline, repository_id, Some(public.public_id)).await {
@@ -423,7 +436,7 @@ pub(in crate::blob_git_gateway) async fn rotate_slot_one(
     }
 
     commit_deadpool_bounded(tx, deadline).await?;
-    Ok(SlotOneAdmission::Fresh { plan: Box::new(plan), receipt })
+    Ok(SlotOneAdmission::Fresh { plan: Box::new(plan), receipt, token })
 }
 
 /// Build the canonical bounded plan from the rotation's locked preview.

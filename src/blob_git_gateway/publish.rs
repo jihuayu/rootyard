@@ -887,23 +887,46 @@ pub(super) async fn retire_slot_one(
     let public_request = handoff.public().clone();
     let admission = slot_one::rotate_slot_one(state, serving, &handoff, &baseline, deadline).await?;
     match admission {
-        slot_one::SlotOneAdmission::Fresh { plan, .. } => {
+        slot_one::SlotOneAdmission::Fresh { plan, token, .. } => {
             #[cfg(test)]
             state.pause_after_slot_one(verified.operation_id()).await;
-            for (index, pair) in verified.pairs().iter().enumerate() {
-                let planned =
-                    plan.packs().get(index).ok_or(GatewayError::Internal("slot one planned pack set is incomplete"))?;
-                publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline).await?;
+            let result = async {
+                for (index, pair) in verified.pairs().iter().enumerate() {
+                    let planned =
+                        plan.packs().get(index).ok_or(GatewayError::Internal("slot one planned pack set is incomplete"))?;
+                    publish_pair(state, &plan, planned.pack_id(), pair, Some(&public_request), deadline).await?;
+                }
+                decide(
+                    state,
+                    verified.actor(),
+                    (*plan).clone(),
+                    verified.mode(),
+                    Some(&public_request),
+                    deadline,
+                )
+                .await
             }
-            let terminal = decide(
-                state,
-                verified.actor(),
-                (*plan).clone(),
-                verified.mode(),
-                Some(&public_request),
-                deadline,
-            )
-            .await?;
+            .await;
+            let terminal = match result {
+                Ok(terminal) => terminal,
+                Err(error @ GatewayError::Conflict(_)) => {
+                    // The last attempt may have lost its base after rotation.
+                    // Only the locked forward-gate proof can close it.
+                    authorized(state)?
+                        .reject_superseded_private(
+                            state.pool(),
+                            &token,
+                            &plan,
+                            verified.actor(),
+                            &public_request,
+                            deadline,
+                        )
+                        .await
+                        .map_err(map_authorized)?
+                        .ok_or(error)?
+                }
+                Err(error) => return Err(error),
+            };
             let private_id = plan.identity().operation_id();
             let record =
                 load_terminal_record(state, serving.gate.repository_id(), private_id, deadline).await?;

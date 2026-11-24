@@ -148,7 +148,7 @@ pub(crate) async fn rotate_direct(
         SlotOneReceive::from_verified_slot_zero(serving, &verified, baseline, backend_identity, evidence, retirement)?;
     let admission = rotate_slot_one(state, serving, &handoff, baseline, deadline).await?;
     Ok(match admission {
-        SlotOneAdmission::Fresh { plan, receipt } => {
+        SlotOneAdmission::Fresh { plan, receipt, .. } => {
             Admission::Fresh { plan: *plan, receipt: ReceiptView::from(receipt) }
         }
         SlotOneAdmission::Replayed(receipt) => Admission::Replayed(ReceiptView::from(receipt)),
