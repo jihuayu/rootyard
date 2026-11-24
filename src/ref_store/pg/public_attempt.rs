@@ -607,8 +607,15 @@ impl PgRefStore {
                 &[&request.repository_id, &request.public_id, &proposed_private_id],
             )
             .await
-            .map_err(lookup_db_error)
-            .map_err(PackCommitError::from)?;
+            .map_err(|error| match error.code() {
+                // A concurrent admission or retirement changed the advisory
+                // lock set while this transaction was waiting. Roll back and
+                // let the caller resolve this same public operation.
+                Some(&SqlState::T_R_SERIALIZATION_FAILURE) => {
+                    RefStoreError::OperationPending { operation_id: request.public_id }
+                }
+                _ => lookup_db_error(error),
+            })?;
             Ok(())
         })
         .await
