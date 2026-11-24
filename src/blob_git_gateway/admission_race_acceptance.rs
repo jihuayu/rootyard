@@ -311,7 +311,7 @@ async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result
     let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     prepare()?;
     require_per_run_blob_prefix()?;
-    let db = Db::setup().await?;
+    let db = Db::setup_public_owned().await?;
     let mut resources = WitnessResources::default();
     let outcome = AssertUnwindSafe(async {
         let outcome = case(&db, &mut resources, &mut phase).await;
@@ -363,7 +363,7 @@ async fn post_admission_independent_refs_both_commit() -> Result<()> {
     let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     prepare()?;
     require_per_run_blob_prefix()?;
-    let db = Db::setup().await?;
+    let db = Db::setup_public_owned().await?;
     let mut resources = WitnessResources::default();
     let outcome = AssertUnwindSafe(async {
         let db = &db;

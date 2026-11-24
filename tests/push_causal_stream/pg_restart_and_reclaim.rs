@@ -150,6 +150,19 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
 
     clear_observed_gateway_receipts();
     let dl = TokioInstant::now() + Duration::from_secs(30);
+    let private_id: Uuid = env
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT a.private_id FROM ref_store_public_operations w
+         JOIN ref_store_private_attempts a ON a.repository_id=w.repository_id
+            AND a.public_id=w.public_id AND a.slot=w.current_slot
+         WHERE w.repository_id=$1 AND w.public_id=$2 AND w.state='committed'",
+            &[&repo_id, &op2],
+        )
+        .await?
+        .get(0);
     let direct_loaded = load_durable_gateway_push_receipt(&DurableGatewayReceiptArgs {
         pool: env.pool,
         store: env.store,
@@ -158,7 +171,7 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
         sandbox_root: None,
         repository_id: repo_id,
         operation_id: op2,
-        private_operation_id: None,
+        private_operation_id: Some(private_id),
         deadline: dl,
     })
     .await?
@@ -188,14 +201,16 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
     let db_c = env.pool.get().await?;
     let bad_ops: i64 = db_c
         .query_one(
-            "SELECT COUNT(*) FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
+            "SELECT (SELECT count(*) FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2)
+                  + (SELECT count(*) FROM ref_store_public_operations WHERE repository_id=$1 AND public_id=$2)",
             &[&repo_id, &op_bad],
         )
         .await?
         .get(0);
     let bad_holds: i64 = db_c
         .query_one(
-            "SELECT COUNT(*) FROM artifact_holds WHERE repository_id=$1 AND operation_id=$2",
+            "SELECT count(*) FROM artifact_holds WHERE repository_id=$1 AND (operation_id=$2 OR operation_id IN
+             (SELECT private_id FROM ref_store_private_attempts WHERE repository_id=$1 AND public_id=$2))",
             &[&repo_id, &op_bad],
         )
         .await?

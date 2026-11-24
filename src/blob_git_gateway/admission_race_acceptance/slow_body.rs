@@ -650,7 +650,7 @@ async fn slow_body_distinct_refs_overlap_and_both_commit() -> Result<()> {
     let _serial = NATIVE_ACCEPTANCE_SERIAL.lock().await;
     prepare().map_err(|_| anyhow!("shared fixture environment preparation failed"))?;
     require_per_run_blob_prefix().map_err(|_| anyhow!("per-run Blob fixture prefix was not proven"))?;
-    let db = Db::setup().await.map_err(|_| anyhow!("fixture PostgreSQL schema setup failed"))?;
+    let db = Db::setup_public_owned().await.map_err(|_| anyhow!("fixture PostgreSQL schema setup failed"))?;
     let mut resources = WitnessResources::default();
     let outcome = AssertUnwindSafe(async {
         let db = &db;

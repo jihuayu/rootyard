@@ -682,15 +682,15 @@ def concurrent_same_ref_one_winner_parseable_no_false_ok(self):
     raw_reports, durable_states = [], []
     for index, (status, body, headers) in enumerate(raw_results):
         operation_query = (" WHERE repository_id='" + str(uuid.UUID(repo["id"]))
-                           + "' AND operation_id='" + raw_operations[index] + "'")
-        state = self.sql("SELECT state FROM ref_store_operations" + operation_query)
+                           + "' AND public_id='" + raw_operations[index] + "'")
+        state = self.sql("SELECT state FROM ref_store_public_operations" + operation_query)
         if status == 409:
             # A pre-admission revision race may have rolled its transaction
             # back. A pending row behind that 409 is the regression, never a
             # reason to retry or accept this run.
             assert not state, "409 left a durable operation instead of a terminal: " + state
             status, body, headers = post(index)
-            state = self.sql("SELECT state FROM ref_store_operations" + operation_query)
+            state = self.sql("SELECT state FROM ref_store_public_operations" + operation_query)
         assert status == 200, "race POST status=" + str(status) + ", state=" + state
         assert header_value(headers, "x-rootyard-operation") == raw_operations[index]
         unpack, statuses = parse_receive_report(body)
