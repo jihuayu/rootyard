@@ -2,6 +2,16 @@
 -- loaded with the current application's registered migrations through M151:
 -- psql -X -v rootyard_owned_disposable_pg17=on -f tests/fixtures/ref_store_schema152_storage.sql
 -- The migration, rows and test role all roll back to the original M151 schema.
+--
+-- Legacy reserve, begin, cancel and lock-protected replay take the M138
+-- repository/operation advisory key before the issuer lane. In a catalog
+-- with M152 they check public/private claims in a separate READ COMMITTED
+-- statement after acquiring that key. A matching claim refuses the legacy path
+-- before it reads or writes legacy operation state.
+-- M152 admission holds the sorted keys for the wrapper and its existing and
+-- proposed attempts before the restore fence and issuer lane. It writes the
+-- exact private M138 record and M147 wire/parent binding under those same
+-- locks, which stay held through commit.
 \set ON_ERROR_STOP on
 \if :{?rootyard_owned_disposable_pg17}
 \else
