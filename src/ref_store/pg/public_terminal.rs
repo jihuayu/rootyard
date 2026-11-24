@@ -284,7 +284,24 @@ impl PgRefStore {
         if Instant::now() >= deadline {
             return Err(PackCommitError::from(RefStoreError::Timeout));
         }
-        self.mirror_public_attempt_terminal_checked(tx, request, record, deadline).await
+        self.mirror_public_attempt_terminal_checked(tx, request, record, true, deadline).await
+    }
+
+    /// A cancellation that loses to the current durable event closes the
+    /// public push with that result, even if the normal push path could retry.
+    /// The cancellation coordinator already holds the wrapper and restore
+    /// locks in this transaction.
+    pub(super) async fn mirror_public_attempt_terminal_after_cancel(
+        &self,
+        tx: &Transaction<'_>,
+        request: &PublicAttemptRequest,
+        record: &OperationRecord,
+        deadline: Instant,
+    ) -> Result<(), PackCommitError> {
+        request.validate()?;
+        validate_record(request, record)?;
+        self.mirror_public_attempt_terminal_checked(tx, request, record, false, deadline).await?;
+        Ok(())
     }
 
     async fn mirror_public_attempt_terminal_checked(
@@ -292,6 +309,7 @@ impl PgRefStore {
         tx: &Transaction<'_>,
         request: &PublicAttemptRequest,
         record: &OperationRecord,
+        allow_retirement: bool,
         deadline: Instant,
     ) -> Result<PublicAttemptTerminalOutcome, PackCommitError> {
         refresh_bound(tx, deadline).await?;
@@ -375,14 +393,16 @@ impl PgRefStore {
         }
 
         if wrapper_state == OperationState::Pending {
-            if retirement_candidate(
-                current_slot,
-                record.state(),
-                current.base_revision,
-                event.revision,
-                gate_revision,
-                &event.payload,
-            ) {
+            if allow_retirement
+                && retirement_candidate(
+                    current_slot,
+                    record.state(),
+                    current.base_revision,
+                    event.revision,
+                    gate_revision,
+                    &event.payload,
+                )
+            {
                 refresh_bound(tx, deadline).await?;
                 let stale_revision = stale_gate_revision(tx, request).await?;
                 if stale_revision != gate_revision || stale_revision != event.revision {

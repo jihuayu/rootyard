@@ -26,6 +26,7 @@ pub(crate) mod slot_zero;
 
 /// Read-only migration-152 public operation/current attempt resolver.
 pub(crate) mod public_attempt;
+pub(crate) mod public_cancel;
 
 /// Crate-private migration-152 public terminal mirror.
 #[allow(dead_code)]
@@ -360,18 +361,20 @@ impl PgRefStore {
         identity: &OperationIdentity,
         deadline: Instant,
     ) -> Result<CancelReceipt, RefStoreError> {
-        before_deadline(deadline, self.cancel_inner(tx, identity, deadline)).await
+        before_deadline(deadline, async {
+            bound(tx, deadline).await?;
+            lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
+            refuse_legacy_collision(tx, identity.repository_id(), identity.operation_id()).await?;
+            self.cancel_locked(tx, identity).await
+        })
+        .await
     }
 
-    async fn cancel_inner(
+    async fn cancel_locked(
         &self,
         tx: &Transaction<'_>,
         identity: &OperationIdentity,
-        deadline: Instant,
     ) -> Result<CancelReceipt, RefStoreError> {
-        bound(tx, deadline).await?;
-        lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
-        refuse_legacy_collision(tx, identity.repository_id(), identity.operation_id()).await?;
         ensure_repository(tx, identity.repository_id()).await?;
         lock_lane(tx, identity).await?;
         let existing = match operation_row(tx, identity.repository_id(), identity.operation_id(), true).await? {

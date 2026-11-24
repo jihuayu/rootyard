@@ -1,7 +1,7 @@
 //! Cancellation of a publication decision, including cancel-before-install.
 //!
-//! There is exactly one entry point, the crate-private [`coordinator_cancel`], which runs inside the
-//! caller-owned transaction and performs the real authorization: the actor must be the live
+//! Both cancellation entry points run inside the caller-owned transaction and
+//! share the live authorization check. The actor must be the live
 //! owner/admin of the repository (effective RBAC role, live non-read-only `api` token). There is
 //! deliberately no authority-skipping variant, so a native hook, a request body or an unauthenticated
 //! caller can never cancel an operation.
@@ -16,14 +16,13 @@ use super::sql_locks;
 use super::usage;
 use crate::db::Identity;
 use crate::members::models::Role;
-use crate::ref_store::contract::{OperationIdentity, OperationState};
-use crate::ref_store::pg::PgRefStore;
+use crate::ref_store::contract::{CancelReceipt, OperationIdentity, OperationState};
+use crate::ref_store::pg::{PgRefStore, public_cancel::PublicCancellation};
 use tokio::time::Instant;
 use tokio_postgres::Transaction;
 use uuid::Uuid;
 
-/// The only cancellation entry: inside a caller-owned transaction. The live authority checks below are
-/// mandatory; nothing is skipped.
+/// Cancel an operation in the legacy registry inside a caller-owned transaction.
 pub(crate) async fn coordinator_cancel(
     tx: &Transaction<'_>,
     actor: &Identity,
@@ -32,7 +31,20 @@ pub(crate) async fn coordinator_cancel(
     deadline: Instant,
 ) -> Result<CancelOutcome, DecisionError> {
     validate_reason(reason)?;
-    cancel_in_tx(tx, actor, identity, reason, deadline).await
+    let receipt = PgRefStore.cancel(tx, identity, deadline).await?;
+    settle_authorized_cancellation(tx, actor, identity, reason, receipt).await
+}
+
+pub(crate) async fn coordinator_cancel_public_attempt(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    cancellation: &PublicCancellation,
+    reason: &str,
+    deadline: Instant,
+) -> Result<CancelOutcome, DecisionError> {
+    validate_reason(reason)?;
+    let receipt = PgRefStore.cancel_locked_public_attempt(tx, cancellation, deadline).await?;
+    settle_authorized_cancellation(tx, actor, cancellation.identity(), reason, receipt).await
 }
 
 fn validate_reason(reason: &str) -> Result<(), DecisionError> {
@@ -45,18 +57,14 @@ fn validate_reason(reason: &str) -> Result<(), DecisionError> {
     Ok(())
 }
 
-async fn cancel_in_tx(
+async fn settle_authorized_cancellation(
     tx: &Transaction<'_>,
     actor: &Identity,
     identity: &OperationIdentity,
     reason: &str,
-    deadline: Instant,
+    receipt: CancelReceipt,
 ) -> Result<CancelOutcome, DecisionError> {
-    crate::ref_store::pg::bound(tx, deadline).await?;
-
-    // 1. Migration-138 prefix FIRST (operation advisory key -> lane -> tombstone), so a cancel can
-    //    never invert against a commit that takes the same prefix.
-    let receipt = PgRefStore.cancel(tx, identity, deadline).await?;
+    // The caller took the operation and lane locks before writing the tombstone.
     // 2. Frozen source table locks, then repository -> tenant usage -> repository usage -> gate ->
     //    protocol, before any live authority read.
     sql_locks::lock_source_tables(tx, &PublicationAction::Push).await?;
