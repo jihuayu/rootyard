@@ -1,14 +1,8 @@
 //! Crate-private terminal mirror for migration 152's current public attempt.
 //!
-//! This is the stage-one production-path prerequisite for issue 42: it makes an
-//! already durable migration-138/139 private terminal visible through the
-//! migration-152 public wrapper. It mirrors the exact current slot-zero attempt
-//! and, once the existing rotation has already atomically admitted slot one, the
-//! exact current slot-one attempt. It is deliberately not a serving cutover and
-//! has no production caller. Nothing here allocates a sequence, claims a new
-//! private UUID, writes an event, rotates or retires a slot, creates a second
-//! retirement or third attempt, resolves an unknown COMMIT or calls the legacy
-//! gateway.
+//! An already durable migration-138/139 private terminal becomes visible
+//! through the migration-152 public wrapper after the current attempt and every
+//! preceding retirement have been verified under the same locks.
 //!
 //! The caller supplies the exact [`PublicAttemptRequest`] already authenticated
 //! at the serving boundary and the exact private [`OperationRecord`] already
@@ -17,9 +11,9 @@
 //! refusals. The record's terminal body is never trusted on its own: it must
 //! equal the stored migration-138 terminal result and the one immutable
 //! migration-139 event body, with the event kind/repository/revision fields and
-//! the exact migration-147 serving binding agreeing with the wrapper. On slot
-//! one the same snapshot must also prove the exact retired slot-zero event and
-//! the fresh successor sequence/base lineage.
+//! the exact migration-147 serving binding agreeing with the wrapper. Each
+//! predecessor must have its own exact retirement event and contiguous
+//! successor lineage.
 //!
 //! # Transaction and lock order
 //!
@@ -36,8 +30,8 @@
 //!
 //! Every identity, attempt, operation, event, binding, realm and revision check
 //! is completed before the single guarded `UPDATE`. That update either affects
-//! exactly the one pending current-slot row pinned by its slot and, for slot
-//! one, the exact `retired_event_id`, or no row; after a successful one-row
+//! exactly the one pending current-slot row pinned by its slot and ordered
+//! retirement events, or no row; after a successful one-row
 //! update the only remaining check is the SQL evidence verifier itself. A
 //! verification failure aborts the caller's transaction instead of returning a
 //! commit-able partially published wrapper. Any SQL error likewise aborts it; a
@@ -51,18 +45,17 @@
 //! good publication is not refused merely because unrelated later revisions
 //! advanced.
 //!
-//! Retirement is independent and slot-zero only. If the rejected event is the
-//! exact slot-zero stale rejection (`revision_mismatch`, empty registrations) at
-//! the current advanced gate, publishing it would close the only migration-152
-//! rotation path. The mirror therefore returns
-//! [`PublicAttemptTerminalOutcome::RetirementRequired`] without writing. The
-//! slot-one branch never returns that outcome and never mutates the retired
-//! attempt; it only publishes or exactly replays the already-current terminal.
+//! A gate-aligned stale rejection (`revision_mismatch`, empty registrations)
+//! on slot zero or one returns [`PublicAttemptTerminalOutcome::RetirementRequired`]
+//! without writing. Slot two publishes or replays its exact terminal outcome.
 use super::{
     PgRefStore, bound,
     public_attempt::{
-        PublicAttemptRequest, RawWrapper, Redacted, ledger, parse_digest, parse_state, stale_realm, validate_wrapper,
+        PublicAttempt, PublicAttemptRequest, RawWrapper, Redacted, ledger, parse_digest, parse_state, stale_realm,
+        validate_wrapper,
     },
+    slot_one::recompute_slot_two_proof,
+    slot_zero::recompute_slot_zero_proof,
 };
 use crate::ref_store::{
     OperationRecord, OperationState, RefStoreError,
@@ -83,6 +76,7 @@ use uuid::Uuid;
 /// result instead of preparing a statement whose objects do not exist.
 const SCHEMA_PROBE: &str = "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152), \
         current_setting('transaction_isolation') = 'read committed', \
+        to_regclass('ref_store_attempt_retirements') IS NOT NULL, \
         to_regprocedure('rootyard_ref_store_lock_public_operation(uuid,uuid,uuid)') IS NOT NULL, \
         to_regprocedure('rootyard_ref_store_attempt_has_binding(\
             ref_store_public_operations,ref_store_private_attempts)') IS NOT NULL, \
@@ -92,7 +86,7 @@ const SCHEMA_PROBE: &str = "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE 
             ref_store_public_operations,ref_store_private_attempts)') IS NOT NULL, \
         to_regprocedure('rootyard_ref_store_verify_public_operation(uuid,uuid)') IS NOT NULL";
 
-/// One snapshot of the wrapper, both possible attempts, the private operation
+/// One snapshot of the wrapper, its ordered attempts, the private operation
 /// and its event. The migration-152 binding predicate stays inside PostgreSQL;
 /// it is the reviewed authoritative SQL check, not a second vocabulary here.
 const SELECT_EVIDENCE: &str = r#"
@@ -102,7 +96,7 @@ SELECT jsonb_build_object(
             SELECT repository_id, public_id, admission_owner_id, issuer_id, wire_digest,
                    request_mode, backend_identity, object_format, history_incarnation,
                    authority_epoch, group_epoch, restore_incarnation, current_slot,
-                   state, event_id, retired_event_id, cancelled_private_id
+                   state, event_id, cancelled_private_id
               FROM ref_store_public_operations
              WHERE repository_id=$1 AND public_id=$2
         ) w
@@ -118,6 +112,7 @@ SELECT jsonb_build_object(
                    o.state AS operation_state,
                    o.terminal_result IS NOT NULL AS terminal_present,
                    e.event_id,
+                   r.event_id AS retired_event_id,
                    e.revision AS event_revision,
                    COALESCE(e.event_id IS NOT NULL AND e.outcome = o.state, false)
                        AS event_outcome_matches,
@@ -156,6 +151,8 @@ SELECT jsonb_build_object(
                 ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
               LEFT JOIN ref_store_core_events e
                 ON e.repository_id=a.repository_id AND e.operation_id=a.private_id
+              LEFT JOIN ref_store_attempt_retirements r
+                ON r.repository_id=a.repository_id AND r.public_id=a.public_id AND r.slot=a.slot
               LEFT JOIN ref_store_cancellations c
                 ON c.repository_id=a.repository_id AND c.operation_id=a.private_id
               LEFT JOIN ref_store_cancellations k
@@ -190,25 +187,16 @@ const CURRENT_SCOPE: &str = "SELECT rootyard_ref_store_attempt_current_scope(w)
 const STALE_GATE: &str = "SELECT rootyard_ref_store_attempt_stale_gate(w,a)
      FROM ref_store_public_operations w
      JOIN ref_store_private_attempts a
-       ON a.repository_id=w.repository_id AND a.public_id=w.public_id AND a.slot=0
+       ON a.repository_id=w.repository_id AND a.public_id=w.public_id AND a.slot=w.current_slot
      WHERE w.repository_id=$1 AND w.public_id=$2";
 
 const UPDATE_TERMINAL: &str = "UPDATE ref_store_public_operations
      SET state=$3,event_id=$4
      WHERE repository_id=$1 AND public_id=$2
-       AND state='pending' AND current_slot=0
-       AND retired_event_id IS NULL AND event_id IS NULL
-       AND cancelled_private_id IS NULL";
-
-/// Slot one is already current on the wrapper. Pin that current slot and the
-/// exact retired slot-zero event selected by the existing rotation; never
-/// create a second retirement or move the wrapper back to slot zero.
-const UPDATE_TERMINAL_SLOT_ONE: &str = "UPDATE ref_store_public_operations
-     SET state=$3,event_id=$4
-     WHERE repository_id=$1 AND public_id=$2
-       AND state='pending' AND current_slot=1
-       AND retired_event_id=$5 AND event_id IS NULL
-       AND cancelled_private_id IS NULL";
+       AND state='pending' AND current_slot=$5 AND event_id IS NULL
+       AND cancelled_private_id IS NULL
+       AND ARRAY(SELECT event_id FROM ref_store_attempt_retirements
+                 WHERE repository_id=$1 AND public_id=$2 ORDER BY slot)=$6::uuid[]";
 
 const VERIFY_TERMINAL: &str = "SELECT rootyard_ref_store_verify_public_operation($1,$2)";
 
@@ -232,7 +220,7 @@ impl fmt::Debug for PublicAttemptTerminalReceipt {
     }
 }
 
-/// A slot-zero stale rejection that is currently retirement-eligible. The
+/// A stale rejection that is currently retirement-eligible. The
 /// wrapper remains pending and the event/operation are untouched.
 #[allow(dead_code)] // Crate-private foundation: retirement is a separate reviewed increment.
 #[derive(Clone, Eq, PartialEq)]
@@ -252,7 +240,7 @@ impl fmt::Debug for PublicAttemptRetirement {
 }
 
 /// The mirror either publishes (or exactly replays) a terminal, or refuses to
-/// close a retirement-eligible slot-zero rejection.
+/// close a retirement-eligible rejection.
 #[allow(dead_code)] // Crate-private foundation: the future wrapper gateway consumes it.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum PublicAttemptTerminalOutcome {
@@ -274,9 +262,7 @@ impl fmt::Debug for PublicAttemptTerminalOutcome {
 impl PgRefStore {
     /// Mirror one already-durable migration-138/139 terminal into its pending
     /// migration-152 current wrapper inside a caller-owned dedicated
-    /// transaction. Current slot zero keeps its exact prior semantics; current
-    /// slot one must already have been admitted by the existing rotation and is
-    /// mirrored only when the record is that exact current private operation.
+    /// transaction. Any prior rotations must already be durable.
     ///
     /// The method never begins, commits or rolls back. On any error the caller
     /// must roll the dedicated transaction back; SQL errors already abort it.
@@ -323,10 +309,10 @@ impl PgRefStore {
                 "public terminal mirror requires a read committed transaction",
             )));
         }
-        for index in 2usize..7 {
+        for index in 2usize..8 {
             if !schema.get::<_, bool>(index) {
                 return Err(PackCommitError::from(RefStoreError::Unsupported(
-                    "public terminal mirror requires the migration 152 lock and evidence functions",
+                    "public terminal mirror requires the migration 152 retirement ledger and evidence functions",
                 )));
             }
         }
@@ -364,116 +350,39 @@ impl PgRefStore {
             }));
         }
 
-        // Slot one is the already-rotated successor. It has exactly one retired
-        // slot-zero rejection and one current slot-one attempt; the caller's
-        // record must be that current private operation, never the retired one.
-        // There is no second retirement, sequence allocation or third attempt.
-        if wrapper.current_slot() == 1 {
-            let retired_event_id = wrapper
-                .retired_event_id()
-                .filter(|event_id| !event_id.is_nil())
-                .ok_or_else(|| ledger("slot one public operation has no exact retired event"))?;
-            if wrapper.cancelled_private_id().is_some() {
-                return Err(PackCommitError::from(RefStoreError::Unsupported(
-                    "slot one terminal mirror requires a non-cancelled public operation",
-                )));
-            }
-
-            let (retired, current) = slot_one_attempts(&evidence.attempts)?;
-            let (retired_sequence, retired_event_revision) =
-                validate_slot_zero_retired(retired, request, retired_event_id)?;
-            let operation =
-                evidence.operation.as_ref().ok_or_else(|| ledger("terminal private operation is missing"))?;
-            validate_operation(operation, record)?;
-            let event = evidence.event.as_ref().ok_or_else(|| ledger("terminal core event is missing"))?;
-            validate_event(event, request, record)?;
-            let current_sequence = validate_slot_one_current(current, request, record, operation, event)?;
-            if current.private_id == retired.private_id
-                || current.plan_digest == retired.plan_digest
-                || current.proof_digest == retired.proof_digest
-                || current.operation_lane != retired.operation_lane
-            {
-                return Err(ledger("slot one terminal reuses retired identity, plan, proof or lane"));
-            }
-            validate_slot_one_lineage(
-                retired_sequence,
-                retired_event_revision,
-                current_sequence,
-                current.base_revision,
-            )?;
-            validate_revision(record.state(), current.base_revision, event.revision)?;
-
-            // The wrapper transition still requires the current ready
-            // repository/serving realm and the active restore incarnation. The
-            // gate revision may legitimately be later than the slot-one base.
-            refresh_bound(tx, deadline).await?;
-            let gate_revision = current_scope_revision(tx, request).await?;
-            if gate_revision < current.base_revision {
-                return Err(ledger("slot one terminal current gate precedes its base revision"));
-            }
-
-            if wrapper_state == OperationState::Pending {
-                refresh_bound(tx, deadline).await?;
-                tx.execute("SET LOCAL synchronous_commit = 'on'", &[]).await.map_err(|error| {
-                    write_sql_error(error, "public terminal mirror durability could not be requested")
-                })?;
-                let state = record.state().as_str();
-                let changed = tx
-                    .execute(
-                        UPDATE_TERMINAL_SLOT_ONE,
-                        &[&request.repository_id, &request.public_id, &state, &event.event_id, &retired_event_id],
-                    )
-                    .await
-                    .map_err(|error| write_sql_error(error, "public operation terminal update was refused"))?;
-                if changed != 1 {
-                    return Err(ledger("public operation terminal update did not match exactly one row"));
-                }
-
-                verify_public_operation(tx, request).await?;
-                return Ok(PublicAttemptTerminalOutcome::Mirrored(PublicAttemptTerminalReceipt {
-                    state: record.state(),
-                    event_id: event.event_id,
-                    replayed: false,
-                }));
-            }
-
-            // Only the exact already-published slot-one terminal may replay.
-            if wrapper_state != record.state() {
-                return Err(PackCommitError::from(RefStoreError::TerminalImmutable));
-            }
-            if wrapper.event_id() != Some(event.event_id) {
-                return Err(ledger("public operation published event differs from its terminal"));
-            }
-            refresh_bound(tx, deadline).await?;
-            verify_public_operation(tx, request).await?;
-            return Ok(PublicAttemptTerminalOutcome::Mirrored(PublicAttemptTerminalReceipt {
-                state: wrapper_state,
-                event_id: event.event_id,
-                replayed: true,
-            }));
-        }
-
-        if wrapper.current_slot() != 0
-            || wrapper.retired_event_id().is_some()
-            || wrapper.cancelled_private_id().is_some()
-        {
-            return Err(PackCommitError::from(RefStoreError::Unsupported(
-                "public terminal mirror requires current slot zero without retirement or cancellation",
-            )));
-        }
-
-        let attempt = validate_attempt(&evidence.attempts, record)?;
+        let current_slot = wrapper.current_slot();
+        let (current, retired_event_ids) = validate_attempt_chain(&evidence.attempts, current_slot, request)?;
         let operation = evidence.operation.as_ref().ok_or_else(|| ledger("terminal private operation is missing"))?;
         validate_operation(operation, record)?;
         let event = evidence.event.as_ref().ok_or_else(|| ledger("terminal core event is missing"))?;
         validate_event(event, request, record)?;
-        validate_revision(record.state(), attempt, event.revision)?;
+        if current.private_id != record.identity().operation_id()
+            || current.plan_digest != *record.identity().digest()
+            || &current.lane != record.identity().lane()
+            || current.sequence != record.identity().sequence()
+            || current.state != record.state()
+            || current.event_id != Some(event.event_id)
+            || current.event_revision != Some(event.revision)
+        {
+            return Err(ledger("current private attempt differs from the terminal record"));
+        }
+        validate_revision(record.state(), current.base_revision, event.revision)?;
 
         refresh_bound(tx, deadline).await?;
         let gate_revision = current_scope_revision(tx, request).await?;
+        if gate_revision < event.revision {
+            return Err(ledger("public terminal current gate precedes its event revision"));
+        }
 
         if wrapper_state == OperationState::Pending {
-            if retirement_candidate(record.state(), attempt, event.revision, gate_revision, &event.payload) {
+            if retirement_candidate(
+                current_slot,
+                record.state(),
+                current.base_revision,
+                event.revision,
+                gate_revision,
+                &event.payload,
+            ) {
                 refresh_bound(tx, deadline).await?;
                 let stale_revision = stale_gate_revision(tx, request).await?;
                 if stale_revision != gate_revision || stale_revision != event.revision {
@@ -486,24 +395,32 @@ impl PgRefStore {
             }
 
             refresh_bound(tx, deadline).await?;
-            // The caller's COMMIT is the publication point; request WAL
-            // durability before the only data-mutating statement.
+            // The caller's COMMIT is the publication point; require WAL
+            // durability before touching the wrapper.
             tx.execute("SET LOCAL synchronous_commit = 'on'", &[])
                 .await
                 .map_err(|error| write_sql_error(error, "public terminal mirror durability could not be requested"))?;
             let state = record.state().as_str();
             let changed = tx
-                .execute(UPDATE_TERMINAL, &[&request.repository_id, &request.public_id, &state, &event.event_id])
+                .execute(
+                    UPDATE_TERMINAL,
+                    &[
+                        &request.repository_id,
+                        &request.public_id,
+                        &state,
+                        &event.event_id,
+                        &current_slot,
+                        &retired_event_ids,
+                    ],
+                )
                 .await
                 .map_err(|error| write_sql_error(error, "public operation terminal update was refused"))?;
             if changed != 1 {
                 return Err(ledger("public operation terminal update did not match exactly one row"));
             }
 
-            // Prove the deferred evidence trigger's shape before returning. A
-            // failure here is a SQL error and aborts the dedicated transaction.
+            // A failure here is a SQL error and aborts the dedicated transaction.
             verify_public_operation(tx, request).await?;
-
             return Ok(PublicAttemptTerminalOutcome::Mirrored(PublicAttemptTerminalReceipt {
                 state: record.state(),
                 event_id: event.event_id,
@@ -511,17 +428,12 @@ impl PgRefStore {
             }));
         }
 
-        // Already published. All exact evidence above still had to agree, and
-        // every mismatching terminal is immutable rather than republished.
         if wrapper_state != record.state() {
             return Err(PackCommitError::from(RefStoreError::TerminalImmutable));
         }
         if wrapper.event_id() != Some(event.event_id) {
             return Err(ledger("public operation published event differs from its terminal"));
         }
-        // Replay is read-only but must still prove the same durable shape,
-        // including cancellation-tombstone consistency that the manual checks
-        // deliberately do not duplicate.
         refresh_bound(tx, deadline).await?;
         verify_public_operation(tx, request).await?;
         Ok(PublicAttemptTerminalOutcome::Mirrored(PublicAttemptTerminalReceipt {
@@ -557,43 +469,120 @@ fn validate_record(request: &PublicAttemptRequest, record: &OperationRecord) -> 
     Ok(())
 }
 
-fn validate_attempt(attempts: &[MirrorAttempt], record: &OperationRecord) -> Result<i64, PackCommitError> {
-    let [attempt] = attempts else {
-        return Err(ledger("public operation must have exactly one slot-zero attempt"));
-    };
-    if attempt.slot != 0 {
-        return Err(ledger("public operation current attempt is not slot zero"));
+fn validate_attempt_chain(
+    attempts: &[MirrorAttempt],
+    current_slot: i16,
+    request: &PublicAttemptRequest,
+) -> Result<(PublicAttempt, Vec<Uuid>), PackCommitError> {
+    let (current, retired) = attempts.split_last().ok_or_else(|| ledger("public operation has no private attempts"))?;
+    if !(0..=2).contains(&current_slot) || retired.len() != current_slot as usize || current.slot != current_slot {
+        return Err(ledger("public operation does not have a contiguous attempt prefix"));
     }
-    if attempt.private_id != record.identity().operation_id() {
-        return Err(ledger("private attempt identity differs from the terminal record"));
+    if current.retired_event_id.is_some() {
+        return Err(ledger("the current private attempt already has a retirement"));
     }
-    if !attempt.serving_bound {
-        return Err(ledger("private attempt serving producer binding differs"));
+    let current = parse_terminal_attempt(current, request)?;
+    let mut preceding = Vec::with_capacity(retired.len());
+    let mut retirement_ids = Vec::with_capacity(retired.len());
+    for (slot, row) in retired.iter().enumerate() {
+        let attempt = parse_terminal_attempt(row, request)?;
+        let event_id = row.retired_event_id.ok_or_else(|| ledger("retired attempt has no linked event"))?;
+        if attempt.slot as usize != slot
+            || attempt.state != OperationState::Rejected
+            || attempt.event_id != Some(event_id)
+            || !row.revision_mismatch_rejection
+            || attempt.event_revision.is_none_or(|revision| revision <= attempt.base_revision)
+        {
+            return Err(ledger("retired attempt is not the exact ordered revision-mismatch rejection"));
+        }
+        if current.event_id == Some(event_id) || retirement_ids.contains(&event_id) {
+            return Err(ledger("private attempt event is reused"));
+        }
+        retirement_ids.push(event_id);
+        preceding.push(attempt);
     }
-    let plan_digest = parse_digest(&attempt.plan_digest, "stored private attempt plan digest is not canonical")?;
-    if plan_digest != *record.identity().digest() {
-        return Err(ledger("private attempt plan digest differs from the terminal record"));
+
+    for (index, retired) in preceding.iter().enumerate() {
+        let successor = preceding.get(index + 1).unwrap_or(&current);
+        let event_revision = retired.event_revision.ok_or_else(|| ledger("retired event revision is missing"))?;
+        validate_successor_revision(retired.sequence, event_revision, successor.sequence, successor.base_revision)?;
+        if retired.lane != successor.lane {
+            return Err(ledger("successor switches the retired attempt's lane"));
+        }
+        if preceding[index + 1..].iter().chain(std::iter::once(&current)).any(|later| {
+            later.private_id == retired.private_id
+                || later.plan_digest == retired.plan_digest
+                || later.proof_digest == retired.proof_digest
+        }) {
+            return Err(ledger("successor reuses a retired identity, plan or proof"));
+        }
     }
-    // The proof is not part of the mirror predicate, but a non-canonical
-    // stored proof is still durable inconsistency and must fail closed.
-    let _proof = parse_digest(&attempt.proof_digest, "stored private attempt proof digest is not canonical")?;
-    if attempt.base_revision <= 0 {
-        return Err(ledger("stored private attempt base revision is not positive"));
+
+    if let [first, second] = preceding.as_slice()
+        && (recompute_slot_zero_proof(request, first)? != first.proof_digest
+            || recompute_slot_two_proof(request, first, second, &current)? != current.proof_digest)
+    {
+        return Err(ledger("third terminal proof does not bind the ordered attempt chain"));
     }
-    Ok(attempt.base_revision)
+
+    Ok((current, retirement_ids))
 }
 
-/// The rotated wrapper carries exactly the retired slot-zero attempt and the
-/// current slot-one attempt. The SQL already orders by slot; any other shape is
-/// ambiguous and fails closed.
-fn slot_one_attempts(attempts: &[MirrorAttempt]) -> Result<(&MirrorAttempt, &MirrorAttempt), PackCommitError> {
-    let [retired, current] = attempts else {
-        return Err(ledger("slot one public operation must have exactly two attempts"));
-    };
-    if retired.slot != 0 || current.slot != 1 {
-        return Err(ledger("slot one public operation attempts are not exactly slot zero then one"));
+fn parse_terminal_attempt(
+    attempt: &MirrorAttempt,
+    request: &PublicAttemptRequest,
+) -> Result<PublicAttempt, PackCommitError> {
+    if attempt.private_id.is_nil() || attempt.private_id == request.public_id || attempt.base_revision <= 0 {
+        return Err(ledger("private attempt has an invalid identity or base revision"));
     }
-    Ok((retired, current))
+    if !attempt.serving_bound || attempt.operation_issuer_id != Some(request.issuer_id) {
+        return Err(ledger("private attempt differs from its serving producer binding or issuer"));
+    }
+    let plan_digest = parse_digest(&attempt.plan_digest, "stored private attempt plan digest is not canonical")?;
+    let proof_digest = parse_digest(&attempt.proof_digest, "stored private attempt proof digest is not canonical")?;
+    let stored_digest = attempt
+        .operation_request_digest
+        .as_deref()
+        .ok_or_else(|| ledger("private attempt operation digest is missing"))?;
+    if parse_digest(stored_digest, "stored private attempt operation digest is not canonical")? != plan_digest {
+        return Err(ledger("private attempt operation digest differs from its plan"));
+    }
+
+    let lane = attempt
+        .operation_lane
+        .as_deref()
+        .ok_or_else(|| ledger("private attempt lane is missing"))?
+        .parse()
+        .map_err(|_| ledger("private attempt lane is not canonical"))?;
+    let sequence = attempt
+        .operation_sequence
+        .filter(|sequence| *sequence > 0)
+        .ok_or_else(|| ledger("private attempt lacks a positive sequence"))?;
+    let stored_state = attempt.operation_state.as_deref().ok_or_else(|| ledger("private attempt state is missing"))?;
+    let state = parse_state(stored_state, "stored private attempt state is not recognized")?;
+    if !matches!(state, OperationState::Committed | OperationState::Rejected) || !attempt.terminal_present {
+        return Err(ledger("private attempt does not have a committed or rejected terminal"));
+    }
+    let (Some(event_id), Some(event_revision)) = (attempt.event_id, attempt.event_revision) else {
+        return Err(ledger("private attempt terminal event evidence is missing"));
+    };
+    if event_id.is_nil() || !attempt.event_outcome_matches || !attempt.event_body_matches {
+        return Err(ledger("private attempt event differs from its operation"));
+    }
+    validate_terminal_tombstone(attempt, state, "private attempt cancellation tombstone differs from its operation")?;
+
+    Ok(PublicAttempt {
+        slot: attempt.slot,
+        private_id: attempt.private_id,
+        plan_digest,
+        proof_digest,
+        base_revision: attempt.base_revision,
+        lane,
+        sequence,
+        state,
+        event_id: Some(event_id),
+        event_revision: Some(event_revision),
+    })
 }
 
 /// A terminal private attempt may have the immutable cancellation tombstone
@@ -625,167 +614,29 @@ fn validate_terminal_tombstone(
     Ok(())
 }
 
-/// Re-prove the already-retired slot-zero attempt from the same snapshot. Its
-/// event must be the wrapper's exact retired event, its terminal body must be
-/// the canonical revision-mismatch rejection at an advanced revision, and its
-/// cancellation evidence must be absent or the exact immutable terminal
-/// tombstone accepted by migration 152.
-fn validate_slot_zero_retired(
-    attempt: &MirrorAttempt,
-    request: &PublicAttemptRequest,
-    retired_event_id: Uuid,
-) -> Result<(i64, i64), PackCommitError> {
-    if attempt.slot != 0 {
-        return Err(ledger("retired public attempt is not slot zero"));
-    }
-    if attempt.private_id.is_nil() || attempt.private_id == request.public_id {
-        return Err(ledger("retired public attempt identity aliases the public identifier"));
-    }
-    let plan_digest = parse_digest(&attempt.plan_digest, "stored retired attempt plan digest is not canonical")?;
-    let _proof_digest = parse_digest(&attempt.proof_digest, "stored retired attempt proof digest is not canonical")?;
-    if attempt.base_revision <= 0 {
-        return Err(ledger("stored retired attempt base revision is not positive"));
-    }
-    if !attempt.serving_bound {
-        return Err(ledger("retired private attempt serving producer binding differs"));
-    }
-    if attempt.operation_issuer_id != Some(request.issuer_id) {
-        return Err(ledger("retired private attempt operation issuer differs from its wrapper"));
-    }
-    if attempt.operation_lane.is_none() {
-        return Err(ledger("retired private attempt operation lane is missing"));
-    }
-    let sequence = attempt.operation_sequence.ok_or_else(|| ledger("retired private attempt sequence is missing"))?;
-    if sequence <= 0 {
-        return Err(ledger("retired private attempt sequence is not positive"));
-    }
-    let operation_digest = parse_digest(
-        attempt
-            .operation_request_digest
-            .as_deref()
-            .ok_or_else(|| ledger("retired private attempt request digest is missing"))?,
-        "stored retired attempt operation digest is not canonical",
-    )?;
-    if operation_digest != plan_digest {
-        return Err(ledger("retired private attempt operation digest differs from its plan digest"));
-    }
-    let state = parse_state(
-        attempt.operation_state.as_deref().ok_or_else(|| ledger("retired private attempt state is missing"))?,
-        "stored retired attempt operation state is not recognized",
-    )?;
-    if state != OperationState::Rejected {
-        return Err(ledger("retired public attempt is not a rejection"));
-    }
-    if !attempt.terminal_present {
-        return Err(ledger("retired private attempt has no terminal result"));
-    }
-    let event_id = attempt.event_id.ok_or_else(|| ledger("retired private attempt has no migration-139 event"))?;
-    if event_id != retired_event_id {
-        return Err(ledger("retired public attempt event differs from the wrapper retirement"));
-    }
-    let event_revision =
-        attempt.event_revision.ok_or_else(|| ledger("retired private attempt event revision is missing"))?;
-    if event_revision <= attempt.base_revision {
-        return Err(ledger("retired public attempt did not observe an advanced gate"));
-    }
-    if !attempt.event_outcome_matches || !attempt.event_body_matches {
-        return Err(ledger("retired private attempt event differs from its operation"));
-    }
-    if !attempt.revision_mismatch_rejection {
-        return Err(ledger("retired public attempt is not the exact revision-mismatch rejection"));
-    }
-    validate_terminal_tombstone(
-        attempt,
-        state,
-        "retired private attempt cancellation tombstone differs from its operation",
-    )?;
-    Ok((sequence, event_revision))
-}
-
-/// Re-prove that the caller's terminal record is the actual current slot-one
-/// private operation: exact identity/digest, canonical proof, exact migration
-/// 138 operation row, migration 139 event, and absent or exact immutable
-/// terminal cancellation evidence.
-fn validate_slot_one_current(
-    attempt: &MirrorAttempt,
-    request: &PublicAttemptRequest,
-    record: &OperationRecord,
-    operation: &MirrorOperation,
-    event: &MirrorEvent,
-) -> Result<i64, PackCommitError> {
-    if attempt.slot != 1 {
-        return Err(ledger("public operation current attempt is not slot one"));
-    }
-    if attempt.private_id != record.identity().operation_id() {
-        return Err(ledger("slot one current private identity differs from the terminal record"));
-    }
-    if attempt.private_id.is_nil() || attempt.private_id == request.public_id {
-        return Err(ledger("slot one current private identity aliases the public identifier"));
-    }
-    let plan_digest = parse_digest(&attempt.plan_digest, "stored slot-one attempt plan digest is not canonical")?;
-    if plan_digest != *record.identity().digest() {
-        return Err(ledger("slot one current plan digest differs from the terminal record"));
-    }
-    let _proof_digest = parse_digest(&attempt.proof_digest, "stored slot-one attempt proof digest is not canonical")?;
-    if attempt.base_revision <= 0 {
-        return Err(ledger("stored slot-one attempt base revision is not positive"));
-    }
-    if !attempt.serving_bound {
-        return Err(ledger("slot one current private attempt serving producer binding differs"));
-    }
-    let sequence =
-        attempt.operation_sequence.ok_or_else(|| ledger("slot one current operation sequence is missing"))?;
-    if sequence <= 0 {
-        return Err(ledger("slot one current operation sequence is not positive"));
-    }
-    if attempt.operation_issuer_id != Some(operation.issuer_id)
-        || attempt.operation_lane.as_deref() != Some(operation.lane.as_str())
-        || attempt.operation_sequence != Some(operation.sequence)
-        || attempt.operation_request_digest.as_deref() != Some(operation.request_digest.as_str())
-        || attempt.operation_state.as_deref() != Some(operation.state.as_str())
-    {
-        return Err(ledger("slot one current private operation differs from its terminal record"));
-    }
-    if !attempt.terminal_present {
-        return Err(ledger("slot one current private operation has no terminal result"));
-    }
-    if attempt.event_id != Some(event.event_id) || attempt.event_revision != Some(event.revision) {
-        return Err(ledger("slot one current private event differs from the terminal record"));
-    }
-    if !attempt.event_outcome_matches || !attempt.event_body_matches {
-        return Err(ledger("slot one current private event differs from its operation"));
-    }
-    validate_terminal_tombstone(
-        attempt,
-        record.state(),
-        "slot one current cancellation tombstone differs from its operation",
-    )?;
-    Ok(sequence)
-}
-
-/// The slot-one successor must use a checked later BIGINT sequence and the
+/// The successor must use a checked later BIGINT sequence and the
 /// retired event revision as its exact base. The base must itself be able to
 /// advance by one for a committed terminal.
-fn validate_slot_one_lineage(
+fn validate_successor_revision(
     retired_sequence: i64,
     retired_event_revision: i64,
     current_sequence: i64,
     current_base_revision: i64,
 ) -> Result<(), PackCommitError> {
     if retired_sequence <= 0 || retired_event_revision <= 0 {
-        return Err(ledger("slot one retired sequence or event revision is not positive"));
+        return Err(ledger("retired sequence or event revision is not positive"));
     }
     if current_sequence <= 0 || current_base_revision <= 0 {
-        return Err(ledger("slot one current sequence or base revision is not positive"));
+        return Err(ledger("successor sequence or base revision is not positive"));
     }
-    let minimum = retired_sequence.checked_add(1).ok_or_else(|| ledger("slot one retired sequence cannot advance"))?;
+    let minimum = retired_sequence.checked_add(1).ok_or_else(|| ledger("retired sequence cannot advance"))?;
     if current_sequence < minimum {
-        return Err(ledger("slot one sequence does not advance the retired attempt"));
+        return Err(ledger("successor sequence does not advance the retired attempt"));
     }
     if current_base_revision != retired_event_revision {
-        return Err(ledger("slot one base revision differs from the retired event"));
+        return Err(ledger("successor base revision differs from the retired event"));
     }
-    current_base_revision.checked_add(1).ok_or_else(|| ledger("slot one base revision cannot advance"))?;
+    current_base_revision.checked_add(1).ok_or_else(|| ledger("successor base revision cannot advance"))?;
     Ok(())
 }
 
@@ -872,13 +723,15 @@ fn validate_revision(state: OperationState, base_revision: i64, event_revision: 
 }
 
 fn retirement_candidate(
+    slot: i16,
     state: OperationState,
     base_revision: i64,
     event_revision: i64,
     gate_revision: i64,
     payload: &Value,
 ) -> bool {
-    state == OperationState::Rejected
+    (0..2).contains(&slot)
+        && state == OperationState::Rejected
         && event_revision > base_revision
         && event_revision == gate_revision
         && is_revision_mismatch_rejection(payload)
@@ -1026,6 +879,7 @@ struct MirrorAttempt {
     operation_state: Option<String>,
     terminal_present: bool,
     event_id: Option<Uuid>,
+    retired_event_id: Option<Uuid>,
     event_revision: Option<i64>,
     event_outcome_matches: bool,
     event_body_matches: bool,
@@ -1057,10 +911,13 @@ struct MirrorEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        MirrorAttempt, is_revision_mismatch_rejection, retirement_candidate, validate_revision,
-        validate_slot_one_lineage, validate_terminal_tombstone,
+        MirrorAttempt, PublicAttemptRequest, is_revision_mismatch_rejection, parse_terminal_attempt,
+        recompute_slot_two_proof, recompute_slot_zero_proof, retirement_candidate, validate_attempt_chain,
+        validate_revision, validate_successor_revision, validate_terminal_tombstone,
     };
-    use crate::ref_store::OperationState;
+    use crate::ref_store::{
+        CommitMode, GitObjectFormat, OperationState, RequestDigest, pg::slot_one::recompute_slot_one_proof,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -1079,6 +936,7 @@ mod tests {
             operation_state: Some("rejected".into()),
             terminal_present: true,
             event_id: Some(Uuid::from_u128(3)),
+            retired_event_id: None,
             event_revision: Some(2),
             event_outcome_matches: true,
             event_body_matches: true,
@@ -1127,15 +985,15 @@ mod tests {
     }
 
     #[test]
-    fn slot_one_lineage_advances_sequence_and_pins_the_retired_revision() {
-        assert!(validate_slot_one_lineage(4, 7, 5, 7).is_ok());
-        assert!(validate_slot_one_lineage(4, 7, 9, 7).is_ok());
-        assert!(validate_slot_one_lineage(4, 7, 4, 7).is_err());
-        assert!(validate_slot_one_lineage(i64::MAX, 7, i64::MAX, 7).is_err());
-        assert!(validate_slot_one_lineage(4, 7, 5, 8).is_err());
-        assert!(validate_slot_one_lineage(4, i64::MAX, 5, i64::MAX).is_err());
-        assert!(validate_slot_one_lineage(0, 7, 1, 7).is_err());
-        assert!(validate_slot_one_lineage(4, 7, 5, 0).is_err());
+    fn successor_advances_sequence_and_starts_at_the_exact_retired_revision() {
+        assert!(validate_successor_revision(4, 7, 5, 7).is_ok());
+        assert!(validate_successor_revision(4, 7, 9, 7).is_ok());
+        assert!(validate_successor_revision(4, 7, 4, 7).is_err());
+        assert!(validate_successor_revision(i64::MAX, 7, i64::MAX, 7).is_err());
+        assert!(validate_successor_revision(4, 7, 5, 8).is_err());
+        assert!(validate_successor_revision(4, i64::MAX, 5, i64::MAX).is_err());
+        assert!(validate_successor_revision(0, 7, 1, 7).is_err());
+        assert!(validate_successor_revision(4, 7, 5, 0).is_err());
     }
 
     #[test]
@@ -1153,10 +1011,12 @@ mod tests {
             "registrations": [],
         });
         assert!(is_revision_mismatch_rejection(&stale));
-        assert!(retirement_candidate(OperationState::Rejected, 3, 4, 4, &stale));
-        assert!(!retirement_candidate(OperationState::Rejected, 3, 4, 5, &stale));
-        assert!(!retirement_candidate(OperationState::Rejected, 4, 4, 4, &stale));
-        assert!(!retirement_candidate(OperationState::Committed, 3, 4, 4, &stale));
+        assert!(retirement_candidate(0, OperationState::Rejected, 3, 4, 4, &stale));
+        assert!(retirement_candidate(1, OperationState::Rejected, 3, 4, 4, &stale));
+        assert!(!retirement_candidate(2, OperationState::Rejected, 3, 4, 4, &stale));
+        assert!(!retirement_candidate(1, OperationState::Rejected, 3, 4, 5, &stale));
+        assert!(!retirement_candidate(1, OperationState::Rejected, 4, 4, 4, &stale));
+        assert!(!retirement_candidate(1, OperationState::Committed, 3, 4, 4, &stale));
 
         let nonempty = json!({
             "kind": "rejected",
@@ -1174,7 +1034,64 @@ mod tests {
         });
         for payload in [&nonempty, &other_code, &missing_registrations] {
             assert!(!is_revision_mismatch_rejection(payload));
-            assert!(!retirement_candidate(OperationState::Rejected, 3, 4, 4, payload));
+            assert!(!retirement_candidate(1, OperationState::Rejected, 3, 4, 4, payload));
         }
+    }
+
+    #[test]
+    fn final_terminal_binds_both_normalized_retirements() {
+        let request = PublicAttemptRequest {
+            repository_id: Uuid::from_u128(10),
+            admission_owner_id: Uuid::from_u128(11),
+            issuer_id: Uuid::from_u128(2),
+            public_id: Uuid::from_u128(12),
+            wire_digest: RequestDigest::of("terminal-test-wire", &[b"original request"]),
+            request_mode: CommitMode::AcceptedSubset,
+            backend_identity: "a".repeat(64),
+            object_format: GitObjectFormat::Sha1,
+            history_incarnation: Uuid::from_u128(13),
+            authority_epoch: 1,
+            group_epoch: 1,
+            restore_incarnation: Uuid::from_u128(14),
+        };
+        let mut rows = [0i16, 1, 2].map(|slot| {
+            let event_id = Uuid::from_u128(90 + slot as u128);
+            let plan = RequestDigest::of("terminal-test-plan", &[&slot.to_be_bytes()]).as_hex();
+            MirrorAttempt {
+                slot,
+                private_id: Uuid::from_u128(20 + slot as u128),
+                plan_digest: plan.clone(),
+                proof_digest: RequestDigest::of("terminal-test-proof", &[&slot.to_be_bytes()]).as_hex(),
+                base_revision: 6 + i64::from(slot),
+                operation_sequence: Some(10 + i64::from(slot)),
+                operation_request_digest: Some(plan),
+                event_id: Some(event_id),
+                event_revision: Some(7 + i64::from(slot)),
+                retired_event_id: (slot < 2).then_some(event_id),
+                ..mirror_attempt()
+            }
+        });
+        let first = parse_terminal_attempt(&rows[0], &request).unwrap();
+        rows[0].proof_digest = recompute_slot_zero_proof(&request, &first).unwrap().as_hex();
+        let first = parse_terminal_attempt(&rows[0], &request).unwrap();
+        let second = parse_terminal_attempt(&rows[1], &request).unwrap();
+        rows[1].proof_digest = recompute_slot_one_proof(&request, &first, &second).unwrap().as_hex();
+        let second = parse_terminal_attempt(&rows[1], &request).unwrap();
+        let current = parse_terminal_attempt(&rows[2], &request).unwrap();
+        rows[2].proof_digest = recompute_slot_two_proof(&request, &first, &second, &current).unwrap().as_hex();
+
+        let (current, used_events) = validate_attempt_chain(&rows, 2, &request).unwrap();
+        assert_eq!(current.slot, 2);
+        assert_eq!(used_events, [Uuid::from_u128(90), Uuid::from_u128(91)]);
+
+        let wrong_link =
+            [rows[0].clone(), MirrorAttempt { retired_event_id: rows[0].event_id, ..rows[1].clone() }, rows[2].clone()];
+        assert!(validate_attempt_chain(&wrong_link, 2, &request).is_err());
+
+        let wrong_order = [rows[1].clone(), rows[0].clone(), rows[2].clone()];
+        assert!(validate_attempt_chain(&wrong_order, 2, &request).is_err());
+
+        rows[2].proof_digest = RequestDigest::of("terminal-test-proof", &[b"other context"]).as_hex();
+        assert!(validate_attempt_chain(&rows, 2, &request).is_err());
     }
 }
