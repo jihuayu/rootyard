@@ -319,6 +319,7 @@ async fn restore_inner(
     let id = Uuid::new_v4();
     let mutation = super::blocking::lock_mutation(id, super::blocking::io_timeout()).await?;
     let lower = super::mounts::lower_path(&state, id);
+    let mut remote_binding = None;
     let (mut lazy_guard, mut published, initial_fingerprint) = if super::mounts::enabled() && cp_state == "committed" {
         let lazy_pub = super::lazy::prepare(&state, id, cp, parent.repository_id, owner_id, &mutation).await?;
         let lower_fp = lower.clone();
@@ -338,17 +339,24 @@ async fn restore_inner(
         };
         (Some(lazy_pub), None, fp)
     } else {
-        super::remote::ensure_local(&state, cp, parent.repository_id, owner_id).await?;
-        let require_committed = cp_state == "committed";
-        let cp_repo = service::checkpoint_repo(&state, cp);
+        let checkpoint_cache = service::checkpoint_repo(&state, cp);
+        let (cp_repo, remote_stage) = if cp_state == "committed" {
+            let verified = super::remote::materialize_committed(&state, cp, parent.repository_id, owner_id).await?;
+            remote_binding = Some(verified.binding);
+            (verified.repo, Some(verified.stage))
+        } else {
+            (checkpoint_cache.clone(), None)
+        };
         let lower_copy = lower.clone();
-        let (pub_dir, fp) = super::blocking::run_mutating(&mutation, move |abandoned, fence| {
+        let (pub_dir, fp, remote_stage) = super::blocking::run_mutating(&mutation, move |abandoned, fence| {
             if abandoned.is_abandoned() {
                 return Err(Error::timeout());
             }
-            let head = super::compat::validate_repo(&cp_repo)?;
-            if require_committed && head == super::compat::HeadKind::Unborn {
-                return Err(Error(StatusCode::CONFLICT, super::compat::CONFLICT_HEAD));
+            if remote_stage.is_none() {
+                if !cp_repo.is_dir() {
+                    return Err(service::conflict());
+                }
+                super::compat::validate_repo(&cp_repo)?;
             }
             let mut pub_dir = copy_snapshot(&cp_repo, &lower_copy)?;
             pub_dir.attach_fence(fence);
@@ -357,13 +365,19 @@ async fn restore_inner(
                 return Err(Error::timeout());
             }
             let fp = super::capture::fingerprint(&lower_copy)?;
+            if remote_stage.is_some() && !abandoned.is_abandoned() {
+                super::remote::publish_checkpoint_cache(&cp_repo, &checkpoint_cache)?;
+            }
             if abandoned.is_abandoned() {
                 pub_dir.cleanup_sync();
                 return Err(Error::timeout());
             }
-            Ok((pub_dir, fp))
+            Ok((pub_dir, fp, remote_stage))
         })
         .await?;
+        if let Some(stage) = remote_stage {
+            stage.cleanup().await;
+        }
         (None, Some(pub_dir), fp)
     };
 
@@ -373,7 +387,8 @@ async fn restore_inner(
         let tx = client.transaction().await.map_err(Error::internal)?;
         let check_row = tx
             .query_opt(
-                "SELECT w.creator_id,w.repository_id,w.owner_slug,w.repository_name,c.base_oid \
+                "SELECT w.creator_id,w.repository_id,w.owner_slug,w.repository_name,c.base_oid, \
+                        c.state,c.manifest_digest,c.manifest_size,c.captured_revision \
                  FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id \
                  WHERE c.id=$1 AND c.state IN ('local_complete','committed') FOR SHARE OF c",
                 &[&cp],
@@ -401,6 +416,18 @@ async fn restore_inner(
                 tx.commit().await.map_err(Error::internal)?;
                 return Ok((StatusCode::OK, saved));
             }
+        }
+        if check_row.get::<_, String>("state") != cp_state {
+            return Err(service::conflict());
+        }
+        if let Some(binding) = remote_binding
+            && (access.owner_id != owner_id
+                || access.repo_id != parent.repository_id
+                || check_row.get::<_, Option<&str>>("manifest_digest") != Some(binding.digest.as_str())
+                || check_row.get::<_, Option<i64>>("manifest_size") != Some(binding.size)
+                || check_row.get::<_, i64>("captured_revision") != binding.captured_revision)
+        {
+            return Err(service::conflict());
         }
         let base_oid: Option<String> = check_row.get(4);
         tx.execute(

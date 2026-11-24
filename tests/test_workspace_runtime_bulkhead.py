@@ -391,6 +391,17 @@ class WorkspaceRuntimeBulkheadTest(unittest.TestCase):
             h.start()
 
             h.sql(f"UPDATE workspaces SET lease_until = clock_timestamp() - interval '1 second' WHERE id = '{wid}'")
+            blocked_cache = vol2 / "workspace-service/checkpoints" / cp1["checkpoint_id"]
+            blocked_cache.parent.mkdir(parents=True, exist_ok=True)
+            blocked_cache.write_bytes(b"occupied by a regular file")
+            status, raw, _ = h.http(
+                f"/api/workspaces/{wid}/lease", token=h.alice, method="POST", body={"expected_lease_epoch": 1}
+            )
+            self.assertEqual(status, 503, raw)
+            self.assertEqual(blocked_cache.read_bytes(), b"occupied by a regular file")
+            self.assertFalse((vol2 / "workspace-service/workspaces" / wid).exists())
+            blocked_cache.unlink()
+
             locker = start_psql_tx(h)
             try:
                 locker.stdin.write(f"BEGIN;\nSELECT 'LOCKED' FROM workspaces WHERE id = '{wid}' FOR UPDATE;\n")
