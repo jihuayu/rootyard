@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Current format22/schema147 PG + Blob paired backup/restore drill.
+"""Current PostgreSQL and Blob paired backup/restore drill.
 
 Requires an attested binary, PostgreSQL 17 with CREATEDB, the strict S3 profile,
 and boto3 (tests/requirements-blob-backup.txt). Only run-owned databases and an
@@ -103,10 +103,10 @@ LIMITATIONS = [
     "serve-blob holds the shared lifecycle advisory lock for its whole lifetime; offline backup/restore hold the exclusive one until publication. The legacy volume flock still only covers the native GitFS path.",
     "The restore barrier is proven at the parked pg_restore, and every probe re-proves the exclusive key.",
     "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
-    "No legacy format/schema upgrade is exercised. The current binary must restore its own format22/schema147 archive; format21/schema147 stays readable as a metadata-only historical archive.",
+    f"The current binary restores its own format {CURRENT_BACKUP_FORMAT} archive at schema {CURRENT_SCHEMA_VERSION}.",
     "The corruption negatives use one privileged, transaction-local `SET LOCAL session_replication_role = replica` statement on a run-owned admin-owned `pg_dump` clone (the documented outside-the-guarantee case of #169, needs a superuser admin); no application path can create those rows, migration-142 triggers are never disabled outside that transaction, and the API source, the clean archive and the production schema are never modified.",
     "The negative cases require the failure to be the source-ledger validator reporting a bounded list that carries the target's canonical_pair_mismatch plus its cause-specific violation (incomplete_pair, missing_artifacts, or declared_set_digest_mismatch from a declared-set source), with no destination, no COMPLETE and no manifest; a backend mismatch, missing Blob bytes, another registration/repository or any unrelated refusal fails the harness instead of passing it.",
-    "The positive format22 roots case needs the source-bound ref_store_format22_backup_fixture receipt from the same candidate; without it the case is an explicit red FIXTURE_UNAVAILABLE, never a skip.",
+    "The positive paired-archive roots case needs the source-bound ref_store_format22_backup_fixture receipt from the same candidate; without it the case is an explicit red FIXTURE_UNAVAILABLE, never a skip.",
 ]
 
 # Deterministic restore-interval gate. `src/backup/postgres.rs::command` passes
@@ -621,7 +621,7 @@ class Drill(BlobOnlyHarness):
                     process.wait(timeout=10)
         assert self.advisory_holds(self.source_db) == 0, "backup did not release its exclusive barrier"
         manifest = json.loads(self.backup.joinpath("manifest.json").read_text())
-        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 30
+        assert manifest["format"] == CURRENT_BACKUP_FORMAT, manifest["format"]
         assert manifest["schema_versions"] == SCHEMA_VERSIONS and max(SCHEMA_VERSIONS) == CURRENT_SCHEMA_VERSION
         assert len(manifest["repositories"]) == 2
         assert manifest["blob_closure"]["artifacts"] == self.closure_rows["count"]
