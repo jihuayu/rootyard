@@ -6,6 +6,11 @@
 //! existing `FOR UPDATE OF s` ref CAS, read leases, decisions, roots, holds or
 //! GC. Queries are bounded by the caller deadline and by a local statement
 //! timeout. There is intentionally no router or unauthenticated public query.
+//!
+//! Legacy reserve, begin and cancel refuse migration-152 wrapper and attempt
+//! UUIDs. The core-only lookup and exact-identity terminal writer are still
+//! shared ledger primitives. A wrapper producer needs its own authorized
+//! attempt lifecycle before it can use the core ledger.
 use super::contract::{
     BeginReceipt, CancelReceipt, Capabilities, CommitReceipt, IssuerLane, OperationIdentity, OperationLookup,
     OperationRecord, OperationState, RefStoreError, RequestDigest, SequenceReservation, TerminalOutcome,
@@ -13,13 +18,59 @@ use super::contract::{
 };
 use std::{future::Future, time::Duration};
 use tokio::time::{Instant, timeout_at};
-use tokio_postgres::{Row, Transaction, error::SqlState};
+use tokio_postgres::{Row, Transaction, error::SqlState, types::ToSql};
 use uuid::Uuid;
+
+/// Crate-private migration-152 slot-zero admission.
+pub(crate) mod slot_zero;
+
+/// Read-only migration-152 public operation/current attempt resolver.
+pub(crate) mod public_attempt;
+
+/// Crate-private migration-152 public terminal mirror.
+#[allow(dead_code)]
+pub(crate) mod public_terminal;
+
+/// Crate-private migration-152 rotation over exact revision-mismatch retirements.
+#[allow(dead_code)]
+pub(crate) mod slot_one;
 
 const MAX_QUERY_WINDOW: Duration = Duration::from_secs(30);
 pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
 pub const OPERATION_LOCK_SQL: &str =
     "SELECT pg_advisory_xact_lock(hashtextextended($1::text || '/' || $2::uuid::text || '/' || $3::uuid::text,0))";
+
+/// One MVCC snapshot for the legacy status route: the eligible legacy operation
+/// row (columns 0..6, read by `record_from_row`), whether this exact UUID is a
+/// migration-152 public wrapper, and whether it is a private attempt claim.
+/// Keeping all three in one statement prevents a concurrent admission commit
+/// from being split between a claim probe and a private core-row read.
+const LEGACY_STATUS_SNAPSHOT: &str = "SELECT \
+        o.issuer_id, o.lane, o.sequence, o.request_digest, o.state, o.terminal_result, o.operation_id, \
+        (w.public_id IS NOT NULL) AS public_wrapper, \
+        (p.private_id IS NOT NULL) AS private_claimed, \
+        (sp.private_id IS NOT NULL) AS selected_private \
+    FROM (VALUES (1)) AS anchor(one) \
+    LEFT JOIN ref_store_operations o \
+        ON o.repository_id=$1 AND o.operation_id=$2 \
+    LEFT JOIN ref_store_public_operations w \
+        ON w.repository_id=$1 AND w.public_id=$2 \
+    LEFT JOIN ref_store_private_attempts p \
+        ON p.repository_id=$1 AND p.private_id=$2 \
+    LEFT JOIN ref_store_private_attempts sp \
+        ON sp.repository_id=w.repository_id AND sp.public_id=w.public_id AND sp.slot=w.current_slot";
+
+const LEGACY_STATUS_SCHEMA_REQUIRED: &str = "legacy operation status requires a complete migration 152 catalog";
+
+/// Read-only legacy status classification. Only `Legacy` carries durable state;
+/// `PublicWrapper`, `PrivateIdentifier` and `Unknown` carry no identity or
+/// payload. A private claim must be rendered exactly like an unknown id.
+pub(crate) enum LegacyStatusLookup {
+    Legacy(OperationRecord),
+    PublicWrapper,
+    PrivateIdentifier,
+    Unknown,
+}
 
 pub(crate) async fn before_deadline<T, F>(deadline: Instant, future: F) -> Result<T, RefStoreError>
 where
@@ -70,6 +121,53 @@ impl PgRefStore {
         Capabilities::pg_transition_increment()
     }
 
+    /// Lock the expected issuer lane, creating its zero row only when it does
+    /// not yet exist.
+    ///
+    /// This is the gateway's fresh-admission lane acquisition and must run after
+    /// the public/operation locks but before any repository/binding authority
+    /// read. It never evaluates `last_reserved_sequence + 1` and never advances
+    /// a sequence; the slot-zero coordinator still previews and conditionally
+    /// advances the now-visible lane later in this same transaction.
+    ///
+    /// An existing lane takes one `FOR NO KEY UPDATE` lock. A missing lane is
+    /// initialized at zero with `ON CONFLICT DO NOTHING`; a concurrent creator
+    /// is visible to that insert's conflict wait, and the loser re-locks the
+    /// winner's row before returning. This closes the READ COMMITTED gap where
+    /// a plain select of an absent row cannot see an in-flight insert. The
+    /// caller must hold the operation key and roll back on later refusal.
+    pub(crate) async fn lock_or_create_expected_lane(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        issuer_id: Uuid,
+        lane: &IssuerLane,
+        deadline: Instant,
+    ) -> Result<(), RefStoreError> {
+        if repository_id.is_nil() || issuer_id.is_nil() {
+            return Err(RefStoreError::InvalidIdentity("expected lane ids must be non-nil".into()));
+        }
+        const LOCK: &str = "SELECT 1 FROM ref_store_issuer_lanes
+             WHERE (repository_id,issuer_id,lane)=($1,$2,$3) FOR NO KEY UPDATE";
+        const CREATE: &str = "INSERT INTO ref_store_issuer_lanes(
+                 repository_id,issuer_id,lane,last_reserved_sequence)
+             VALUES($1,$2,$3,0) ON CONFLICT(repository_id,issuer_id,lane) DO NOTHING
+             RETURNING 1";
+        bound(tx, deadline).await?;
+        let lane_name = lane.as_str();
+        let params: &[&(dyn ToSql + Sync)] = &[&repository_id, &issuer_id, &lane_name];
+        if tx.query_opt(LOCK, params).await.map_err(db_error)?.is_some() {
+            return Ok(());
+        }
+        if tx.query_opt(CREATE, params).await.map_err(db_error)?.is_some() {
+            return Ok(());
+        }
+        // A concurrent creator committed the same issuer lane between the read
+        // and insert. Re-lock that row before returning to the authority reads.
+        tx.query_one(LOCK, params).await.map_err(db_error)?;
+        Ok(())
+    }
+
     /// Reserve the next sequence in one durable issuer lane. This is the
     /// preallocation primitive for trusted callers that can keep their own
     /// operation id across a retry. The caller chooses `operation_id` before
@@ -109,6 +207,7 @@ impl PgRefStore {
         }
         bound(tx, deadline).await?;
         lock_operation_key(tx, repository_id, operation_id).await?;
+        refuse_legacy_collision(tx, repository_id, operation_id).await?;
         ensure_repository(tx, repository_id).await?;
         let row = tx
             .query_one(
@@ -147,6 +246,7 @@ impl PgRefStore {
     ) -> Result<BeginReceipt, RefStoreError> {
         bound(tx, deadline).await?;
         lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
+        refuse_legacy_collision(tx, identity.repository_id(), identity.operation_id()).await?;
         ensure_repository(tx, identity.repository_id()).await?;
         lock_lane(tx, identity).await?;
         if let Some(row) = operation_row(tx, identity.repository_id(), identity.operation_id(), true).await? {
@@ -171,6 +271,78 @@ impl PgRefStore {
         let record = OperationRecord::new(identity.clone(), OperationState::Pending, None)?;
         Ok(BeginReceipt { created: true, record })
     }
+}
+
+/// A candidate sequence protected by the issuer-lane row lock in this transaction.
+/// Only advancement can turn it into a reservation.
+struct LockedSequence {
+    sequence: i64,
+}
+
+impl LockedSequence {
+    /// The caller holds the operation key and has checked the UUID namespace.
+    ///
+    /// An existing lane costs one locked preview plus the conditional advance.
+    /// A lane first created here reads its initial candidate straight from the
+    /// insert, so it also spends one preview statement rather than a second
+    /// locked read. Only a concurrent creator that wins the `ON CONFLICT` race
+    /// yields no inserted row; that loser re-reads under `FOR NO KEY UPDATE`.
+    async fn preview(
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        issuer_id: Uuid,
+        lane: &IssuerLane,
+    ) -> Result<Self, RefStoreError> {
+        const PREVIEW: &str = "SELECT last_reserved_sequence + 1 FROM ref_store_issuer_lanes
+             WHERE (repository_id,issuer_id,lane)=($1,$2,$3) FOR NO KEY UPDATE";
+        const CREATE_LANE: &str = "INSERT INTO ref_store_issuer_lanes(
+                 repository_id,issuer_id,lane,last_reserved_sequence)
+             VALUES($1,$2,$3,0) ON CONFLICT(repository_id,issuer_id,lane) DO NOTHING
+             RETURNING last_reserved_sequence + 1";
+        let lane_name = lane.as_str();
+        let params: &[&(dyn ToSql + Sync)] = &[&repository_id, &issuer_id, &lane_name];
+        let sequence: i64 = match tx.query_opt(PREVIEW, params).await.map_err(db_error)? {
+            Some(row) => row.get(0),
+            // No lane row is visible. The insert both creates the row and takes
+            // the initial candidate; the row lock is held for the advance.
+            None => match tx.query_opt(CREATE_LANE, params).await.map_err(db_error)? {
+                Some(row) => row.get(0),
+                // A concurrent creator committed the same lane between the
+                // preview and this insert. Re-read it under the row lock; the
+                // conditional advance below proves the re-read is still current.
+                None => tx.query_one(PREVIEW, params).await.map_err(db_error)?.get(0),
+            },
+        };
+        Ok(Self { sequence })
+    }
+}
+
+/// Advance one already locked lane preview to its candidate sequence.
+///
+/// The row lock taken by [`LockedSequence::preview`] is transaction-scoped and
+/// survives dropping that value, so a caller that must build a plan between the
+/// preview and the advance can still call this conditionally. The predicate
+/// rejects a stale candidate if this transaction moved the lane in the meantime.
+async fn advance_sequence(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    issuer_id: Uuid,
+    lane: &IssuerLane,
+    operation_id: Uuid,
+    sequence: i64,
+) -> Result<SequenceReservation, RefStoreError> {
+    let changed = tx
+        .execute(
+            "UPDATE ref_store_issuer_lanes SET last_reserved_sequence=$4, updated_at=clock_timestamp()
+             WHERE (repository_id,issuer_id,lane)=($1,$2,$3) AND last_reserved_sequence=$4::bigint - 1",
+            &[&repository_id, &issuer_id, &lane.as_str(), &sequence],
+        )
+        .await
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(RefStoreError::IdentityConflict);
+    }
+    Ok(SequenceReservation::new(repository_id, issuer_id, lane.clone(), sequence, operation_id))
 }
 
 struct Cancellation {
@@ -199,6 +371,7 @@ impl PgRefStore {
     ) -> Result<CancelReceipt, RefStoreError> {
         bound(tx, deadline).await?;
         lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
+        refuse_legacy_collision(tx, identity.repository_id(), identity.operation_id()).await?;
         ensure_repository(tx, identity.repository_id()).await?;
         lock_lane(tx, identity).await?;
         let existing = match operation_row(tx, identity.repository_id(), identity.operation_id(), true).await? {
@@ -334,8 +507,10 @@ impl PgRefStore {
         Ok(CommitReceipt { record, replayed: false })
     }
 
-    /// Internal repository-scoped lookup. No route exposes this today. A missing
-    /// row is [`OperationLookup::Unknown`], never an aborted result.
+    /// Internal repository-scoped core lookup, including private identities.
+    /// Mutation/cancel callers that must serialize use `get_legacy_locked`; the
+    /// read-only status route uses `get_legacy_status`. A missing row is
+    /// [`OperationLookup::Unknown`], never an aborted result.
     pub async fn get(
         &self,
         tx: &Transaction<'_>,
@@ -344,6 +519,87 @@ impl PgRefStore {
         deadline: Instant,
     ) -> Result<OperationLookup, RefStoreError> {
         before_deadline(deadline, self.get_inner(tx, repository_id, operation_id, deadline)).await
+    }
+
+    /// Resolve a legacy operation for an authorized HTTP caller that must
+    /// serialize with operation mutations. The caller must already hold the
+    /// migration-138 operation lock in this transaction.
+    pub(crate) async fn get_legacy_locked(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        operation_id: Uuid,
+        deadline: Instant,
+    ) -> Result<OperationLookup, RefStoreError> {
+        before_deadline(deadline, async {
+            bound(tx, deadline).await?;
+            refuse_legacy_collision(tx, repository_id, operation_id).await?;
+            self.get_inner(tx, repository_id, operation_id, deadline).await
+        })
+        .await
+    }
+
+    /// Classify one repository-scoped identifier for the authenticated read-only
+    /// status route.
+    ///
+    /// A complete migration-152 catalog is classified by one statement over one
+    /// MVCC snapshot: the eligible legacy operation row, this exact UUID's public
+    /// wrapper, and this exact UUID's private attempt claim are read together.
+    /// A concurrent admission commit therefore cannot be split between a claim
+    /// check and a core-row read, and a private core row is never exposed as a
+    /// legacy operation. Private claims return a marker the caller renders as the
+    /// same 404 as an unknown id; a public wrapper remains a non-legacy marker.
+    ///
+    /// A wholly absent migration 152 uses the pre-152 legacy read. A partial
+    /// catalog fails closed. This method takes no migration-138 operation key,
+    /// writes no row and does not change any writer path.
+    pub(crate) async fn get_legacy_status(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        operation_id: Uuid,
+        deadline: Instant,
+    ) -> Result<LegacyStatusLookup, RefStoreError> {
+        if repository_id.is_nil() || operation_id.is_nil() {
+            return Err(RefStoreError::InvalidIdentity("lookup ids must be non-nil".into()));
+        }
+        before_deadline(deadline, async {
+            bound(tx, deadline).await?;
+            let schema = tx.query_one(public_attempt::SCHEMA_PROBE, &[]).await.map_err(db_error)?;
+            let version = schema.get::<_, bool>(0);
+            let wrapper_relation = schema.get::<_, bool>(1);
+            let attempt_relation = schema.get::<_, bool>(2);
+            let binding_function = schema.get::<_, bool>(3);
+            let retirement_relation = schema.get::<_, bool>(4);
+            if !version && !wrapper_relation && !attempt_relation && !binding_function && !retirement_relation {
+                return match self.get_inner(tx, repository_id, operation_id, deadline).await? {
+                    OperationLookup::Known(record) => Ok(LegacyStatusLookup::Legacy(record)),
+                    OperationLookup::Unknown => Ok(LegacyStatusLookup::Unknown),
+                };
+            }
+            if !version || !wrapper_relation || !attempt_relation || !binding_function || !retirement_relation {
+                return Err(RefStoreError::Unsupported(LEGACY_STATUS_SCHEMA_REQUIRED));
+            }
+            let row = tx.query_one(LEGACY_STATUS_SNAPSHOT, &[&repository_id, &operation_id]).await.map_err(db_error)?;
+            let legacy_present = row.get::<_, Option<Uuid>>(6).is_some();
+            let public_wrapper: bool = row.get(7);
+            let private_claimed: bool = row.get(8);
+            let selected_private: bool = row.get(9);
+            if public_wrapper {
+                if legacy_present || private_claimed || !selected_private {
+                    return Err(RefStoreError::IdentityConflict);
+                }
+                return Ok(LegacyStatusLookup::PublicWrapper);
+            }
+            if private_claimed {
+                return Ok(LegacyStatusLookup::PrivateIdentifier);
+            }
+            if legacy_present {
+                return Ok(LegacyStatusLookup::Legacy(record_from_row(&row, repository_id)?));
+            }
+            Ok(LegacyStatusLookup::Unknown)
+        })
+        .await
     }
 
     async fn get_inner(
@@ -402,6 +658,43 @@ pub(crate) async fn lock_operation(
         lock_operation_key(tx, repository_id, operation_id).await
     })
     .await
+}
+
+/// Called only under the migration-138 key, before any issuer-lane mutation
+/// or external replay lookup. Migration 152 claims wrapper and attempt UUIDs
+/// with that same key. A read-committed statement issued after locking sees
+/// claims committed by the preceding holder of the key.
+async fn refuse_legacy_collision(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    operation_id: Uuid,
+) -> Result<(), RefStoreError> {
+    let schema = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152),
+                    current_setting('transaction_isolation') = 'read committed'",
+            &[],
+        )
+        .await
+        .map_err(db_error)?;
+    // Older catalogs lack both relations. Keep their legacy identity contract
+    // without preparing a statement that references the absent tables.
+    if !schema.get::<_, bool>(0) {
+        return Ok(());
+    }
+    if !schema.get::<_, bool>(1) {
+        return Err(RefStoreError::Database("legacy operation UUID checks require read committed".into()));
+    }
+    let claimed: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM ref_store_public_operations WHERE repository_id=$1 AND public_id=$2)
+                 OR EXISTS(SELECT 1 FROM ref_store_private_attempts WHERE repository_id=$1 AND private_id=$2)",
+            &[&repository_id, &operation_id],
+        )
+        .await
+        .map_err(db_error)?
+        .get(0);
+    if claimed { Err(RefStoreError::IdentityConflict) } else { Ok(()) }
 }
 
 pub(crate) async fn bound(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RefStoreError> {
