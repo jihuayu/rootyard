@@ -6,8 +6,9 @@ pub mod closure_prove;
 pub mod commit_gate;
 #[path = "push_causal_stream/gateway_bridge.rs"]
 pub mod gateway_bridge;
-#[path = "push_causal_stream/gateway_durable_replay.rs"]
+#[path = "push_causal_stream/gateway_durable_binding.rs"]
 mod gateway_durable_binding;
+#[path = "push_causal_stream/gateway_durable_replay.rs"]
 pub mod gateway_durable_replay;
 #[path = "push_causal_stream/gateway_durable_sql.rs"]
 mod gateway_durable_sql;

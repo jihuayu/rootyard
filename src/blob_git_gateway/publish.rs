@@ -486,8 +486,7 @@ async fn complete_private_probe(
                 }
             }
         }
-        operation::Probe::FinishCancelled { reason } => {
-            let _ = reason;
+        operation::Probe::FinishCancelled => {
             Err(GatewayError::Conflict("operation cancellation requires reconciliation"))
         }
     }

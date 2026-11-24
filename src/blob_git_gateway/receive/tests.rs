@@ -369,8 +369,8 @@ fn handoff_refuses_receive_provenance_from_another_repository() {
 
 #[test]
 fn receive_value_is_completed_only_by_the_producer() {
-    let source = include_str!("receive.rs");
-    let production = source.split("#[cfg(test)]").next().expect("production source");
+    let source = include_str!("../receive.rs");
+    let (production, _) = source.split_once("#[cfg(test)]\nmod tests;").expect("production source");
     assert!(production.contains("struct ReceiveInput<'a> {"));
     assert!(!production.contains("pub(super) struct ReceiveInput<'a>"));
     assert!(production.contains("fn complete(self, pairs: Vec<Pair>) -> VerifiedReceive<'a>"));
