@@ -977,6 +977,10 @@ class Drill(BlobOnlyHarness):
                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             _, stderr = restore.communicate(timeout=300)
             assert restore.returncode == 0, case.name + ": clone restore failed: " + self.redact(stderr[-2000:])
+            # Like the product restore, reinstate the M152 function ACL omitted
+            # by --no-privileges. The clone owner can revoke it before corruption.
+            self.query(copy,
+                "REVOKE EXECUTE ON FUNCTION public.rootyard_ref_store_private_cancellation_evidence() FROM PUBLIC")
             binding = self.binding(copy)
             assert binding == self.corruption_bindings, \
                 case.name + ": the clone's Blob binding is not the valid source root/backend: " + self.redact(binding)
