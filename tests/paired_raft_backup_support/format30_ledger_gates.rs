@@ -1,4 +1,4 @@
-//! Explicit A3/A4 ledger gates for the format 30 paired restore.
+//! Explicit A3/A4 ledger gates for paired restore.
 //!
 //! Source-realm receipts stay byte-for-byte immutable; the new realm is re-established
 //! canonically and every cross-incarnation replay is refused with its exact typed error.

@@ -1,4 +1,4 @@
-//! Live 3-voter mTLS `raft-node` + `schema 151` / `format 30` + Smart-HTTP `BlobGitState` + OpenDAL S3 E2E (#153).
+//! Live mTLS Raft, current paired backup, Smart-HTTP and OpenDAL S3 E2E (#153).
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -379,7 +379,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         let dst_stranger_url = git_url(dst_gw_addr, &new_stranger.username, &new_stranger.token);
         ensure!(
             !run_git_cli(&git, dir.path(), &["clone", &dst_stranger_url, "dst-stranger-denied"]).status.success(),
-            "stranger must still be denied repo_access after format 30 restore"
+            "stranger must still be denied repo_access after paired restore"
         );
         let dst_collab_url = git_url(dst_gw_addr, &new_collab.username, &new_collab.token);
         let dst_clone = dir.path().join("dst-collab-clone");

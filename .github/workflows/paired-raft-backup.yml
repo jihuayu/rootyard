@@ -121,7 +121,7 @@ jobs:
           cargo build --locked --no-default-features --bin rootyard-peer-attestor
           echo "ROOTYARD_REFCAS_NODE_BIN=$GITHUB_WORKSPACE/crates/refcas-log/target/debug/raft-node" >> "$GITHUB_ENV"
           echo "ROOTYARD_PEER_ATTESTOR_BIN=$GITHUB_WORKSPACE/target/debug/rootyard-peer-attestor" >> "$GITHUB_ENV"
-      - name: Run Clippy, library unit tests, OpenDAL S3 + Git tests, and live PG 17 + 3-voter mTLS Raft format 30 restore tests
+      - name: Run Clippy, library unit tests, OpenDAL S3 + Git tests, and live PG 17 + 3-voter mTLS Raft paired restore tests
         run: |
           cargo clippy --locked --no-default-features --lib --bin rootyard-peer-attestor --test paired_raft_backup_restore -- -D warnings
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib maintenance::paired_raft_backup
