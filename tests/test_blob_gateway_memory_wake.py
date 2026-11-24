@@ -92,32 +92,68 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
 
     def test_trigger_requires_a_fresh_committed_terminal_with_audit_outbox(self):
         text = source("src/blob_git_gateway/publish.rs")
-        push = body(text, "Start::Fresh { plan, _token: token }", "async fn repository_owner")
-        self.assertIn("decide(state, actor, (*plan).clone(), mode, serving.cluster_incarnation, deadline).await", push)
-        self.assertLess(push.index("decide(state"), push.index("if notify"))
-        self.assertLess(push.index("if notify"), push.index("state.dispatch().committed()"))
+        legacy = body(text, "pub(super) async fn push(", "pub(super) async fn push_private(")
+        self.assertIn(
+            "decide(state, actor, (*plan).clone(), mode, serving.cluster_incarnation, None, deadline).await",
+            legacy,
+        )
+        private = body(text, "pub(super) async fn push_private(", "async fn complete_private_probe(")
+        receive = source("src/blob_git_gateway/receive.rs")
+        self.assertIn("publish::push_private(&state, &serving, &receive, deadline).await", receive)
+        fresh = body(private, "Start::Fresh { plan, _token: token }", "Start::Terminal(_)")
+        self.assertIn(
+            "publish_admitted_attempt(state, verified, &public_request, &plan, &token, deadline).await?", fresh
+        )
+        probe = body(text, "async fn complete_private_probe(", "async fn repository_owner(")
+        self.assertIn(
+            "operation::Probe::Replay { terminal, private_id } => Ok(PrivatePushOutcome::Terminal { terminal, private_id })",
+            probe,
+        )
+        retired = body(text, "pub(super) async fn retire_slot_one(", "async fn publish_admitted_attempt(")
+        self.assertIn(
+            "publish_admitted_attempt(state, verified, public_request, &plan, &token, deadline).await?", retired
+        )
+        admitted = body(text, "async fn publish_admitted_attempt(", "async fn load_terminal_record(")
+        self.assertIn("Some(public_request)", body(admitted, "decide(", ".await"))
+        for path, publication in (("legacy", legacy), ("private", admitted)):
+            with self.subTest(path=path):
+                wake = body(publication, "Ok((terminal, notify)) => {", "state.dispatch().committed();")
+                self.assertIn("if notify {", wake)
+                self.assertLess(publication.index("decide("), publication.index("Ok((terminal, notify))"))
+        self.assertEqual(text.count("state.dispatch().committed()"), 2)
         predicate = body(text, "fn should_notify", "/// The authorized A4 facade")
-        self.assertIn("terminal.is_committed()", predicate)
-        self.assertIn("!replayed", predicate)
-        self.assertIn("audit_enqueued", predicate)
+        self.assertIn("terminal.is_committed() && !replayed && audit_enqueued", predicate)
         decide = body(text, "async fn decide(", "/// The one trigger predicate")
+        self.assertIn("Some(public) => adapter.prepare_private(state.pool(), plan, public, deadline).await", decide)
+        self.assertIn("None => adapter.prepare(state.pool(), plan, deadline).await", decide)
         self.assertIn("PrepareOutcome::Replayed(receipt) => return Ok((receipt.terminal, false))", decide)
-        self.assertIn("receipt.replayed", decide)
-        self.assertIn("receipt.audit_enqueued", decide)
+        self.assertIn("should_notify(&receipt.terminal, receipt.replayed, receipt.audit_enqueued)", decide)
+        self.assertLess(decide.index(".commit_with_expected_cluster_incarnation("), decide.index("should_notify("))
 
     def test_core_commit_enqueues_audit_projection_in_the_same_transaction(self):
         text = source("src/ref_store/core/pack_commit/authorized/commit.rs")
+        inner = body(text, "async fn commit_inner(", "async fn commit_in_tx(")
+        self.assertIn("commit_in_tx(&tx, verified, backend_identity, expected_cluster_incarnation, deadline)", inner)
+        self.assertLess(inner.index("commit_in_tx(&tx,"), inner.index("commit_bounded(tx,"))
+        self.assertLess(inner.index("commit_bounded(tx,"), inner.index("Ok(receipt)\n"))
         commit = body(text, "async fn commit_in_tx(", "fn audit_changes(")
-        self.assertIn("pg_commit::write_verified_commit(", commit)
-        self.assertIn("enqueue_core_audit(", commit)
-        self.assertIn("selection.actor()", commit)
-        self.assertIn("&committed.terminal", commit)
-        self.assertIn("backend_identity", commit)
-        self.assertLess(commit.index("write_verified_commit("), commit.index("enqueue_core_audit("))
-        # The wake-producing audit kind is narrowed to the serving gateway's
-        # captured-and-matched A4 call; generic commit passes None.
-        self.assertIn("if let Some((incarnation, false)) = captured_cluster_incarnation", commit)
-        self.assertNotIn("captured_cluster_incarnation.map(|(incarnation, _)| incarnation)", commit)
+        committed = body(commit, "let committed = if terminal.is_committed()", "TerminalOutcome::Rejected")
+        core_write = body(committed, "pg_commit::write_verified_commit(", ".await?;")
+        self.assertIn("tx,", core_write)
+        enqueue = body(committed, "if let Some(incarnation) = captured_cluster_incarnation", ".await?;")
+        for marker in (
+            "audit_enqueued = enqueue_core_audit(",
+            "tx,",
+            "selection.actor()",
+            "&committed.terminal",
+            "backend_identity",
+            "incarnation,",
+        ):
+            self.assertIn(marker, enqueue)
+        self.assertLess(committed.index("write_verified_commit("), committed.index("enqueue_core_audit("))
+        receipt = body(text, "fn receipt(", "record: value.record,")
+        self.assertIn("!value.replayed && value.terminal.is_committed()", receipt)
+        self.assertIn("audit_enqueued: audit_enqueued && fresh_committed", receipt)
         helper = body(text, "async fn enqueue_core_audit(", "fn receipt(")
         self.assertIn('"kind": "pg_refstore_core_commit_audit"', helper)
         self.assertIn("crate::events::publish_core_commit_audit_in_tx", helper)
@@ -170,26 +206,49 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
 
     def test_restore_incarnation_is_threaded_from_authorized_serving(self):
         publish = source("src/blob_git_gateway/publish.rs")
-        push = body(publish, "Start::Fresh { plan, _token: token }", "async fn repository_owner")
-        self.assertIn("serving.cluster_incarnation", push)
+        private = body(publish, "pub(super) async fn push_private(", "async fn complete_private_probe(")
+        self.assertIn("public_attempt_request_from_serving(\n                    serving,", private)
+        request = body(publish, "fn public_attempt_request_from_serving(", "fn slot_zero_admission_request(")
+        self.assertIn("restore_incarnation: serving.cluster_incarnation", request)
+        admitted = body(publish, "async fn publish_admitted_attempt(", "async fn load_terminal_record(")
+        self.assertIn("public_request.restore_incarnation,", body(admitted, "decide(", ".await"))
         decide = body(publish, "async fn decide(", "/// The one trigger predicate")
-        self.assertIn("expected_cluster_incarnation", decide)
-        self.assertIn("commit_with_expected_cluster_incarnation", decide)
+        self.assertIn(
+            ".commit_with_expected_cluster_incarnation(state.pool(), &verified, expected_cluster_incarnation, deadline)",
+            decide,
+        )
 
         commit = source("src/ref_store/core/pack_commit/authorized/commit.rs")
-        inner = body(commit, "async fn commit_inner(", "async fn commit_in_tx(")
-        self.assertIn("expected_cluster_incarnation", inner)
+        serving = body(commit, "pub async fn commit_with_expected_cluster_incarnation(", "async fn commit_inner(")
+        self.assertIn("self.commit_inner(pool, verified, Some(expected_cluster_incarnation), deadline).await", serving)
         tx = body(commit, "async fn commit_in_tx(", "fn audit_changes(")
-        self.assertIn("crate::ref_store::pg::bound", tx)
-        self.assertIn("public_cluster_incarnation_nowait", tx)
-        self.assertLess(tx.index("public_cluster_incarnation_nowait"), tx.index("PgRefStore.begin"))
-        self.assertIn("Some((current, current != expected))", tx)
-        pending = body(tx, "OperationState::Pending => {", "}\n")
+        public = body(tx, "let captured_cluster_incarnation = if let Some(public) = public", "let cluster = match")
+        self.assertIn(
+            "expected_cluster_incarnation.is_some_and(|expected| expected != public.restore_incarnation)", public
+        )
+        self.assertLess(public.index("RestoreIncarnationMismatch"), public.index("lock_private_pending_attempt("))
+        self.assertIn("lock_private_pending_attempt(tx, public, plan, deadline).await?;", public)
+        lock = body(
+            source("src/ref_store/pg/public_attempt.rs"),
+            "pub(crate) async fn lock_private_pending_attempt(",
+            "pub(crate) async fn lock_public_attempt(",
+        )
+        self.assertLess(lock.index("self.lock_public_attempt("), lock.index("lock_cluster_incarnation(tx)"))
+        self.assertIn("if lock_cluster_incarnation(tx).await? != public.restore_incarnation", lock)
+        locked_cluster = source("src/ref_store/core/pack_snapshot/serving_read_sql/sealed.rs")
+        self.assertIn("SELECT incarnation FROM public.cluster_authority WHERE singleton=true FOR SHARE", locked_cluster)
+        self.assertLess(tx.index("lock_private_pending_attempt("), tx.index("lock_source_tables("))
+
+        legacy = body(tx, "let cluster = match expected_cluster_incarnation", "lock_source_tables(")
+        self.assertIn("crate::ref_store::pg::bound", legacy)
+        self.assertLess(legacy.index("public_cluster_incarnation_nowait"), legacy.index("PgRefStore.begin"))
+        self.assertIn("Some((current, expected))", legacy)
+        pending = body(legacy, "OperationState::Pending => {", "cluster.map(")
+        self.assertIn("cluster.is_some_and(|(current, expected)| current != expected)", pending)
         self.assertIn("RestoreIncarnationMismatch", pending)
-        replay = body(tx, "OperationState::Committed | OperationState::Rejected", "OperationState::Cancelled")
-        self.assertIn("return Ok(receipt", replay)
-        # Only the already-compared equality may reach the audit bridge.
-        self.assertIn("if let Some((incarnation, false)) = captured_cluster_incarnation", tx)
+        replay = body(legacy, "OperationState::Committed | OperationState::Rejected", "OperationState::Cancelled")
+        self.assertIn("return Ok(receipt(pg::replay_terminal(begun)?, *selection.selection_digest(), false))", replay)
+        self.assertIn("cluster.map(|(current, _)| current)", legacy)
         audit = body(commit, "async fn enqueue_core_audit(", "fn receipt(")
         self.assertIn("restore_incarnation: Uuid", audit)
         self.assertNotIn("captured_restore_incarnation", audit)
@@ -209,14 +268,19 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         self.assertIn("self.commit_inner(pool, verified, None, deadline).await", generic)
         self.assertNotIn("commit_with_expected_cluster_incarnation", generic)
         tx = body(text, "async fn commit_in_tx(", "fn audit_changes(")
-        self.assertIn("Some((current, current != expected))", tx)
-        self.assertIn("if let Some((incarnation, false)) = captured_cluster_incarnation", tx)
+        private = body(tx, "let captured_cluster_incarnation = if let Some(public) = public", "let cluster = match")
+        self.assertRegex(
+            private, r"lock_private_pending_attempt\(tx, public, plan, deadline\)\.await\?;\s+"
+            r"expected_cluster_incarnation\s+\} else \{"
+        )
+        legacy = body(tx, "let cluster = match expected_cluster_incarnation", "lock_source_tables(")
+        self.assertIn("None => None,", legacy)
+        self.assertIn("cluster.map(|(current, _)| current)", legacy)
         self.assertEqual(tx.count("enqueue_core_audit("), 1)
         self.assertLess(
-            tx.index("if let Some((incarnation, false)) = captured_cluster_incarnation"),
+            tx.index("if let Some(incarnation) = captured_cluster_incarnation"),
             tx.index("enqueue_core_audit("),
         )
-        self.assertNotIn("captured_cluster_incarnation.map(|(incarnation, _)| incarnation)", tx)
         self.assertNotIn("SELECT incarnation FROM cluster_authority", tx)
         helper = body(text, "async fn enqueue_core_audit(", "fn receipt(")
         self.assertNotIn("FROM cluster_authority", helper)
