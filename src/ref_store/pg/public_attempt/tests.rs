@@ -1256,7 +1256,7 @@ fn pending_slot_two_returns_only_the_current_attempt() {
     }
     match evaluate_status(raw, &status_request()).expect("valid pending status") {
         PublicOperationStatusLookup::Found(status) => {
-            assert_eq!(status.state(), OperationState::Pending);
+            assert_eq!(status.state, OperationState::Pending);
             assert!(status.terminal().is_none());
         }
         other => panic!("expected pending public status, got {other:?}"),
@@ -1318,7 +1318,7 @@ fn slot_two_finish_and_status_project_only_the_exact_current_terminal() {
     let sealed = with_terminal(snapshot(wrapper.clone(), attempts.clone()), terminal_value(&terminal));
     match evaluate_status(sealed, &status_request()).expect("valid committed status") {
         PublicOperationStatusLookup::Found(status) => {
-            assert_eq!(status.state(), OperationState::Committed);
+            assert_eq!(status.state, OperationState::Committed);
             assert_eq!(status.terminal(), Some(&terminal_value(&terminal)));
         }
         other => panic!("expected committed public status, got {other:?}"),
