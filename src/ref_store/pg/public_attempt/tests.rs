@@ -908,10 +908,16 @@ fn status_request_shape_and_debug_are_bounded_and_redacted() {
 fn status_terminal_projection_keeps_the_exact_typed_public_payload() {
     let terminal = pack_committed_terminal();
     let expected = terminal_value(&terminal);
-    let projected =
-        project_terminal(OperationState::Committed, repo(), GitObjectFormat::Sha1, Some(2), Some(&expected))
-            .expect("valid committed projection")
-            .expect("committed terminal is present");
+    let projected = project_terminal(
+        OperationState::Committed,
+        repo(),
+        GitObjectFormat::Sha1,
+        CommitMode::Atomic,
+        Some(2),
+        Some(&expected),
+    )
+    .expect("valid committed projection")
+    .expect("committed terminal is present");
     assert_eq!(projected, expected);
     let object = projected.as_object().expect("terminal object");
     assert_eq!(object.len(), 8);
@@ -927,10 +933,52 @@ fn status_terminal_projection_keeps_the_exact_typed_public_payload() {
 
     let rejected = pack_rejected_terminal(PackCommitRejectCode::RevisionMismatch, "admitted base was superseded");
     let expected = terminal_value(&rejected);
-    let projected = project_terminal(OperationState::Rejected, repo(), GitObjectFormat::Sha1, Some(2), Some(&expected))
-        .expect("valid rejected projection")
-        .expect("rejected terminal is present");
+    let projected = project_terminal(
+        OperationState::Rejected,
+        repo(),
+        GitObjectFormat::Sha1,
+        CommitMode::Atomic,
+        Some(2),
+        Some(&expected),
+    )
+    .expect("valid rejected projection")
+    .expect("rejected terminal is present");
     assert_eq!(projected, expected);
+}
+
+#[test]
+fn status_terminal_projects_a_committed_subset_but_refuses_it_for_atomic() {
+    let mut terminal = pack_committed_terminal();
+    terminal.refs.push(RefCommitResult::NotApplied {
+        name: "refs/heads/protected".into(),
+        reason: CommitRejectCode::PolicyDenied,
+    });
+    let expected = terminal_value(&terminal);
+    let mut subset = wrapper(0, "committed");
+    subset.request_mode = CommitMode::AcceptedSubset.as_str().into();
+    let status = evaluate_status(
+        with_terminal(snapshot(subset, vec![committed_attempt()]), expected.clone()),
+        &status_request(),
+    )
+    .expect("mixed terminal in accepted-subset mode");
+    let PublicOperationStatusLookup::Found(status) = status else {
+        panic!("expected the accepted-subset terminal");
+    };
+    assert_eq!(status.terminal(), Some(&expected));
+
+    let atomic = with_terminal(snapshot(wrapper(0, "committed"), vec![committed_attempt()]), expected);
+    assert_status_ledger(evaluate_status(atomic, &status_request()));
+}
+
+#[test]
+fn status_terminal_refuses_a_committed_subset_without_an_applied_ref() {
+    let mut terminal = pack_committed_terminal();
+    terminal.refs =
+        vec![RefCommitResult::NotApplied { name: "refs/heads/main".into(), reason: CommitRejectCode::PolicyDenied }];
+    let mut wrapper = wrapper(0, "committed");
+    wrapper.request_mode = CommitMode::AcceptedSubset.as_str().into();
+    let subset = with_terminal(snapshot(wrapper, vec![committed_attempt()]), terminal_value(&terminal));
+    assert_status_ledger(evaluate_status(subset, &status_request()));
 }
 
 #[test]
@@ -940,6 +988,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Pending,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         None,
         Some(&expected),
     ));
@@ -947,6 +996,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Cancelled,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         None,
         Some(&serde_json::json!({"state": "cancelled", "reason": "cancel_before_register"})),
     ));
@@ -957,6 +1007,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&extra),
     ));
@@ -967,6 +1018,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&missing),
     ));
@@ -977,6 +1029,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&wrong_repo),
     ));
@@ -987,6 +1040,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&wrong_revision),
     ));
@@ -997,6 +1051,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&wrong_kind),
     ));
@@ -1011,6 +1066,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&non_applied),
     ));
@@ -1021,6 +1077,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&bad_head),
     ));
@@ -1031,6 +1088,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&bad_oid),
     ));
@@ -1039,6 +1097,7 @@ fn status_terminal_projection_fails_closed_on_untyped_or_mismatched_payloads() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&serde_json::json!([1, 2])),
     ));
@@ -1052,10 +1111,16 @@ fn status_terminal_projection_validates_rejection_paths_and_registrations() {
         pack_rejected_terminal(PackCommitRejectCode::DecisionRejected, "policy_changed"),
     ] {
         let expected = terminal_value(&terminal);
-        let projected =
-            project_terminal(OperationState::Rejected, repo(), GitObjectFormat::Sha1, Some(2), Some(&expected))
-                .expect("accepted rejection producer path")
-                .expect("rejected terminal is present");
+        let projected = project_terminal(
+            OperationState::Rejected,
+            repo(),
+            GitObjectFormat::Sha1,
+            CommitMode::Atomic,
+            Some(2),
+            Some(&expected),
+        )
+        .expect("accepted rejection producer path")
+        .expect("rejected terminal is present");
         assert_eq!(projected, expected);
     }
 
@@ -1065,6 +1130,7 @@ fn status_terminal_projection_validates_rejection_paths_and_registrations() {
         OperationState::Rejected,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&unknown_detail),
     ));
@@ -1076,6 +1142,7 @@ fn status_terminal_projection_validates_rejection_paths_and_registrations() {
         OperationState::Rejected,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&with_registration),
     ));
@@ -1087,6 +1154,7 @@ fn status_terminal_projection_validates_rejection_paths_and_registrations() {
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&bad_registration),
     ));
@@ -1105,13 +1173,24 @@ fn status_terminal_projection_uses_the_compact_64k_bound() {
     dense.registrations.clear();
     let dense = terminal_value(&dense);
     assert!(serde_json::to_vec(&dense).expect("compact terminal").len() < 64 * 1024);
-    assert!(project_terminal(OperationState::Committed, repo(), GitObjectFormat::Sha1, Some(2), Some(&dense)).is_ok());
+    assert!(
+        project_terminal(
+            OperationState::Committed,
+            repo(),
+            GitObjectFormat::Sha1,
+            CommitMode::Atomic,
+            Some(2),
+            Some(&dense)
+        )
+        .is_ok()
+    );
 
     let oversized = serde_json::json!({"body": "x".repeat(65 * 1024)});
     assert_projection_ledger(project_terminal(
         OperationState::Committed,
         repo(),
         GitObjectFormat::Sha1,
+        CommitMode::Atomic,
         Some(2),
         Some(&oversized),
     ));

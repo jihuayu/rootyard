@@ -321,10 +321,8 @@ fn plan_for(
         request.history_incarnation,
         request.authority_epoch,
         request.group_epoch,
-    )
-    .map_err(PackCommitError::from)?;
-    let expected = PackCommitExpectation::new(preview.base_revision(), *fixture.gate.digest(), PackMode::MetadataOnly)
-        .map_err(PackCommitError::from)?;
+    )?;
+    let expected = PackCommitExpectation::new(preview.base_revision(), *fixture.gate.digest(), PackMode::MetadataOnly)?;
     let refs = vec![RefUpdate::new(
         RefName::new("refs/heads/main").map_err(PackCommitError::from)?,
         RefPrecondition::Absent,

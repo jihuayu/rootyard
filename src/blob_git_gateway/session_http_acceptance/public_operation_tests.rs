@@ -89,6 +89,46 @@ async fn case(db: &Db) -> Result<()> {
     ensure!(private_body["error"] == json!("not found"), "private identifier refusal changed");
     ensure_public_safe(&private_body, &[public_id, private_id], "private identifier refusal")?;
 
+    let hidden_cancel =
+        client.post(format!("{base}/operations/{private_id}/cancel")).bearer_auth(&owner.token).send().await?;
+    ensure!(hidden_cancel.status() == StatusCode::NOT_FOUND, "private identifier cancellation was not an opaque 404");
+    ensure_public_safe(&hidden_cancel.json().await?, &[public_id, private_id], "private cancellation refusal")?;
+
+    let expected = json!({
+        "operation_id": public_id,
+        "state": "cancelled",
+        "terminal": {"state": "cancelled", "reason": "cancel_requested"},
+    });
+    let cancel_path = format!("{public_path}/cancel");
+    for _ in 0..2 {
+        let cancel = client.post(&cancel_path).bearer_auth(&owner.token).send().await?;
+        ensure!(cancel.status() == StatusCode::OK, "public cancellation HTTP {}", cancel.status());
+        let terminal: Value = cancel.json().await?;
+        ensure!(terminal == expected, "public cancellation returned an unexpected terminal");
+        ensure_public_safe(&terminal, &[private_id], "public cancellation terminal")?;
+    }
+    let readback = client.get(&public_path).bearer_auth(&owner.token).send().await?;
+    ensure!(readback.status() == StatusCode::OK, "cancelled public readback HTTP {}", readback.status());
+    ensure!(readback.json::<Value>().await? == expected, "cancelled public readback differs");
+    let durable = db
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT w.cancelled_private_id=$3, o.state='cancelled', c.operation_id=$3,
+                w.event_id IS NULL, g.revision=$4
+         FROM ref_store_public_operations w
+         JOIN ref_store_operations o ON o.repository_id=w.repository_id AND o.operation_id=w.cancelled_private_id
+         JOIN ref_store_cancellations c ON c.repository_id=o.repository_id AND c.operation_id=o.operation_id
+         JOIN ref_store_core_gates g ON g.repository_id=w.repository_id
+         WHERE w.repository_id=$1 AND w.public_id=$2",
+            &[&serving.gate.repository_id(), &public_id, &private_id, &serving.gate.revision()],
+        )
+        .await?;
+    for index in 0..5 {
+        ensure!(durable.get::<_, bool>(index), "public cancellation database proof failed");
+    }
+
     Ok(())
 }
 
@@ -197,10 +237,8 @@ fn build_plan(
         facts.history_incarnation,
         facts.authority_epoch,
         facts.group_epoch,
-    )
-    .map_err(PackCommitError::from)?;
-    let expected = PackCommitExpectation::new(preview.base_revision(), facts.gate_digest, PackMode::MetadataOnly)
-        .map_err(PackCommitError::from)?;
+    )?;
+    let expected = PackCommitExpectation::new(preview.base_revision(), facts.gate_digest, PackMode::MetadataOnly)?;
     let refs = vec![RefUpdate::new(
         RefName::new("refs/heads/main").map_err(PackCommitError::from)?,
         RefPrecondition::Absent,

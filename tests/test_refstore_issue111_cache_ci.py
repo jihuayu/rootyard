@@ -51,7 +51,12 @@ class Issue111CacheCiTest(unittest.TestCase):
     def test_existing_174_selector_list_is_untouched(self):
         session = step(self.workflow, 'Exercise the #174 HTTP foundation cases against the owned database and Blob fixture')
         self.assertNotIn('cache_tests', session)
-        self.assertEqual(session.count('blob_git_gateway::session_http_acceptance'), 26)
+        public_case = (
+            'blob_git_gateway::session_http_acceptance::public_operation_tests::'
+            'public_operation_get_is_owned_pending_and_private_safe'
+        )
+        self.assertEqual(session.count(public_case), 2)
+        self.assertEqual(session.replace(public_case, '').count('blob_git_gateway::session_http_acceptance'), 26)
         self.assertIn(
             'blob_git_gateway::admission_race_acceptance::pre_admission_revision_mismatch_rebases_to_old_oid_mismatch',
             session,

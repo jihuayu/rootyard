@@ -63,7 +63,7 @@ pub(super) async fn resolve(
 ) -> Result<OperationRead, GatewayError> {
     let live =
         request(repository_id, operation_id, PublicOperationReadAuthorization::LiveIssuer { issuer_id: identity.id });
-    match PgRefStore.lookup_public_operation_status(&**tx, &live, deadline).await {
+    match PgRefStore.lookup_public_operation_status(tx, &live, deadline).await {
         Ok(PublicOperationStatusLookup::Found(status)) => Ok(OperationRead::Public(status)),
         // A private attempt identifier is indistinguishable from an unknown
         // public UUID on this route: both are opaque 404s after the repository
@@ -102,7 +102,7 @@ async fn resolve_admin(
     // authoritative admin-marked statement resolves the current state, matching
     // the legacy resolver's READ COMMITTED policy-fence behavior.
     let admin = request(repository_id, operation_id, PublicOperationReadAuthorization::RepositoryAdmin);
-    match PgRefStore.lookup_public_operation_status(&**tx, &admin, deadline).await {
+    match PgRefStore.lookup_public_operation_status(tx, &admin, deadline).await {
         Ok(PublicOperationStatusLookup::Found(status)) => Ok(OperationRead::Public(status)),
         // The issuer-mismatch probe already proved the wrapper existed; any
         // different marker is a durable race/integrity refusal, not a route.
@@ -124,7 +124,7 @@ async fn resolve_legacy_status(
     operation_id: Uuid,
     deadline: Instant,
 ) -> Result<OperationRead, GatewayError> {
-    let record = match PgRefStore.get_legacy_status(&**tx, repository_id, operation_id, deadline).await? {
+    let record = match PgRefStore.get_legacy_status(tx, repository_id, operation_id, deadline).await? {
         LegacyStatusLookup::Legacy(record) => record,
         // The public probe said this UUID was legacy-only; a wrapper appearing
         // in the atomic classifier is a concurrent change, never a legacy row.
@@ -149,7 +149,7 @@ async fn effective_role(
     actor_id: Uuid,
     deadline: Instant,
 ) -> Result<Option<Role>, GatewayError> {
-    crate::ref_store::pg::bound(&**tx, deadline).await.map_err(GatewayError::from)?;
+    crate::ref_store::pg::bound(tx, deadline).await.map_err(GatewayError::from)?;
     resolve_effective_role(&**tx, repository_id, owner_id, actor_id)
         .await
         .map(|role| role.map(|(effective, _, _)| effective))

@@ -369,14 +369,12 @@ const HTTP_CANCEL_REASON: &str = "http_cancel_requested";
 /// owner/admin role. Those checks happen before any 200/404 existence answer, so
 /// a non-admin cannot enumerate operation UUIDs.
 ///
-/// The facade then opens exactly one bounded `synchronous_commit=on` transaction,
-/// takes the migration-138 operation advisory key, resolves the core record and
-/// its migration-147 producer binding, and calls the existing authorized
-/// coordinator. The coordinator rechecks live authority for the known mutation
-/// and either wins with an immutable `Cancelled` terminal or returns the exact
-/// committed/rejected terminal that already won. An unknown UUID is `404` and
-/// writes no tombstone; a core row without its exact A3 producer binding fails
-/// closed. An ambiguous cancellation `COMMIT` remains the typed `503` unknown.
+/// The facade resolves the current attempt under the public wrapper locks and
+/// settles the public result in the same transaction as the private tombstone.
+/// Historical operations use the legacy registry and its producer binding.
+/// Both paths recheck live authority and preserve any immutable result that
+/// already won. Unknown or private-only UUIDs are opaque 404s. An ambiguous
+/// cancellation `COMMIT` remains a typed 503.
 pub(super) async fn cancel_operation(
     state: State<Arc<BlobGitState>>,
     path: Path<(String, String, String)>,
@@ -400,7 +398,7 @@ async fn cancel_operation_authorized(
         .map_err(authority_error)?;
     require_cancel_admin(&state, &identity, &serving, deadline).await?;
     let record = super::publish::authorized(&state)?
-        .cancel_known(state.pool(), &identity, serving.gate.repository_id(), operation_id, HTTP_CANCEL_REASON, deadline)
+        .cancel_gateway_operation(state.pool(), &identity, &serving, operation_id, HTTP_CANCEL_REASON, deadline)
         .await
         .map_err(super::publish::map_authorized)?;
     let Some(record) = record else {

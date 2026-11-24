@@ -825,10 +825,10 @@ fn validate_status_request(request: &PublicOperationStatusRequest) -> Result<(),
     if request.repository_id.is_nil() || request.public_id.is_nil() {
         return Err(PackCommitError::Invalid("public operation status ids must be non-nil"));
     }
-    if let PublicOperationReadAuthorization::LiveIssuer { issuer_id } = request.authorization {
-        if issuer_id.is_nil() {
-            return Err(PackCommitError::Invalid("public operation status live issuer must be non-nil"));
-        }
+    if let PublicOperationReadAuthorization::LiveIssuer { issuer_id } = request.authorization
+        && issuer_id.is_nil()
+    {
+        return Err(PackCommitError::Invalid("public operation status live issuer must be non-nil"));
     }
     Ok(())
 }
@@ -868,10 +868,10 @@ fn evaluate_status(
     // live-issuer variant is still bound to the exact durable issuer here; the
     // admin variant is accepted only because the caller already resolved the
     // current repository-admin policy. Neither marker can reveal a private id.
-    if let PublicOperationReadAuthorization::LiveIssuer { issuer_id } = request.authorization {
-        if issuer_id != wrapper.issuer_id {
-            return Ok(PublicOperationStatusLookup::Forbidden);
-        }
+    if let PublicOperationReadAuthorization::LiveIssuer { issuer_id } = request.authorization
+        && issuer_id != wrapper.issuer_id
+    {
+        return Ok(PublicOperationStatusLookup::Forbidden);
     }
 
     // Parse the stored digest/mode/object format and prove the wrapper's
@@ -892,6 +892,7 @@ fn evaluate_status(
         state,
         wrapper.repository_id,
         stored.object_format,
+        stored.request_mode,
         evidence.current.event_revision,
         snapshot.status_terminal.as_ref(),
     )?;

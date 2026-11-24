@@ -289,7 +289,7 @@ pub(in crate::blob_git_gateway) async fn rotate_slot_one(
     };
     let savepoint = {
         let created =
-            timeout_at(deadline, tokio_postgres::Transaction::savepoint(&mut *tx, GATEWAY_SLOT_ONE_SAVEPOINT)).await;
+            timeout_at(deadline, tokio_postgres::Transaction::savepoint(&mut tx, GATEWAY_SLOT_ONE_SAVEPOINT)).await;
         match created {
             Ok(Ok(savepoint)) => savepoint,
             // Dropping the still-owned outer transaction queues its rollback;

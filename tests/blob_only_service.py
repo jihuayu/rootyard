@@ -997,9 +997,13 @@ def server_side_mixed_ref_policy_atomic_then_subset_sha1_sha256(self):
             assert len(terminal["refs"]) == 2 and outcomes == {protected: denied, allowed: expected_refs}, outcomes
 
             reason = self.sql(
-                "SELECT r.reject_code FROM ref_store_publication_decisions d "
+                "SELECT r.reject_code FROM ref_store_public_operations p "
+                "JOIN ref_store_private_attempts a ON (a.repository_id,a.public_id,a.slot) = "
+                "(p.repository_id,p.public_id,p.current_slot) "
+                "JOIN ref_store_publication_decisions d "
+                "ON (d.repository_id,d.operation_id) = (a.repository_id,a.private_id) "
                 "JOIN ref_store_decision_refs r ON r.decision_id=d.decision_id "
-                "WHERE d.repository_id='" + repo_id + "' AND d.operation_id='" + operation + "' "
+                "WHERE p.repository_id='" + repo_id + "' AND p.public_id='" + operation + "' "
                 "AND r.ref_name='refs/heads/main' AND r.verdict='reject'")
             assert reason == "missing_approvals", reason
             assert int(self.sql("SELECT revision FROM ref_store_core_gates" + repo_filter)) == expected_revision
