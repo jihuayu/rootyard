@@ -9,7 +9,7 @@ use super::super::{pg, pg_commit, registration, sql, usage};
 use super::{
     AuthorizedCommitError, PgAuthorizedCommit, VerifiedAuthorizedPublication, effective_deadline, pooled_client,
 };
-use crate::ref_store::contract::{OperationRecord, OperationState, RequestDigest, TerminalOutcome};
+use crate::ref_store::contract::{OperationRecord, OperationState, RefStoreError, RequestDigest, TerminalOutcome};
 use crate::ref_store::core::decision_commit::{self, RealmExpectation};
 use crate::ref_store::core::publication_decision::{self as decisions, ConsumptionRecord};
 use crate::ref_store::core::subset::RefRejectReason;
@@ -41,7 +41,13 @@ impl PgAuthorizedCommit {
         deadline: Instant,
     ) -> Result<AuthorizedCommitReceipt, AuthorizedCommitError> {
         let deadline = effective_deadline(deadline)?;
-        let plan = verified.selection().prepared().plan();
+        let prepared = verified.selection().prepared();
+        let plan = prepared.plan();
+        if let Some(public) = prepared.public_attempt()
+            && self.store.backend_identity().as_hex() != public.backend_identity
+        {
+            return Err(pg::reject(PackCommitRejectCode::PublicationMismatch, "private attempt backend differs").into());
+        }
         ensure_pack_terminal_budget(plan)?;
         let mut client = pooled_client(pool, deadline).await?;
         let tx = begin_bounded(&mut client, deadline).await?;
@@ -72,26 +78,37 @@ async fn commit_in_tx(
     let selection = verified.selection();
     let prepared = selection.prepared();
     let plan = prepared.plan();
+    let public = prepared.public_attempt();
     pg::set_ack_durability(tx, deadline).await?;
-    let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
-    match begun.record.state() {
-        OperationState::Committed | OperationState::Rejected => {
-            return Ok(receipt(pg::replay_terminal(begun)?, *selection.selection_digest()));
+    if let Some(public) = public {
+        // Private terminal replay is owned by the public wrapper finish path.
+        PgRefStore.lock_private_pending_attempt(tx, public, plan, deadline).await?;
+    } else {
+        let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
+        match begun.record.state() {
+            OperationState::Committed | OperationState::Rejected => {
+                return Ok(receipt(pg::replay_terminal(begun)?, *selection.selection_digest()));
+            }
+            OperationState::Cancelled => {
+                return Err(super::reject(PackCommitRejectCode::Cancelled, "cancellation tombstone won"));
+            }
+            OperationState::Pending if begun.created => {
+                return Err(super::reject(
+                    PackCommitRejectCode::PendingMissing,
+                    "publication needs an existing pending operation",
+                ));
+            }
+            OperationState::Pending => {}
         }
-        OperationState::Cancelled => {
-            return Err(super::reject(PackCommitRejectCode::Cancelled, "cancellation tombstone won"));
-        }
-        OperationState::Pending if begun.created => {
-            return Err(super::reject(
-                PackCommitRejectCode::PendingMissing,
-                "publication needs an existing pending operation",
-            ));
-        }
-        OperationState::Pending => {}
     }
     // SHARE NOWAIT is taken before any authorization reads and retained through COMMIT.
     decisions::sql_locks::lock_source_tables(tx, selection.selected().action()).await.map_err(super::decision_error)?;
-    pg::ensure_repository(tx, plan, true).await?;
+    let repository_scope = pg::ensure_repository(tx, plan, true).await?;
+    if let Some(public) = public {
+        repository_scope
+            .require_serving(public.admission_owner_id, &public.backend_identity)
+            .map_err(|refusal| RefStoreError::Unsupported(refusal.reason()))?;
+    }
     decisions::sql_locks::lock_usage(tx, plan.repository_id(), plan.tenant_id())
         .await
         .map_err(super::decision_error)?;

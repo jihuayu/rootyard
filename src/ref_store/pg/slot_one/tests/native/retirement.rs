@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
-async fn slot_zero_private_stage_and_selection_use_the_exact_public_attempt() -> Result<()> {
+async fn slot_zero_private_stage_selection_and_commit_use_the_exact_public_attempt() -> Result<()> {
     use super::{common, setup};
     use rootyard::ref_store::{
         RefStoreError, RequestDigest,
@@ -201,6 +201,35 @@ async fn slot_zero_private_stage_and_selection_use_the_exact_public_attempt() ->
         ensure!(stored.parent_digest == plan.parent_digest().as_hex());
         ensure!(stored_ref(&db, repo.id, REF_RETRY).await?.is_none(), "selection published a ref");
         ensure!(db::gate_version(&db.pool, repo.id, actor.id).await?.revision() == gate.revision());
+        let verified = adapter.verify(replay, deadline()).await?;
+        let result = adapter.commit(&db.pool, &verified, deadline()).await?;
+        let revision = gate.revision() + 1;
+        ensure!(result.is_committed() && !result.replayed);
+        ensure!(result.selection_digest == *selection.selection_digest());
+        ensure!(result.terminal.revision == revision);
+        ensure!(result.terminal.registrations.len() == 1 && result.terminal.registrations[0].pack_id == pack_id);
+        ensure!(stored_ref(&db, repo.id, REF_RETRY).await?.as_deref() == Some(oid.as_str()));
+        ensure!(db::gate_version(&db.pool, repo.id, actor.id).await?.revision() == revision);
+        ensure!(operation_record(&db, repo.id, admitted.private_id).await? == result.record);
+        ensure!(wrapper_json(&db, repo.id, public.public_id).await? == wrapper_before);
+
+        let effects = db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT d.state,d.consume_receipt_id,e.outcome,e.revision,m.joined_revision
+                 FROM ref_store_publication_decisions d
+                 JOIN ref_store_core_events e USING (repository_id,operation_id)
+                 JOIN ref_store_core_pack_memberships m ON m.repository_id=d.repository_id AND m.pack_id=$3
+                 WHERE d.repository_id=$1 AND d.operation_id=$2",
+                &[&repo.id, &admitted.private_id, &pack_id],
+            )
+            .await?;
+        ensure!(effects.get::<_, String>(0) == "CONSUMED");
+        ensure!(effects.get::<_, Uuid>(1) == admitted.private_id);
+        ensure!(effects.get::<_, String>(2) == "committed");
+        ensure!(effects.get::<_, i64>(3) == revision && effects.get::<_, i64>(4) == revision);
         Ok(())
     }
     .await;
