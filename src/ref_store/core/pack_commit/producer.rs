@@ -132,6 +132,26 @@ impl PgPackCommit {
         }
         Ok(token)
     }
+
+    /// Write the exact migration-147 producer binding for a pending operation
+    /// that the caller already inserted in this same transaction.
+    ///
+    /// This is the slot-zero wrapper writer's binding step, after it has
+    /// claimed the private UUID and inserted the migration-138 pending row. It
+    /// deliberately does not call `PgRefStore::begin` again: the wrapper's
+    /// private UUID is already claimed by `ref_store_private_attempts`, so the
+    /// legacy begin prefix would (correctly) refuse it. The insert trigger and
+    /// the read-back below still prove the parent pending row, exact issuer and
+    /// exact plan parent digest.
+    pub(crate) async fn bind_existing_serving_pending_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        plan: &PackCommitPlan,
+        producer_request_digest: RequestDigest,
+        deadline: Instant,
+    ) -> Result<(), PackCommitError> {
+        bind_producer_request(tx, plan, &producer_request_digest, deadline).await
+    }
 }
 
 /// Typed read adapter for the durable producer binding.

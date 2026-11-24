@@ -87,11 +87,15 @@ class BlobGatewayCommitCacheShapeTests(unittest.TestCase):
     def test_native_http_hit_proof_seam_is_cfg_test_only(self):
         state = source("src/blob_git_gateway/state.rs")
         history = source("src/blob_git_gateway/history.rs")
+        pauses = source("src/blob_git_gateway/state/acceptance_pauses.rs")
         native = source("src/blob_git_gateway/session_http_acceptance/cache_tests.rs")
+        self.assertIn("#[cfg(test)]\nmod acceptance_pauses;", state)
         self.assertIn(
-            "#[cfg(test)]\n    pub(crate) async fn pause_before_commit_finalize",
+            "#[cfg(test)]\npub(crate) use acceptance_pauses::{AdmissionPause, ReadPause};",
             state,
         )
+        self.assertNotIn("async fn pause_before_commit_finalize", state)
+        self.assertIn("pub(crate) async fn pause_before_commit_finalize", pauses)
         self.assertIn(
             "#[cfg(test)]\n    session.state.pause_before_commit_finalize(&oid).await;",
             history,
@@ -113,10 +117,10 @@ class BlobGatewayCommitCacheShapeTests(unittest.TestCase):
             self.assertIn(marker, native)
 
     def test_paused_cache_request_is_released_reaped_and_never_panics(self):
-        state = source("src/blob_git_gateway/state.rs")
+        pauses = source("src/blob_git_gateway/state/acceptance_pauses.rs")
         native = source("src/blob_git_gateway/session_http_acceptance/cache_tests.rs")
         wait = body(
-            state,
+            pauses,
             "pub(crate) async fn wait_reached(&self, deadline: Instant)",
             "/// Let the paused request",
         )

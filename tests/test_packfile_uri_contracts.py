@@ -23,6 +23,7 @@ OWNED_RUST_FILES = [
 ]
 GATEWAY_WIRING_FILES = [
     ROOT / "src" / "blob_git_gateway" / "state.rs",
+    ROOT / "src" / "blob_git_gateway" / "state" / "acceptance_pauses.rs",
     ROOT / "src" / "blob_git_gateway" / "state" / "signals.rs",
     ROOT / "src" / "blob_git_gateway" / "smart_http.rs",
 ]
@@ -148,6 +149,7 @@ class PackfileUriContractsTest(unittest.TestCase):
                 "src/browse/packfile_uri.rs",
                 "src/browse/packfile_uri/**",
                 "src/blob_git_gateway/state.rs",
+                "src/blob_git_gateway/state/acceptance_pauses.rs",
                 "src/blob_git_gateway/state/signals.rs",
                 "src/blob_git_gateway/smart_http.rs",
                 "tests/packfile_uri_delivery.rs",

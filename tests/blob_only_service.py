@@ -682,15 +682,15 @@ def concurrent_same_ref_one_winner_parseable_no_false_ok(self):
     raw_reports, durable_states = [], []
     for index, (status, body, headers) in enumerate(raw_results):
         operation_query = (" WHERE repository_id='" + str(uuid.UUID(repo["id"]))
-                           + "' AND operation_id='" + raw_operations[index] + "'")
-        state = self.sql("SELECT state FROM ref_store_operations" + operation_query)
+                           + "' AND public_id='" + raw_operations[index] + "'")
+        state = self.sql("SELECT state FROM ref_store_public_operations" + operation_query)
         if status == 409:
             # A pre-admission revision race may have rolled its transaction
             # back. A pending row behind that 409 is the regression, never a
             # reason to retry or accept this run.
             assert not state, "409 left a durable operation instead of a terminal: " + state
             status, body, headers = post(index)
-            state = self.sql("SELECT state FROM ref_store_operations" + operation_query)
+            state = self.sql("SELECT state FROM ref_store_public_operations" + operation_query)
         assert status == 200, "race POST status=" + str(status) + ", state=" + state
         assert header_value(headers, "x-rootyard-operation") == raw_operations[index]
         unpack, statuses = parse_receive_report(body)
@@ -997,9 +997,13 @@ def server_side_mixed_ref_policy_atomic_then_subset_sha1_sha256(self):
             assert len(terminal["refs"]) == 2 and outcomes == {protected: denied, allowed: expected_refs}, outcomes
 
             reason = self.sql(
-                "SELECT r.reject_code FROM ref_store_publication_decisions d "
+                "SELECT r.reject_code FROM ref_store_public_operations p "
+                "JOIN ref_store_private_attempts a ON (a.repository_id,a.public_id,a.slot) = "
+                "(p.repository_id,p.public_id,p.current_slot) "
+                "JOIN ref_store_publication_decisions d "
+                "ON (d.repository_id,d.operation_id) = (a.repository_id,a.private_id) "
                 "JOIN ref_store_decision_refs r ON r.decision_id=d.decision_id "
-                "WHERE d.repository_id='" + repo_id + "' AND d.operation_id='" + operation + "' "
+                "WHERE p.repository_id='" + repo_id + "' AND p.public_id='" + operation + "' "
                 "AND r.ref_name='refs/heads/main' AND r.verdict='reject'")
             assert reason == "missing_approvals", reason
             assert int(self.sql("SELECT revision FROM ref_store_core_gates" + repo_filter)) == expected_revision

@@ -23,6 +23,34 @@
 //! 5. B's refreshed native facts must select `OldOidMismatch`, and only that
 //!    durable terminal may produce the raw `ng refs/heads/main stale info`.
 //!
+//! A second case uses the same rendezvous in a post-admission phase. B is
+//! paused after its pending operation is durable and before prepare, A commits
+//! a different ref, then B is released. The original AC requires both
+//! independent refs to commit with exact `ok` report-statuses. The current
+//! repo-wide gate is expected to reject B as `stale info`; this case records
+//! that known source gap rather than weakening the expectation. On every
+//! post-spawn return, error or panic, the one-shot pause is released and any
+//! still-owned push task is aborted and joined before fixture teardown. It does
+//! not prove slow HTTP body overlap and does not cover AC3 GC, backup, PR
+//! merge, crash or Raft.
+//!
+//! A third case,
+//! [`slow_body::slow_body_distinct_refs_overlap_and_both_commit`], is the
+//! separate slow-body extension for the original distinct-ref criterion. It
+//! wraps only that fixture's two exact receive-pack operation ids with a
+//! test-only body observer, records bounded per-data-frame pack progress as the
+//! production handler actually consumes each body, and requires an overlapping
+//! pair of progress intervals before either response completes. The observer is
+//! attached by the test router, never by the production router or state, and it
+//! neither synthesizes client bytes nor infers progress from response delivery,
+//! request scheduling or native-child wall clocks. Its durable result oracle is
+//! the restore-scoped public wrapper to exact private operation path, not a
+//! lookup keyed by the public Git operation UUID, and a legacy-only row cannot
+//! satisfy that product qualification. This case does not replace or relax the
+//! two rendezvous cases above, and it does not claim the other ACs (same-old-OID
+//! conflict, multi-ref atomic/accepted-subset, GC, backup, PR merge, crash or
+//! Raft).
+//!
 //! The external `tests/blob_git_gateway.rs` race case and its exact one-ok /
 //! one-ng assertions remain untouched; it stays the unsynchronized stress case.
 //!
@@ -49,14 +77,15 @@
 // modules in the cfg(test) library graph.
 use super::session_http_acceptance::fixtures::{
     actor::{self, Actor},
-    db::{Db, RUN_BLOB_PREFIX, deadline},
+    db::{Db, RUN_BLOB_PREFIX, deadline, prepare},
     git::{self, Git},
 };
 
 use std::{
     collections::HashMap,
     fs::OpenOptions,
-    io::Write,
+    io::{self, Write},
+    panic::AssertUnwindSafe,
     path::Path,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
@@ -71,8 +100,14 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
+use futures_util::FutureExt;
 use serde_json::Value;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::oneshot,
+    task::JoinHandle,
+    time::{Instant, timeout_at},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -88,9 +123,15 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+mod slow_body;
+mod three_way;
+
 const SEED_FILE: &str = "seed.txt";
 const SEED_CONTENT: &str = "seed\n";
 const SEED_REF: &str = "refs/heads/main";
+const INDEPENDENT_A: &str = "refs/heads/indep-a";
+const INDEPENDENT_B: &str = "refs/heads/indep-b";
 const MAX_CAPTURED_RESPONSE: usize = 64 * 1024 * 1024;
 const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
 const FAILURE_PHASE_MARKER: &str = "ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKER";
@@ -98,14 +139,83 @@ const FAILURE_PHASE_MARKER: &str = "ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKE
 /// A parsed `report-status`: the `unpack` status and `(ref, ng reason)` rows.
 type GitReport = (String, Vec<(String, Option<String>)>);
 
-/// Abort the real `axum::serve` task when the case ends, including on failure.
-struct ServerGuard {
-    task: JoinHandle<Result<(), std::io::Error>>,
+#[derive(Default)]
+struct WitnessResources {
+    pause: Option<Arc<AdmissionPause>>,
+    extra_pauses: Vec<Arc<AdmissionPause>>,
+    scratch: Option<tempfile::TempDir>,
+    work: Option<tempfile::TempDir>,
+    shutdown: Option<oneshot::Sender<()>>,
+    server: Option<JoinHandle<io::Result<()>>>,
+    second_push: Option<JoinHandle<Result<git::Output>>>,
+    first_push: Option<JoinHandle<Result<git::Output>>>,
+    third_push: Option<JoinHandle<Result<git::Output>>>,
 }
 
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        self.task.abort();
+impl WitnessResources {
+    async fn drain_pushes(&mut self) {
+        if let Some(pause) = &self.pause {
+            pause.release();
+        }
+        for pause in &self.extra_pauses {
+            pause.release();
+        }
+        for push in [&mut self.second_push, &mut self.first_push, &mut self.third_push] {
+            if let Some(task) = push.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    async fn drain_server(&mut self, cleanup_deadline: Instant) -> Result<()> {
+        if let Some(server) = self.server.as_mut() {
+            let signaled = self.shutdown.take().is_some_and(|shutdown| shutdown.send(()).is_ok());
+            let drained = timeout_at(cleanup_deadline, server).await;
+            if drained.is_ok() {
+                self.server = None;
+            }
+            ensure!(signaled && matches!(drained, Ok(Ok(Ok(())))), "gateway server drain unproven; schema retained");
+        }
+        Ok(())
+    }
+
+    async fn teardown(&mut self, db: &Db, fence: &mut Vec<deadpool_postgres::Client>) -> Result<()> {
+        let cleanup_deadline = deadline();
+        self.drain_pushes().await;
+        self.drain_server(cleanup_deadline).await?;
+
+        let capacity = db.pool.status().max_size;
+        ensure!(capacity > 0, "witness pool has no checkout capacity; schema retained");
+        for _ in 0..capacity {
+            let Ok(Ok(client)) = timeout_at(cleanup_deadline, db.pool.get()).await else {
+                return Err(anyhow!("witness pool checkout fence failed; schema retained"));
+            };
+            fence.push(client);
+        }
+        for client in fence {
+            ensure!(
+                matches!(timeout_at(cleanup_deadline, client.simple_query("SELECT 1")).await, Ok(Ok(_))),
+                "witness pool roundtrip failed; schema retained"
+            );
+        }
+
+        db.pool.close();
+        ensure!(Instant::now() < cleanup_deadline, "witness cleanup deadline elapsed; schema retained");
+        ensure!(
+            matches!(timeout_at(cleanup_deadline, db.teardown()).await, Ok(Ok(()))),
+            "witness schema teardown unconfirmed"
+        );
+        Ok(())
+    }
+
+    async fn seal_failed_cleanup(&mut self, db: &Db) {
+        db.pool.close();
+        self.drain_pushes().await;
+        if let Some(server) = self.server.take() {
+            server.abort();
+            let _ = server.await;
+        }
     }
 }
 
@@ -195,19 +305,41 @@ fn require_per_run_blob_prefix() -> Result<()> {
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
 async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result<()> {
     let mut phase = "fixture_setup";
-    let result = async {
-        require_owned_disposable_blob_fixture()?;
-        let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
-        let db = Db::setup().await?;
-        require_per_run_blob_prefix()?;
-        let outcome = case(&db, &mut phase).await;
+    require_owned_disposable_blob_fixture()?;
+    let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    prepare()?;
+    require_per_run_blob_prefix()?;
+    let db = Db::setup_public_owned().await?;
+    let mut resources = WitnessResources::default();
+    let outcome = AssertUnwindSafe(async {
+        let outcome = case(&db, &mut resources, &mut phase).await;
         if outcome.is_ok() {
             phase = "fixture_cleanup";
         }
-        db.finish(outcome).await
-    }
+        outcome
+    })
+    .catch_unwind()
     .await;
+    let mut fence = Vec::new();
+    let cleanup = AssertUnwindSafe(resources.teardown(&db, &mut fence))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("pre-admission witness cleanup panicked")));
+    if let Err(error) = &cleanup {
+        let sealed = AssertUnwindSafe(resources.seal_failed_cleanup(&db)).catch_unwind().await;
+        if sealed.is_err() {
+            let _ = writeln!(io::stderr().lock(), "pre-admission witness cleanup fallback panicked");
+        }
+        if !matches!(&outcome, Ok(Ok(()))) {
+            let _ = writeln!(io::stderr().lock(), "pre-admission witness cleanup failed ({error})");
+        }
+    }
+    drop(fence);
 
+    let result = match outcome {
+        Ok(result) => result.and(cleanup),
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
     // The fixture preserves a case error over a cleanup error. Record its
     // phase only after that decision, never while the race is in flight.
     if result.is_err()
@@ -222,7 +354,254 @@ async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result
     result
 }
 
-async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
+#[tokio::test]
+#[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
+async fn post_admission_independent_refs_both_commit() -> Result<()> {
+    require_owned_disposable_blob_fixture()?;
+    let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    prepare()?;
+    require_per_run_blob_prefix()?;
+    let db = Db::setup_public_owned().await?;
+    let mut resources = WitnessResources::default();
+    let outcome = AssertUnwindSafe(async {
+        let db = &db;
+        let store = open_store()?;
+        let git: &'static Git = Box::leak(Box::new(Git::new()?));
+
+        let first_operation = Uuid::new_v4();
+        let second_operation = Uuid::new_v4();
+        ensure!(first_operation != second_operation, "the independent race pins shared an operation id");
+
+        // The post-admission phase must not consume the existing pre-admission
+        // pause; `new_after_admission` is a distinct selector.
+        let body_pause =
+            resources.pause.insert(Arc::new(AdmissionPause::new_after_admission(second_operation))).clone();
+        let captures = Captures::default();
+        let scratch = resources.scratch.insert(tempfile::tempdir().context("temporary gateway scratch root")?);
+        let state = Arc::new(
+            BlobGitState::new(BlobGitConfig {
+                pool: db.pool.clone(),
+                store: store.clone(),
+                git_binary: git.binary().to_path_buf(),
+                scratch_root: scratch.path().to_path_buf(),
+                max_concurrent_requests: 4,
+                max_request_bytes: 16 * 1024 * 1024,
+                max_response_bytes: 64 * 1024 * 1024,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                operation_deadline: Duration::from_secs(120),
+                native_limits: Default::default(),
+            })
+            .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?
+            .with_admission_pause(body_pause.clone()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let app = capture_receive_responses(router(state.clone()), captures.clone());
+        let (shutdown, signal) = oneshot::channel();
+        resources.shutdown = Some(shutdown);
+        resources.server = Some(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = signal.await;
+                })
+                .await
+        }));
+        let (second_push, first_push) = (&mut resources.second_push, &mut resources.first_push);
+
+        let owner = actor::owner(&db.pool).await?;
+        let name = format!("race-independent-{}", &Uuid::new_v4().simple().to_string()[..12]);
+
+        let created = create_repository(address, &owner, &name).await?;
+        let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
+        provision_decision_realm(db, &owner, &name, &store).await?;
+
+        // Seed one real main tip, then clone two independent worktrees from it.
+        let work = resources.work.insert(tempfile::tempdir().context("temporary Git work root")?);
+        let direct_url = clone_url(address, &owner, &name);
+        let seeded = git.clone(work.path(), &direct_url, "seed").await?;
+        ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
+        let seed_dir = work.path().join("seed");
+        let seed = git.commit(&seed_dir, SEED_FILE, SEED_CONTENT, "seed commit").await?;
+        let seed_target = format!("HEAD:{SEED_REF}");
+        let pushed = git.run(&seed_dir, &["push", "origin", seed_target.as_str()]).await?;
+        ensure!(pushed.success, "seed push was refused");
+
+        let first_dir = clone_one(git, work.path(), &direct_url, "independent-a").await?;
+        let second_dir = clone_one(git, work.path(), &direct_url, "independent-b").await?;
+        let first_old = git.text(&first_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
+        let second_old = git.text(&second_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
+        ensure!(first_old == seed && second_old == seed, "the two clones did not share the seed tip");
+        let first_new = git.commit(&first_dir, "a.txt", "from a\n", "commit from a").await?;
+        let second_new = git.commit(&second_dir, "b.txt", "from b\n", "commit from b").await?;
+        ensure!(first_new != second_new, "the two independent commits are identical");
+        let revision_before = gate_revision(db, repository_id).await?;
+
+        // B reaches Start::Fresh and pauses with its pending row durable, before
+        // prepare can observe a later gate revision. From this point on, every
+        // fallible read/assertion and both push tasks are owned by the guarded
+        // block so the pause is released and the tasks are aborted/joined before
+        // the fixture returns, including on a panic.
+        *second_push = Some(spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
+        {
+            let selected: Option<std::result::Result<Result<git::Output>, tokio::task::JoinError>> = {
+                let second_handle =
+                    second_push.as_mut().ok_or_else(|| anyhow!("the independent push task was not created"))?;
+                tokio::select! {
+                    _ = body_pause.wait_reached() => None,
+                    exited = second_handle => Some(exited),
+                }
+            };
+            if let Some(exited) = selected {
+                // The select consumed this JoinHandle's output. Remove the
+                // completed handle without polling it again, then preserve the
+                // original completion result.
+                let _consumed = second_push.take();
+                let output = exited.context("the paused independent push task failed")??;
+                return Err(anyhow!(
+                    "the independent push exited before its post-admission rendezvous: {}",
+                    redacted(&output)
+                ));
+            }
+        }
+        let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the paused independent operation has no durable row"))?;
+        ensure!(second_state == "pending", "the paused independent operation is {second_state}, not pending");
+        ensure!(second_terminal.is_none(), "the paused independent operation already has a terminal");
+        ensure!(
+            gate_revision(db, repository_id).await? == revision_before,
+            "the gate moved before the first independent commit"
+        );
+
+        // A commits a different ref while B is paused after admission.
+        *first_push = Some(spawn_push_ref(git, first_dir, direct_url, first_operation, INDEPENDENT_A));
+        let first_join = {
+            let first_handle =
+                first_push.as_mut().ok_or_else(|| anyhow!("the first independent push task was not created"))?;
+            first_handle.await
+        };
+        *first_push = None;
+        let first_output = first_join.context("the first independent push task failed")??;
+        ensure!(first_output.success, "the first independent push failed: {}", redacted(&first_output));
+        let revision_after_first = gate_revision(db, repository_id).await?;
+        ensure!(
+            revision_after_first == revision_before + 1,
+            "the first independent commit did not advance the gate exactly once"
+        );
+
+        body_pause.release();
+        let second_join = {
+            let second_handle =
+                second_push.as_mut().ok_or_else(|| anyhow!("the paused independent push task was lost"))?;
+            second_handle.await
+        };
+        *second_push = None;
+        let second_output = second_join.context("the paused independent push task failed")??;
+
+        let first_capture =
+            captures.take(first_operation).ok_or_else(|| anyhow!("the first independent push has no raw reply"))?;
+        let second_capture =
+            captures.take(second_operation).ok_or_else(|| anyhow!("the second independent push has no raw reply"))?;
+        ensure!(captures.is_empty(), "the service answered unexpected extra receive-pack operations");
+        ensure!(
+            first_capture.status == 200,
+            "the service answered the first independent push with {}",
+            first_capture.status
+        );
+        ensure!(
+            second_capture.status == 200,
+            "the service answered the second independent push with {}",
+            second_capture.status
+        );
+        ensure!(!first_capture.truncated, "the first independent raw reply is truncated");
+        ensure!(!second_capture.truncated, "the second independent raw reply is truncated");
+        let (first_unpack, first_verdicts) = report_status(&first_capture.body)?;
+        let (second_unpack, second_verdicts) = report_status(&second_capture.body)?;
+        ensure!(first_unpack == "ok", "the first independent report-status did not unpack: {first_unpack}");
+        ensure!(second_unpack == "ok", "the second independent report-status did not unpack: {second_unpack}");
+        ensure!(
+            first_verdicts == vec![(INDEPENDENT_A.to_owned(), None)],
+            "the first independent report-status is not exactly one ok on {INDEPENDENT_A}: {first_verdicts:?}"
+        );
+        ensure!(
+            second_verdicts == vec![(INDEPENDENT_B.to_owned(), None)],
+            "the second independent report-status is not exactly one ok on {INDEPENDENT_B}: {second_verdicts:?}"
+        );
+        ensure!(first_output.success, "the first independent push was refused: {}", redacted(&first_output));
+        ensure!(second_output.success, "the second independent push was refused: {}", redacted(&second_output));
+
+        let first_oid = durable_ref(db, repository_id, INDEPENDENT_A)
+            .await?
+            .ok_or_else(|| anyhow!("durable {INDEPENDENT_A} is missing"))?;
+        let second_oid = durable_ref(db, repository_id, INDEPENDENT_B)
+            .await?
+            .ok_or_else(|| anyhow!("durable {INDEPENDENT_B} is missing"))?;
+        ensure!(first_oid == first_new, "durable {INDEPENDENT_A} is {first_oid}, not {first_new}");
+        ensure!(second_oid == second_new, "durable {INDEPENDENT_B} is {second_oid}, not {second_new}");
+
+        let (first_state, first_terminal) = operation_row(db, repository_id, first_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the first independent operation has no durable row"))?;
+        let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the second independent operation has no durable row"))?;
+        ensure!(first_state == "committed", "the first independent operation is {first_state}, not committed");
+        ensure!(second_state == "committed", "the second independent operation is {second_state}, not committed");
+        ensure!(first_terminal.is_some(), "the first independent operation has no terminal");
+        ensure!(second_terminal.is_some(), "the second independent operation has no terminal");
+
+        let revision_after = gate_revision(db, repository_id).await?;
+        ensure!(
+            revision_after == revision_before + 2,
+            "the gate moved {revision_before}->{revision_after}, not exactly two independent revisions"
+        );
+        let (first_event_revision, first_event_outcome) = core_event(db, repository_id, first_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the first independent operation has no core event"))?;
+        let (second_event_revision, second_event_outcome) = core_event(db, repository_id, second_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the second independent operation has no core event"))?;
+        ensure!(first_event_outcome == "committed", "the first core event is {first_event_outcome}, not committed");
+        ensure!(second_event_outcome == "committed", "the second core event is {second_event_outcome}, not committed");
+        ensure!(
+            first_event_revision == revision_before + 1,
+            "the first core event revision is {first_event_revision}, not {}",
+            revision_before + 1
+        );
+        ensure!(
+            second_event_revision == revision_before + 2,
+            "the second core event revision is {second_event_revision}, not {}",
+            revision_before + 2
+        );
+
+        Ok::<(), anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+
+    let mut fence = Vec::new();
+    let cleanup = AssertUnwindSafe(resources.teardown(&db, &mut fence))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("witness cleanup panicked")));
+    if let Err(error) = &cleanup {
+        let sealed = AssertUnwindSafe(resources.seal_failed_cleanup(&db)).catch_unwind().await;
+        if sealed.is_err() {
+            let _ = writeln!(io::stderr().lock(), "post-admission witness cleanup fallback panicked");
+        }
+        if !matches!(&outcome, Ok(Ok(()))) {
+            let _ = writeln!(io::stderr().lock(), "post-admission witness cleanup failed ({error})");
+        }
+    }
+    drop(fence);
+
+    match outcome {
+        Ok(result) => result.and(cleanup),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+async fn case(db: &Db, resources: &mut WitnessResources, phase: &mut &'static str) -> Result<()> {
     let store = open_store()?;
     let git: &'static Git = Box::leak(Box::new(Git::new()?));
     let owner = actor::owner(&db.pool).await?;
@@ -233,9 +612,9 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     ensure!(winner_operation != loser_operation, "the race pins shared an operation id");
 
     // The rendezvous is keyed by the operation UUID and can fire only once.
-    let pause = Arc::new(AdmissionPause::new(loser_operation));
+    let pause = resources.pause.insert(Arc::new(AdmissionPause::new(loser_operation))).clone();
     let captures = Captures::default();
-    let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
+    let scratch = resources.scratch.insert(tempfile::tempdir().context("temporary gateway scratch root")?);
     let state = Arc::new(
         BlobGitState::new(BlobGitConfig {
             pool: db.pool.clone(),
@@ -255,7 +634,15 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let app = capture_receive_responses(router(state.clone()), captures.clone());
-    let _server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
+    let (shutdown, signal) = oneshot::channel();
+    resources.shutdown = Some(shutdown);
+    resources.server = Some(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = signal.await;
+            })
+            .await
+    }));
 
     *phase = "repository_seed";
     let created = create_repository(address, &owner, &name).await?;
@@ -264,7 +651,7 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
 
     // Seed one real main tip, then clone twice so both stock clients advertise
     // exactly the same old OID.
-    let work = tempfile::tempdir().context("temporary Git work root")?;
+    let work = resources.work.insert(tempfile::tempdir().context("temporary Git work root")?);
     let direct_url = clone_url(address, &owner, &name);
     let seeded = git.clone(work.path(), &direct_url, "seed").await?;
     ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
@@ -288,10 +675,21 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     // publish baseline capture have completed. It is then held before its
     // admission transaction while the winner commits.
     *phase = "pre_admission_barrier";
-    let mut loser_push = spawn_push(git, second_dir, direct_url.clone(), loser_operation);
-    tokio::select! {
-        _ = pause.wait_reached() => {}
-        exited = &mut loser_push => {
+    resources.second_push = Some(spawn_push(git, second_dir, direct_url.clone(), loser_operation));
+    {
+        let selected: Option<std::result::Result<Result<git::Output>, tokio::task::JoinError>> = {
+            let loser_handle =
+                resources.second_push.as_mut().ok_or_else(|| anyhow!("the losing stock push task was not created"))?;
+            tokio::select! {
+                _ = pause.wait_reached() => None,
+                exited = loser_handle => Some(exited),
+            }
+        };
+        if let Some(exited) = selected {
+            // The select consumed this JoinHandle's output. Remove the
+            // completed handle without polling it again, then preserve the
+            // original completion result.
+            let _consumed = resources.second_push.take();
             let output = exited.context("the losing stock push task failed")??;
             return Err(anyhow!(
                 "the losing stock push exited before its post-capture rendezvous: {}",
@@ -306,13 +704,25 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     ensure!(gate_revision(db, repository_id).await? == revision_before, "the gate moved before the winner started");
 
     *phase = "winner_publish";
-    let winner_output = spawn_push(git, first_dir, direct_url, winner_operation).await?;
-    let winner_output = winner_output.context("the winning stock push task failed")?;
+    resources.first_push = Some(spawn_push(git, first_dir, direct_url, winner_operation));
+    let winner_join = {
+        let winner_handle =
+            resources.first_push.as_mut().ok_or_else(|| anyhow!("the winning stock push task was not created"))?;
+        winner_handle.await
+    };
+    resources.first_push = None;
+    let winner_output = winner_join.context("the winning stock push task failed")??;
     ensure!(winner_output.success, "the winning stock push failed: {}", redacted(&winner_output));
 
     *phase = "loser_rebase_await";
     pause.release();
-    let loser_output = loser_push.await.context("the losing stock push task failed")??;
+    let loser_join = {
+        let loser_handle =
+            resources.second_push.as_mut().ok_or_else(|| anyhow!("the paused stock push task was lost"))?;
+        loser_handle.await
+    };
+    resources.second_push = None;
+    let loser_output = loser_join.context("the losing stock push task failed")??;
     *phase = "loser_rebase_exit_status";
     ensure!(!loser_output.success, "the paused loser unexpectedly succeeded");
     *phase = "loser_rebase_forbidden_text";
@@ -402,6 +812,24 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
         revision_after == revision_before + 1,
         "the gate moved {revision_before}->{revision_after}, not exactly one winner revision"
     );
+    let (winner_event_revision, winner_event_outcome) = core_event(db, repository_id, winner_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the winning public operation has no current wrapper event"))?;
+    ensure!(winner_event_outcome == "committed", "the winning wrapper event is {winner_event_outcome}, not committed");
+    ensure!(
+        winner_event_revision == revision_before + 1,
+        "the winning wrapper event revision is {winner_event_revision}, not {}",
+        revision_before + 1
+    );
+    let (loser_event_revision, loser_event_outcome) = core_event(db, repository_id, loser_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the losing public operation has no current wrapper event"))?;
+    ensure!(loser_event_outcome == "rejected", "the losing wrapper event is {loser_event_outcome}, not rejected");
+    ensure!(
+        loser_event_revision == revision_before + 1,
+        "the losing wrapper event revision is {loser_event_revision}, not {}",
+        revision_before + 1
+    );
     let durable_main = durable_main(db, repository_id).await?;
     ensure!(durable_main == first_new, "durable main is {durable_main}, not the winning commit {first_new}");
 
@@ -471,9 +899,19 @@ fn spawn_push(
     url: String,
     operation: Uuid,
 ) -> JoinHandle<Result<git::Output>> {
+    spawn_push_ref(git, directory, url, operation, SEED_REF)
+}
+
+fn spawn_push_ref(
+    git: &'static Git,
+    directory: std::path::PathBuf,
+    url: String,
+    operation: Uuid,
+    ref_name: &'static str,
+) -> JoinHandle<Result<git::Output>> {
     tokio::spawn(async move {
         let header = format!("http.extraHeader=X-Rootyard-Operation: {operation}");
-        let target = format!("HEAD:{SEED_REF}");
+        let target = format!("HEAD:{ref_name}");
         git.run(&directory, &["-c", header.as_str(), "push", url.as_str(), target.as_str()]).await
     })
 }
@@ -501,14 +939,177 @@ async fn durable_main(db: &Db, repository_id: Uuid) -> Result<String> {
         .get(0))
 }
 
-async fn operation_row(db: &Db, repository_id: Uuid, operation: Uuid) -> Result<Option<(String, Option<Value>)>> {
+async fn durable_ref(db: &Db, repository_id: Uuid, ref_name: &str) -> Result<Option<String>> {
     let row = db
         .pool
         .get()
         .await?
         .query_opt(
-            "SELECT state, terminal_result FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
-            &[&repository_id, &operation],
+            "SELECT oid FROM ref_store_core_refs WHERE repository_id=$1 AND ref_name=$2",
+            &[&repository_id, &ref_name],
+        )
+        .await?;
+    Ok(row.map(|row| row.get(0)))
+}
+
+/// Resolve one public header UUID through the immutable migration-152 wrapper
+/// and its current private attempt, then read the exact private operation and
+/// matching positive event/terminal. The public identifier is never used as a
+/// direct `ref_store_operations` key here.
+async fn operation_row(
+    db: &Db,
+    repository_id: Uuid,
+    public_operation: Uuid,
+) -> Result<Option<(String, Option<Value>)>> {
+    let client = db.pool.get().await?;
+    let wrapper = client
+        .query_opt(
+            "SELECT w.issuer_id, w.state, w.event_id, a.private_id, a.plan_digest
+               FROM ref_store_public_operations w
+               JOIN ref_store_private_attempts a
+                 ON a.repository_id = w.repository_id
+                AND a.public_id = w.public_id
+                AND a.slot = w.current_slot
+              WHERE w.repository_id = $1 AND w.public_id = $2",
+            &[&repository_id, &public_operation],
+        )
+        .await?;
+    let Some(wrapper) = wrapper else {
+        // A wrapper without the current attempt join is wrapper-only fake
+        // evidence, not an absent operation.
+        let wrapper_only: bool = client
+            .query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM ref_store_public_operations
+                      WHERE repository_id = $1 AND public_id = $2
+                 )",
+                &[&repository_id, &public_operation],
+            )
+            .await?
+            .get(0);
+        if wrapper_only {
+            return Err(anyhow!("public wrapper {public_operation} has no current private attempt"));
+        }
+        // No wrapper is only valid before admission. Any direct legacy or
+        // private alias evidence for this public id means the route fell back
+        // or selected the wrong identity.
+        let fallback: bool = client
+            .query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM ref_store_operations
+                      WHERE repository_id = $1 AND operation_id = $2
+                 ) OR EXISTS(
+                     SELECT 1 FROM ref_store_cancellations
+                      WHERE repository_id = $1 AND operation_id = $2
+                 ) OR EXISTS(
+                     SELECT 1 FROM ref_store_private_attempts
+                      WHERE repository_id = $1 AND private_id = $2
+                 ) OR EXISTS(
+                     SELECT 1 FROM ref_store_private_attempts
+                      WHERE repository_id = $1 AND public_id = $2
+                 )",
+                &[&repository_id, &public_operation],
+            )
+            .await?
+            .get(0);
+        if fallback {
+            return Err(anyhow!(
+                "public operation {public_operation} has legacy/private evidence without a current wrapper"
+            ));
+        }
+        return Ok(None);
+    };
+    let wrapper_issuer: Uuid = wrapper.get(0);
+    let wrapper_state: String = wrapper.get(1);
+    let wrapper_event: Option<Uuid> = wrapper.get(2);
+    let private_id: Uuid = wrapper.get(3);
+    let plan_digest: String = wrapper.get(4);
+
+    // Reuse the reviewed migration-152 wrapper/attempt/event verifier before
+    // accepting wrapper-only or mixed evidence. A pending wrapper with a
+    // pending current attempt is valid for the explicit pause assertion; any
+    // terminal/event mismatch raises and is mapped to a fixed test refusal.
+    client
+        .query_one("SELECT rootyard_ref_store_verify_public_operation($1,$2)", &[&repository_id, &public_operation])
+        .await
+        .map_err(|_| anyhow!("public wrapper {public_operation} failed exact wrapper evidence verification"))?;
+
+    let row = client
+        .query_opt(
+            "SELECT o.operation_id, o.issuer_id, o.request_digest, o.state, o.terminal_result,
+                    e.event_id, e.payload
+               FROM ref_store_operations o
+               LEFT JOIN ref_store_core_events e
+                 ON e.repository_id = o.repository_id AND e.operation_id = o.operation_id
+              WHERE o.repository_id = $1 AND o.operation_id = $2",
+            &[&repository_id, &private_id],
+        )
+        .await?
+        .ok_or_else(|| anyhow!("public wrapper {public_operation} has no exact private operation"))?;
+    let operation_id: Uuid = row.get(0);
+    let operation_issuer: Uuid = row.get(1);
+    let operation_digest: String = row.get(2);
+    let operation_state: String = row.get(3);
+    let terminal: Option<Value> = row.get(4);
+    let private_event: Option<Uuid> = row.get(5);
+    let event_payload: Option<Value> = row.get(6);
+
+    if operation_id != private_id
+        || operation_issuer != wrapper_issuer
+        || operation_digest != plan_digest
+        || operation_state != wrapper_state
+    {
+        return Err(anyhow!("public wrapper {public_operation} does not match its exact private identity/state"));
+    }
+    match wrapper_state.as_str() {
+        "pending" => {
+            if wrapper_event.is_some() || private_event.is_some() || terminal.is_some() || event_payload.is_some() {
+                return Err(anyhow!("pending public wrapper {public_operation} carries terminal/event evidence"));
+            }
+        }
+        "committed" | "rejected" => {
+            let wrapper_event =
+                wrapper_event.ok_or_else(|| anyhow!("terminal public wrapper {public_operation} has no event"))?;
+            if private_event != Some(wrapper_event) {
+                return Err(anyhow!("public wrapper {public_operation} event differs from its private event"));
+            }
+            let terminal =
+                terminal.as_ref().ok_or_else(|| anyhow!("terminal private operation {private_id} has no terminal"))?;
+            if event_payload.as_ref() != Some(terminal) {
+                return Err(anyhow!(
+                    "public wrapper {public_operation} event payload differs from its private terminal"
+                ));
+            }
+        }
+        "cancelled" => {
+            return Err(anyhow!(
+                "public wrapper {public_operation} is cancelled; the race witness accepts no cancellation"
+            ));
+        }
+        _ => return Err(anyhow!("public wrapper {public_operation} has unknown state {wrapper_state}")),
+    }
+    Ok(Some((operation_state, terminal)))
+}
+
+async fn core_event(db: &Db, repository_id: Uuid, public_operation: Uuid) -> Result<Option<(i64, String)>> {
+    let row = db
+        .pool
+        .get()
+        .await?
+        .query_opt(
+            "SELECT e.revision, e.outcome
+               FROM ref_store_public_operations w
+               JOIN ref_store_private_attempts a
+                 ON a.repository_id = w.repository_id
+                AND a.public_id = w.public_id
+                AND a.slot = w.current_slot
+               JOIN ref_store_core_events e
+                 ON e.repository_id = a.repository_id
+                AND e.operation_id = a.private_id
+              WHERE w.repository_id = $1 AND w.public_id = $2
+                AND w.state IN ('committed', 'rejected')
+                AND w.event_id = e.event_id",
+            &[&repository_id, &public_operation],
         )
         .await?;
     Ok(row.map(|row| (row.get(0), row.get(1))))

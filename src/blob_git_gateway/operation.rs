@@ -32,9 +32,18 @@ use crate::ref_store::{
     CommitMode, GitObjectFormat, OperationLookup, OperationRecord, OperationState, PgRefStore, RefCommitResult,
     RequestDigest, TerminalKind,
     core::pack_commit::{PackCommitTerminal, read_serving_operation},
+    pg::{
+        public_attempt::{PublicAttemptEvidence, PublicAttemptFinishLookup, PublicAttemptRequest, PublicReplayRestore},
+        slot_one, slot_zero,
+    },
 };
 
-use super::{error::GatewayError, native, protocol::PushRequest, state::BlobGitState};
+use super::{
+    error::{DIFFERENT_REQUEST, GatewayError},
+    native,
+    protocol::PushRequest,
+    state::BlobGitState,
+};
 
 /// Domain separator of the producer operation digest. Changing it invalidates
 /// every durable producer digest, so it is versioned like any other contract.
@@ -71,6 +80,37 @@ pub(super) struct ResolvedOperation {
 pub(super) enum Lookup {
     Known(ResolvedOperation),
     Unknown,
+}
+
+/// One verified private resolution: the request-aware classification plus the
+/// exact terminal/pending record loaded under the migration-152 attempt lock.
+/// The mirror needs the record's immutable terminal body; the route must never
+/// synthesize one from `PublicAttemptEvidence`.
+pub(super) struct ResolvedPublicPrivate {
+    pub claim: Claim,
+    pub record: OperationRecord,
+}
+
+/// Early receive classification after migration 152 is consulted. A `Finish`
+/// is not a Git result: the wrapper is still pending and the exact private
+/// attempt is terminal, so the reviewed terminal mirror must first derive
+/// `Mirrored` or `RetirementRequired`. The record is owned by this value; no
+/// private UUID is formatted into a public error or response.
+#[allow(clippy::large_enum_variant)] // Finish carries the exact owned record/evidence once, not a hot path.
+pub(super) enum Probe {
+    Fresh,
+    Pending,
+    Replay { terminal: PackCommitTerminal, private_id: Option<Uuid> },
+    HistoricalReplay { terminal: PackCommitTerminal, private_id: Uuid, restore: PublicReplayRestore },
+    Cancelled { reason: &'static str },
+    Finish { terminal: PackCommitTerminal, private_id: Uuid, evidence: PublicAttemptEvidence, record: OperationRecord },
+    FinishCancelled,
+}
+
+/// Only the early receive probe can serve an archived terminal report.
+pub(super) enum ReplayBoundary {
+    EarlyReceive,
+    ActivePublication,
 }
 
 /// Compute the operation-level request digest over the **decoded** wire body.
@@ -134,6 +174,7 @@ fn digest_from_parts(
 /// (`serving::lookup_in_tx`: token, RBAC, repository `ready`, durable binding and
 /// live gate), so a record can never be classified for a repository the caller
 /// may not serve. The local row read itself is [`lookup_in_tx`].
+#[allow(dead_code)] // Legacy probe/begin-only lookup; private receive uses probe_public.
 pub(super) async fn lookup(
     state: &BlobGitState,
     serving: &crate::ref_store::serving::ServingRepository,
@@ -147,6 +188,11 @@ pub(super) async fn lookup(
         .await
         .map_err(|_| GatewayError::Timeout)?
         .map_err(|_| GatewayError::Internal("operation lookup transaction failed"))?;
+    // Acquire the operation key before the serving lookup takes row locks.
+    // Only classify the UUID after the live authority recheck below.
+    crate::ref_store::pg::lock_operation(&tx, repository_id, operation_id, deadline)
+        .await
+        .map_err(GatewayError::from)?;
     let fresh = crate::ref_store::serving::lookup_in_tx(
         &tx,
         actor,
@@ -180,24 +226,22 @@ pub(super) async fn lookup(
 /// producer binding read inside a **caller-owned** transaction.
 ///
 /// This helper performs no authorization and no repository resolution; it is
-/// only valid when the caller's transaction is already authorized for exactly
-/// this repository. That is true both for the authorized read probe above and
-/// for the gateway's fresh write transaction, whose earlier authorized probe on
-/// this same request has completed (so the write transaction must not take a
-/// second repository read lock).
+/// only valid when the transaction holds the operation key and the request
+/// is already authorized for this repository. The read probe above takes the
+/// key directly. The fresh write transaction takes it during reservation and
+/// relies on the earlier authorized probe for this request to avoid taking
+/// a second repository read lock in the write transaction.
 ///
-/// `Unknown` means no operation row. A known record without a producer binding
-/// is a typed conflict, never a replay. The binding's stored parent digest is
-/// compared against the very record read above: the A3 invariant makes it equal
-/// to `identity.digest()`, so a binding that disagrees names a different
-/// operation than the one being classified.
+/// Wrapper and private attempt UUIDs are refused before reading the core
+/// record. A known record without a producer binding is a typed conflict. The
+/// binding must have the same parent digest as the record, as required by A3.
 pub(super) async fn lookup_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
     repository_id: Uuid,
     operation_id: Uuid,
     deadline: Instant,
 ) -> Result<Lookup, GatewayError> {
-    match PgRefStore.get(tx, repository_id, operation_id, deadline).await.map_err(GatewayError::from)? {
+    match PgRefStore.get_legacy_locked(tx, repository_id, operation_id, deadline).await.map_err(GatewayError::from)? {
         OperationLookup::Unknown => Ok(Lookup::Unknown),
         OperationLookup::Known(record) => {
             let Some(binding) =
@@ -218,6 +262,10 @@ pub(super) async fn lookup_in_tx(
 }
 
 /// Query the immutable operation registry before native ingestion.
+///
+/// Source-preserved for the legacy replay path and its tests. Normal receive
+/// selects [`probe_public`] and never reaches this probe.
+#[allow(dead_code)]
 pub(super) async fn probe(
     state: &BlobGitState,
     serving: &crate::ref_store::serving::ServingRepository,
@@ -237,6 +285,150 @@ pub(super) async fn probe(
 
 /// Classify one already-fetched operation against this exact request.
 ///
+/// Early receive classification that consults migration 152 before any native
+/// child or A3/A4 write.
+///
+/// The public UUID and producer digest are the stable public identity. A
+/// private wrapper is resolved only through the migration-152 public/attempt
+/// lock, the exact current/retired evidence and the private operation's
+/// migration-147 binding. A pending wrapper with a terminal private attempt is
+/// returned as [`Probe::Finish`] (the mirror has not published it yet), never as
+/// a false replay. Unknown wrapper/legacy rows are `Fresh`/legacy as marked;
+/// a private identifier, mismatched proof or malformed evidence is a typed
+/// refusal. No write, sequence allocation or terminal body is performed here.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn probe_public(
+    state: &BlobGitState,
+    serving: &crate::ref_store::serving::ServingRepository,
+    actor: &crate::db::Identity,
+    public_id: Uuid,
+    request: &PushRequest,
+    digest: RequestDigest,
+    mode: CommitMode,
+    boundary: ReplayBoundary,
+    deadline: Instant,
+) -> Result<Probe, GatewayError> {
+    let repository_id = serving.gate.repository_id();
+    let gate = &serving.gate;
+    let public_request = PublicAttemptRequest {
+        repository_id,
+        admission_owner_id: gate.tenant_id(),
+        issuer_id: actor.id,
+        public_id,
+        wire_digest: digest,
+        request_mode: mode,
+        backend_identity: state.store().backend_identity().as_hex().to_owned(),
+        object_format: gate.object_format(),
+        history_incarnation: gate.history_incarnation(),
+        authority_epoch: gate.authority_epoch(),
+        group_epoch: gate.group_epoch(),
+        restore_incarnation: serving.cluster_incarnation,
+    };
+    let mut client = state.pooled(deadline).await?;
+    let tx = timeout_at(deadline, client.transaction())
+        .await
+        .map_err(|_| GatewayError::Timeout)?
+        .map_err(|_| GatewayError::Internal("private operation probe transaction failed"))?;
+    let result: Result<Probe, GatewayError> = async {
+        // Migration-152 public/attempt keys first. The proposed private id is
+        // random and exists only to make the lock set complete; it is never
+        // allocated, written or exposed.
+        crate::ref_store::PgRefStore
+            .lock_public_attempt(&tx, &public_request, Uuid::new_v4(), deadline)
+            .await
+            .map_err(GatewayError::from)?;
+        // The legacy key is taken before the guarded legacy lookup below, and
+        // is a no-op when this identifier is private or unknown.
+        crate::ref_store::pg::lock_operation(&tx, repository_id, public_id, deadline)
+            .await
+            .map_err(GatewayError::from)?;
+        let fresh = crate::ref_store::serving::lookup_in_tx(
+            &tx,
+            actor,
+            &serving.repository.owner,
+            &serving.repository.name,
+            true,
+            state.store().backend_identity(),
+            deadline,
+        )
+        .await
+        .map_err(GatewayError::from)?;
+        if fresh.gate.repository_id() != repository_id
+            || crate::ref_store::core::RealmExpectation::from_gate(&fresh.gate)
+                != crate::ref_store::core::RealmExpectation::from_gate(&serving.gate)
+            || fresh.cluster_incarnation != serving.cluster_incarnation
+        {
+            return Err(GatewayError::Conflict("repository authority changed; retry"));
+        }
+        let (outcome, historical) = match boundary {
+            ReplayBoundary::EarlyReceive => {
+                PgRefStore.lookup_public_attempt_receive(&tx, &public_request, deadline).await?
+            }
+            ReplayBoundary::ActivePublication => {
+                (PgRefStore.lookup_public_attempt_finish(&tx, &public_request, deadline).await?, None)
+            }
+        };
+        match outcome {
+            PublicAttemptFinishLookup::Unknown => Ok(Probe::Fresh),
+            PublicAttemptFinishLookup::PrivateIdentifier => {
+                Err(GatewayError::Conflict("operation identifier is already a private attempt"))
+            }
+            PublicAttemptFinishLookup::LegacyPath => {
+                match lookup_in_tx(&tx, repository_id, public_id, deadline).await? {
+                    Lookup::Known(resolved) => {
+                        match classify(resolved, repository_id, actor.id, public_id, request, digest)? {
+                            Claim::Fresh => Err(GatewayError::Internal("known operation was classified as fresh")),
+                            Claim::Pending => Ok(Probe::Pending),
+                            Claim::Replay(terminal) => Ok(Probe::Replay { terminal, private_id: None }),
+                            Claim::Cancelled(reason) => Ok(Probe::Cancelled { reason }),
+                        }
+                    }
+                    Lookup::Unknown => {
+                        Err(GatewayError::Internal("legacy public marker has no durable operation record"))
+                    }
+                }
+            }
+            PublicAttemptFinishLookup::Evidence(found) => {
+                let evidence = found.evidence;
+                let wrapper_state = found.wrapper_state;
+                let private_id = evidence.current.private_id;
+                let proof_request = PublicAttemptRequest {
+                    restore_incarnation: historical.map_or(public_request.restore_incarnation, |scope| scope.original),
+                    ..public_request
+                };
+                let ResolvedPublicPrivate { claim, record } =
+                    lookup_public_private_in_tx(&tx, &proof_request, &evidence, request, digest, deadline).await?;
+                if let Some(restore) = historical {
+                    return match claim {
+                        Claim::Replay(terminal) => Ok(Probe::HistoricalReplay { terminal, private_id, restore }),
+                        Claim::Cancelled(reason) => Ok(Probe::Cancelled { reason }),
+                        _ => Err(GatewayError::Internal("restored operation terminal evidence disagrees")),
+                    };
+                }
+                match (wrapper_state, claim) {
+                    (OperationState::Pending, Claim::Pending) => Ok(Probe::Pending),
+                    (OperationState::Pending, Claim::Replay(terminal)) => {
+                        Ok(Probe::Finish { terminal, private_id, evidence, record })
+                    }
+                    (OperationState::Pending, Claim::Cancelled(_)) => Ok(Probe::FinishCancelled),
+                    (_, Claim::Replay(terminal)) => Ok(Probe::Replay { terminal, private_id: Some(private_id) }),
+                    (_, Claim::Cancelled(reason)) => Ok(Probe::Cancelled { reason }),
+                    (_, Claim::Pending) => Ok(Probe::Pending),
+                    (_, Claim::Fresh) => Err(GatewayError::Internal("known private operation was classified as fresh")),
+                }
+            }
+        }
+    }
+    .await;
+    let cleanup = timeout_at(deadline, tx.rollback()).await;
+    drop(client);
+    match cleanup {
+        Err(_) => Err(GatewayError::Timeout),
+        Ok(Err(_)) => Err(GatewayError::Internal("private operation probe cleanup failed")),
+        Ok(Ok(())) => result,
+    }
+}
+
 /// Order matters and is part of the contract:
 ///
 /// 1. the identity must be the one that was asked for;
@@ -271,7 +463,7 @@ pub(super) fn classify(
     // here (before the state match) makes a reused operation id with different
     // bytes a conflict even while the operation is still pending.
     if producer_digest != digest {
-        return Err(GatewayError::Conflict("operation identifier was already used with a different request"));
+        return Err(GatewayError::Conflict(DIFFERENT_REQUEST));
     }
     match record.state() {
         // An exact pending row is an open outcome: the caller answers "unknown"
@@ -291,6 +483,93 @@ pub(super) fn classify(
             }
         }
     }
+}
+
+/// Resolve the private record named by one already-verified migration-152
+/// public attempt, without entering the legacy UUID guard.
+///
+/// This is deliberately separate from [`lookup_in_tx`]: the public wrapper path
+/// first holds migration 152's public/attempt advisory lock, authenticates the
+/// live repository in the same transaction, and obtains `evidence` from
+/// [`PgRefStore::lookup_public_attempt`]. Only then may this helper read the
+/// exact private operation and its migration-147 producer binding.
+///
+/// The stored private UUID, lane, sequence, plan digest, state, realm and
+/// producer digest must all agree with that evidence. The migration-152 attempt
+/// lock is re-proved before the raw core read, so a caller cannot use this
+/// helper to bypass the external legacy collision guard or reach a private
+/// record from a legacy route. Every refusal is fixed and carries no UUID.
+pub(super) async fn lookup_public_private_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    public_request: &PublicAttemptRequest,
+    evidence: &PublicAttemptEvidence,
+    request: &PushRequest,
+    digest: RequestDigest,
+    deadline: Instant,
+) -> Result<ResolvedPublicPrivate, GatewayError> {
+    let repository_id = public_request.repository_id;
+    let public_id = public_request.public_id;
+    if evidence.public_id != public_id {
+        return Err(GatewayError::Internal("verified public attempt names another public operation"));
+    }
+    let private_id = evidence.current.private_id;
+    if private_id.is_nil() || private_id == public_id {
+        return Err(GatewayError::Internal("verified public attempt has an invalid private identity"));
+    }
+    let current = &evidence.current;
+    let expected_proof = match (current.slot, evidence.retired.as_slice()) {
+        (0, []) => slot_zero::recompute_slot_zero_proof(public_request, current),
+        (1, [zero]) => slot_one::recompute_slot_one_proof(public_request, zero, current),
+        (2, [zero, one]) => slot_one::recompute_slot_two_proof(public_request, zero, one, current),
+        _ => {
+            return Err(GatewayError::Internal("verified public attempt does not have the expected retirement prefix"));
+        }
+    }
+    .map_err(|_| GatewayError::Internal("verified public attempt proof is not recomputable"))?;
+    if expected_proof != evidence.current.proof_digest {
+        return Err(GatewayError::Internal("verified public attempt proof differs from its durable attempt"));
+    }
+    // The public preflight lock includes every existing private attempt of this
+    // wrapper. Re-prove that exact operation lock before the raw core read.
+    tx.query_one("SELECT rootyard_ref_store_require_attempt_lock($1,$2)", &[&repository_id, &private_id])
+        .await
+        .map_err(|_| GatewayError::Internal("verified public attempt lock is not held"))?;
+
+    let Some(binding) =
+        read_serving_operation(tx, repository_id, private_id, deadline).await.map_err(GatewayError::from)?
+    else {
+        return Err(GatewayError::Internal("verified public attempt has no producer binding"));
+    };
+    let record = match PgRefStore.get(tx, repository_id, private_id, deadline).await.map_err(GatewayError::from)? {
+        OperationLookup::Unknown => {
+            return Err(GatewayError::Internal("verified public attempt has no private operation record"));
+        }
+        OperationLookup::Known(record) => record,
+    };
+    let identity = record.identity();
+    if identity.repository_id() != repository_id
+        || identity.operation_id() != private_id
+        || identity.lane() != &current.lane
+        || identity.sequence() != current.sequence
+        || identity.digest() != &current.plan_digest
+        || record.state() != current.state
+    {
+        return Err(GatewayError::Internal("verified public attempt does not match its private operation identity"));
+    }
+    if binding.parent_digest() != identity.digest() {
+        return Err(GatewayError::Internal(
+            "verified public attempt producer binding differs from its private operation",
+        ));
+    }
+    let claim = classify(
+        ResolvedOperation { record: record.clone(), producer_digest: *binding.producer_digest() },
+        repository_id,
+        public_request.issuer_id,
+        private_id,
+        request,
+        digest,
+    )?;
+    Ok(ResolvedPublicPrivate { claim, record })
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

@@ -4,6 +4,7 @@ Centralizes version lists, table sets, and catalog paths so parallel tracks
 adding new migrations do not cause cross-suite test conflicts.
 """
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,12 +23,12 @@ LATEST_PREFIX = f"{LATEST_VERSION:03d}"
 # Legacy metadata archives use format21/schema147, format22/schema147 remains
 # frozen at schema147, formats 23..=24 remain frozen at schema148, formats 25..=26
 # remain frozen at schema149, formats 27..=28 remain frozen at schema150, and
-# format20 remains frozen at schema144. Current archives use format29 (metadata
-# + legacy Pando fence) and format30 (paired PG + OpenDAL Blob closure) at
-# schema151; current fixtures are generated from actual PostgreSQL.
-CURRENT_BACKUP_FORMAT = 29
-CURRENT_BLOB_BACKUP_FORMAT = 30
-CURRENT_SCHEMA_VERSION = 151
+# format20 remains frozen at schema144. Formats 29 and 30 remain frozen at
+# schema151. Current archives use format31 (metadata + legacy Pando fence) and
+# format32 (paired PG + OpenDAL Blob closure) at schema152.
+CURRENT_BACKUP_FORMAT = 31
+CURRENT_BLOB_BACKUP_FORMAT = 32
+CURRENT_SCHEMA_VERSION = 152
 assert LATEST_VERSION == CURRENT_SCHEMA_VERSION, (
     "a new migration requires an explicit current backup format/schema contract bump")
 FROZEN_FORMAT17_SCHEMA_VERSION = 141
@@ -81,3 +82,18 @@ A5_PACK_SNAPSHOT_TABLES = schema_delta(143)
 def backup_format_arm(format):
     """Match a complete decimal Rust pattern arm, including shared catalogs."""
     return rf"\n\s*(?:\d+\s*\|\s*)*{format}(?:\s*\|\s*\d+)*\s*=>"
+
+
+def backup_schema_versions(catalog_source, format, versions=SCHEMA_VERSIONS):
+    """Evaluate the catalog's full or version-capped roster against a supplied migration list."""
+    arm = re.search(
+        backup_format_arm(format) + r"\s*Ok\(crate::db::SCHEMA_VERSIONS"
+        r"(?:\.to_vec\(\)|\.iter\(\)\.copied\(\)\.filter\(\|version\| \*version <= (\d+)\)\.collect\(\))\)",
+        catalog_source,
+    )
+    if arm is None:
+        raise AssertionError(f"missing schema version roster for backup format {format}")
+    ceiling = arm.group(1)
+    if ceiling is None:
+        return list(versions)
+    return [version for version in versions if version <= int(ceiling)]

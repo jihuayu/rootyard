@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Root-only real-PostgreSQL regressions for Cancel token-scope ordering.
 
-The implementation worker only compiles and statically inspects this file. Root
-runs it on the final reviewed Linux source with the attested standalone CLI,
-real PostgreSQL 17, the owned Blob profile and stock Git.
+Run this on Linux with the attested standalone CLI, real PostgreSQL 17,
+the owned Blob profile and stock Git.
 
 The fixture proves both orders of the documented late-scope contract:
 
 * ``narrow_first_scope_denial_leaves_cancel_state_unchanged`` parks a real Cancel
-  request on the operation advisory key after its HTTP preflight has passed,
+  request on its selected private attempt's advisory key after HTTP preflight,
   commits a real restricted-token PATCH that removes ContentsWrite, then releases
   Cancel. Cancel must reach its late check, deny with 403, and leave the
   operation, decision, cancellation tombstones, refs, gate and events unchanged.
@@ -50,8 +49,8 @@ CANCEL_FIRST = "cancel_first_late_scope_holds_until_terminal_commit"
 CASES = (NARROW_FIRST, CANCEL_FIRST)
 
 LIMITATIONS = [
-    "Root-only native fixture: requires the attested standalone binary, real PostgreSQL, the owned Blob profile and trusted stock Git. The implementation worker only py-compiled it.",
-    "The narrow-first barrier is the real migration-138 operation advisory key, held by a separate PostgreSQL session. Cancel has already passed the HTTP writable lookup before it blocks there; the scope PATCH then commits before the late check.",
+    "Native fixture requires the attested standalone binary, real PostgreSQL, the owned Blob profile and trusted stock Git.",
+    "The narrow-first barrier is the current private attempt's real operation advisory key, held by a separate PostgreSQL session. Public Cancel takes that key in its migration-152 lock set after the HTTP writable lookup; the scope PATCH then commits before the late check.",
     "The cancel-first barrier is a fixture-owned BEFORE UPDATE advisory trigger on ref_store_publication_decisions. It fires after authorize_repository_late has acquired the token row FOR SHARE, so a real concurrent PATCH is observed blocked by the Cancel backend until cancellation commits.",
     "Blocking and order are observed through pg_stat_activity and pg_blocking_pids on distinct connections; there is no sleep-only assertion.",
     "The pending cancellable operation comes from one real receive-pack COMMIT whose fixture-blocked backend is terminated before the deferred trigger is released. This is a durable pending state, not a fabricated operation, ACK or terminal.",
@@ -85,13 +84,13 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
         assert data.get("operation_id") == operation, data
         return data
 
-    def _decision_rows(self, repo, operation):
+    def _decision_rows(self, repo, private_id):
         rid = str(uuid.UUID(repo["id"]))
-        operation = str(uuid.UUID(operation))
+        private_id = str(uuid.UUID(private_id))
         raw = self.sql(
             "SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.decision_id), '[]'::jsonb)::text "
             "FROM ref_store_publication_decisions d "
-            "WHERE d.repository_id='" + rid + "' AND d.operation_id='" + operation + "'")
+            "WHERE d.repository_id='" + rid + "' AND d.operation_id='" + private_id + "'")
         return checkpoint.rows(raw)
 
     def _scope_actions(self, repo, token_id):
@@ -263,12 +262,14 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
         return repo, operation
 
     def narrow_first_scope_denial_leaves_cancel_state_unchanged(self):
-        repo, operation = self._pending_operation("cancel-scope-narrow")
+        repo, public_id = self._pending_operation("cancel-scope-narrow")
         token = self._issue_scope_token(repo, "cancel-narrow")
+        _, attempt = self.current_public_attempt(repo["id"], public_id, "pending")
+        private_id = attempt["private_id"]
         before_ledger = self.exact_ledger(repo["id"])
-        before_tombstones = self.cancellation_snapshot(repo["id"], operation)
-        before_decisions = self._decision_rows(repo, operation)
-        before_view = self._operation_view(repo, operation)
+        before_tombstones = self.cancellation_snapshot(repo["id"], private_id)
+        before_decisions = self._decision_rows(repo, private_id)
+        before_view = self._operation_view(repo, public_id)
         assert before_view["state"] == "pending" and before_view["terminal"] is None, before_view
         assert len(before_decisions) == 1 and before_decisions[0]["state"] == "OPEN", before_decisions
         assert not before_tombstones["legacy"] and not before_tombstones["decision"], before_tombstones
@@ -278,17 +279,17 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             rid = str(uuid.UUID(repo["id"]))
-            oid = str(uuid.UUID(operation))
+            attempt_id = str(uuid.UUID(private_id))
             blocker = self._start_blocker_sql(
-                "SELECT pg_advisory_lock(hashtextextended("
-                "'rootyard-ref-store-operation-v1' || '/' || '" + rid + "' || '/' || '" + oid + "', 0))",
+                "SELECT pg_advisory_lock(rootyard_ref_store_attempt_key("
+                "'" + rid + "'::uuid, '" + attempt_id + "'::uuid))",
                 application_name)
             blocker_pid = self._session_pid(application_name)
             cancel_future = executor.submit(
-                self._timed_http, self._cancel_path(repo, operation), token, "POST")
-            cancel_pid = self._await_blocked_by(blocker_pid, "cancel operation advisory lock")
+                self._timed_http, self._cancel_path(repo, public_id), token, "POST")
+            cancel_pid = self._await_blocked_by(blocker_pid, "cancel private attempt advisory lock")
             assert not cancel_future.done(), "cancel finished before the operation barrier"
-            assert self._operation_view(repo, operation) == before_view, \
+            assert self._operation_view(repo, public_id) == before_view, \
                 "cancel changed the operation before the late scope check"
             self._narrow_token(repo, token, ("contents_read", "repo_read"))
             narrow_done = time.monotonic()
@@ -301,22 +302,23 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
             assert json.loads(raw) == {"error": "publication is not authorized"}, raw
             assert cancel_done > narrow_done, "cancel did not deny after narrowing committed"
             assert self.exact_ledger(repo["id"]) == before_ledger, \
-                "denied cancel changed refs/gate/events/operation rows"
-            assert self.cancellation_snapshot(repo["id"], operation) == before_tombstones, \
+                "denied cancel changed refs/gate/events/public wrapper/private ledger"
+            assert self.cancellation_snapshot(repo["id"], private_id) == before_tombstones, \
                 "denied cancel wrote a cancellation tombstone"
-            assert self._decision_rows(repo, operation) == before_decisions, \
+            assert self._decision_rows(repo, private_id) == before_decisions, \
                 "denied cancel changed the decision row"
-            assert self._operation_view(repo, operation) == before_view, \
+            assert self._operation_view(repo, public_id) == before_view, \
                 "denied cancel changed the operation view"
             assert self._scope_actions(repo, token["id"]) == {"contents_read", "repo_read"}, \
                 "scope narrowing did not commit the expected grant set"
             return {
-                "operation": operation,
+                "operation": public_id,
                 "decision_id": before_decisions[0]["decision_id"],
                 "cancel_pid": cancel_pid,
                 "narrow_first": True,
                 "denied_status": status,
                 "exact_operation_terminal_tombstones_refs_gate_events_unchanged": True,
+                "public_wrapper_and_private_attempt_unchanged": True,
                 "scope_version": token["scope_version"],
                 "remaining_scope_actions": sorted(self._scope_actions(repo, token["id"])),
             }
@@ -326,11 +328,13 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
             executor.shutdown(wait=True, cancel_futures=False)
 
     def cancel_first_late_scope_holds_until_terminal_commit(self):
-        repo, operation = self._pending_operation("cancel-scope-cancel")
+        repo, public_id = self._pending_operation("cancel-scope-cancel")
         token = self._issue_scope_token(repo, "cancel-first")
+        before_wrapper, before_attempt = self.current_public_attempt(repo["id"], public_id, "pending")
+        private_id = before_attempt["private_id"]
         before_ledger = self.exact_ledger(repo["id"])
-        before_view = self._operation_view(repo, operation)
-        before_decisions = self._decision_rows(repo, operation)
+        before_view = self._operation_view(repo, public_id)
+        before_decisions = self._decision_rows(repo, private_id)
         assert before_view["state"] == "pending" and before_view["terminal"] is None, before_view
         assert len(before_decisions) == 1 and before_decisions[0]["state"] == "OPEN", before_decisions
         assert self._scope_actions(repo, token["id"]) == {"contents_read", "contents_write", "repo_read"}
@@ -352,10 +356,10 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
                 "SELECT pg_advisory_lock(" + str(key) + ")", application_name)
             blocker_pid = self._session_pid(application_name)
             cancel_future = executor.submit(
-                self._timed_http, self._cancel_path(repo, operation), token, "POST")
+                self._timed_http, self._cancel_path(repo, public_id), token, "POST")
             cancel_pid = self._await_blocked_by(blocker_pid, "cancel decision-write advisory barrier")
             assert not cancel_future.done(), "cancel finished before the decision barrier"
-            assert self._operation_view(repo, operation) == before_view, \
+            assert self._operation_view(repo, public_id) == before_view, \
                 "cancel terminal became visible before the decision barrier released"
             narrow_future = executor.submit(
                 self._timed_http, "/api/tokens/" + token["id"], self.alice, "PATCH",
@@ -368,14 +372,15 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
             # Narrowing was observed blocked by this exact Cancel backend. It
             # cannot pass the target-token FOR UPDATE until Cancel releases the
             # FOR SHARE at commit, so the database order is Cancel then narrowing.
-            cancel_status, cancel_raw, _cancel_headers, _cancel_done = cancel_future.result(timeout=30)
+            cancel_status, cancel_raw, cancel_headers, _cancel_done = cancel_future.result(timeout=30)
             narrow_status, narrow_raw, _narrow_headers, _narrow_done = narrow_future.result(timeout=30)
             assert cancel_status == 200, ("cancel-first status=" + str(cancel_status)
                                           + ": " + repr(cancel_raw[:300]))
             cancel_view = json.loads(cancel_raw)
-            assert cancel_view.get("operation_id") == operation, cancel_view
+            assert cancel_view.get("operation_id") == public_id, cancel_view
             assert cancel_view.get("state") == "cancelled", cancel_view
             assert cancel_view.get("terminal") == {"state": "cancelled", "reason": "cancel_requested"}, cancel_view
+            self.assert_private_id_hidden(cancel_raw, cancel_headers, private_id)
             assert narrow_status == 200, ("scope narrowing status=" + str(narrow_status)
                                          + ": " + repr(narrow_raw[:300]))
             narrowed = json.loads(narrow_raw)
@@ -389,23 +394,31 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
                 "cancel-first changed the gate"
             assert checkpoint.rows(after_ledger["events"]) == checkpoint.rows(before_ledger["events"]), \
                 "cancel-first wrote an event"
-            after_decisions = self._decision_rows(repo, operation)
+            after_wrapper, after_attempt = self.current_public_attempt(repo["id"], public_id, "cancelled")
+            assert after_attempt == before_attempt, "cancel changed the current private attempt mapping"
+            assert after_wrapper == {
+                **before_wrapper, "state": "cancelled", "cancelled_private_id": private_id,
+            }, "cancel did not bind the same public wrapper to the private tombstone"
+            assert after_ledger["attempt_retirements"] == before_ledger["attempt_retirements"], \
+                "cancel changed retired attempts"
+            after_decisions = self._decision_rows(repo, private_id)
             assert len(after_decisions) == 1 and after_decisions[0]["state"] == "CANCELLED", after_decisions
-            cancelled_operation = self.operation_row(repo["id"], operation)
+            cancelled_operation = self.operation_row(repo["id"], private_id)
             assert cancelled_operation["state"] == "cancelled", cancelled_operation
             assert cancelled_operation["terminal_result"] == {"state": "cancelled", "reason": "cancel_requested"}, \
                 cancelled_operation
-            tombstones = self.cancellation_snapshot(repo["id"], operation)
+            tombstones = self.cancellation_snapshot(repo["id"], private_id)
             assert len(tombstones["legacy"]) == 1, tombstones
             assert len(tombstones["decision"]) == 1, tombstones
             decision = tombstones["decision"][0]
+            assert tombstones["legacy"][0]["operation_id"] == decision["operation_id"] == private_id
             assert decision["decision_id"] == before_decisions[0]["decision_id"], decision
             assert decision["reason"] == "http_cancel_requested", decision
             assert decision["actor_id"] == self.alice["user_id"], decision
             assert self._scope_actions(repo, token["id"]) == {"contents_read", "repo_read"}, \
                 "scope narrowing did not commit after the Cancel terminal"
             return {
-                "operation": operation,
+                "operation": public_id,
                 "decision_id": before_decisions[0]["decision_id"],
                 "cancel_pid": cancel_pid,
                 "narrow_pid": narrow_pid,
@@ -414,6 +427,7 @@ class CancelScopeHarness(checkpoint.CheckpointHarness):
                 "narrow_status": narrow_status,
                 "narrow_blocked_by_cancel_backend": True,
                 "cancel_terminal_committed_before_narrowing": True,
+                "public_wrapper_bound_to_private_tombstones": True,
                 "scope_version": narrowed["scope_version"],
                 "remaining_scope_actions": sorted(self._scope_actions(repo, token["id"])),
             }

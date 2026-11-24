@@ -4,6 +4,10 @@ use serde::Serialize;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
+mod restore_lineage;
+pub(super) use restore_lineage::RestoreLineage;
+use restore_lineage::rotate_cluster_incarnation;
+
 const RESET_DELIVERIES: &str = "UPDATE public.event_deliveries SET state='pending', lease_owner=NULL, lease_until=NULL, next_attempt_at=clock_timestamp() WHERE state='leased'";
 const FENCED_WORKSPACES: &str = "UPDATE public.workspaces SET lease_epoch=lease_epoch+1, lease_until=clock_timestamp()-interval '1 second' WHERE state='ready'";
 const CANCELLED_DECISIONS: &str = "UPDATE public.ref_store_publication_decisions SET state='CANCELLED', cancelled_at=clock_timestamp(), closed_code='restored_incarnation', cancel_change_id=gen_random_uuid() WHERE state='OPEN'";
@@ -31,11 +35,11 @@ pub struct W8aFenceReceipt {
     pub reset_deliveries: i64,
 }
 
-pub(super) async fn fence(client: &Client) -> Result<()> {
-    client.batch_execute(
-        "BEGIN;
-         UPDATE public.cluster_authority SET incarnation=gen_random_uuid(),rotated_at=clock_timestamp() WHERE singleton=true;
-         DELETE FROM public.cluster_transport_nonces;
+pub(super) async fn fence(client: &mut Client, lineage: RestoreLineage) -> Result<()> {
+    let tx = client.transaction().await?;
+    rotate_cluster_incarnation(&tx, lineage).await?;
+    tx.batch_execute(
+        "DELETE FROM public.cluster_transport_nonces;
          UPDATE public.ci_runs SET state='cancelled',lease_generation=lease_generation+1,
              lease_expires_unix=0,runner_id=NULL,updated_at=clock_timestamp()
              WHERE state IN ('queued','leased');
@@ -50,9 +54,10 @@ pub(super) async fn fence(client: &Client) -> Result<()> {
          UPDATE public.sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp()
              WHERE state IN ('queued','preparing','running');
          UPDATE public.tokens SET revoked=true WHERE kind='browser';
-         UPDATE public.web_sessions SET revoked=true;
-         COMMIT;"
-    ).await?;
+         UPDATE public.web_sessions SET revoked=true;",
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -62,8 +67,31 @@ pub async fn fence_w8a_fresh_incarnation(
     source_cluster_incarnation: Uuid,
     source_storage_authority_epoch: i64,
 ) -> Result<W8aFenceReceipt> {
+    fence_w8a(client, source_cluster_incarnation, source_storage_authority_epoch, RestoreLineage::None).await
+}
+
+pub(super) async fn fence_w8a_fresh_incarnation_from_restore(
+    client: &mut Client,
+    source_cluster_incarnation: Uuid,
+    source_storage_authority_epoch: i64,
+    carry_lineage: bool,
+) -> Result<W8aFenceReceipt> {
+    let lineage = if carry_lineage {
+        RestoreLineage::VerifiedW8aSource(source_cluster_incarnation)
+    } else {
+        RestoreLineage::None
+    };
+    fence_w8a(client, source_cluster_incarnation, source_storage_authority_epoch, lineage).await
+}
+
+async fn fence_w8a(
+    client: &mut Client,
+    source_cluster_incarnation: Uuid,
+    source_storage_authority_epoch: i64,
+    lineage: RestoreLineage,
+) -> Result<W8aFenceReceipt> {
     ensure!(source_storage_authority_epoch >= 1, "source storage authority epoch is invalid");
-    fence(client).await?;
+    fence(client, lineage).await?;
     let tx = client.transaction().await?;
     tx.execute("UPDATE public.tokens SET revoked=true WHERE NOT revoked", &[]).await?;
     tx.execute("UPDATE public.web_sessions SET revoked=true WHERE NOT revoked", &[]).await?;

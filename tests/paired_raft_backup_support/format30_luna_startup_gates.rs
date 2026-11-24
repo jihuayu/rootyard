@@ -40,7 +40,7 @@ async fn gate5_startup_serving_guard_and_journal_lock_serialization() -> Result<
         let barrier_client = db::connect_url(&url).await?;
 
         let installed = install_production_serving_guard(&barrier_client).await?;
-        ensure!(installed.is_some(), "clean schema 151 must install a serving guard");
+        ensure!(installed.is_some(), "a clean current schema must install a serving guard");
         ensure!(installed_production_runtime_guard().is_some(), "guard must be process-wide installed");
         ensure_serving_database_unfrozen(&barrier_client).await?;
 

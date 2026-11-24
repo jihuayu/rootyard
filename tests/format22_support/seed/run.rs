@@ -1,4 +1,4 @@
-//! The seed entrypoint: real API-produced format22 source in fixture order.
+//! The seed entrypoint for the current paired backup fixture.
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::config::BlobProfile;
 use rootyard::blob_store::opendal::BlobStore;
@@ -213,8 +213,8 @@ pub async fn run(options: &Options) -> Result<Value> {
     };
     let marker = json!({
         "kind": marker::KIND,
-        "format": 30,
-        "schema_version": 151,
+        "format": 32,
+        "schema_version": 152,
         "bound_repository_id": repo_id.to_string(),
         "empty_repository_id": empty.to_string(),
         "unrelated_repository_id": unrelated.to_string(),

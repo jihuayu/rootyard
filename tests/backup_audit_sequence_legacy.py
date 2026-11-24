@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """#7 recovery drill: the audit ID sequence survives backup -> fresh restore.
 
-The fixture is a **format 21** source: a real GitFS volume served by the stock
-candidate binary's hooks, so a CLI backup can only write the metadata archive
-(a served ``pg_refstore`` source is refused as metadata and would need format
-22).  No Blob serving service is started.  The archive format matches a legacy
-producer, but the producer here is the current source-bound binary: this is not
-a replay of a historical legacy binary.
+The stock candidate binary serves a real GitFS volume and writes the current
+metadata-only archive. The same source-bound binary restores the archive into
+a fresh database and volume.
 
 What the audit assertions observe is produced only through the CLI and real
 HTTP/Git against run-owned databases, a temporary volume and temporary clones:
@@ -551,7 +548,7 @@ class AuditSequenceLegacyHarness(BackupHarness):
         self.stop()
         self.backup_result = json.loads(self.backup_command().stdout)
         manifest = json.loads((self.backup / "manifest.json").read_text())
-        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 29, manifest["format"]
+        assert manifest["format"] == CURRENT_BACKUP_FORMAT, manifest["format"]
         assert manifest["schema_versions"][-1] == CURRENT_SCHEMA_VERSION
         assert manifest.get("blob_closure") is None and not manifest.get("blob_artifacts"), \
             "a paired Blob archive would bypass this storage/format family"
@@ -869,7 +866,7 @@ def main():
             report = dict(passed=success, cases=harness.results, runtime=runtime,
                           binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                           limitations=[
-                              "Format21 metadata archive of a stock GitFS source; no Blob closure is read or written.",
+                              f"Format {CURRENT_BACKUP_FORMAT} metadata-only archive of a stock GitFS source.",
                               "A Git push is checked as a Git/audit_events fact; only API audit writes advance "
                               "repository_audit_log ids.",
                               "The control removes the migration-110 sequence default (the pre-110 shape); it does "
