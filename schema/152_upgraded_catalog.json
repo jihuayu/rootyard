@@ -7785,6 +7785,50 @@
       "name": "repository_id",
       "not_null": true,
       "position": 1,
+      "table": "ref_store_attempt_retirements",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "public_id",
+      "not_null": true,
+      "position": 2,
+      "table": "ref_store_attempt_retirements",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "slot",
+      "not_null": true,
+      "position": 3,
+      "table": "ref_store_attempt_retirements",
+      "type": "smallint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "event_id",
+      "not_null": true,
+      "position": 4,
+      "table": "ref_store_attempt_retirements",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 1,
       "table": "ref_store_cancellations",
       "type": "uuid"
     },
@@ -13029,20 +13073,9 @@
       "default": null,
       "generated": "",
       "identity": "",
-      "name": "retired_event_id",
-      "not_null": false,
-      "position": 16,
-      "table": "ref_store_public_operations",
-      "type": "uuid"
-    },
-    {
-      "collation": null,
-      "default": null,
-      "generated": "",
-      "identity": "",
       "name": "cancelled_private_id",
       "not_null": false,
-      "position": 17,
+      "position": 16,
       "table": "ref_store_public_operations",
       "type": "uuid"
     },
@@ -22935,6 +22968,60 @@
       "validated": true
     },
     {
+      "deferrable": true,
+      "deferred": true,
+      "definition": "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+      "name": "ref_store_attempt_retirement_evidence",
+      "table": "ref_store_attempt_retirements",
+      "type": "t",
+      "validated": true
+    },
+    {
+      "deferrable": true,
+      "deferred": true,
+      "definition": "FOREIGN KEY (event_id) REFERENCES public.ref_store_core_events(event_id) DEFERRABLE INITIALLY DEFERRED",
+      "name": "ref_store_attempt_retirements_event_id_fkey",
+      "table": "ref_store_attempt_retirements",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "UNIQUE (event_id)",
+      "name": "ref_store_attempt_retirements_event_id_key",
+      "table": "ref_store_attempt_retirements",
+      "type": "u",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (repository_id, public_id, slot)",
+      "name": "ref_store_attempt_retirements_pkey",
+      "table": "ref_store_attempt_retirements",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id, public_id, slot) REFERENCES public.ref_store_private_attempts(repository_id, public_id, slot) ON DELETE CASCADE",
+      "name": "ref_store_attempt_retirements_repository_id_public_id_slot_fkey",
+      "table": "ref_store_attempt_retirements",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((slot = ANY (ARRAY[0, 1])))",
+      "name": "ref_store_attempt_retirements_slot_check",
+      "table": "ref_store_attempt_retirements",
+      "type": "c",
+      "validated": true
+    },
+    {
       "deferrable": false,
       "deferred": false,
       "definition": "PRIMARY KEY (repository_id, issuer_id, lane, sequence)",
@@ -26312,7 +26399,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((slot = ANY (ARRAY[0, 1])))",
+      "definition": "CHECK ((slot = ANY (ARRAY[0, 1, 2])))",
       "name": "ref_store_private_attempts_slot_check",
       "table": "ref_store_private_attempts",
       "type": "c",
@@ -26375,7 +26462,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK (((current_slot = 1) = (retired_event_id IS NOT NULL)))",
+      "definition": "CHECK (((state = 'cancelled'::text) = (cancelled_private_id IS NOT NULL)))",
       "name": "ref_store_public_operations_check1",
       "table": "ref_store_public_operations",
       "type": "c",
@@ -26384,16 +26471,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK (((state = 'cancelled'::text) = (cancelled_private_id IS NOT NULL)))",
-      "name": "ref_store_public_operations_check2",
-      "table": "ref_store_public_operations",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((current_slot = ANY (ARRAY[0, 1])))",
+      "definition": "CHECK ((current_slot = ANY (ARRAY[0, 1, 2])))",
       "name": "ref_store_public_operations_current_slot_check",
       "table": "ref_store_public_operations",
       "type": "c",
@@ -26514,24 +26592,6 @@
       "name": "ref_store_public_operations_restore_incarnation_check",
       "table": "ref_store_public_operations",
       "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": true,
-      "deferred": true,
-      "definition": "FOREIGN KEY (retired_event_id) REFERENCES public.ref_store_core_events(event_id) DEFERRABLE INITIALLY DEFERRED",
-      "name": "ref_store_public_operations_retired_event_id_fkey",
-      "table": "ref_store_public_operations",
-      "type": "f",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "UNIQUE (retired_event_id)",
-      "name": "ref_store_public_operations_retired_event_id_key",
-      "table": "ref_store_public_operations",
-      "type": "u",
       "validated": true
     },
     {
@@ -30056,6 +30116,23 @@
       "volatility": "v"
     },
     {
+      "arguments": "",
+      "binary": null,
+      "config": null,
+      "cost": 100,
+      "kind": "f",
+      "language": "plpgsql",
+      "leakproof": false,
+      "name": "rootyard_ref_store_attempt_retirement_insert",
+      "parallel": "u",
+      "result": "trigger",
+      "rows": 0,
+      "security_definer": false,
+      "source": "\nDECLARE\n    wrapper ref_store_public_operations;\n    retired ref_store_private_attempts;\n    gate_revision bigint;\nBEGIN\n    PERFORM rootyard_ref_store_require_attempt_lock(NEW.repository_id, NEW.public_id);\n    SELECT * INTO wrapper FROM ref_store_public_operations\n    WHERE (repository_id, public_id) = (NEW.repository_id, NEW.public_id);\n    SELECT * INTO retired FROM ref_store_private_attempts\n    WHERE (repository_id, public_id, slot) = (NEW.repository_id, NEW.public_id, NEW.slot);\n    IF retired.private_id IS NULL OR wrapper.state <> 'pending' OR wrapper.current_slot <> NEW.slot OR NEW.slot >= 2 THEN\n        RAISE EXCEPTION 'retirement must select the current pending wrapper attempt' USING ERRCODE = '23514';\n    END IF;\n    gate_revision := rootyard_ref_store_attempt_stale_gate(wrapper, retired);\n    IF NOT EXISTS (\n        SELECT FROM ref_store_core_events e\n        JOIN ref_store_operations o USING (repository_id, operation_id)\n        WHERE (e.repository_id, e.operation_id, e.event_id, e.revision)\n            = (NEW.repository_id, retired.private_id, NEW.event_id, gate_revision)\n        AND (o.state, e.outcome, e.payload, e.payload->>'kind', e.payload->'repository_id', e.payload->'revision')\n            = ('rejected', 'rejected', o.terminal_result, 'rejected', to_jsonb(NEW.repository_id), to_jsonb(gate_revision))\n        AND e.payload#>>'{rejection,code}' = 'revision_mismatch'\n        AND e.payload->'registrations' = '[]'::jsonb\n    ) THEN\n        RAISE EXCEPTION 'retirement requires the exact current revision mismatch' USING ERRCODE = '23514';\n    END IF;\n    RETURN NEW;\nEND ",
+      "strict": false,
+      "volatility": "v"
+    },
+    {
       "arguments": "w public.ref_store_public_operations, a public.ref_store_private_attempts",
       "binary": null,
       "config": null,
@@ -30459,7 +30536,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\nDECLARE\n    wrapper ref_store_public_operations;\n    previous ref_store_private_attempts;\n    gate_revision bigint;\nBEGIN\n    PERFORM rootyard_ref_store_require_attempt_lock(NEW.repository_id, NEW.public_id);\n    PERFORM rootyard_ref_store_require_unclaimed_attempt(NEW.repository_id, NEW.private_id);\n    SELECT * INTO wrapper FROM ref_store_public_operations WHERE (repository_id, public_id) = (NEW.repository_id, NEW.public_id);\n    IF NOT FOUND OR wrapper.current_slot <> 0 OR wrapper.state <> 'pending' THEN\n        RAISE EXCEPTION 'public operation cannot reserve an attempt' USING ERRCODE = '23514';\n    END IF;\n    IF NEW.slot = 1 THEN\n        SELECT * INTO previous FROM ref_store_private_attempts\n        WHERE (repository_id, public_id, slot) = (NEW.repository_id, NEW.public_id, 0);\n        IF NOT FOUND THEN\n            RAISE EXCEPTION 'rotation requires slot zero history' USING ERRCODE = '23514';\n        END IF;\n        gate_revision := rootyard_ref_store_attempt_stale_gate(wrapper, previous);\n    ELSE\n        gate_revision := rootyard_ref_store_attempt_current_scope(wrapper);\n    END IF;\n    IF NEW.base_revision <> gate_revision THEN\n        RAISE EXCEPTION 'private attempt base revision differs' USING ERRCODE = '23514';\n    END IF;\n    RETURN NEW;\nEND ",
+      "source": "\nDECLARE\n    wrapper ref_store_public_operations;\n    gate_revision bigint;\nBEGIN\n    PERFORM rootyard_ref_store_require_attempt_lock(NEW.repository_id, NEW.public_id);\n    PERFORM rootyard_ref_store_require_unclaimed_attempt(NEW.repository_id, NEW.private_id);\n    SELECT * INTO wrapper FROM ref_store_public_operations\n    WHERE (repository_id, public_id) = (NEW.repository_id, NEW.public_id);\n    IF NOT FOUND OR wrapper.state <> 'pending' THEN\n        RAISE EXCEPTION 'public operation cannot reserve an attempt' USING ERRCODE = '23514';\n    END IF;\n    gate_revision := rootyard_ref_store_attempt_current_scope(wrapper);\n    IF NEW.slot = 0 AND wrapper.current_slot = 0 THEN\n        NULL; -- The primary key permits exactly one initial attempt.\n    ELSIF NEW.slot = wrapper.current_slot + 1 AND NEW.slot <= 2 THEN\n        IF NOT EXISTS (\n            SELECT FROM ref_store_attempt_retirements r\n            JOIN ref_store_core_events e ON e.event_id = r.event_id\n            WHERE (r.repository_id, r.public_id, r.slot) = (NEW.repository_id, NEW.public_id, wrapper.current_slot)\n              AND e.revision = gate_revision\n        ) THEN\n            RAISE EXCEPTION 'next attempt requires an exact retirement at the gate' USING ERRCODE = '23514';\n        END IF;\n    ELSE\n        RAISE EXCEPTION 'private attempt must occupy the next slot' USING ERRCODE = '23514';\n    END IF;\n    IF NEW.base_revision <> gate_revision THEN\n        RAISE EXCEPTION 'private attempt base revision differs' USING ERRCODE = '23514';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -30512,7 +30589,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\nDECLARE\n    attempt ref_store_private_attempts;\n    gate_revision bigint;\nBEGIN\n    IF TG_OP = 'INSERT' THEN\n        PERFORM rootyard_ref_store_require_unclaimed_attempt(NEW.repository_id, NEW.public_id);\n        IF NEW.current_slot <> 0 OR NEW.state <> 'pending' THEN\n            RAISE EXCEPTION 'public operation must begin pending on slot zero' USING ERRCODE = '23514';\n        END IF;\n        PERFORM rootyard_ref_store_attempt_current_scope(NEW);\n        RETURN NEW;\n    END IF;\n    PERFORM rootyard_ref_store_require_attempt_lock(OLD.repository_id, OLD.public_id);\n    IF (OLD.repository_id, OLD.public_id, OLD.admission_owner_id, OLD.issuer_id, OLD.wire_digest, OLD.request_mode,\n        OLD.backend_identity, OLD.object_format, OLD.history_incarnation, OLD.authority_epoch, OLD.group_epoch, OLD.restore_incarnation)\n        IS DISTINCT FROM\n       (NEW.repository_id, NEW.public_id, NEW.admission_owner_id, NEW.issuer_id, NEW.wire_digest, NEW.request_mode,\n        NEW.backend_identity, NEW.object_format, NEW.history_incarnation, NEW.authority_epoch, NEW.group_epoch, NEW.restore_incarnation)\n       OR OLD.state <> 'pending' THEN\n        RAISE EXCEPTION 'public operation identity or terminal is immutable' USING ERRCODE = '23514';\n    END IF;\n    FOR attempt IN SELECT * FROM ref_store_private_attempts WHERE (repository_id, public_id) = (OLD.repository_id, OLD.public_id)\n    LOOP\n        PERFORM rootyard_ref_store_require_attempt_lock(OLD.repository_id, attempt.private_id);\n    END LOOP;\n    IF OLD.current_slot = 0 AND NEW.current_slot = 1 AND NEW.state = 'pending' THEN\n        SELECT * INTO attempt FROM ref_store_private_attempts\n        WHERE (repository_id, public_id, slot) = (OLD.repository_id, OLD.public_id, 0);\n        IF NOT FOUND THEN\n            RAISE EXCEPTION 'rotation requires slot zero history' USING ERRCODE = '23514';\n        END IF;\n        gate_revision := rootyard_ref_store_attempt_stale_gate(OLD, attempt);\n        IF NOT EXISTS (\n            SELECT FROM ref_store_core_events e WHERE e.event_id = NEW.retired_event_id\n            AND (e.repository_id, e.operation_id, e.revision) = (OLD.repository_id, attempt.private_id, gate_revision)\n        ) THEN\n            RAISE EXCEPTION 'retired attempt event does not match the advanced gate' USING ERRCODE = '23514';\n        END IF;\n    ELSIF OLD.current_slot <> NEW.current_slot OR NEW.state = 'pending' THEN\n        RAISE EXCEPTION 'invalid public operation transition' USING ERRCODE = '23514';\n    ELSIF OLD.retired_event_id IS DISTINCT FROM NEW.retired_event_id THEN\n        RAISE EXCEPTION 'retired operation event is immutable' USING ERRCODE = '23514';\n    END IF;\n    RETURN NEW;\nEND ",
+      "source": "\nDECLARE\n    attempt ref_store_private_attempts;\n    gate_revision bigint;\nBEGIN\n    IF TG_OP = 'INSERT' THEN\n        PERFORM rootyard_ref_store_require_unclaimed_attempt(NEW.repository_id, NEW.public_id);\n        IF NEW.current_slot <> 0 OR NEW.state <> 'pending' THEN\n            RAISE EXCEPTION 'public operation must begin pending on slot zero' USING ERRCODE = '23514';\n        END IF;\n        PERFORM rootyard_ref_store_attempt_current_scope(NEW);\n        RETURN NEW;\n    END IF;\n    PERFORM rootyard_ref_store_require_attempt_lock(OLD.repository_id, OLD.public_id);\n    IF (OLD.repository_id, OLD.public_id, OLD.admission_owner_id, OLD.issuer_id, OLD.wire_digest, OLD.request_mode,\n        OLD.backend_identity, OLD.object_format, OLD.history_incarnation, OLD.authority_epoch, OLD.group_epoch, OLD.restore_incarnation)\n        IS DISTINCT FROM\n       (NEW.repository_id, NEW.public_id, NEW.admission_owner_id, NEW.issuer_id, NEW.wire_digest, NEW.request_mode,\n        NEW.backend_identity, NEW.object_format, NEW.history_incarnation, NEW.authority_epoch, NEW.group_epoch, NEW.restore_incarnation)\n       OR OLD.state <> 'pending' THEN\n        RAISE EXCEPTION 'public operation identity or terminal is immutable' USING ERRCODE = '23514';\n    END IF;\n    FOR attempt IN SELECT * FROM ref_store_private_attempts WHERE (repository_id, public_id) = (OLD.repository_id, OLD.public_id)\n    LOOP\n        PERFORM rootyard_ref_store_require_attempt_lock(OLD.repository_id, attempt.private_id);\n    END LOOP;\n    IF NEW.current_slot = OLD.current_slot + 1 AND NEW.state = 'pending' THEN\n        gate_revision := rootyard_ref_store_attempt_current_scope(OLD);\n        IF NOT EXISTS (\n            SELECT FROM ref_store_attempt_retirements r\n            JOIN ref_store_core_events e ON e.event_id = r.event_id\n            JOIN ref_store_private_attempts a\n                ON (a.repository_id, a.public_id, a.slot) = (r.repository_id, r.public_id, NEW.current_slot)\n            WHERE (r.repository_id, r.public_id, r.slot) = (OLD.repository_id, OLD.public_id, OLD.current_slot)\n              AND e.revision = gate_revision AND a.base_revision = gate_revision\n        ) THEN\n            RAISE EXCEPTION 'rotation requires the current retirement and next attempt' USING ERRCODE = '23514';\n        END IF;\n    ELSIF OLD.current_slot <> NEW.current_slot OR NEW.state = 'pending' THEN\n        RAISE EXCEPTION 'invalid public operation transition' USING ERRCODE = '23514';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -30614,7 +30691,7 @@
       "result": "void",
       "rows": 0,
       "security_definer": false,
-      "source": "\nDECLARE\n    wrapper ref_store_public_operations;\n    attempt record;\nBEGIN\n    SELECT * INTO wrapper FROM ref_store_public_operations WHERE (repository_id, public_id) = (repo, public_op);\n    IF NOT FOUND THEN RETURN; END IF;\n    FOR attempt IN\n        SELECT a.slot, a.private_id, a.base_revision, o.state AS core_state, o.terminal_result,\n               e.event_id, e.outcome, e.payload, e.revision,\n               rootyard_ref_store_attempt_has_binding(wrapper, a) AS serving_bound,\n               c.operation_id IS NOT NULL AS has_tombstone,\n               c.operation_id IS DISTINCT FROM k.operation_id AS tombstone_key_differs,\n               (c.issuer_id, c.lane, c.sequence, c.request_digest) = (o.issuer_id, o.lane, o.sequence, o.request_digest) AS exact_tombstone\n        FROM ref_store_private_attempts a\n        LEFT JOIN ref_store_operations o ON (o.repository_id, o.operation_id) = (a.repository_id, a.private_id)\n        LEFT JOIN ref_store_core_events e ON (e.repository_id, e.operation_id) = (a.repository_id, a.private_id)\n        LEFT JOIN ref_store_cancellations c ON (c.repository_id, c.operation_id) = (a.repository_id, a.private_id)\n        LEFT JOIN ref_store_cancellations k ON (k.repository_id, k.issuer_id, k.lane, k.sequence)\n            = (o.repository_id, o.issuer_id, o.lane, o.sequence)\n        WHERE (a.repository_id, a.public_id) = (repo, public_op)\n    LOOP\n        IF NOT attempt.serving_bound\n           OR attempt.slot > wrapper.current_slot\n           OR attempt.tombstone_key_differs\n           OR (attempt.has_tombstone AND (attempt.exact_tombstone IS NOT TRUE OR attempt.core_state = 'pending'))\n           OR (attempt.core_state = 'cancelled' AND\n               (NOT attempt.has_tombstone\n                OR attempt.terminal_result IS DISTINCT FROM '{\"state\":\"cancelled\",\"reason\":\"cancel_requested\"}'::jsonb))\n           OR (attempt.event_id IS NOT NULL AND\n               (attempt.outcome IS DISTINCT FROM attempt.core_state\n                OR attempt.payload IS DISTINCT FROM attempt.terminal_result\n                OR attempt.payload->>'kind' IS DISTINCT FROM attempt.core_state\n                OR attempt.payload->'repository_id' IS DISTINCT FROM to_jsonb(repo)\n                OR attempt.payload->'revision' IS DISTINCT FROM to_jsonb(attempt.revision)))\n           OR (attempt.slot < wrapper.current_slot AND\n               (attempt.core_state IS DISTINCT FROM 'rejected' OR attempt.event_id IS DISTINCT FROM wrapper.retired_event_id\n                OR attempt.revision <= attempt.base_revision\n                OR attempt.payload#>>'{rejection,code}' IS DISTINCT FROM 'revision_mismatch'\n                OR attempt.payload->'registrations' IS DISTINCT FROM '[]'::jsonb))\n           OR (attempt.slot = wrapper.current_slot AND\n               (attempt.core_state IS DISTINCT FROM wrapper.state\n                OR (wrapper.state = 'cancelled' AND attempt.private_id IS DISTINCT FROM wrapper.cancelled_private_id)\n                OR attempt.event_id IS DISTINCT FROM wrapper.event_id)) THEN\n            RAISE EXCEPTION 'public operation and private attempt evidence disagree'\n                USING ERRCODE = '23514', CONSTRAINT = 'ref_store_public_attempt_evidence';\n        END IF;\n    END LOOP;\nEND ",
+      "source": "\nDECLARE\n    wrapper ref_store_public_operations;\n    attempt record;\n    expected_slot smallint := 0;\n    previous_lane text;\n    previous_sequence bigint;\nBEGIN\n    SELECT * INTO wrapper FROM ref_store_public_operations WHERE (repository_id, public_id) = (repo, public_op);\n    IF NOT FOUND THEN RETURN; END IF;\n    FOR attempt IN\n        SELECT a.slot, a.private_id, a.base_revision, next.base_revision AS next_base,\n               o.state AS core_state, o.terminal_result, o.lane, o.sequence,\n               r.event_id AS retired_event_id,\n               e.event_id, e.outcome, e.payload, e.revision,\n               rootyard_ref_store_attempt_has_binding(wrapper, a) AS serving_bound,\n               c.operation_id IS NOT NULL AS has_tombstone,\n               c.operation_id IS DISTINCT FROM k.operation_id AS tombstone_key_differs,\n               (c.issuer_id, c.lane, c.sequence, c.request_digest) = (o.issuer_id, o.lane, o.sequence, o.request_digest) AS exact_tombstone\n        FROM ref_store_private_attempts a\n        LEFT JOIN ref_store_private_attempts next ON (next.repository_id, next.public_id, next.slot)\n            = (a.repository_id, a.public_id, a.slot + 1)\n        LEFT JOIN ref_store_attempt_retirements r ON (r.repository_id, r.public_id, r.slot)\n            = (a.repository_id, a.public_id, a.slot)\n        LEFT JOIN ref_store_operations o ON (o.repository_id, o.operation_id) = (a.repository_id, a.private_id)\n        LEFT JOIN ref_store_core_events e ON (e.repository_id, e.operation_id) = (a.repository_id, a.private_id)\n        LEFT JOIN ref_store_cancellations c ON (c.repository_id, c.operation_id) = (a.repository_id, a.private_id)\n        LEFT JOIN ref_store_cancellations k ON (k.repository_id, k.issuer_id, k.lane, k.sequence)\n            = (o.repository_id, o.issuer_id, o.lane, o.sequence)\n        WHERE (a.repository_id, a.public_id) = (repo, public_op)\n        ORDER BY a.slot\n    LOOP\n        IF NOT attempt.serving_bound\n           OR attempt.slot <> expected_slot\n           OR attempt.slot > wrapper.current_slot\n           OR (attempt.slot > 0 AND (attempt.lane IS DISTINCT FROM previous_lane\n                                   OR (attempt.sequence > previous_sequence) IS NOT TRUE))\n           OR attempt.tombstone_key_differs\n           OR (attempt.has_tombstone AND (attempt.exact_tombstone IS NOT TRUE OR attempt.core_state = 'pending'))\n           OR (attempt.core_state = 'cancelled' AND\n               (NOT attempt.has_tombstone\n                OR attempt.terminal_result IS DISTINCT FROM '{\"state\":\"cancelled\",\"reason\":\"cancel_requested\"}'::jsonb))\n           OR (attempt.event_id IS NOT NULL AND\n               (attempt.outcome IS DISTINCT FROM attempt.core_state\n                OR attempt.payload IS DISTINCT FROM attempt.terminal_result\n                OR attempt.payload->>'kind' IS DISTINCT FROM attempt.core_state\n                OR attempt.payload->'repository_id' IS DISTINCT FROM to_jsonb(repo)\n                OR attempt.payload->'revision' IS DISTINCT FROM to_jsonb(attempt.revision)))\n           OR (attempt.slot < wrapper.current_slot AND\n               (attempt.core_state IS DISTINCT FROM 'rejected' OR attempt.retired_event_id IS NULL\n                OR attempt.event_id IS DISTINCT FROM attempt.retired_event_id\n                OR (attempt.revision > attempt.base_revision) IS NOT TRUE\n                OR attempt.next_base IS DISTINCT FROM attempt.revision\n                OR attempt.payload#>>'{rejection,code}' IS DISTINCT FROM 'revision_mismatch'\n                OR attempt.payload->'registrations' IS DISTINCT FROM '[]'::jsonb))\n           OR (attempt.slot = wrapper.current_slot AND\n               (attempt.retired_event_id IS NOT NULL OR attempt.core_state IS DISTINCT FROM wrapper.state\n                OR (wrapper.state = 'cancelled' AND attempt.private_id IS DISTINCT FROM wrapper.cancelled_private_id)\n                OR attempt.event_id IS DISTINCT FROM wrapper.event_id)) THEN\n            RAISE EXCEPTION 'public operation and private attempt evidence disagree'\n                USING ERRCODE = '23514', CONSTRAINT = 'ref_store_public_attempt_evidence';\n        END IF;\n        expected_slot := expected_slot + 1;\n        previous_lane := attempt.lane;\n        previous_sequence := attempt.sequence;\n    END LOOP;\n    IF expected_slot <> wrapper.current_slot + 1 THEN\n        RAISE EXCEPTION 'public operation does not have a complete attempt prefix'\n            USING ERRCODE = '23514', CONSTRAINT = 'ref_store_public_attempt_evidence';\n    END IF;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -32040,6 +32117,24 @@
       "valid": true
     },
     {
+      "definition": "CREATE UNIQUE INDEX ref_store_attempt_retirements_event_id_key ON public.ref_store_attempt_retirements USING btree (event_id)",
+      "live": true,
+      "name": "ref_store_attempt_retirements_event_id_key",
+      "ready": true,
+      "table": "ref_store_attempt_retirements",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ref_store_attempt_retirements_pkey ON public.ref_store_attempt_retirements USING btree (repository_id, public_id, slot)",
+      "live": true,
+      "name": "ref_store_attempt_retirements_pkey",
+      "ready": true,
+      "table": "ref_store_attempt_retirements",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX ref_store_cancellations_pkey ON public.ref_store_cancellations USING btree (repository_id, issuer_id, lane, sequence)",
       "live": true,
       "name": "ref_store_cancellations_pkey",
@@ -32853,15 +32948,6 @@
       "definition": "CREATE UNIQUE INDEX ref_store_public_operations_pkey ON public.ref_store_public_operations USING btree (repository_id, public_id)",
       "live": true,
       "name": "ref_store_public_operations_pkey",
-      "ready": true,
-      "table": "ref_store_public_operations",
-      "tablespace": null,
-      "valid": true
-    },
-    {
-      "definition": "CREATE UNIQUE INDEX ref_store_public_operations_retired_event_id_key ON public.ref_store_public_operations USING btree (retired_event_id)",
-      "live": true,
-      "name": "ref_store_public_operations_retired_event_id_key",
       "ready": true,
       "table": "ref_store_public_operations",
       "tablespace": null,
@@ -34503,6 +34589,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "ref_cas_projection_jobs",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "ref_store_attempt_retirements",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
@@ -36246,6 +36342,70 @@
       "old_transition": null,
       "table": "ref_cas_projected_operations",
       "type": 34
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": true,
+      "deferrable": true,
+      "deferred": true,
+      "definition": "CREATE CONSTRAINT TRIGGER ref_store_attempt_retirement_evidence AFTER INSERT ON public.ref_store_attempt_retirements DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rootyard_ref_store_public_operation_evidence()",
+      "enabled": "O",
+      "function": "rootyard_ref_store_public_operation_evidence",
+      "function_schema": "public",
+      "name": "ref_store_attempt_retirement_evidence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "ref_store_attempt_retirements",
+      "type": 5
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER ref_store_attempt_retirement_insert BEFORE INSERT ON public.ref_store_attempt_retirements FOR EACH ROW EXECUTE FUNCTION public.rootyard_ref_store_attempt_retirement_insert()",
+      "enabled": "O",
+      "function": "rootyard_ref_store_attempt_retirement_insert",
+      "function_schema": "public",
+      "name": "ref_store_attempt_retirement_insert",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "ref_store_attempt_retirements",
+      "type": 7
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER ref_store_attempt_retirement_no_truncate BEFORE TRUNCATE ON public.ref_store_attempt_retirements FOR EACH STATEMENT EXECUTE FUNCTION public.rootyard_ref_store_attempt_retain()",
+      "enabled": "O",
+      "function": "rootyard_ref_store_attempt_retain",
+      "function_schema": "public",
+      "name": "ref_store_attempt_retirement_no_truncate",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "ref_store_attempt_retirements",
+      "type": 34
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER ref_store_attempt_retirement_retain BEFORE DELETE OR UPDATE ON public.ref_store_attempt_retirements FOR EACH ROW EXECUTE FUNCTION public.rootyard_ref_store_attempt_retain()",
+      "enabled": "O",
+      "function": "rootyard_ref_store_attempt_retain",
+      "function_schema": "public",
+      "name": "ref_store_attempt_retirement_retain",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "ref_store_attempt_retirements",
+      "type": 27
     },
     {
       "argument_count": 0,
