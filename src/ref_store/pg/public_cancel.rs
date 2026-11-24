@@ -7,6 +7,7 @@ use uuid::Uuid;
 use super::{
     PgRefStore, bound,
     public_attempt::{PublicAttemptFinishLookup, PublicAttemptRequest, ledger, parse_digest, parse_mode},
+    public_terminal::current_scope_revision,
 };
 use crate::ref_store::{
     CancelReceipt, OperationIdentity, OperationLookup, OperationRecord, OperationState, RefStoreError,
@@ -128,6 +129,10 @@ impl PgRefStore {
             return Ok(());
         }
         bound(tx, deadline).await?;
+        // The coordinator now holds the repository and authority locks. An
+        // archive or serving-realm change during the lane wait must roll the
+        // tombstone back together with the wrapper update.
+        current_scope_revision(tx, request).await?;
         if cancellation.wrapper_state == OperationState::Pending {
             let changed = tx
                 .execute(

@@ -774,7 +774,10 @@ async fn verify_public_operation(tx: &Transaction<'_>, request: &PublicAttemptRe
     Ok(())
 }
 
-async fn current_scope_revision(tx: &Transaction<'_>, request: &PublicAttemptRequest) -> Result<i64, PackCommitError> {
+pub(super) async fn current_scope_revision(
+    tx: &Transaction<'_>,
+    request: &PublicAttemptRequest,
+) -> Result<i64, PackCommitError> {
     let row = tx
         .query_opt(CURRENT_SCOPE, &[&request.repository_id, &request.public_id])
         .await
