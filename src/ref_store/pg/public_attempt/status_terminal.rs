@@ -6,14 +6,14 @@
 //! proof. A returned terminal is decoded from `PackCommitTerminal`, re-encoded
 //! to compare the entire JSON shape (so unknown, missing or coerced fields fail
 //! closed), validated against the wrapper repository, current event revision,
-//! object format and state, and only then serialized. The SQL layer withholds a
-//! canonical `jsonb::text` body above a generous 256 KiB transport cap and
+//! object format, request mode and state, and only then serialized. The SQL
+//! layer withholds a canonical `jsonb::text` body above a 256 KiB transport cap and
 //! reports that fail-closed marker; Rust then applies the exact compact 64 KiB
 //! semantic bound. Pending is `None`; cancelled is the exact two-field tombstone
 //! body.
 use super::{is_canonical_hex_64, ledger};
 use crate::ref_store::{
-    GitObjectFormat, GitOid, OperationState, RefCommitResult, RefName, TerminalKind, TerminalResult,
+    CommitMode, GitObjectFormat, GitOid, OperationState, RefCommitResult, RefName, TerminalKind, TerminalResult,
     core::pack_commit::{
         MAX_BATCH_NEW_PACKS, MAX_PLAN_REFS, PackCommitError, PackCommitRejectCode, PackCommitTerminal, PackMode,
     },
@@ -179,6 +179,7 @@ pub(super) fn project_terminal(
     state: OperationState,
     repository_id: Uuid,
     object_format: GitObjectFormat,
+    request_mode: CommitMode,
     event_revision: Option<i64>,
     terminal: Option<&Value>,
 ) -> Result<Option<Value>, PackCommitError> {
@@ -207,7 +208,7 @@ pub(super) fn project_terminal(
             if &canonical != result.value() {
                 return Err(ledger("public terminal has non-canonical or undeclared fields"));
             }
-            validate_typed(state, repository_id, object_format, event_revision, &typed)?;
+            validate_typed(state, repository_id, object_format, request_mode, event_revision, &typed)?;
             Ok(Some(canonical))
         }
     }
@@ -221,6 +222,7 @@ fn validate_typed(
     state: OperationState,
     repository_id: Uuid,
     object_format: GitObjectFormat,
+    request_mode: CommitMode,
     event_revision: Option<i64>,
     typed: &PackCommitTerminal,
 ) -> Result<(), PackCommitError> {
@@ -240,8 +242,13 @@ fn validate_typed(
             if typed.head_ref.is_none() {
                 return Err(ledger("committed public terminal has no HEAD"));
             }
-            if !typed.refs.iter().all(|result| matches!(result, RefCommitResult::Applied { .. })) {
-                return Err(ledger("committed public terminal contains a non-applied ref"));
+            let applied = |result: &RefCommitResult| matches!(result, RefCommitResult::Applied { .. });
+            let valid_refs = match request_mode {
+                CommitMode::Atomic => typed.refs.iter().all(applied),
+                CommitMode::AcceptedSubset => typed.refs.iter().any(applied),
+            };
+            if !valid_refs {
+                return Err(ledger("committed public terminal refs differ from the request mode"));
             }
         }
         OperationState::Rejected => {

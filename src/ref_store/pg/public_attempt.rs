@@ -892,6 +892,7 @@ fn evaluate_status(
         state,
         wrapper.repository_id,
         stored.object_format,
+        stored.request_mode,
         evidence.current.event_revision,
         snapshot.status_terminal.as_ref(),
     )?;
