@@ -1762,6 +1762,7 @@ jobs:
               'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
               'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
               'blob_git_gateway::session_http_acceptance::public_operation_tests::public_operation_get_is_owned_pending_and_private_safe',
+              'blob_git_gateway::session_http_acceptance::public_operation_tests::public_cancel_rolls_back_if_the_repository_archives_while_waiting_for_its_lane',
           ])
           lib = readonly_alias(lib, 'lib alias')
           cli = readonly_alias(cli, 'CLI alias')
@@ -2343,6 +2344,7 @@ jobs:
               'blob_git_gateway::admission_race_acceptance::slow_body::slow_body_distinct_refs_overlap_and_both_commit',
               'blob_git_gateway::admission_race_acceptance::three_way::three_independent_pushes_succeed_on_their_first_request',
               'blob_git_gateway::session_http_acceptance::public_operation_tests::public_operation_get_is_owned_pending_and_private_safe',
+              'blob_git_gateway::session_http_acceptance::public_operation_tests::public_cancel_rolls_back_if_the_repository_archives_while_waiting_for_its_lane',
           ])
           if required_names != names:
               raise SystemExit('session174 cases: preflight required_names differs from the selected inventory')
