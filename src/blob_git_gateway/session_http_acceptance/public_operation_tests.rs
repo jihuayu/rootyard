@@ -1,10 +1,10 @@
-//! Owned PostgreSQL/Blob HTTP proof for the public operation GET route.
+//! Owned PostgreSQL/Blob HTTP proof for public operation reads and cancellation.
 //!
-//! One ignored case creates a random, disposable database whose `public` schema
+//! Each ignored case creates a random, disposable database whose `public` schema
 //! is migrated (migration 152 names `public.cluster_authority`), starts the real
 //! production router over the real Blob store, admits a pending public/private
 //! pair through the actual slot-zero planner/adaptor, and drives the existing
-//! authenticated GET endpoint as a network client. No wrapper row or JSON
+//! authenticated operation endpoint as a network client. No wrapper row or JSON
 //! response is fabricated.
 use anyhow::{Result, ensure};
 use reqwest::{StatusCode, header};
@@ -130,6 +130,116 @@ async fn case(db: &Db) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires real PostgreSQL with CREATEDB, S3-compatible Blob and native Git"]
+async fn public_cancel_rolls_back_if_the_repository_archives_while_waiting_for_its_lane() -> Result<()> {
+    let _serial = NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    let db = Db::setup_public_owned().await?;
+    let outcome = archive_while_cancel_waits(&db).await;
+    db.finish(outcome).await
+}
+
+async fn archive_while_cancel_waits(db: &Db) -> Result<()> {
+    let store = open_store()?;
+    let tokens = test_tokens(store.backend_identity())?;
+    let gateway = Gateway::start(db, store, tokens).await?;
+    let owner = actor::owner(&db.pool).await?;
+    let name = super::support::unique_name("public-cancel-archive");
+    gateway.create_repository(&owner, &name).await?;
+    gateway.provision_decision_realm(db, &owner, &name).await?;
+    let serving = super::support::serving(db, &gateway, &owner, &name, true).await?;
+    let repository_id = serving.gate.repository_id();
+    let public_id = Uuid::new_v4();
+    let private_id = Uuid::new_v4();
+    admit_pending_public(db, &gateway, &owner, &serving, public_id, private_id).await?;
+    let before = cancellation_ledger(db, repository_id).await?;
+
+    let mut blocker = db.pool.get().await?;
+    let hold = tokio_postgres::Client::transaction(&mut blocker).await?;
+    let blocker_pid: i32 = hold
+        .query_one(
+            "SELECT pg_backend_pid() FROM ref_store_issuer_lanes l
+             JOIN ref_store_operations o USING (repository_id,issuer_id,lane)
+             WHERE o.repository_id=$1 AND o.operation_id=$2 FOR UPDATE OF l",
+            &[&repository_id, &private_id],
+        )
+        .await?
+        .get(0);
+
+    let observer = db.pool.get().await?;
+    let client = reqwest::Client::new();
+    let base = gateway.base(&owner.username, &name);
+    let cancel = client.post(format!("{base}/operations/{public_id}/cancel")).bearer_auth(&owner.token).send();
+    tokio::pin!(cancel);
+    let stop = deadline();
+    tokio::select! {
+        response = &mut cancel => anyhow::bail!("public cancel returned HTTP {} before waiting on its lane", response?.status()),
+        blocked = tokio::time::timeout_at(stop, async {
+            let mut polls = tokio::time::interval(std::time::Duration::from_millis(10));
+            loop {
+                polls.tick().await;
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS(SELECT FROM pg_stat_activity s
+                         WHERE s.datname=current_database() AND s.state='active'
+                           AND ltrim(s.query) LIKE 'INSERT INTO ref_store_issuer_lanes(%'
+                           AND $1=ANY(pg_blocking_pids(s.pid)))",
+                        &[&blocker_pid],
+                    )
+                    .await?
+                    .get(0);
+                if waiting {
+                    return Ok::<(), tokio_postgres::Error>(());
+                }
+            }
+        }) => blocked??,
+    }
+
+    // The fixture owns this database. Commit the lifecycle row change through
+    // a separate connection while the real HTTP handler still waits on its lane.
+    let changed = tokio::time::timeout_at(
+        stop,
+        observer.execute(
+            "UPDATE repositories SET archived_at=clock_timestamp(), archived_by=$2, version=version+1
+         WHERE id=$1 AND archived_at IS NULL",
+            &[&repository_id, &owner.identity.id],
+        ),
+    )
+    .await??;
+    ensure!(changed == 1, "fixture archive did not change exactly one repository");
+    tokio::time::timeout_at(stop, hold.rollback()).await??;
+
+    let response = tokio::time::timeout_at(stop, cancel).await??;
+    let status = response.status();
+    let body: Value = tokio::time::timeout_at(stop, response.json()).await??;
+    let after = cancellation_ledger(db, repository_id).await?;
+    ensure!(after == before, "cancel changed the ledger after the repository archived (HTTP {status})");
+    ensure!(status == StatusCode::CONFLICT, "archive must refuse the pending public cancel, got HTTP {status}");
+    ensure_public_safe(&body, &[private_id], "archived cancellation refusal")?;
+    Ok(())
+}
+
+async fn cancellation_ledger(db: &Db, repository_id: Uuid) -> Result<Value> {
+    let snapshot = db.pool.get().await?.query_one(
+        "SELECT jsonb_build_array(
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_public_operations r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_private_attempts r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_attempt_retirements r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_operations r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_issuer_lanes r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_cancellations r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_decision_cancellations r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_publication_decisions r WHERE repository_id=$1),
+            (SELECT to_jsonb(r) FROM ref_store_decision_repo_usage r WHERE repository_id=$1),
+            (SELECT to_jsonb(r) FROM ref_store_core_gates r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_core_refs r WHERE repository_id=$1),
+            (SELECT jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)) FROM ref_store_core_events r WHERE repository_id=$1)
+        )",
+        &[&repository_id],
+    ).await?;
+    Ok(snapshot.get(0))
 }
 
 async fn admit_pending_public(
