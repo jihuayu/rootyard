@@ -9,10 +9,12 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from pack_compression_eval.capacity import derive_capacity_envelope  # noqa: E402
+from pack_compression_eval import correctness  # noqa: E402
 from pack_compression_eval.corpus import (  # noqa: E402
     DATASET_ARCHETYPES,
     build_archetype_commits,
@@ -89,6 +92,24 @@ class PackCompressionEvalTests(unittest.TestCase):
                 self.assertTrue(safe["truncated_pack_refused"])
                 self.assertTrue(safe["missing_idx_refused"])
                 self.assertTrue(safe["invalid_depth_refused"])
+
+    def test_normal_pack_exit_does_not_count_as_cancellation(self) -> None:
+        def let_pack_finish(proc: subprocess.Popen[bytes]) -> bool:
+            assert proc.stdin is not None
+            proc.stdin.close()
+            self.assertEqual(proc.wait(timeout=5), 0)
+            return True
+
+        with tempfile.TemporaryDirectory(prefix="pack-eval-cancel-") as tmp:
+            with mock.patch.object(correctness, "kill_process_group", side_effect=let_pack_finish):
+                result = run_correctness_suite(
+                    resolve_trusted_git(None), 178, "quick", Path(tmp), isolated_git_env(os.environ),
+                    configs=(CANDIDATE_CONFIGS[0],),
+                )
+
+        self.assertFalse(result["passed"])
+        for row in result["formats"].values():
+            self.assertFalse(row["safety_and_failure_checks"]["cancel_mid_repack_preserves_serving_pack"])
 
     def test_s3_meter_proxy_preserves_host_and_counts_bytes(self) -> None:
         observed_hosts: list[str] = []

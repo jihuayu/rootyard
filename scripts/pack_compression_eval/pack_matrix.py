@@ -268,6 +268,7 @@ def _run_pack_objects_instrumented(
         if hasattr(os, "wait4"):
             _, status, rusage = os.wait4(proc.pid, 0)
             rc = os.waitstatus_to_exitcode(status)
+            proc.returncode = rc  # wait4 reaped the child outside Popen.
             cpu_seconds = round(float(rusage.ru_utime) + float(rusage.ru_stime), 4)
             raw_rss = int(rusage.ru_maxrss)
             if raw_rss > 0:

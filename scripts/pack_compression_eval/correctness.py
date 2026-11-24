@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import time
 from typing import Any
@@ -62,9 +63,9 @@ def _verify_pack_cancellation_and_failures(
     work_dir: Path,
     env: dict[str, str],
 ) -> dict[str, Any]:
-    """Prove mid-compaction cancellation, truncated/corrupted pack, missing idx, and bad bounds fail closed."""
+    """Check cancellation during pack input and refusal of incomplete packs or invalid bounds."""
     before_packs = sorted((bare_dir / "objects" / "pack").glob("pack-*.pack"))
-    # 1. Cancel git pack-objects mid-stdin feed -> zero serving impact + source repo still fsck-clean.
+    # Keep input open so Git is still waiting for the rest of the object list.
     cancel_stage = work_dir / "cancel-stage"
     cancel_stage.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -95,7 +96,8 @@ def _verify_pack_cancellation_and_failures(
         proc.stdin.flush()
         time.sleep(0.01)
     finally:
-        kill_process_group(proc)
+        was_running = proc.poll() is None
+        reaped = not was_running or kill_process_group(proc)
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             if stream is not None:
                 try:
@@ -105,8 +107,12 @@ def _verify_pack_cancellation_and_failures(
     after_packs = sorted((bare_dir / "objects" / "pack").glob("pack-*.pack"))
     fsck_after_cancel, _ = run_git(git_bin, ["--git-dir", str(bare_dir), "fsck", "--full", "--strict"], None, env)
     refs_after_cancel, _ = list_all_refs(git_bin, bare_dir, env)
+    killed_status = 1 if os.name == "nt" else -signal.SIGKILL
     cancel_ok = (
-        before_packs == after_packs
+        was_running
+        and reaped
+        and proc.returncode == killed_status
+        and before_packs == after_packs
         and fsck_after_cancel.returncode == 0
         and refs_after_cancel == source_refs
     )
