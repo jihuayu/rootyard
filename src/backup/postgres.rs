@@ -267,3 +267,63 @@ pub(super) async fn git_inventory(config: &Config, root: &Path, repos: &mut [Rep
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires an owned disposable PostgreSQL 17 database at schema 151"]
+    async fn format_29_and_30_refuse_schema_152_relations_and_versions() -> Result<()> {
+        ensure!(std::env::var("ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES").as_deref() == Ok("1"));
+        let pool = crate::db::pool(&std::env::var("ROOTYARD_TEST_DATABASE_URL")?)?;
+        let mut client = pool.get().await?;
+        let server_version: i32 = client
+            .query_one("SELECT current_setting('server_version_num')::int", &[])
+            .await?
+            .get(0);
+        ensure!(server_version / 10_000 == 17);
+
+        assert_frozen_prefix(&mut client).await?;
+
+        let tx = client.transaction().await?;
+        tx.batch_execute(
+            "SET LOCAL search_path=public,pg_catalog;
+             SET LOCAL statement_timeout='15s'; SET LOCAL lock_timeout='2s';
+             INSERT INTO schema_migrations (version) VALUES (152);",
+        )
+        .await?;
+        for format in [29, 30] {
+            ensure!(
+                schema(&*tx, format).await.unwrap_err().to_string() == "unsupported migration version",
+                "format {format} did not refuse the newer version on an unchanged schema"
+            );
+        }
+        tx.batch_execute("DELETE FROM schema_migrations WHERE version=152;").await?;
+        tx.batch_execute(include_str!("../../tests/fixtures/ref_store_public_attempts_migration_152.sql")).await?;
+        for suppress_version in [false, true] {
+            if suppress_version {
+                tx.batch_execute("DELETE FROM schema_migrations WHERE version=152;").await?;
+            }
+            for format in [29, 30] {
+                ensure!(
+                    schema(&*tx, format).await.unwrap_err().to_string()
+                        == "backup supports only the exact Rootyard public schema",
+                    "format {format} did not refuse the newer table identities"
+                );
+            }
+        }
+        tx.rollback().await?;
+        assert_frozen_prefix(&mut client).await
+    }
+
+    async fn assert_frozen_prefix(client: &mut deadpool_postgres::Client) -> Result<()> {
+        for format in [29, 30] {
+            let tx = client.transaction().await?;
+            let versions = schema(&*tx, format).await?;
+            ensure!(versions.last() == Some(&151), "format {format} did not accept its exact schema 151 prefix");
+            tx.rollback().await?;
+        }
+        Ok(())
+    }
+}
