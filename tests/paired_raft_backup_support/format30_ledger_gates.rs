@@ -24,6 +24,9 @@ const REQUESTS: &str = "SELECT request_id,request_digest,consume_request_id,ack_
 const CONSUMES: &str = "SELECT r.hold_id,r.consume_digest,r.body,q.history_incarnation,q.authority_epoch,q.group_epoch FROM artifact_hold_consume_receipts r JOIN artifact_hold_requests q ON q.request_id=r.request_id WHERE r.repository_id=$1 ORDER BY r.hold_id";
 const PUBLICATIONS: &str = "SELECT registration_id,pack_id,parent_digest,ack_body,history_incarnation,authority_epoch,group_epoch FROM ref_store_core_pack_publications WHERE repository_id=$1 ORDER BY registration_id";
 
+#[path = "format30_ledger_gates/public_restore.rs"]
+mod public_restore;
+
 type Realm = (Uuid, i64, i64);
 /// Immutable pre-backup A3/A4 ledger evidence captured under the source realm.
 pub struct PreBackupLedgerProof {
@@ -97,31 +100,7 @@ pub async fn verify_post_restore_ledger_immutability_and_denials(
     let mut c = dst_pool.get().await?;
     let old = (pre.old_history_inc, pre.old_authority_epoch, pre.old_group_epoch);
     let new = (inc.new_history_incarnation, inc.new_authority_epoch, inc.new_group_epoch);
-    let old_public = c
-        .query(
-            "SELECT public_id FROM public.ref_store_public_operations
-          WHERE repository_id=$1 AND state='committed'
-            AND (history_incarnation,authority_epoch,group_epoch)=($2,$3,$4)",
-            &[&pre.repo_id, &old.0, &old.1, &old.2],
-        )
-        .await?;
-    ensure!(old_public.len() == 2, "expected both old committed public operations to be preserved");
-    for row in old_public {
-        let public_id: Uuid = row.get(0);
-        let refusal = c
-            .query_one(
-                "SELECT rootyard_ref_store_attempt_current_scope(
-                 jsonb_populate_record(w, jsonb_build_object('restore_incarnation', $3::uuid)))
-             FROM public.ref_store_public_operations w WHERE (w.repository_id,w.public_id)=($1,$2)",
-                &[&pre.repo_id, &public_id, &inc.new_cluster_incarnation],
-            )
-            .await
-            .expect_err("old terminal must fail the current realm proof in a fresh #153 history");
-        ensure!(
-            refusal.code() == Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION),
-            "old terminal received a non-scope refusal after the history rebind"
-        );
-    }
+    public_restore::verify_historical_wrapper_realm_refusal(&c, pre.repo_id, old, inc.new_cluster_incarnation).await?;
     let requests: Vec<(Uuid, String, Uuid, String, Realm)> = c
         .query(REQUESTS, &[&pre.repo_id])
         .await?
