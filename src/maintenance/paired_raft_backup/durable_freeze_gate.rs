@@ -16,14 +16,14 @@ pub use super::durable_guarded_ops::{
 };
 use super::freeze_drain::{RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 use super::mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend};
-use super::pg_cutpoint::{pg_err, sync_restored_pg_projection_cursors};
+use super::pg_cutpoint::{pg_err, require_pg_projection_resync_clear, sync_frozen_source_pg_projection_cursors};
 pub use super::pg_freeze_settings::{
     PAIRED_FREEZE_JOURNAL_LOCK_KEY, PG_FREEZE_SETTING, enforce_maintenance_pg_write_guard,
     read_pg_database_freeze_marker, read_pg_database_read_only, terminate_and_await_other_pg_sessions,
     verify_no_active_pg_writers, verify_no_active_pg_writers_except_fence,
 };
 use super::pg_freeze_settings::{
-    set_pg_database_freeze_marker, set_pg_database_read_only, verify_pg_quiescent_before_freeze,
+    ProvisionalPgFreeze, set_pg_database_freeze_marker, set_pg_database_read_only, verify_pg_quiescent_before_freeze,
 };
 use super::pg_write_fence::{PgTableShareFence, acquire_pg_table_share_fence};
 use super::quorum_wal::DurableRaftBackend;
@@ -108,6 +108,8 @@ pub async fn enter_durable_pg_raft_freeze(
     let barrier_id = Uuid::new_v4();
     // A recycled pooled backend can still be inside an abandoned transaction block.
     let _ = pg_client.batch_execute("ROLLBACK").await;
+    // Refuse a known gap before changing the source database or any Raft group.
+    require_pg_projection_resync_clear(pg_client).await?;
     // A recycled `Fast` session may already carry a latched `READ ONLY`; remember it for rollback.
     let prior_ro: String = pg_client.query_one("SHOW default_transaction_read_only", &[]).await.map_err(pg_err)?.get(0);
     pg_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
@@ -126,14 +128,14 @@ pub async fn enter_durable_pg_raft_freeze(
             record_seal: String::new(),
         }
         .seal()?;
-        set_pg_database_freeze_marker(pg_client, Some(&format!("{barrier_id}:{}", req.fenced_deleter_epoch))).await?;
-        set_pg_database_read_only(pg_client, true).await?;
+        let latch = ProvisionalPgFreeze::begin(pg_client, barrier_id, req.fenced_deleter_epoch).await?;
         terminate_and_await_other_pg_sessions(pg_client, Duration::from_secs(5)).await?;
         pg_client
             .query_one("SELECT pg_advisory_lock($1)", &[&PAIRED_FREEZE_JOURNAL_LOCK_KEY])
             .await
             .map_err(|_| PairedBackupError::FreezeNotHeld("failed to serialize journal retirement barrier"))?;
         let _ = pg_client.query_one("SELECT pg_advisory_unlock($1)", &[&PAIRED_FREEZE_JOURNAL_LOCK_KEY]).await;
+        latch.refuse_resync_before_raft(pg_client).await?;
         raft.write_freeze_record(&pre_freeze_rec)?;
         for peer_raft in peer_rafts.values() {
             peer_raft.write_freeze_record(&pre_freeze_rec)?;
@@ -268,7 +270,7 @@ pub async fn enter_durable_pg_raft_freeze(
         }
 
         raft.write_freeze_record(&freeze_record)?;
-        sync_restored_pg_projection_cursors(pg_client, raft.group_id(), &durable_snap, &peer_snaps).await?;
+        sync_frozen_source_pg_projection_cursors(pg_client, raft.group_id(), &durable_snap, &peer_snaps).await?;
         let _ = pg_client.batch_execute("ROLLBACK").await;
         let write_fence = acquire_pg_table_share_fence(req.fence_database_url, Duration::from_secs(5)).await?;
 

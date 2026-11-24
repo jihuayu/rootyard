@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use tokio_postgres::{GenericClient, Transaction};
 use uuid::Uuid;
 
-use crate::ref_store::GitObjectFormat;
+use crate::ref_store::{GitObjectFormat, core::state_machine::RefCasSnapshot};
 
 use super::peer_groups::{ExpectedGroupCursorCut, verify_all_group_cursors};
 use super::types::{
@@ -203,13 +203,69 @@ pub async fn capture_pg_cutpoint_in_tx(
     Ok(proof)
 }
 
+pub(super) async fn require_pg_projection_resync_clear(
+    client: &(impl GenericClient + Sync),
+) -> Result<(), PairedBackupError> {
+    let has_cursors: bool = client
+        .query_one("SELECT to_regclass('public.ref_cas_projection_cursors') IS NOT NULL", &[])
+        .await
+        .map_err(pg_err)?
+        .get(0);
+    if !has_cursors {
+        // An unmigrated source cannot have an explicit resync cursor. The
+        // existing source schema checks still apply during freeze and capture.
+        return Ok(());
+    }
+    let requires_resync: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM public.ref_cas_projection_cursors WHERE stream_state = 'resync_required')",
+            &[],
+        )
+        .await
+        .map_err(pg_err)?
+        .get(0);
+    if requires_resync {
+        return Err(PairedBackupError::CutpointSkew("source PostgreSQL projection cursor requires resync".into()));
+    }
+    Ok(())
+}
+
+pub(super) async fn sync_frozen_source_pg_projection_cursors(
+    client: &mut tokio_postgres::Client,
+    active_gid: i64,
+    active_snap: &RefCasSnapshot,
+    peer_snaps: &BTreeMap<i64, RefCasSnapshot>,
+) -> Result<(), PairedBackupError> {
+    let tx = client.transaction().await.map_err(pg_err)?;
+    // Exclude both cursor writers and SELECT FOR UPDATE before deleting any
+    // row. Recheck here even if the stream was clear before entering freeze.
+    tx.batch_execute("SET LOCAL lock_timeout = '5s'; LOCK TABLE public.ref_cas_projection_cursors IN EXCLUSIVE MODE")
+        .await
+        .map_err(pg_err)?;
+    require_pg_projection_resync_clear(&tx).await?;
+    replace_pg_projection_cursors(&tx, active_gid, active_snap, peer_snaps).await?;
+    tx.commit().await.map_err(pg_err)?;
+    Ok(())
+}
+
 pub(super) async fn sync_restored_pg_projection_cursors(
     client: &mut tokio_postgres::Client,
     active_gid: i64,
-    active_snap: &crate::ref_store::core::state_machine::RefCasSnapshot,
-    peer_snaps: &BTreeMap<i64, crate::ref_store::core::state_machine::RefCasSnapshot>,
+    active_snap: &RefCasSnapshot,
+    peer_snaps: &BTreeMap<i64, RefCasSnapshot>,
 ) -> Result<(), PairedBackupError> {
     let tx = client.transaction().await.map_err(pg_err)?;
+    replace_pg_projection_cursors(&tx, active_gid, active_snap, peer_snaps).await?;
+    tx.commit().await.map_err(pg_err)?;
+    Ok(())
+}
+
+async fn replace_pg_projection_cursors(
+    tx: &Transaction<'_>,
+    active_gid: i64,
+    active_snap: &RefCasSnapshot,
+    peer_snaps: &BTreeMap<i64, RefCasSnapshot>,
+) -> Result<(), PairedBackupError> {
     tx.execute("DELETE FROM public.ref_cas_projection_cursors", &[]).await.map_err(pg_err)?;
     for (gid, gsnap) in std::iter::once((active_gid, active_snap)).chain(peer_snaps.iter().map(|(&k, v)| (k, v))) {
         let cut = ExpectedGroupCursorCut::from_verified_snapshot(gid, gsnap)?;
@@ -230,6 +286,5 @@ pub(super) async fn sync_restored_pg_projection_cursors(
         .await
         .map_err(pg_err)?;
     }
-    tx.commit().await.map_err(pg_err)?;
     Ok(())
 }

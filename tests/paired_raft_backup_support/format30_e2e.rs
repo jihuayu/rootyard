@@ -132,6 +132,8 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         let pre_ledger =
             super::format30_ledger_gates::capture_pre_backup_ledger_proof(&src_pool, repo_id, &gate).await?;
         let src_authority_id = specs[0].authority_id;
+        let src_cfg = make_backup_config(src_url.clone(), dir.path().join("src-vol"), git.clone());
+        init_volume_dir(&src_cfg.data_dir)?;
         let mut peer_rafts = BTreeMap::from([(2i64, raft2)]);
         let freeze_handle = {
             let mut c = src_pool.get().await?;
@@ -143,6 +145,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
                 peer_repos_by_group: BTreeMap::from([(2i64, vec![(peer_repo, peer_tenant, src_authority_id)])]),
                 fence_database_url: src_url.as_str(),
             };
+            super::resync_gate::verify(&mut c, &mut raft1, &mut peer_rafts, &req, &src_cfg, &s3).await?;
             enter_durable_pg_raft_freeze(&mut c, &mut raft1, &mut peer_rafts, &req).await?
         };
         let bypass_conn = db::connect_url(&src_url).await?;
@@ -234,9 +237,6 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             PairedBackupError::DeleterNotFenced(_)
         ));
         drop(fresh_src_pool);
-        let src_data_dir = dir.path().join("src-vol");
-        init_volume_dir(&src_data_dir)?;
-        let src_cfg = make_backup_config(src_url.clone(), src_data_dir, git.clone());
         let archive_dir = dir.path().join("fmt30-paired-archive");
         let peer_inputs = vec![PeerGroupBackupInput {
             group_id: 2,
