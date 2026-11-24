@@ -51,6 +51,7 @@ TOUCHED = [
     TESTS / "s4_ci_pins_git_view.rs",
     TESTS / "s4_ci_pins_git_view_support" / "harness.rs",
     TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs",
+    TESTS / "s4_ci_pins_git_view_support" / "git_view_cleanup.rs",
     TESTS / "s4_ci_pins_git_view_support" / "s3.rs",
 ]
 
@@ -309,9 +310,11 @@ class SourceContracts(unittest.TestCase):
         self.assertIn("GateEpochRestoreGuard", hold)
 
     def test_hold_regressions_cover_the_two_review_items(self) -> None:
-        body = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
-        for needle in ("/ci-pins", "ref_store_core_root_heads", "/git/views/", "/proc/"):
+        support = TESTS / "s4_ci_pins_git_view_support"
+        body = text(support / "hold_regressions.rs")
+        for needle in ("/ci-pins", "ref_store_core_root_heads", "/git/views/", "wait_scratch_gone("):
             self.assertIn(needle, body)
+        self.assertIn("/proc/", text(support / "git_view_cleanup.rs"))
 
     def test_line_endings_are_pure_lf(self) -> None:
         for path in TOUCHED + [WORKFLOW, DOC]:
